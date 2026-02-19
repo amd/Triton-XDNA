@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.a
+
+# Wheel files
+*.whl
+wheelhouse/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Patch marker files (tracks which patches have been applied)
+.patches_applied
+
+# OS files
+.DS_Store
+Thumbs.db
