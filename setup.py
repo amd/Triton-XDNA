@@ -805,7 +805,7 @@ setup(
     description="Triton compiler with MLIR-AIR backend for AMD NPU devices",
     long_description=(BASE_DIR / "README.md").read_text(),
     long_description_content_type="text/markdown",
-    url="https://github.com/AARInternal/triton-xdna",
+    url="https://github.com/amd/Triton-XDNA",
     license="MIT",
     packages=[],  # No packages - we build from triton
     install_requires=get_install_requires(),

@@ -26,14 +26,14 @@ classifiers = [
 
 # Installation command:
 # pip install triton-xdna \
-#   --find-links https://github.com/AARInternal/triton-xdna/releases/expanded_assets/latest-wheels \
+#   --find-links https://github.com/amd/Triton-XDNA/releases/expanded_assets/latest-wheels \
 #   --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti \
 #   --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
 #   --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
 
 [project.urls]
-Homepage = "https://github.com/AARInternal/triton-xdna"
-Repository = "https://github.com/AARInternal/triton-xdna.git"
+Homepage = "https://github.com/amd/Triton-XDNA"
+Repository = "https://github.com/amd/Triton-XDNA.git"
 
 [project.entry-points."triton.backends"]
 amd_triton_npu = "triton.backends.amd_triton_npu"
