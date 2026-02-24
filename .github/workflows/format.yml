@@ -1,0 +1,85 @@
+name: Code Formatting Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formatting:
+    name: Python and C/C++ Format Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          submodules: "true"
+
+      - name: Install clang-format
+        uses: aminya/setup-cpp@v1
+        with:
+          clangformat: 17.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install black
+        run: pip install black
+
+      - name: Run git-clang-format
+        id: git-clang-format
+        run: |
+          git fetch origin main
+          git clang-format origin/main || true
+          git diff > clang-format.diff
+          cat clang-format.diff
+
+      - name: Upload clang-format diff
+        uses: actions/upload-artifact@v4
+        with:
+          path: clang-format.diff
+          name: clang_format_diffs
+
+      - name: Check C/C++ format
+        uses: reviewdog/action-suggester@v1.22
+        with:
+          tool_name: clang-format
+          level: error
+          cleanup: true
+          fail_level: any
+
+      - name: Run black format
+        if: success() || failure()
+        id: black-format
+        run: |
+          black . || true
+          git diff > black-format.diff
+          cat black-format.diff
+
+      - name: Upload black-format diff
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          path: black-format.diff
+          name: black_format_diffs
+
+      - name: Check Python format
+        if: success() || failure()
+        uses: reviewdog/action-suggester@v1.22
+        with:
+          tool_name: black
+          level: error
+          fail_level: any
