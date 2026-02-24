@@ -96,3 +96,13 @@ before-build = [
 
 [tool.setuptools]
 packages = []
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+extend-exclude = '''
+(
+  third_party/
+  | build/
+)
+'''
