@@ -4,8 +4,8 @@
 # SPDX-License-Identifier: MIT
 
 IMAGE_NAME="triton-xdna-public-dev-github-runner"
-GITHUB_OWNER="AARInternal"
-GITHUB_REPO="triton-xdna"
+GITHUB_OWNER="amd"
+GITHUB_REPO="Triton-XDNA"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GITHUB_PAT=$(cat "${SCRIPT_DIR}/secret_github_token")

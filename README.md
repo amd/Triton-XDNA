@@ -1,12 +1,38 @@
 # Triton-XDNA
-This repository contains a plugin for building AIR as Triton's compiler backend.
+
+**An experimental open-source project demonstrating compiler-driven kernel generation for AMD XDNA NPUs using [Triton](https://github.com/triton-lang/triton) and [MLIR-AIR](https://github.com/Xilinx/mlir-air).**
+
+Triton-XDNA provides an end-to-end compilation flow that lowers standard Triton kernels directly to AMD NPU hardware — no prebuilt kernel libraries required. It bridges Triton's high-level parallel programming model with AMD's MLIR-AIR/AIE compilation stack, producing XRT-compatible binaries for AMD AI Engine architectures (AIE2 and AIE2P).
+
+### How it works
+
+Triton kernels are first lowered to compact Linalg compute graphs via [triton-shared](https://github.com/microsoft/triton-shared), then tiled and mapped onto parallel NPU cores using the MLIR Transform dialect, and finally compiled through [MLIR-AIR](https://github.com/Xilinx/mlir-air) and [MLIR-AIE](https://github.com/Xilinx/mlir-aie) to produce device binaries.
+
+```
+Triton kernel (@triton.jit)
+  -> triton-shared (Linalg)
+    -> MLIR Transform dialect (tiling, bufferization, vectorization)
+      -> MLIR-AIR / MLIR-AIE
+        -> XRT binary (aie.xclbin)
+```
+
+### Key results
+
+- For dense matrix multiplication (I8/I16/BF16), compiler-generated kernels achieve **performance parity with handwritten NPU implementations**
+- Over **90% of tested matmul configurations reach at least 90% of baseline throughput**; no configuration falls below 80%
+- Currently supports matrix multiplication, elementwise operations, softmax, and layer normalization
+- Complex compute graphs with reductions and broadcasts are mapped onto parallel NPU tiles
+
+### Contributing
+
+This is an experimental project and we welcome community contributions. Whether it's adding support for new kernel types, improving performance, or extending platform support — we'd love to collaborate.
 
 ## Usage
 
 ### Clone the repository
 ```
-git clone https://github.com/AARInternal/triton-xdna.git
-cd triton-xdna
+git clone https://github.com/amd/Triton-XDNA.git
+cd Triton-XDNA
 git submodule update --init
 ```
 
@@ -27,7 +53,7 @@ python3 -m pip install --upgrade pip
 
 # Install triton-xdna from GitHub Releases
 pip install triton-xdna \
-  --find-links https://github.com/AARInternal/triton-xdna/releases/expanded_assets/latest-wheels \
+  --find-links https://github.com/amd/Triton-XDNA/releases/expanded_assets/latest-wheels \
   --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti \
   --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
   --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
@@ -52,7 +78,7 @@ python3 -m pip install --upgrade pip
 pip install cmake pybind11 nanobind wheel ninja pytest setuptools Cython
 
 # Install triton-xdna from source and all dependencies automatically
-pip install . \
+pip install . --no-build-isolation \
   --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti \
   --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
   --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
@@ -74,7 +100,7 @@ python3 -m pip install --upgrade pip
 pip install cmake pybind11 nanobind wheel ninja pytest setuptools Cython
 source utils/env_setup.sh
 
-cmake cmake -GNinja -S . -Bbuild
+cmake -GNinja -S . -Bbuild
 cd build
 ninja
 ```
