@@ -12,9 +12,18 @@ index 7ae68d3..bc827b3 100644
  endif()
  
 diff --git a/README.md b/README.md
-index 8d40553..9802ee7 100644
+index b1cb966..9802ee7 100644
 --- a/README.md
 +++ b/README.md
+@@ -25,7 +25,7 @@ You need to set the `TRITON_PLUGIN_DIRS` environment variable to the location of
+ ```
+ export TRITON_PLUGIN_DIRS=$(pwd)/triton_shared
+ 
+-git clone https://github.com/facebookincubator/triton-shared.git triton_shared
++git clone https://github.com/microsoft/triton-shared.git triton_shared
+ git clone https://github.com/triton-lang/triton.git
+ cd triton && git checkout $(cat ../triton_shared/triton-hash.txt)
+ ```
 @@ -95,7 +95,7 @@ As part of the conversion process, there are three important analyses:
  
  ### Conversion strategy
@@ -24,11 +33,44 @@ index 8d40553..9802ee7 100644
  
  ```mlir
  tt.func @kernel(%afloat : !tt.ptr<bf16>, %res : !tt.ptr<bf16>) {
+@@ -209,3 +209,25 @@ ll.ir  ll.mlir  tt.mlir  ttshared.mlir
+ 
+ ## Debugging Triton Programs
+ Triton-shared includes a build option that enables LLVM-sanitizers - AddressSanitizer (ASan) and ThreadSanitizer (TSan) - to help detect memory safety and concurrency issues in Triton programs. These sanitizers dynamically analyze the program during execution, identifying bugs such as buffer overflows and data races respectively. For more details and setup instructions, refer [here](triton-san/README.md).
++
++## Contributing
++
++This project welcomes contributions and suggestions.  Most contributions require you to agree to a
++Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
++the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
++
++When you submit a pull request, a CLA bot will automatically determine whether you need to provide
++a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
++provided by the bot. You will only need to do this once across all repos using our CLA.
++
++This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
++For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
++contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
++
++## Trademarks
++
++This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft
++trademarks or logos is subject to and must follow
++[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
++Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
++Any use of third-party trademarks or logos are subject to those third-party's policies.
 diff --git a/backend/compiler.py b/backend/compiler.py
-index 9efdb48..ee941bb 100644
+index d534835..ee941bb 100644
 --- a/backend/compiler.py
 +++ b/backend/compiler.py
-@@ -64,6 +64,7 @@ def _ttir_to_ttsharedir(mod):
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ from triton.backends.compiler import BaseBackend, GPUTarget
+ from triton._C.libtriton import ir, passes
+ from dataclasses import dataclass
+@@ -67,6 +64,7 @@ def _ttir_to_ttsharedir(mod):
              subprocess_args.insert(2, "--add-llvm-debug-info")
  
          subprocess.check_call(subprocess_args)
@@ -36,7 +78,7 @@ index 9efdb48..ee941bb 100644
          return Path(dst_path).read_text()
  
  
-@@ -113,6 +114,7 @@ def _ttsharedir_to_llir(ttsharedir: str):
+@@ -116,6 +114,7 @@ def _ttsharedir_to_llir(ttsharedir: str):
              "--mlir-print-debuginfo",
              "-o",
              llmlir_path])
@@ -44,7 +86,7 @@ index 9efdb48..ee941bb 100644
  
          # LLVM-MLIR to LLVM-IR
          mlir_translate_path = _get_llvm_bin_path("mlir-translate")
-@@ -120,7 +122,7 @@ def _ttsharedir_to_llir(ttsharedir: str):
+@@ -123,7 +122,7 @@ def _ttsharedir_to_llir(ttsharedir: str):
              "--mlir-to-llvmir",
              "-o",
              llir_path])
@@ -53,7 +95,7 @@ index 9efdb48..ee941bb 100644
          return Path(llir_path).read_text()
  
  
-@@ -151,7 +153,7 @@ def _llir_to_bin(llir: str, metadata):
+@@ -154,7 +153,7 @@ def _llir_to_bin(llir: str, metadata):
              sanitizer_attributes_pass_path = str(next(Path(top_level_triton_path).rglob("libSanitizerAttributes.so"), None))
  
              if not sanitizer_attributes_pass_path:
@@ -62,7 +104,7 @@ index 9efdb48..ee941bb 100644
  
              subprocess.check_call([opt_path, "-load-pass-plugin", sanitizer_attributes_pass_path, 
                  "-passes=sanitizer-attributes", f"-sanitizer-type={sanitizer_type}", "-S", src_path, 
-@@ -194,6 +196,7 @@ class CPUOptions:
+@@ -197,6 +196,7 @@ class CPUOptions:
      allow_fp8e4nv: bool = False
      allowed_dot_input_precisions: Tuple[str] = ("ieee", )
      sanitize_overflow: bool = True
@@ -70,7 +112,7 @@ index 9efdb48..ee941bb 100644
  
      def __post_init__(self):
          pass
-@@ -256,7 +259,7 @@ class CPUBackend(BaseBackend):
+@@ -259,7 +259,7 @@ class CPUBackend(BaseBackend):
          passes.common.add_symbol_dce(pm)
          passes.ttir.add_loop_unroll(pm)
          passes.common.add_cse(pm)
@@ -80,10 +122,13 @@ index 9efdb48..ee941bb 100644
  
      def add_stages(self, stages, options, language):
 diff --git a/backend/driver.py b/backend/driver.py
-index dcfe9b7..de45f70 100644
+index f528179..de45f70 100644
 --- a/backend/driver.py
 +++ b/backend/driver.py
-@@ -1,10 +1,12 @@
+@@ -1,13 +1,12 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
  import hashlib
  import tempfile
 -import sysconfig
@@ -98,7 +143,7 @@ index dcfe9b7..de45f70 100644
  
  from pathlib import Path
  
-@@ -63,7 +65,18 @@ def _ty_to_cpp(ty):
+@@ -66,7 +65,18 @@ def _ty_to_cpp(ty):
          "fp64": "double",
      }[ty]
  
@@ -117,7 +162,7 @@ index dcfe9b7..de45f70 100644
      if ty[0] == '*':
          return "PyObject*"
      if ty == "constexpr":
-@@ -71,6 +84,15 @@ def _extracted_type(ty):
+@@ -74,6 +84,15 @@ def _extracted_type(ty):
      return _ty_to_cpp(ty)
  
  def _format_of(ty):
@@ -133,7 +178,7 @@ index dcfe9b7..de45f70 100644
      return {
        "PyObject*": "O",
        "constexpr": "O",
-@@ -85,15 +107,20 @@ def _format_of(ty):
+@@ -88,15 +107,20 @@ def _format_of(ty):
        "uint16_t": "H",
        "uint32_t": "I",
        "uint64_t": "K",
@@ -158,7 +203,7 @@ index dcfe9b7..de45f70 100644
      kernel_arg_decls += ', ' if kernel_arg_decls else ''
  
      kernel_parameters = ', '.join(f"static_cast<{_ty_to_cpp(ty)}>(arg{i})" if ty[0] != "*" else f"0, &ptr_arg{i}" for i, ty in signature.items() if ty != "constexpr")
-@@ -327,7 +354,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
+@@ -330,7 +354,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
                            libomp_path = next(Path(Path(_get_llvm_bin_path("")).parent).rglob("libomp.so"), None)
  
                            if not libomp_path:
@@ -167,7 +212,7 @@ index dcfe9b7..de45f70 100644
  
                            libomp_path = str(libomp_path.parent)
  
-@@ -364,7 +391,8 @@ class CPULauncher(object):
+@@ -367,7 +391,8 @@ class CPULauncher(object):
          kernel_placeholder_name = "KERNEL_NAME_PLACEHOLDER"
  
          constants = src.constants if hasattr(src, "constants") else dict()
@@ -177,7 +222,7 @@ index dcfe9b7..de45f70 100644
          constants = {cst_key(key): value for key, value in constants.items()}
          signature = {cst_key(key): value for key, value in src.signature.items()}
          launcher_src = _generate_launcher(constants, signature, kernel_placeholder_name)
-@@ -431,9 +459,56 @@ class CPUDriver(DriverBase):
+@@ -434,9 +459,56 @@ class CPUDriver(DriverBase):
      def is_active():
          return False
  
@@ -236,6 +281,66 @@ index dcfe9b7..de45f70 100644
  
      def get_device_capability(self):
          return ("cpu", 0)
+diff --git a/include/triton-shared/Analysis/MaskAnalysis.h b/include/triton-shared/Analysis/MaskAnalysis.h
+index 8ca8cc4..0ad7c6f 100644
+--- a/include/triton-shared/Analysis/MaskAnalysis.h
++++ b/include/triton-shared/Analysis/MaskAnalysis.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Analysis/OpFoldResultUtils.h b/include/triton-shared/Analysis/OpFoldResultUtils.h
+index 476a8fd..248dfc3 100644
+--- a/include/triton-shared/Analysis/OpFoldResultUtils.h
++++ b/include/triton-shared/Analysis/OpFoldResultUtils.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Analysis/PtrAnalysis.h b/include/triton-shared/Analysis/PtrAnalysis.h
+index 759cc78..5a95ebd 100644
+--- a/include/triton-shared/Analysis/PtrAnalysis.h
++++ b/include/triton-shared/Analysis/PtrAnalysis.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Analysis/UseAnalysis.h b/include/triton-shared/Analysis/UseAnalysis.h
+index a1c661b..39c3055 100644
+--- a/include/triton-shared/Analysis/UseAnalysis.h
++++ b/include/triton-shared/Analysis/UseAnalysis.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/AnalysisStructured/PtrAnalysis.h b/include/triton-shared/AnalysisStructured/PtrAnalysis.h
+index 306a7b5..b1791aa 100644
+--- a/include/triton-shared/AnalysisStructured/PtrAnalysis.h
++++ b/include/triton-shared/AnalysisStructured/PtrAnalysis.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 diff --git a/include/triton-shared/Conversion/CMakeLists.txt b/include/triton-shared/Conversion/CMakeLists.txt
 index a4a0394..f8e180a 100644
 --- a/include/triton-shared/Conversion/CMakeLists.txt
@@ -245,10 +350,64 @@ index a4a0394..f8e180a 100644
  add_subdirectory(TritonToLinalgExperimental)
  add_subdirectory(TritonToStructured)
  add_subdirectory(TritonArithToLinalg)
+diff --git a/include/triton-shared/Conversion/StructuredToMemref/Passes.h b/include/triton-shared/Conversion/StructuredToMemref/Passes.h
+index 1af4f3c..198675b 100644
+--- a/include/triton-shared/Conversion/StructuredToMemref/Passes.h
++++ b/include/triton-shared/Conversion/StructuredToMemref/Passes.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_STRUCTURED_TO_MEMREF_CONVERSION_PASSES_H
+ #define TRITON_STRUCTURED_TO_MEMREF_CONVERSION_PASSES_H
+ 
+diff --git a/include/triton-shared/Conversion/StructuredToMemref/Passes.td b/include/triton-shared/Conversion/StructuredToMemref/Passes.td
+index be56471..ac318f5 100644
+--- a/include/triton-shared/Conversion/StructuredToMemref/Passes.td
++++ b/include/triton-shared/Conversion/StructuredToMemref/Passes.td
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef STRUCTURED_TO_MEMREF_CONVERSION_PASSES
+ #define STRUCTURED_TO_MEMREF_CONVERSION_PASSES
+ 
+diff --git a/include/triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h b/include/triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h
+index 196cc22..8c67c9e 100644
+--- a/include/triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h
++++ b/include/triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_CONVERSION_STRUCTUREDTOMEMREF_STRUCTUREDTOMEMREF_H
+ #define TRITON_CONVERSION_STRUCTUREDTOMEMREF_STRUCTUREDTOMEMREF_H
+ 
 diff --git a/include/triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp b/include/triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp
-index 1d9244d..c509be3 100644
+index 097254c..c509be3 100644
 --- a/include/triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp
 +++ b/include/triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp
+@@ -3,7 +3,7 @@
+ 
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -59,14 +59,14 @@ static Value getScalarValue(Value operand, Location loc,
                    if (auto shapedType = dyn_cast<ShapedType>(resType)) {
                      resType = shapedType.getElementType();
@@ -1070,6 +1229,111 @@ index 1d9244d..c509be3 100644
      rewriter.replaceOpWithNewOp<tensor::ReshapeOp>(op, outputType, input,
                                                     shape);
  
+diff --git a/include/triton-shared/Conversion/TritonArithToLinalg/ConversionTools.h b/include/triton-shared/Conversion/TritonArithToLinalg/ConversionTools.h
+index a0f5047..b3b42c1 100644
+--- a/include/triton-shared/Conversion/TritonArithToLinalg/ConversionTools.h
++++ b/include/triton-shared/Conversion/TritonArithToLinalg/ConversionTools.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_CONVERSION_TRITONARITHTOLINALG_CONVERSIONTOOLS_H
+ #define TRITON_CONVERSION_TRITONARITHTOLINALG_CONVERSIONTOOLS_H
+ 
+diff --git a/include/triton-shared/Conversion/TritonArithToLinalg/Passes.h b/include/triton-shared/Conversion/TritonArithToLinalg/Passes.h
+index e748c4c..b95cbde 100644
+--- a/include/triton-shared/Conversion/TritonArithToLinalg/Passes.h
++++ b/include/triton-shared/Conversion/TritonArithToLinalg/Passes.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_ARITH_TO_LINALG_CONVERSION_PASSES_H
+ #define TRITON_ARITH_TO_LINALG_CONVERSION_PASSES_H
+ 
+diff --git a/include/triton-shared/Conversion/TritonArithToLinalg/Passes.td b/include/triton-shared/Conversion/TritonArithToLinalg/Passes.td
+index 1a55303..d1f0f63 100644
+--- a/include/triton-shared/Conversion/TritonArithToLinalg/Passes.td
++++ b/include/triton-shared/Conversion/TritonArithToLinalg/Passes.td
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_ARITH_TO_LINALG_CONVERSION_PASSES
+ #define TRITON_ARITH_TO_LINALG_CONVERSION_PASSES
+ 
+diff --git a/include/triton-shared/Conversion/TritonArithToLinalg/TritonArithToLinalg.h b/include/triton-shared/Conversion/TritonArithToLinalg/TritonArithToLinalg.h
+index 45867e4..22dc652 100644
+--- a/include/triton-shared/Conversion/TritonArithToLinalg/TritonArithToLinalg.h
++++ b/include/triton-shared/Conversion/TritonArithToLinalg/TritonArithToLinalg.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_CONVERSION_TRITONARITHTOLINALG_TRITONARITHTOLINALG_H
+ #define TRITON_CONVERSION_TRITONARITHTOLINALG_TRITONARITHTOLINALG_H
+ 
+diff --git a/include/triton-shared/Conversion/TritonPtrToMemref/Passes.h b/include/triton-shared/Conversion/TritonPtrToMemref/Passes.h
+index f0df4ab..e1f6f33 100644
+--- a/include/triton-shared/Conversion/TritonPtrToMemref/Passes.h
++++ b/include/triton-shared/Conversion/TritonPtrToMemref/Passes.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_PTR_TO_MEMREF_CONVERSION_PASSES_H
+ #define TRITON_PTR_TO_MEMREF_CONVERSION_PASSES_H
+ 
+diff --git a/include/triton-shared/Conversion/TritonPtrToMemref/Passes.td b/include/triton-shared/Conversion/TritonPtrToMemref/Passes.td
+index 0aaec4c..c027b09 100644
+--- a/include/triton-shared/Conversion/TritonPtrToMemref/Passes.td
++++ b/include/triton-shared/Conversion/TritonPtrToMemref/Passes.td
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_PTR_TO_MEMREF_CONVERSION_PASSES
+ #define TRITON_PTR_TO_MEMREF_CONVERSION_PASSES
+ 
+diff --git a/include/triton-shared/Conversion/TritonPtrToMemref/TritonPtrToMemref.h b/include/triton-shared/Conversion/TritonPtrToMemref/TritonPtrToMemref.h
+index c2df315..4476f7d 100644
+--- a/include/triton-shared/Conversion/TritonPtrToMemref/TritonPtrToMemref.h
++++ b/include/triton-shared/Conversion/TritonPtrToMemref/TritonPtrToMemref.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_CONVERSION_TRITON_PTR_TO_MEMREF_TRITON_PTR_TO_MEMREF_H
+ #define TRITON_CONVERSION_TRITON_PTR_TO_MEMREF_TRITON_PTR_TO_MEMREF_H
+ 
 diff --git a/include/triton-shared/Conversion/TritonToLinalg/CMakeLists.txt b/include/triton-shared/Conversion/TritonToLinalg/CMakeLists.txt
 deleted file mode 100644
 index 74ccdd3..0000000
@@ -1087,13 +1351,13 @@ index 74ccdd3..0000000
 -add_public_tablegen_target(TritonToLinalgConversionPassIncGen)
 diff --git a/include/triton-shared/Conversion/TritonToLinalg/Passes.h b/include/triton-shared/Conversion/TritonToLinalg/Passes.h
 deleted file mode 100644
-index 404af08..0000000
+index c2c79fc..0000000
 --- a/include/triton-shared/Conversion/TritonToLinalg/Passes.h
 +++ /dev/null
 @@ -1,22 +0,0 @@
 -//===----------------------------------------------------------------------===//
 -//
--// Copyright (c) Microsoft Corporation.
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
 -// Licensed under the MIT license.
 -//
 -//===----------------------------------------------------------------------===//
@@ -1115,13 +1379,13 @@ index 404af08..0000000
 -#endif
 diff --git a/include/triton-shared/Conversion/TritonToLinalg/Passes.td b/include/triton-shared/Conversion/TritonToLinalg/Passes.td
 deleted file mode 100644
-index 627077e..0000000
+index 2b3dfc2..0000000
 --- a/include/triton-shared/Conversion/TritonToLinalg/Passes.td
 +++ /dev/null
 @@ -1,18 +0,0 @@
 -//===----------------------------------------------------------------------===//
 -//
--// Copyright (c) Microsoft Corporation.
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
 -// Licensed under the MIT license.
 -//
 -//===----------------------------------------------------------------------===//
@@ -1139,13 +1403,13 @@ index 627077e..0000000
 -#endif
 diff --git a/include/triton-shared/Conversion/TritonToLinalg/TritonToLinalg.h b/include/triton-shared/Conversion/TritonToLinalg/TritonToLinalg.h
 deleted file mode 100644
-index 4c58e99..0000000
+index dd5c556..0000000
 --- a/include/triton-shared/Conversion/TritonToLinalg/TritonToLinalg.h
 +++ /dev/null
 @@ -1,33 +0,0 @@
 -//===----------------------------------------------------------------------===//
 -//
--// Copyright (c) Microsoft Corporation.
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
 -// Licensed under the MIT license.
 -//
 -//===----------------------------------------------------------------------===//
@@ -1176,10 +1440,363 @@ index 4c58e99..0000000
 -} // namespace mlir
 -
 -#endif // TRITON_CONVERSION_TRITONTOLINALG_TRITONTOLINALG_H
+diff --git a/include/triton-shared/Conversion/TritonToLinalgExperimental/CollapseShape.h b/include/triton-shared/Conversion/TritonToLinalgExperimental/CollapseShape.h
+index 2c44951..064528e 100644
+--- a/include/triton-shared/Conversion/TritonToLinalgExperimental/CollapseShape.h
++++ b/include/triton-shared/Conversion/TritonToLinalgExperimental/CollapseShape.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Conversion/TritonToLinalgExperimental/Passes.h b/include/triton-shared/Conversion/TritonToLinalgExperimental/Passes.h
+index fa5333f..5aa650a 100644
+--- a/include/triton-shared/Conversion/TritonToLinalgExperimental/Passes.h
++++ b/include/triton-shared/Conversion/TritonToLinalgExperimental/Passes.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Conversion/TritonToLinalgExperimental/Passes.td b/include/triton-shared/Conversion/TritonToLinalgExperimental/Passes.td
+index 8ffae62..09d6655 100644
+--- a/include/triton-shared/Conversion/TritonToLinalgExperimental/Passes.td
++++ b/include/triton-shared/Conversion/TritonToLinalgExperimental/Passes.td
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h b/include/triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h
+index 01f0229..bea24e8 100644
+--- a/include/triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h
++++ b/include/triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Conversion/TritonToLinalgExperimental/TritonToLinalgExperimental.h b/include/triton-shared/Conversion/TritonToLinalgExperimental/TritonToLinalgExperimental.h
+index f8a5f06..59b7b23 100644
+--- a/include/triton-shared/Conversion/TritonToLinalgExperimental/TritonToLinalgExperimental.h
++++ b/include/triton-shared/Conversion/TritonToLinalgExperimental/TritonToLinalgExperimental.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Conversion/TritonToLinalgExperimental/TritonToPtr.h b/include/triton-shared/Conversion/TritonToLinalgExperimental/TritonToPtr.h
+index 8a3831b..305d5aa 100644
+--- a/include/triton-shared/Conversion/TritonToLinalgExperimental/TritonToPtr.h
++++ b/include/triton-shared/Conversion/TritonToLinalgExperimental/TritonToPtr.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Conversion/TritonToStructured/Passes.h b/include/triton-shared/Conversion/TritonToStructured/Passes.h
+index 31bc380..3c3b81c 100644
+--- a/include/triton-shared/Conversion/TritonToStructured/Passes.h
++++ b/include/triton-shared/Conversion/TritonToStructured/Passes.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_TO_STRUCTURED_CONVERSION_PASSES_H
+ #define TRITON_TO_STRUCTURED_CONVERSION_PASSES_H
+ 
+diff --git a/include/triton-shared/Conversion/TritonToStructured/Passes.td b/include/triton-shared/Conversion/TritonToStructured/Passes.td
+index 07ad788..ef61f0f 100644
+--- a/include/triton-shared/Conversion/TritonToStructured/Passes.td
++++ b/include/triton-shared/Conversion/TritonToStructured/Passes.td
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_TO_STRUCTURED_CONVERSION_PASSES
+ #define TRITON_TO_STRUCTURED_CONVERSION_PASSES
+ 
+diff --git a/include/triton-shared/Conversion/TritonToStructured/TritonToStructured.h b/include/triton-shared/Conversion/TritonToStructured/TritonToStructured.h
+index d919cbb..bbf730e 100644
+--- a/include/triton-shared/Conversion/TritonToStructured/TritonToStructured.h
++++ b/include/triton-shared/Conversion/TritonToStructured/TritonToStructured.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_CONVERSION_TRITONTOSTRUCTURED_TRITONTOSTRUCTURED_H
+ #define TRITON_CONVERSION_TRITONTOSTRUCTURED_TRITONTOSTRUCTURED_H
+ 
+diff --git a/include/triton-shared/Conversion/TritonToUnstructured/Passes.h b/include/triton-shared/Conversion/TritonToUnstructured/Passes.h
+index d0380b9..a2016c7 100644
+--- a/include/triton-shared/Conversion/TritonToUnstructured/Passes.h
++++ b/include/triton-shared/Conversion/TritonToUnstructured/Passes.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_TO_UNSTRUCTURED_CONVERSION_PASSES_H
+ #define TRITON_TO_UNSTRUCTURED_CONVERSION_PASSES_H
+ 
+diff --git a/include/triton-shared/Conversion/TritonToUnstructured/Passes.td b/include/triton-shared/Conversion/TritonToUnstructured/Passes.td
+index cd7397c..542d087 100644
+--- a/include/triton-shared/Conversion/TritonToUnstructured/Passes.td
++++ b/include/triton-shared/Conversion/TritonToUnstructured/Passes.td
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_TO_UNSTRUCTURED_CONVERSION_PASSES
+ #define TRITON_TO_UNSTRUCTURED_CONVERSION_PASSES
+ 
+diff --git a/include/triton-shared/Conversion/TritonToUnstructured/TritonToUnstructured.h b/include/triton-shared/Conversion/TritonToUnstructured/TritonToUnstructured.h
+index a36a343..03ccdcd 100644
+--- a/include/triton-shared/Conversion/TritonToUnstructured/TritonToUnstructured.h
++++ b/include/triton-shared/Conversion/TritonToUnstructured/TritonToUnstructured.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_CONVERSION_TRITON_TO_UNSTRUCTURED_TRITON_TO_UNSTRUCTURED_H
+ #define TRITON_CONVERSION_TRITON_TO_UNSTRUCTURED_TRITON_TO_UNSTRUCTURED_H
+ 
+diff --git a/include/triton-shared/Conversion/UnstructuredToMemref/Passes.h b/include/triton-shared/Conversion/UnstructuredToMemref/Passes.h
+index db664ef..f2d7117 100644
+--- a/include/triton-shared/Conversion/UnstructuredToMemref/Passes.h
++++ b/include/triton-shared/Conversion/UnstructuredToMemref/Passes.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Conversion/UnstructuredToMemref/Passes.td b/include/triton-shared/Conversion/UnstructuredToMemref/Passes.td
+index 4a7b382..a0bf316 100644
+--- a/include/triton-shared/Conversion/UnstructuredToMemref/Passes.td
++++ b/include/triton-shared/Conversion/UnstructuredToMemref/Passes.td
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Conversion/UnstructuredToMemref/UnstructuredToMemref.h b/include/triton-shared/Conversion/UnstructuredToMemref/UnstructuredToMemref.h
+index 4ad6d0a..ad0f5c4 100644
+--- a/include/triton-shared/Conversion/UnstructuredToMemref/UnstructuredToMemref.h
++++ b/include/triton-shared/Conversion/UnstructuredToMemref/UnstructuredToMemref.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Dialect/TPtr/IR/TPtrDialect.h b/include/triton-shared/Dialect/TPtr/IR/TPtrDialect.h
+index f810b40..c7e5933 100644
+--- a/include/triton-shared/Dialect/TPtr/IR/TPtrDialect.h
++++ b/include/triton-shared/Dialect/TPtr/IR/TPtrDialect.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef MLIR_DIALECT_TPTR_IR_TPTR_DIALECT_H_
+ #define MLIR_DIALECT_TPTR_IR_TPTR_DIALECT_H_
+ 
+diff --git a/include/triton-shared/Dialect/TPtr/IR/TPtrDialect.td b/include/triton-shared/Dialect/TPtr/IR/TPtrDialect.td
+index f724f78..04d894f 100644
+--- a/include/triton-shared/Dialect/TPtr/IR/TPtrDialect.td
++++ b/include/triton-shared/Dialect/TPtr/IR/TPtrDialect.td
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TPTR_DIALECT
+ #define TPTR_DIALECT
+ 
+diff --git a/include/triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h b/include/triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h
+index af72fbe..fbead0c 100644
+--- a/include/triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h
++++ b/include/triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef MLIR_DIALECT_TRITON_STRUCTURED_IR_TRITON_STRUCTURED_DIALECT_H_
+ #define MLIR_DIALECT_TRITON_STRUCTURED_IR_TRITON_STRUCTURED_DIALECT_H_
+ 
+diff --git a/include/triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.td b/include/triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.td
+index e5c81b2..17c3ce9 100644
+--- a/include/triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.td
++++ b/include/triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.td
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_STRUCTURED_DIALECT
+ #define TRITON_STRUCTURED_DIALECT
+ 
+diff --git a/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h b/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h
+index 5cf8492..53e031d 100644
+--- a/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h
++++ b/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtInterfaces.td b/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtInterfaces.td
+index 567d95e..e74fbb6 100644
+--- a/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtInterfaces.td
++++ b/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtInterfaces.td
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtOps.td b/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtOps.td
+index d589aab..d3a4268 100644
+--- a/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtOps.td
++++ b/include/triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtOps.td
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Transform/AddLLVMDebugInfo/AddLLVMDebugInfo.h b/include/triton-shared/Transform/AddLLVMDebugInfo/AddLLVMDebugInfo.h
+index d2fc8f4..e350e8a 100644
+--- a/include/triton-shared/Transform/AddLLVMDebugInfo/AddLLVMDebugInfo.h
++++ b/include/triton-shared/Transform/AddLLVMDebugInfo/AddLLVMDebugInfo.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Transform/AddLLVMDebugInfo/Passes.h b/include/triton-shared/Transform/AddLLVMDebugInfo/Passes.h
+index 69b127e..9c94ac4 100644
+--- a/include/triton-shared/Transform/AddLLVMDebugInfo/Passes.h
++++ b/include/triton-shared/Transform/AddLLVMDebugInfo/Passes.h
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Transform/AddLLVMDebugInfo/Passes.td b/include/triton-shared/Transform/AddLLVMDebugInfo/Passes.td
+index 1d606d7..e391eb2 100644
+--- a/include/triton-shared/Transform/AddLLVMDebugInfo/Passes.td
++++ b/include/triton-shared/Transform/AddLLVMDebugInfo/Passes.td
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/include/triton-shared/Utils/Utils.h b/include/triton-shared/Utils/Utils.h
+index dfc693a..e484bee 100644
+--- a/include/triton-shared/Utils/Utils.h
++++ b/include/triton-shared/Utils/Utils.h
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #ifndef TRITON_SHARED_UTILITY_H
+ #define TRITON_SHARED_UTILITY_H
+ 
 diff --git a/lib/Analysis/MaskAnalysis.cpp b/lib/Analysis/MaskAnalysis.cpp
-index 1aa9760..5b84859 100644
+index 10794bb..5b84859 100644
 --- a/lib/Analysis/MaskAnalysis.cpp
 +++ b/lib/Analysis/MaskAnalysis.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -65,11 +65,10 @@ tensor::ExtractSliceOp MaskState::getExtractSlice(Value source,
    SmallVector<OpFoldResult> offsets(getRank(), builder.getIndexAttr(0));
    SmallVector<OpFoldResult> strides(getRank(), builder.getIndexAttr(1));
@@ -1296,9 +1913,17 @@ index 1aa9760..5b84859 100644
        masks[cmpOpDim] = unstructuredMask;
      }
 diff --git a/lib/Analysis/OpFoldResultUtils.cpp b/lib/Analysis/OpFoldResultUtils.cpp
-index 49ae4c4..85d7842 100644
+index 6c1b5ca..85d7842 100644
 --- a/lib/Analysis/OpFoldResultUtils.cpp
 +++ b/lib/Analysis/OpFoldResultUtils.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -59,7 +59,7 @@ Value ofrToValue(const OpFoldResult ofr, const Location loc, OpBuilder &b) {
  
    auto attr = dyn_cast<Attribute>(ofr);
@@ -1525,9 +2150,17 @@ index 49ae4c4..85d7842 100644
  }
  
 diff --git a/lib/Analysis/PtrAnalysis.cpp b/lib/Analysis/PtrAnalysis.cpp
-index 2fc2f85..1a17567 100644
+index 9ebd54d..1a17567 100644
 --- a/lib/Analysis/PtrAnalysis.cpp
 +++ b/lib/Analysis/PtrAnalysis.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -82,7 +82,7 @@ void PtrState::addState(const PtrState &lhsState, const PtrState &rhsState,
  
    if (lhsState.scalar && rhsState.scalar) {
@@ -1752,10 +2385,30 @@ index 2fc2f85..1a17567 100644
  
            args[chunkData[0].initArgIndex].replaceUsesWithIf(
                combinedCast.getResult(0), [](OpOperand &operand) {
+diff --git a/lib/Analysis/UseAnalysis.cpp b/lib/Analysis/UseAnalysis.cpp
+index 7bde980..62e4508 100644
+--- a/lib/Analysis/UseAnalysis.cpp
++++ b/lib/Analysis/UseAnalysis.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 diff --git a/lib/AnalysisStructured/PtrAnalysis.cpp b/lib/AnalysisStructured/PtrAnalysis.cpp
-index 2253c80..e5b6ece 100644
+index befcfbd..e5b6ece 100644
 --- a/lib/AnalysisStructured/PtrAnalysis.cpp
 +++ b/lib/AnalysisStructured/PtrAnalysis.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -63,29 +63,26 @@ static Value applyUnstructuredMask(Operation *op, Value ptr,
        return nullptr;
      }
@@ -2005,9 +2658,17 @@ index 358b4f9..2a591e9 100644
  add_subdirectory(TritonToStructured)
  add_subdirectory(TritonToUnstructured)
 diff --git a/lib/Conversion/StructuredToMemref/StructuredToMemref.cpp b/lib/Conversion/StructuredToMemref/StructuredToMemref.cpp
-index 1024029..6a8ca9e 100644
+index 7619d82..6a8ca9e 100644
 --- a/lib/Conversion/StructuredToMemref/StructuredToMemref.cpp
 +++ b/lib/Conversion/StructuredToMemref/StructuredToMemref.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -56,8 +56,8 @@ static memref::SubViewOp getSubview(int rank, ArrayRef<OpFoldResult> dims,
    auto dstType =
        memref::SubViewOp::inferResultType(sourceType, offsets, dims, strides);
@@ -2665,9 +3326,17 @@ index 1024029..6a8ca9e 100644
      }
  
 diff --git a/lib/Conversion/StructuredToMemref/StructuredToMemrefPass.cpp b/lib/Conversion/StructuredToMemref/StructuredToMemrefPass.cpp
-index c0d4cd0..2a393e8 100644
+index 049b3f6..2a393e8 100644
 --- a/lib/Conversion/StructuredToMemref/StructuredToMemrefPass.cpp
 +++ b/lib/Conversion/StructuredToMemref/StructuredToMemrefPass.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -51,13 +51,15 @@ public:
      addTargetMaterialization([&](OpBuilder &builder,
                                   UnrankedMemRefType resultType,
@@ -2686,10 +3355,30 @@ index c0d4cd0..2a393e8 100644
            .getResult(0);
      });
    }
+diff --git a/lib/Conversion/TritonArithToLinalg/TritonArithToLinalg.cpp b/lib/Conversion/TritonArithToLinalg/TritonArithToLinalg.cpp
+index 22142c0..44ecd72 100644
+--- a/lib/Conversion/TritonArithToLinalg/TritonArithToLinalg.cpp
++++ b/lib/Conversion/TritonArithToLinalg/TritonArithToLinalg.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 diff --git a/lib/Conversion/TritonArithToLinalg/TritonArithToLinalgPass.cpp b/lib/Conversion/TritonArithToLinalg/TritonArithToLinalgPass.cpp
-index 8c86fe2..39cf0ba 100644
+index 42661af..39cf0ba 100644
 --- a/lib/Conversion/TritonArithToLinalg/TritonArithToLinalgPass.cpp
 +++ b/lib/Conversion/TritonArithToLinalg/TritonArithToLinalgPass.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -215,7 +215,8 @@ public:
          func.getAllArgAttrs(argAttrs);
          func.getAllResultAttrs(resAttrs);
@@ -2710,9 +3399,17 @@ index 8c86fe2..39cf0ba 100644
            }
          }
 diff --git a/lib/Conversion/TritonPtrToMemref/TritonPtrToMemrefPass.cpp b/lib/Conversion/TritonPtrToMemref/TritonPtrToMemrefPass.cpp
-index b75e7dd..09d8c23 100644
+index 689cf1b..09d8c23 100644
 --- a/lib/Conversion/TritonPtrToMemref/TritonPtrToMemrefPass.cpp
 +++ b/lib/Conversion/TritonPtrToMemref/TritonPtrToMemrefPass.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -61,7 +61,8 @@ public:
  
      auto createUnrealizedCast = [&](OpBuilder &builder, Type resultType,
@@ -2758,13 +3455,13 @@ index acc3c4f..0000000
 -)
 diff --git a/lib/Conversion/TritonToLinalg/TritonToLinalg.cpp b/lib/Conversion/TritonToLinalg/TritonToLinalg.cpp
 deleted file mode 100644
-index 1c8ed9c..0000000
+index d47a325..0000000
 --- a/lib/Conversion/TritonToLinalg/TritonToLinalg.cpp
 +++ /dev/null
 @@ -1,95 +0,0 @@
 -//===----------------------------------------------------------------------===//
 -//
--// Copyright (c) Microsoft Corporation.
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
 -// Licensed under the MIT license.
 -//
 -//===----------------------------------------------------------------------===//
@@ -2859,13 +3556,13 @@ index 1c8ed9c..0000000
 -}
 diff --git a/lib/Conversion/TritonToLinalg/TritonToLinalgPass.cpp b/lib/Conversion/TritonToLinalg/TritonToLinalgPass.cpp
 deleted file mode 100644
-index 25b7db8..0000000
+index e0696f2..0000000
 --- a/lib/Conversion/TritonToLinalg/TritonToLinalgPass.cpp
 +++ /dev/null
 @@ -1,229 +0,0 @@
 -//===----------------------------------------------------------------------===//
 -//
--// Copyright (c) Microsoft Corporation.
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
 -// Licensed under the MIT license.
 -//
 -//===----------------------------------------------------------------------===//
@@ -3093,9 +3790,17 @@ index 25b7db8..0000000
 -  return std::make_unique<TritonToLinalgPass>();
 -}
 diff --git a/lib/Conversion/TritonToLinalgExperimental/CollapseShape.cpp b/lib/Conversion/TritonToLinalgExperimental/CollapseShape.cpp
-index 95061ac..0130ede 100644
+index 495518e..0130ede 100644
 --- a/lib/Conversion/TritonToLinalgExperimental/CollapseShape.cpp
 +++ b/lib/Conversion/TritonToLinalgExperimental/CollapseShape.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -83,8 +83,8 @@ struct CollapseFill : public OpRewritePattern<linalg::FillOp> {
      }
      auto elementType = resultType.getElementType();
@@ -3217,9 +3922,17 @@ index 95061ac..0130ede 100644
                                 newReduce.getRegion().begin());
  
 diff --git a/lib/Conversion/TritonToLinalgExperimental/ReconcilePtrCastsPass.cpp b/lib/Conversion/TritonToLinalgExperimental/ReconcilePtrCastsPass.cpp
-index e8a3b7f..0f7eda6 100644
+index 02caff0..0f7eda6 100644
 --- a/lib/Conversion/TritonToLinalgExperimental/ReconcilePtrCastsPass.cpp
 +++ b/lib/Conversion/TritonToLinalgExperimental/ReconcilePtrCastsPass.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -61,8 +61,8 @@ struct SimplifyUnrealizedCast
        }
  
@@ -3269,10 +3982,30 @@ index e8a3b7f..0f7eda6 100644
  
        rewriter.replaceAllUsesWith(output, newUnrankedMemref);
        rewriter.eraseOp(op);
+diff --git a/lib/Conversion/TritonToLinalgExperimental/TritonToLinalgExperimentalPass.cpp b/lib/Conversion/TritonToLinalgExperimental/TritonToLinalgExperimentalPass.cpp
+index eafc5a0..dbfb274 100644
+--- a/lib/Conversion/TritonToLinalgExperimental/TritonToLinalgExperimentalPass.cpp
++++ b/lib/Conversion/TritonToLinalgExperimental/TritonToLinalgExperimentalPass.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 diff --git a/lib/Conversion/TritonToLinalgExperimental/TritonToPtrPass.cpp b/lib/Conversion/TritonToLinalgExperimental/TritonToPtrPass.cpp
-index 8234360..6e3cc9d 100644
+index 60dd0d5..6e3cc9d 100644
 --- a/lib/Conversion/TritonToLinalgExperimental/TritonToPtrPass.cpp
 +++ b/lib/Conversion/TritonToLinalgExperimental/TritonToPtrPass.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -182,9 +182,9 @@ struct AddPtrConverter : public OpConversionPattern<triton::AddPtrOp> {
      auto pointeeType = cast<triton::PointerType>(op.getType()).getPointeeType();
      auto offsetType = op.getOffset().getType();
@@ -3389,9 +4122,17 @@ index 8234360..6e3cc9d 100644
      };
      addTargetMaterialization(createCast);
 diff --git a/lib/Conversion/TritonToStructured/TritonToStructuredPass.cpp b/lib/Conversion/TritonToStructured/TritonToStructuredPass.cpp
-index 0c3269e..ec80fcd 100644
+index 1de70e9..ec80fcd 100644
 --- a/lib/Conversion/TritonToStructured/TritonToStructuredPass.cpp
 +++ b/lib/Conversion/TritonToStructured/TritonToStructuredPass.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation, Meta Platforms.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -137,20 +137,20 @@ public:
      // result is still being used by another tt.load or tt.store.
      converter.addSourceMaterialization([](OpBuilder &builder, Type resultType,
@@ -3445,9 +4186,17 @@ index 0c3269e..ec80fcd 100644
        return placeholder.getResults();
      });
 diff --git a/lib/Conversion/TritonToUnstructured/TritonToUnstructuredPass.cpp b/lib/Conversion/TritonToUnstructured/TritonToUnstructuredPass.cpp
-index 8856879..867ebd4 100644
+index 377f082..867ebd4 100644
 --- a/lib/Conversion/TritonToUnstructured/TritonToUnstructuredPass.cpp
 +++ b/lib/Conversion/TritonToUnstructured/TritonToUnstructuredPass.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -252,8 +252,8 @@ public:
          }
  
@@ -3566,9 +4315,17 @@ index 8856879..867ebd4 100644
                  offsetOpnd.set(accumulatedOffset);
  
 diff --git a/lib/Conversion/UnstructuredToMemref/UnstructuredToMemrefPass.cpp b/lib/Conversion/UnstructuredToMemref/UnstructuredToMemrefPass.cpp
-index 316537b..df97ac6 100644
+index 68cb18a..df97ac6 100644
 --- a/lib/Conversion/UnstructuredToMemref/UnstructuredToMemrefPass.cpp
 +++ b/lib/Conversion/UnstructuredToMemref/UnstructuredToMemrefPass.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -53,7 +53,8 @@ public:
      addTargetMaterialization([&](OpBuilder &builder,
                                   UnrankedMemRefType resultType,
@@ -3808,10 +4565,21 @@ index 316537b..df97ac6 100644
  
      rewriter.eraseOp(scatterOp);
 diff --git a/lib/Dialect/TPtr/IR/TPtrDialect.cpp b/lib/Dialect/TPtr/IR/TPtrDialect.cpp
-index 3235a1e..c4b8b7c 100644
+index 6db2c63..c4b8b7c 100644
 --- a/lib/Dialect/TPtr/IR/TPtrDialect.cpp
 +++ b/lib/Dialect/TPtr/IR/TPtrDialect.cpp
-@@ -51,27 +51,30 @@ void mlir::tptr::TPtrDialect::initialize() {
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #include "mlir/IR/Builders.h"
+ 
+ #include "triton-shared/Dialect/TPtr/IR/TPtrDialect.h"
+@@ -58,27 +51,30 @@ void mlir::tptr::TPtrDialect::initialize() {
  }
  
  bool tptr::DefaultMemorySpaceAttr::isValidLoad(
@@ -3846,11 +4614,52 @@ index 3235a1e..c4b8b7c 100644
      llvm::function_ref<InFlightDiagnostic()> emitError) const {
    return true;
  }
+diff --git a/lib/Dialect/TPtr/IR/TPtrOps.cpp b/lib/Dialect/TPtr/IR/TPtrOps.cpp
+index 06bffd5..dad589e 100644
+--- a/lib/Dialect/TPtr/IR/TPtrOps.cpp
++++ b/lib/Dialect/TPtr/IR/TPtrOps.cpp
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #include "mlir/Bytecode/BytecodeOpInterface.h"
+ #include "mlir/Interfaces/SideEffectInterfaces.h" // Required for IR/TPtrOps.h.inc
+ 
+diff --git a/lib/Dialect/TritonStructured/IR/TritonStructuredDialect.cpp b/lib/Dialect/TritonStructured/IR/TritonStructuredDialect.cpp
+index 0a9ce77..2af19b8 100644
+--- a/lib/Dialect/TritonStructured/IR/TritonStructuredDialect.cpp
++++ b/lib/Dialect/TritonStructured/IR/TritonStructuredDialect.cpp
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
+ 
+ using namespace mlir;
 diff --git a/lib/Dialect/TritonStructured/IR/TritonStructuredOps.cpp b/lib/Dialect/TritonStructured/IR/TritonStructuredOps.cpp
-index df7de99..150e926 100644
+index daa9cf1..150e926 100644
 --- a/lib/Dialect/TritonStructured/IR/TritonStructuredOps.cpp
 +++ b/lib/Dialect/TritonStructured/IR/TritonStructuredOps.cpp
-@@ -46,14 +46,14 @@ Value getScalarValue(Value operand, Location loc, OpBuilder &builder) {
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #include "triton/Dialect/Triton/IR/Dialect.h"
+ #include "triton/Dialect/Triton/IR/Types.h"
+ 
+@@ -53,14 +46,14 @@ Value getScalarValue(Value operand, Location loc, OpBuilder &builder) {
                    if (auto shapedType = dyn_cast<ShapedType>(resType)) {
                      resType = shapedType.getElementType();
                    }
@@ -3867,10 +4676,42 @@ index df7de99..150e926 100644
                  })
                  .Default([](Operation *op) {
                    llvm_unreachable("unsupported op in generating ");
+diff --git a/lib/Dialect/TritonTilingExt/IR/BufferizableOpInterfaceImpl.cpp b/lib/Dialect/TritonTilingExt/IR/BufferizableOpInterfaceImpl.cpp
+index d992f2a..d98d763 100644
+--- a/lib/Dialect/TritonTilingExt/IR/BufferizableOpInterfaceImpl.cpp
++++ b/lib/Dialect/TritonTilingExt/IR/BufferizableOpInterfaceImpl.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/lib/Dialect/TritonTilingExt/IR/CumSum.cpp b/lib/Dialect/TritonTilingExt/IR/CumSum.cpp
+index ebada13..619b653 100644
+--- a/lib/Dialect/TritonTilingExt/IR/CumSum.cpp
++++ b/lib/Dialect/TritonTilingExt/IR/CumSum.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 diff --git a/lib/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.cpp b/lib/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.cpp
-index da4d976..acf118a 100644
+index 2e90b82..acf118a 100644
 --- a/lib/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.cpp
 +++ b/lib/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 @@ -29,12 +29,12 @@ Value getSlice(OpBuilder &b, Location loc, Value source,
                 ArrayRef<OpFoldResult> strides) {
    return TypeSwitch<Type, Value>(source.getType())
@@ -3888,11 +4729,82 @@ index da4d976..acf118a 100644
        })
        .Default([&](Type t) { return nullptr; });
  }
+diff --git a/lib/Sanitizer/SanitizerAttributes/SanitizerAttributes.cpp b/lib/Sanitizer/SanitizerAttributes/SanitizerAttributes.cpp
+index 3846ee5..a13ed51 100644
+--- a/lib/Sanitizer/SanitizerAttributes/SanitizerAttributes.cpp
++++ b/lib/Sanitizer/SanitizerAttributes/SanitizerAttributes.cpp
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #include "llvm/Passes/PassBuilder.h"
+ #include "llvm/Passes/PassPlugin.h"
+ #include "llvm/Support/CommandLine.h"
+diff --git a/lib/Transform/AddLLVMDebugInfo/AddLLVMDebugInfoPass.cpp b/lib/Transform/AddLLVMDebugInfo/AddLLVMDebugInfoPass.cpp
+index 2bfe211..c01356b 100644
+--- a/lib/Transform/AddLLVMDebugInfo/AddLLVMDebugInfoPass.cpp
++++ b/lib/Transform/AddLLVMDebugInfo/AddLLVMDebugInfoPass.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
+diff --git a/lib/Utils/Utils.cpp b/lib/Utils/Utils.cpp
+index 7abd47b..2483d53 100644
+--- a/lib/Utils/Utils.cpp
++++ b/lib/Utils/Utils.cpp
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #include "triton/Dialect/Triton/IR/Dialect.h"
+ 
+ namespace mlir {
+diff --git a/python/examples/bare_matmul.py b/python/examples/bare_matmul.py
+index 1793c31..eaa408b 100644
+--- a/python/examples/bare_matmul.py
++++ b/python/examples/bare_matmul.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ # this is a benchmark which multiplies square matrices with maximum block size
+ # to check the performance of tl.dot operation
+ 
+diff --git a/python/examples/benchmark.py b/python/examples/benchmark.py
+index a95c326..f82d344 100644
+--- a/python/examples/benchmark.py
++++ b/python/examples/benchmark.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import time
+ import numpy as np
+ from functools import wraps
 diff --git a/python/examples/conftest.py b/python/examples/conftest.py
-index 4bac989..33397c5 100644
+index 6eafc17..33397c5 100644
 --- a/python/examples/conftest.py
 +++ b/python/examples/conftest.py
-@@ -119,7 +119,8 @@ def pytest_collection_modifyitems(config, items):
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import pytest
+ import os
+ import tempfile
+@@ -122,7 +119,8 @@ def pytest_collection_modifyitems(config, items):
              for param_name, param_value in item.callspec.params.items():
                  if (param_name.startswith('dtype') or param_name.endswith('dtype')) and param_value == 'bfloat16':
                      item.add_marker(skip_marker_bfloat)
@@ -3902,6 +4814,281 @@ index 4bac989..33397c5 100644
                      item.add_marker(skip_marker_tf32)
                  if (param_name.startswith('dtype') or param_name.endswith('dtype')) and ('float8' in str(param_value)):
                      item.add_marker(skip_marker_float8)
+diff --git a/python/examples/test_addptr.py b/python/examples/test_addptr.py
+index 53e4ffc..5239c85 100644
+--- a/python/examples/test_addptr.py
++++ b/python/examples/test_addptr.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_blockptr_complex_offset.py b/python/examples/test_blockptr_complex_offset.py
+index 2123f1f..94c0cd5 100644
+--- a/python/examples/test_blockptr_complex_offset.py
++++ b/python/examples/test_blockptr_complex_offset.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_early_return.py b/python/examples/test_early_return.py
+index 231ea78..2bb59be 100644
+--- a/python/examples/test_early_return.py
++++ b/python/examples/test_early_return.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_einsum_qhmd_hmpd_to_qhmp.py b/python/examples/test_einsum_qhmd_hmpd_to_qhmp.py
+index a07553c..ffaa84e 100644
+--- a/python/examples/test_einsum_qhmd_hmpd_to_qhmp.py
++++ b/python/examples/test_einsum_qhmd_hmpd_to_qhmp.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_gather_scatter.py b/python/examples/test_gather_scatter.py
+index e448063..db08736 100644
+--- a/python/examples/test_gather_scatter.py
++++ b/python/examples/test_gather_scatter.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_gather_scatter_continuous.py b/python/examples/test_gather_scatter_continuous.py
+index 4126408..98fe5c0 100644
+--- a/python/examples/test_gather_scatter_continuous.py
++++ b/python/examples/test_gather_scatter_continuous.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import pytest
+ import torch
+ 
+diff --git a/python/examples/test_index_select.py b/python/examples/test_index_select.py
+index 76de60a..c28b8b1 100644
+--- a/python/examples/test_index_select.py
++++ b/python/examples/test_index_select.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import pytest
+ import torch
+ 
+diff --git a/python/examples/test_layernorm.py b/python/examples/test_layernorm.py
+index abb4dd7..dc9b847 100644
+--- a/python/examples/test_layernorm.py
++++ b/python/examples/test_layernorm.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ # This is the Layer Norm forward pass from the Triton tutorial found here:
+ # https://github.com/triton-lang/triton/blob/main/python/tutorials/05-layer-norm.py
+ 
+diff --git a/python/examples/test_load_2d_tensor_block.py b/python/examples/test_load_2d_tensor_block.py
+index 78d86a0..ec7d53d 100644
+--- a/python/examples/test_load_2d_tensor_block.py
++++ b/python/examples/test_load_2d_tensor_block.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_load_2d_tensor_col.py b/python/examples/test_load_2d_tensor_col.py
+index 17055fd..f1ed8ad 100644
+--- a/python/examples/test_load_2d_tensor_col.py
++++ b/python/examples/test_load_2d_tensor_col.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_mask.py b/python/examples/test_mask.py
+index 9253187..bc063c1 100644
+--- a/python/examples/test_mask.py
++++ b/python/examples/test_mask.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_mask_loop_iter_arg.py b/python/examples/test_mask_loop_iter_arg.py
+index ffef270..3677ed7 100644
+--- a/python/examples/test_mask_loop_iter_arg.py
++++ b/python/examples/test_mask_loop_iter_arg.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ import triton
+ import pytest
+diff --git a/python/examples/test_matmul.py b/python/examples/test_matmul.py
+index 2ea8fe2..470006a 100644
+--- a/python/examples/test_matmul.py
++++ b/python/examples/test_matmul.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_mm.py b/python/examples/test_mm.py
+index 5d5ba57..5bbdcd5 100644
+--- a/python/examples/test_mm.py
++++ b/python/examples/test_mm.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ 
+ import torch
+ import triton
+diff --git a/python/examples/test_modulo.py b/python/examples/test_modulo.py
+index 130618b..f7e1775 100644
+--- a/python/examples/test_modulo.py
++++ b/python/examples/test_modulo.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_nested_loops.py b/python/examples/test_nested_loops.py
+index 5ff3a79..9ce055a 100644
+--- a/python/examples/test_nested_loops.py
++++ b/python/examples/test_nested_loops.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_reduce.py b/python/examples/test_reduce.py
+index 3f7339f..2b46a83 100644
+--- a/python/examples/test_reduce.py
++++ b/python/examples/test_reduce.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ import pytest
+ import math
+diff --git a/python/examples/test_scalar_store.py b/python/examples/test_scalar_store.py
+index 4249a92..7ef14d4 100644
+--- a/python/examples/test_scalar_store.py
++++ b/python/examples/test_scalar_store.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_sign_extend.py b/python/examples/test_sign_extend.py
+index 50928b7..21726e7 100644
+--- a/python/examples/test_sign_extend.py
++++ b/python/examples/test_sign_extend.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_softmax.py b/python/examples/test_softmax.py
+index 9bf4257..b3d43df 100644
+--- a/python/examples/test_softmax.py
++++ b/python/examples/test_softmax.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_splat.py b/python/examples/test_splat.py
+index dd79e15..a396b5e 100644
+--- a/python/examples/test_splat.py
++++ b/python/examples/test_splat.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_swap.py b/python/examples/test_swap.py
+index 5a6a7a1..2693ab6 100644
+--- a/python/examples/test_swap.py
++++ b/python/examples/test_swap.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_tensor_index_iterargs.py b/python/examples/test_tensor_index_iterargs.py
+index 159b9d3..4b3ac80 100644
+--- a/python/examples/test_tensor_index_iterargs.py
++++ b/python/examples/test_tensor_index_iterargs.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_unstructured_mask.py b/python/examples/test_unstructured_mask.py
+index 58302cc..2b37c2a 100644
+--- a/python/examples/test_unstructured_mask.py
++++ b/python/examples/test_unstructured_mask.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
+diff --git a/python/examples/test_vec_add.py b/python/examples/test_vec_add.py
+index 49e92c6..db2fa09 100644
+--- a/python/examples/test_vec_add.py
++++ b/python/examples/test_vec_add.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ 
+ import triton
 diff --git a/test/Conversion/StructuredToMemref/convert_addi_reduce.mlir b/test/Conversion/StructuredToMemref/convert_addi_reduce.mlir
 index d8308a1..3d52776 100644
 --- a/test/Conversion/StructuredToMemref/convert_addi_reduce.mlir
@@ -9018,11 +10205,34 @@ index 9fd9cc5..d48ebeb 100644
  // CHECK:           }
  // CHECK:           return
  // CHECK:         }
+diff --git a/test/lit.cfg.py b/test/lit.cfg.py
+index 54a7d16..72c9cc7 100644
+--- a/test/lit.cfg.py
++++ b/test/lit.cfg.py
+@@ -1,7 +1,4 @@
+ # -*- Python -*-
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ 
+ import os
+ import platform
 diff --git a/tools/triton-shared-opt/RegisterTritonSharedDialects.h b/tools/triton-shared-opt/RegisterTritonSharedDialects.h
-index 6d92953..d78f96b 100644
+index 9031f4f..d78f96b 100644
 --- a/tools/triton-shared-opt/RegisterTritonSharedDialects.h
 +++ b/tools/triton-shared-opt/RegisterTritonSharedDialects.h
-@@ -13,7 +13,6 @@
+@@ -1,10 +1,3 @@
+-//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+ #pragma once
+ #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+@@ -20,7 +13,6 @@
  #include "triton-shared/Conversion/StructuredToMemref/Passes.h"
  #include "triton-shared/Conversion/TritonArithToLinalg/Passes.h"
  #include "triton-shared/Conversion/TritonPtrToMemref/Passes.h"
@@ -9030,7 +10240,7 @@ index 6d92953..d78f96b 100644
  #include "triton-shared/Conversion/TritonToLinalgExperimental/Passes.h"
  #include "triton-shared/Conversion/TritonToStructured/Passes.h"
  #include "triton-shared/Conversion/TritonToUnstructured/Passes.h"
-@@ -29,7 +28,6 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
+@@ -36,7 +28,6 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
    mlir::registerAllPasses();
    mlir::registerLinalgPasses();
    mlir::triton::registerTritonPasses();
@@ -9038,6 +10248,18 @@ index 6d92953..d78f96b 100644
    mlir::triton::registerTritonToLinalgExperimentalPasses();
    mlir::triton::registerTritonToStructuredPass();
    mlir::triton::registerTritonPtrToMemref();
+diff --git a/tools/triton-shared-opt/triton-shared-opt.cpp b/tools/triton-shared-opt/triton-shared-opt.cpp
+index ff19e0e..3ed831d 100644
+--- a/tools/triton-shared-opt/triton-shared-opt.cpp
++++ b/tools/triton-shared-opt/triton-shared-opt.cpp
+@@ -1,6 +1,6 @@
+ //===----------------------------------------------------------------------===//
+ //
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ //===----------------------------------------------------------------------===//
 diff --git a/triton-hash.txt b/triton-hash.txt
 index 80f8308..0f8b487 100644
 --- a/triton-hash.txt
@@ -9046,276 +10268,42 @@ index 80f8308..0f8b487 100644
 -e44bd1c83c1c3e8deac7c4f02683cfb3cc395c8b
 +dbfbc1e1e6cca56eeaa853050b7962e7445f0a82
 \ No newline at end of file
-diff --git a/triton-san/README.md b/triton-san/README.md
-index c5f8e3c..0647199 100644
---- a/triton-san/README.md
-+++ b/triton-san/README.md
-@@ -66,11 +66,15 @@ Usage: triton-san <sanitizer type> <original command used to launch the triton p
- Example: triton-san asan python ./my_triton_program.py
- ```
- 
--**Note: before running TritonSan, please add the following import to the Triton program to specify the use of the CPU backend, which ensures all Triton kernels run on the CPU. The sanitizers require CPU backend in order to work.**
-+**Note: before running TritonSan, please add the following import to the Triton program to specify the use of the CPU backend, which ensures all Triton kernels run on the CPU. The sanitizers require CPU backend in order to work. In addition, all desired GPU tensors in the Triton program need to be set to CPU**
- 
- ```python
- from triton.backends.triton_shared.driver import CPUDriver
- triton.runtime.driver.set_active(CPUDriver())
-+...
-+
-+#output = torch.empty((size, )).to("gpu")
-+output = torch.empty((size, )).to("cpu")
- ```
- 
- ## Example
-diff --git a/triton-san/build.sh b/triton-san/build.sh
-index 8691d2b..c0ded59 100755
---- a/triton-san/build.sh
-+++ b/triton-san/build.sh
-@@ -11,6 +11,7 @@ function check_required_files() {
- }
- 
- PARENT_FOLDER="$(realpath "$(dirname "$0")")"
-+TRITON_SHARED_PATH="$(realpath "${PARENT_FOLDER}/..")"
- ROOT="$(realpath "${PARENT_FOLDER}/../..")"
- SCRIPT_FOLDER="$(realpath "${PARENT_FOLDER}/script")"
- VENV_PATH="${ROOT}/venv"
-@@ -23,9 +24,42 @@ TRITON_SAN_INSTALL_DIR="${ROOT}"
- # include utility functions
- source "${SCRIPT_FOLDER}/utility.inc"
- 
-+echo "================= Check out triton ================"
-+TRITON_HASH_FILE="${TRITON_SHARED_PATH}/triton-hash.txt"
-+if [ ! -e "${TRITON_HASH_FILE}" ]; then
-+  print_error_and_exit "${TRITON_HASH_FILE} does not exist."
-+fi
-+
-+EXPECT_HEAD_COMMIT=$(cat "${TRITON_HASH_FILE}")
-+if [ -e "${TRITON_PATH}" ]; then
-+  warning_msg=("The path ${TRITON_PATH} already exists.")
-+  print_warning "${warning_msg[@]}"
-+  pushd "${TRITON_PATH}" > /dev/null
-+  HEAD_COMMIT=$(git rev-parse HEAD)
-+  if [ "${HEAD_COMMIT}" != "${EXPECT_HEAD_COMMIT}" ]; then
-+    error_msg=("The head commit of the existing Triton repository does not match the expected commit hash."
-+               "HEAD: ${HEAD_COMMIT}, EXPECTED: ${EXPECT_HEAD_COMMIT}")
-+    print_error_and_exit "${error_msg[@]}"
-+  fi
-+  EXIST_TRITON_BUILD="${TRITON_PATH}/build"
-+  if [ -e "${EXIST_TRITON_BUILD}" ]; then
-+    rm -rf "${TRITON_PATH}/build"
-+    echo "Remove ${TRITON_PATH}/build"
-+  fi
-+  popd > /dev/null
-+else
-+  mkdir -p "${TRITON_PATH}"
-+  git clone https://github.com/triton-lang/triton.git "${TRITON_PATH}"
-+  pushd "${TRITON_PATH}" > /dev/null
-+  cd "${TRITON_PATH}" && git checkout ${EXPECT_HEAD_COMMIT}
-+  popd > /dev/null
-+fi
-+
-+echo -e "\n\n\n"
-+
- echo "================= Setup Python virtual environment ================"
- if [ ! -e "${VENV_PATH}" ]; then
--  "${SCRIPT_FOLDER}/setup_prerequisite.sh" "${VENV_PATH}"
-+  "${SCRIPT_FOLDER}/setup_prerequisite.sh" "${TRITON_PATH}" "${VENV_PATH}" 
- else 
-   required_file=(
-     "${VENV_PATH}/bin/activate"
-@@ -47,7 +81,7 @@ echo -e "\n\n\n"
- echo "=========================== Build LLVM ============================"
- if [ ! -e "${LLVM_PATH}" ]; then
-   mkdir -p "${LLVM_PATH}"
--  "${SCRIPT_FOLDER}/build_llvm.sh" "${LLVM_PATH}"
-+  "${SCRIPT_FOLDER}/build_llvm.sh" "${TRITON_PATH}" "${LLVM_PATH}"
- else
-   required_file=(
-     "${LLVM_PATH}/llvm-install/bin"
-@@ -64,14 +98,9 @@ fi
- echo -e "\n\n\n"
- 
- echo "================== Build trion-shared and triton =================="
--if [ -e "${TRITON_PATH}" ]; then
--  warning_msg=("The path ${TRITON_PATH} already exists and will be overwritten.")
--  print_warning "${warning_msg[@]}"
--  rm -rf "${TRITON_PATH}"
--fi
--mkdir -p "${TRITON_PATH}"
--"${SCRIPT_FOLDER}/build_triton_shared_with_triton_san.sh" "${LLVM_BUILD_PATH}" "${VENV_PATH}" "${TRITON_PATH}"
-+export PATH="${LLVM_PATH}/llvm-install/bin:${PATH}"
-+"${SCRIPT_FOLDER}/build_triton_shared_with_triton_san.sh" "${LLVM_BUILD_PATH}" "${VENV_PATH}" "${TRITON_PATH}" "${TRITON_SHARED_PATH}"
- echo -e "\n\n\n"
- 
- echo "======================== Install triton-san ======================="
--"${SCRIPT_FOLDER}/install_triton_san.sh" "${TRITON_SAN_INSTALL_DIR}" "${LLVM_INSTALL_DIR}" "${VENV_PATH}" "${TRITON_PATH}"
-\ No newline at end of file
-+"${SCRIPT_FOLDER}/install_triton_san.sh" "${LLVM_INSTALL_DIR}" "${VENV_PATH}" "${TRITON_PATH}" "${TRITON_SAN_INSTALL_DIR}"
-diff --git a/triton-san/script/build_llvm.sh b/triton-san/script/build_llvm.sh
-index 497ebd9..c522b3b 100755
---- a/triton-san/script/build_llvm.sh
-+++ b/triton-san/script/build_llvm.sh
-@@ -6,13 +6,13 @@
- set -e
- 
- if [ "$#" -lt 1 ]; then
--  echo "Usage: $0 <desired path for LLVM installation>"
-+  echo "Usage: $0 <path to Triton source directory> <desired path for LLVM installation>"
-   exit 1
- fi
- 
- PARENT_FOLDER="$(realpath "$(dirname "$0")")"
--TRITON_SHARED_PATH="$(realpath "${PARENT_FOLDER}/../..")"
--LLVM_PATH="$(realpath "$1")"
-+TRITON_PATH="$(realpath "$1")"
-+LLVM_PATH="$(realpath "$2")"
- 
- # include utility functions
- source "${PARENT_FOLDER}/utility.inc"
-@@ -20,7 +20,7 @@ source "${PARENT_FOLDER}/utility.inc"
- print_info "Installing LLVM to path: ${LLVM_PATH}."
- cd $LLVM_PATH
- 
--LLVM_HASH_FILE="${TRITON_SHARED_PATH}/triton/cmake/llvm-hash.txt"
-+LLVM_HASH_FILE="${TRITON_PATH}/cmake/llvm-hash.txt"
- if [ ! -e "${LLVM_HASH_FILE}" ]; then
-   print_error_and_exit "${LLVM_HASH_FILE} does not exist."
- fi
-@@ -32,7 +32,7 @@ LLVM_SOURCE="${LLVM_SOURCE_DIR}/llvm"
- 
- # compiler-rt and clang are the sanitizer-specific LLVM projects
- # openmp is used for parallelizing the triton grid for ThreadSanitizer (TSan)
--LLVM_PROJECTS="clang;compiler-rt;openmp;mlir"
-+LLVM_PROJECTS="clang;compiler-rt;openmp;mlir;lld"
- 
- # these are the targets supported by the Triton language
- # Triton's build script for LLVM uses these exact targets
-@@ -49,6 +49,17 @@ LLVM_HASH=$(cat "${LLVM_HASH_FILE}")
- cd "${LLVM_SOURCE_DIR}"
- git checkout ${LLVM_HASH}
- 
-+# Cherry-pick the patch to resolve the OpenMP build error. An incorrect setting in openmp/runtime/src/CMakeLists.txt 
-+# causes the generated omp-tools.h to be placed in Clang's include directory instead of OpenMP's, leading to a 
-+# compilation failure when locating omp-tools.h.
-+# More details are available at this link: https://github.com/llvm/llvm-project/commit/62ff9ac4c68f48c089528105259c68943ab176de
-+
-+# TODO: remove this once the LLVM hash for the next LLVM->Triton merge beyond this commit is confirmed.
-+if ! git merge-base --is-ancestor 62ff9ac HEAD; then
-+  echo "cherry pick commit 62ff9ac to avoid OpenMP build failure"
-+  git cherry-pick 62ff9ac
-+fi
-+
- export CXXFLAGS="-Wno-unused-command-line-argument $CXXFLAGS" 
- export CFLAGS="-Wno-unused-command-line-argument $CFLAGS" 
- 
-@@ -64,4 +75,4 @@ cmake -GNinja -DCMAKE_BUILD_TYPE=Release        \
- ninja -j$(nproc --all) -l$(nproc --all) || exit -1
- ninja -j$(nproc --all) -l$(nproc --all) install
- 
--print_info "LLVM installation succeeded."
-\ No newline at end of file
-+print_info "LLVM installation succeeded."
-diff --git a/triton-san/script/build_triton_shared_with_triton_san.sh b/triton-san/script/build_triton_shared_with_triton_san.sh
-index 54c36e3..b198a27 100755
---- a/triton-san/script/build_triton_shared_with_triton_san.sh
-+++ b/triton-san/script/build_triton_shared_with_triton_san.sh
-@@ -4,15 +4,15 @@
- set -e
- 
- if [ "$#" -lt 3 ]; then
--  echo "Usage: $0 <path to LLVM build directory> <path to Python venv> <path to Triton source directory>"
-+  echo "Usage: $0 <path to LLVM build directory> <path to Python venv> <path to Triton source directory> <path to triton-shared source directory>"
-   exit 1
- fi
- 
- PARENT_FOLDER="$(realpath "$(dirname "$0")")"
--TRITON_SHARED_PATH="$(realpath "${PARENT_FOLDER}/../..")"
- LLVM_BUILD_PATH="$(realpath "$1")"
- VENV_PATH="$(realpath "$2")"
- TRITON_PATH="$(realpath "$3")"
-+TRITON_SHARED_PATH="$(realpath "$4")"
- 
- # include utility functions
- source "${PARENT_FOLDER}/utility.inc"
-@@ -46,15 +46,10 @@ fi
- mkdir -p "${TRITON_HOME}"
- 
- # build triton-shared and triton with the custom LLVM
--TRITON_HASH_FILE="${TRITON_SHARED_PATH}/triton-hash.txt"
--if [ ! -e "${TRITON_HASH_FILE}" ]; then
--  print_error_and_exit "${TRITON_HASH_FILE} does not exist."
--fi
+diff --git a/triton-san/examples/buffer-overflow.py b/triton-san/examples/buffer-overflow.py
+index 4f647fb..a0599a0 100644
+--- a/triton-san/examples/buffer-overflow.py
++++ b/triton-san/examples/buffer-overflow.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
 -
--git clone https://github.com/triton-lang/triton.git "${TRITON_PATH}"
--cd "${TRITON_PATH}" && git checkout $(cat "${TRITON_HASH_FILE}")
-+pushd "${TRITON_PATH}" > /dev/null
- export TRITON_PLUGIN_DIRS="${TRITON_SHARED_PATH}"
- export LLVM_BUILD_DIR="${LLVM_BUILD_PATH}"
- LLVM_INCLUDE_DIRS="${LLVM_BUILD_DIR}/include" LLVM_LIBRARY_DIR="${LLVM_BUILD_DIR}/lib" LLVM_SYSPATH="${LLVM_BUILD_DIR}" TRITON_BUILD_WITH_CLANG_LLD=true TRITON_BUILD_WITH_CCACHE=false python3 -m pip install --no-build-isolation -vvv '.[tests]'
-+popd > /dev/null
+ import torch
+ import triton
+ import triton.language as tl
+diff --git a/triton-san/examples/data-race.py b/triton-san/examples/data-race.py
+index 86a0fed..cfca91b 100644
+--- a/triton-san/examples/data-race.py
++++ b/triton-san/examples/data-race.py
+@@ -1,6 +1,3 @@
+-# Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-# Licensed under the MIT license.
+-
+ import torch
+ import triton
+ import triton.language as tl
+diff --git a/triton_shared.cc b/triton_shared.cc
+index 43058b6..e69ed1d 100644
+--- a/triton_shared.cc
++++ b/triton_shared.cc
+@@ -1,11 +1,4 @@
+-﻿//===----------------------------------------------------------------------===//
+-//
+-// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#include <pybind11/pybind11.h>
++﻿#include <pybind11/pybind11.h>
  
--print_info "triton-shared and triton build completed."
-\ No newline at end of file
-+print_info "triton-shared and triton build completed."
-diff --git a/triton-san/script/install_triton_san.sh b/triton-san/script/install_triton_san.sh
-index 88f9643..98cf32d 100755
---- a/triton-san/script/install_triton_san.sh
-+++ b/triton-san/script/install_triton_san.sh
-@@ -4,16 +4,16 @@
- set -e
+ namespace py = pybind11;
  
- if [ "$#" -lt 4 ]; then
--  echo "Usage: $0 <desired path for triton-san installation> <path to LLVM install directory> <path to Python venv> <path to Triton source directory>"
-+  echo "Usage: $0 <path to LLVM install directory> <path to Python venv> <path to Triton source directory> <desired path for triton-san installation>"
-   exit 1
- fi
- 
- PARENT_FOLDER="$(realpath "$(dirname "$0")")"
- TRITON_SAN_PATH="$(realpath "${PARENT_FOLDER}/..")"
--TRITON_SAN_INSTALL_DIR="$(realpath "$1")"
--LLVM_INSTALL_DIR="$(realpath "$2")"
--VENV_PATH="$(realpath "$3")"
--TRITON_PATH="$(realpath "$4")"
-+LLVM_INSTALL_DIR="$(realpath "$1")"
-+VENV_PATH="$(realpath "$2")"
-+TRITON_PATH="$(realpath "$3")"
-+TRITON_SAN_INSTALL_DIR="$(realpath "$4")"
- 
- # include utility functions
- source "${PARENT_FOLDER}/utility.inc"
-@@ -57,4 +57,4 @@ cp -r "${TRITON_SAN_PATH}/examples" "${TRITON_SAN_INSTALL_ROOT}/examples"
- info_message=("triton-san has been installed into ${TRITON_SAN_INSTALL_ROOT} successfully."
-               "To optionally enable global access, add triton-san to your PATH environment variable using:"
-               'export PATH="${PATH}:'"${TRITON_SAN_INSTALL_ROOT}\"")
--print_info "${info_message[@]}"
-\ No newline at end of file
-+print_info "${info_message[@]}"
-diff --git a/triton-san/script/setup_prerequisite.sh b/triton-san/script/setup_prerequisite.sh
-index 94e7cb0..56ce061 100755
---- a/triton-san/script/setup_prerequisite.sh
-+++ b/triton-san/script/setup_prerequisite.sh
-@@ -4,14 +4,14 @@
- set -e
- 
- if [ "$#" -lt 1 ]; then
--  echo "Usage: $0 <desired path to venv>"
-+  echo "Usage: $0 <path to Triton source directory> <desired path to venv>"
-   exit 1
- fi
- 
- PARENT_FOLDER="$(realpath "$(dirname "$0")")"
- TRITON_SHARED_PATH="$(realpath "${PARENT_FOLDER}/../..")"
--TRITON_PATH="${TRITON_SHARED_PATH}/triton"
--VENV_PATH="$(realpath "$1")"
-+TRITON_PATH="$(realpath "$1")"
-+VENV_PATH="$(realpath "$2")"
- 
- # include utility functions
- source "${PARENT_FOLDER}/utility.inc"
-@@ -36,4 +36,4 @@ python3 -m pip install pytest-xdist torch
- # echo to user to start virtual environment
- info_message=("Please start the virtual environment: source \"${VENV_PATH}/bin/activate\""
-               "This export is recommended for subsequent triton-shared builds: export TRITON_PLUGIN_DIRS=\"${TRITON_SHARED_PATH}/triton_shared\"")
--print_info "${info_message[@]}"
-\ No newline at end of file
-+print_info "${info_message[@]}"
