@@ -27,8 +27,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-changes:
+    name: Check for new commits
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    outputs:
+      has_new_commits: ${{ steps.check.outputs.has_new_commits }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for commits in last 24 hours
+        id: check
+        run: |
+          # Check if there are any commits in the last 25 hours
+          # (25h instead of 24h to add a buffer for cron scheduling jitter)
+          RECENT_COMMITS=$(git log --oneline --since="25 hours ago" HEAD)
+          if [ -z "$RECENT_COMMITS" ]; then
+            echo "No new commits in the last 25 hours. Skipping wheel build."
+            echo "has_new_commits=false" >> $GITHUB_OUTPUT
+          else
+            echo "New commits found:"
+            echo "$RECENT_COMMITS"
+            echo "has_new_commits=true" >> $GITHUB_OUTPUT
+          fi
+
   build-wheels:
     name: Build triton wheel (Python ${{ matrix.python_version }})
+    needs: [check-changes]
+    if: >-
+      always() &&
+      (needs.check-changes.result == 'skipped' ||
+       needs.check-changes.outputs.has_new_commits == 'true')
 
     runs-on: ubuntu-latest
 
