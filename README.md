@@ -6,7 +6,7 @@ Triton-XDNA provides an end-to-end compilation flow that lowers standard Triton 
 
 ### How it works
 
-Triton kernels are first lowered to compact Linalg compute graphs via [triton-shared](https://github.com/microsoft/triton-shared), then tiled and mapped onto parallel NPU cores using the MLIR Transform dialect, and finally compiled through [MLIR-AIR](https://github.com/Xilinx/mlir-air) and [MLIR-AIE](https://github.com/Xilinx/mlir-aie) to produce device binaries.
+Triton kernels are first lowered to compact Linalg compute graphs via [triton-shared](https://github.com/facebookincubator/triton-shared), then tiled and mapped onto parallel NPU cores using the MLIR Transform dialect, and finally compiled through [MLIR-AIR](https://github.com/Xilinx/mlir-air) and [MLIR-AIE](https://github.com/Xilinx/mlir-aie) to produce device binaries.
 
 ```
 Triton kernel (@triton.jit)
