@@ -210,16 +210,15 @@ def _get_transform_ir_string():
     custom_script_path = os.getenv("AIR_TRANSFORM_TILING_SCRIPT")
 
     if custom_script_path:
-        try:
-            with open(custom_script_path, "r") as f:
-                print(f"Using custom tiling script from: {custom_script_path}")
-                return f.read()
-        except FileNotFoundError:
-            print(f"Warning: Custom tiling script file not found: {custom_script_path}")
-            print("Falling back to default tiling recipe.")
-        except Exception as e:
-            print(f"Error reading custom tiling script {custom_script_path}: {e}")
-            print("Falling back to default tiling recipe.")
+        if not os.path.isfile(custom_script_path):
+            raise FileNotFoundError(
+                f"AIR_TRANSFORM_TILING_SCRIPT is set to '{custom_script_path}' "
+                f"but the file was not found (cwd: {os.getcwd()}). "
+                f"Use an absolute path or run from the directory containing the script."
+            )
+        with open(custom_script_path, "r") as f:
+            print(f"Using custom tiling script from: {custom_script_path}")
+            return f.read()
 
     # Default hardcoded transform IR string
     matmul_tiling_size_l1_m = 32
