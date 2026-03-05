@@ -228,38 +228,28 @@ def _get_transform_ir_string():
     elemwise_tiling_size_l1_n = 32
 
     return f"""
-        transform.with_pdl_patterns {{
-        ^bb0(%arg0: !pdl.operation):
-            transform.sequence %arg0 : !pdl.operation failures(propagate) {{
-            ^bb1(%arg1: !pdl.operation):
-                %mul = transform.structured.match ops{{["linalg.mul"]}} in %arg1  : (!pdl.operation) -> !pdl.operation
-                transform.sequence %mul : !pdl.operation failures(propagate) {{
-                    ^bb2(%arg2: !pdl.operation):
-                    %mul_1, %loop = transform.air.linalg_tile %arg2 [{elemwise_tiling_size_l1_m}, {elemwise_tiling_size_l1_n}]
-                    transform.air.linalg_promote %mul_1 {{"operands_to_promote"=[2], "memory_space"="L1"}}
-                    transform.air.linalg_promote %mul_1 {{"operands_to_promote"=[0,1], "memory_space"="L1"}}
+        module attributes {{transform.with_named_sequence}} {{
+          transform.named_sequence @__transform_main(%arg1: !transform.any_op {{transform.readonly}}) {{
+                %mul = transform.structured.match ops{{["linalg.mul"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
+                %mul_1, %loop = transform.air.linalg_tile %mul [{elemwise_tiling_size_l1_m}, {elemwise_tiling_size_l1_n}]
+                transform.air.linalg_promote %mul_1 {{"operands_to_promote"=[2], "memory_space"="L1"}}
+                transform.air.linalg_promote %mul_1 {{"operands_to_promote"=[0,1], "memory_space"="L1"}}
 
-                }}
-                %add = transform.structured.match ops{{["linalg.add"]}} in %arg1  : (!pdl.operation) -> !pdl.operation
-                transform.sequence %add : !pdl.operation failures(propagate) {{
-                    ^bb2(%arg2: !pdl.operation):
-                    %add_1, %loop = transform.air.linalg_tile %arg2 [{elemwise_tiling_size_l1_m}, {elemwise_tiling_size_l1_n}]
-                    transform.air.linalg_promote %add_1 {{"operands_to_promote"=[2], "memory_space"="L1"}}
-                    transform.air.linalg_promote %add_1 {{"operands_to_promote"=[0,1], "memory_space"="L1"}}
+                %add = transform.structured.match ops{{["linalg.add"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
+                %add_1, %add_loop = transform.air.linalg_tile %add [{elemwise_tiling_size_l1_m}, {elemwise_tiling_size_l1_n}]
+                transform.air.linalg_promote %add_1 {{"operands_to_promote"=[2], "memory_space"="L1"}}
+                transform.air.linalg_promote %add_1 {{"operands_to_promote"=[0,1], "memory_space"="L1"}}
 
-                }}
-                %matmul = transform.structured.match ops{{["linalg.matmul"]}} in %arg1  : (!pdl.operation) -> !pdl.operation
-                transform.sequence %matmul : !pdl.operation failures(propagate) {{
-                    ^bb2(%arg2: !pdl.operation):
-                    %fill = transform.structured.match ops{{["linalg.fill"]}} in %arg1  : (!pdl.operation) -> !pdl.operation
-                    %matmul_1, %loop = transform.air.linalg_tile %arg2 [{matmul_tiling_size_l1_m}, {matmul_tiling_size_l1_n}]
-                    %fill_1 = transform.air.fuse_into_containing_op %fill into %loop
-                    transform.air.linalg_promote %fill_1 {{"operands_to_promote"=[1], "memory_space"="L1"}}
-                    transform.air.linalg_promote %matmul_1 {{"operands_to_promote"=[2], "memory_space"="L1"}}
-                    %matmul_2, %reduction_loop = transform.air.linalg_tile %matmul_1 [0, 0, {matmul_tiling_size_l1_k}]
-                    transform.air.linalg_promote %matmul_2 {{"operands_to_promote"=[0,1], "memory_space"="L1"}}
-                }}
-            }}
+                %matmul = transform.structured.match ops{{["linalg.matmul"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
+                %fill = transform.structured.match ops{{["linalg.fill"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
+                %matmul_1, %matmul_loop = transform.air.linalg_tile %matmul [{matmul_tiling_size_l1_m}, {matmul_tiling_size_l1_n}]
+                %fill_1 = transform.air.fuse_into_containing_op %fill into %matmul_loop
+                transform.air.linalg_promote %fill_1 {{"operands_to_promote"=[1], "memory_space"="L1"}}
+                transform.air.linalg_promote %matmul_1 {{"operands_to_promote"=[2], "memory_space"="L1"}}
+                %matmul_2, %reduction_loop = transform.air.linalg_tile %matmul_1 [0, 0, {matmul_tiling_size_l1_k}]
+                transform.air.linalg_promote %matmul_2 {{"operands_to_promote"=[0,1], "memory_space"="L1"}}
+            transform.yield
+          }}
         }}
         """
 
