@@ -278,21 +278,18 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ):
         transform_ir_string = _get_transform_ir_string()
         transform_ir = Module.parse(transform_ir_string, context=air_context)
         run_transform(transform_ir, air_module)
-        # MLIR-AIR compilation step 2.5: fix memory spaces after transform
-        # Re-run override to catch new memref.alloc from one_shot_bufferize.
-        # Order: func→1 first (catch all), then herd→2 (upgrade herd internals).
-        # Fix memory spaces after transform's one_shot_bufferize.
-        # Herd-internal allocs need memory_space 2 (L1).
-        # Non-herd allocs need memory_space 1 (L2) -- handled by pre-pass.
-        # Note: scope=func can't be used because the herd verifier
-        # rejects memory_space < 2 between pass runs.
-        pm_herd = air.passmanager.PassManager.parse(
+        # MLIR-AIR compilation step 2.5: fix memory spaces after transform.
+        # one_shot_bufferize creates memref.alloc at default memory_space 0.
+        # Override: herd allocs→2 (L1), func allocs→1 (L2).
+        # With exclusive scopes (mlir-air >= a2a7316), scope=func skips herds.
+        pm_ms = air.passmanager.PassManager.parse(
             "builtin.module("
-            "air-override-memref-memory-space{scope=herd memory-space=2}"
+            "air-override-memref-memory-space{scope=herd memory-space=2},"
+            "air-override-memref-memory-space{scope=func memory-space=1}"
             ")",
             context=air_context,
         )
-        pm_herd.run(air_module.operation)
+        pm_ms.run(air_module.operation)
         # MLIR-AIR compilation step 3: converting to AIR
         pipeline = (
             "builtin.module("
