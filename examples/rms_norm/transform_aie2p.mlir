@@ -45,15 +45,7 @@ module attributes {transform.with_named_sequence} {
     } : !transform.any_op
     transform.apply_cse to %func_2 : !transform.any_op
 
-    // Phase 4: Promote generic inside forall to L1 (no pad needed)
-    %gen_in_forall = transform.structured.match ops{["linalg.generic"]} in %forall : (!transform.any_op) -> !transform.any_op
-    %gen_l1_buf, %gen_l1_new = transform.structured.bufferize_to_allocation %gen_in_forall
-        {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
-
-    %func_3 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %func_3 { transform.apply_patterns.canonicalization } : !transform.any_op
-    transform.apply_cse to %func_3 : !transform.any_op
-
+    // Phase 4: No L1 alloc -- let post-passes handle memory hierarchy.
     // Phase 5: Bufferize
     // Memory spaces for remaining allocs handled by post-transform overrides
     // in driver.py (scope=herd→2, scope=func→1 with exclusive scopes).

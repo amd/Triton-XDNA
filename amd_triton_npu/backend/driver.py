@@ -290,72 +290,7 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ):
             context=air_context,
         )
         pm_ms.run(air_module.operation)
-        # Step 2.6: DISABLED -- fixing herd block arg types causes
-        # air-par-to-launch to hang (applyPatternsGreedily convergence issue).
-        # See mlir-air #1384. Waiting for upstream fix.
-        if False:
-            import re as _re
-            import subprocess as _sp
-        _ir = str(air_module)
-        _hm = _re.search(
-            r"air\.herd\s+@\w+\s+tile\s*\([^)]+\)\s+in\s*\([^)]+\)\s+"
-            r"args\(([^)]+)\)\s*:\s*([^{]+)\{",
-            _ir,
-        )
-        if _hm:
-            _types = []
-            _d, _c = 0, ""
-            for ch in _hm.group(2):
-                if ch == "<": _d += 1
-                elif ch == ">": _d -= 1
-                if ch == "," and _d == 0:
-                    _types.append(_c.strip()); _c = ""
-                else: _c += ch
-            if _c.strip(): _types.append(_c.strip())
-
-            _hs = _hm.end()
-            _d, _he = 1, _hs
-            for i in range(_hs, len(_ir)):
-                if _ir[i] == "{": _d += 1
-                elif _ir[i] == "}":
-                    _d -= 1
-                    if _d == 0: _he = i + 1; break
-
-            _hb = _ir[_hs:_he]
-            _changed = False
-            for _t in _types:
-                if "memref<" not in _t: continue
-                _ms = _re.search(r",\s*(\d+\s*:\s*i\d+)\s*>$", _t)
-                if not _ms: continue
-                _ms_s = _ms.group(1)
-                _base = _t[:_ms.start()] + ">"
-                if _base == _t: continue
-                _hb = _hb.replace(_base, _t)
-                _el = _re.search(r"memref<\d+x(\w+)>", _base)
-                if _el:
-                    for _sm in set(_re.findall(
-                        r"memref<\d+x" + _re.escape(_el.group(1))
-                        + r",\s*strided<[^\]]*\],\s*offset:\s*\??>>", _hb
-                    )):
-                        if _ms_s not in _sm:
-                            _hb = _hb.replace(_sm, _sm[:-1] + ", " + _ms_s + ">")
-                _changed = True
-
-            if _changed:
-                _fixed = _ir[:_hs] + _hb + _ir[_he:]
-                _tmpf = os.path.join(tmpdir, "step26_fixed.mlir")
-                with open(_tmpf, "w") as f:
-                    f.write(_fixed)
-                # Re-parse via air-opt (which has all dialects registered)
-                _air_opt = _get_air_opt_path()
-                _result = _sp.run(
-                    [_air_opt, _tmpf, "--allow-unregistered-dialect"],
-                    capture_output=True, text=True, timeout=30,
-                )
-                if _result.returncode == 0:
-                    air_module = Module.parse(
-                        _result.stdout, context=air_context
-                    )
+        # Step 2.6: REMOVED -- type fix moved to step 3.5 (after air-par-to-launch).
         # MLIR-AIR compilation step 3: converting to AIR
         pipeline = (
             "builtin.module("
