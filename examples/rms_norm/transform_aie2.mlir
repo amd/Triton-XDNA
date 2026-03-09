@@ -51,6 +51,30 @@ module attributes {transform.with_named_sequence} {
     %f3, %fl3 = transform.structured.fuse_into_containing_op %fill into %fl2
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
+    // L1 memory promotion (softmax pattern)
+    // Fuse sq into reduce to eliminate intermediate buffer
+    %fused_reduce = transform.structured.match ops{["linalg.reduce"]} in %fl3 : (!transform.any_op) -> !transform.any_op
+    %fused_sq = transform.structured.match ops{["linalg.generic"]} in %fl3 : (!transform.any_op) -> !transform.any_op
+    %fused_sq_only, %fused_out_only = transform.split_handle %fused_sq {overflow_result = 1}
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %fused_sq_red = transform.air.fuse_multi_op_linalg %fused_sq_only, %fused_reduce : (!transform.any_op, !transform.any_op) -> !transform.any_op
+
+    // Promote reduce input to L1 (creates L1 alloc + copy from L2)
+    %reduce2 = transform.structured.match ops{["linalg.reduce"]} in %fl3 : (!transform.any_op) -> !transform.any_op
+    %reduce_inp = transform.get_operand %reduce2[0]
+        : (!transform.any_op) -> !transform.any_value
+    transform.structured.promote_tensor to 2 %reduce_inp : !transform.any_value
+
+    // Allocate fills to L1
+    %fills2 = transform.structured.match ops{["linalg.fill"]} in %fl3 : (!transform.any_op) -> !transform.any_op
+    %fill_buf, %fill_new = transform.structured.bufferize_to_allocation %fills2
+        {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+
+    // Allocate output generic to L1 (creates L1 alloc for output)
+    %out_gens = transform.structured.match ops{["linalg.generic"]} in %fl3 : (!transform.any_op) -> !transform.any_op
+    %gen_buf, %gen_new = transform.structured.bufferize_to_allocation %out_gens
+        {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+
     // Canonicalize
     %f2c = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %f2c { transform.apply_patterns.linalg.tiling_canonicalization
@@ -78,14 +102,25 @@ module attributes {transform.with_named_sequence} {
     %mc3 = transform.structured.linalg_copy_to_memref %lc2 : (!transform.any_op) -> !transform.any_op
     %ac = transform.merge_handles %mc2, %mc3 { deduplicate } : !transform.any_op
     %dm = transform.air.copy_to_dma %ac : (!transform.any_op) -> !transform.any_op
-    %vh = transform.air.herd_vectorize %h : (!transform.any_op) -> !transform.any_op
-    %vm = transform.structured.match ops{["arith.mulf"]} in %vh : (!transform.any_op) -> !transform.any_op
-    %vc = transform.air.vector_type_cast %vm {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+    // Inner vectorization tiling at 16-lane width BEFORE vectorize
+    %gens_h = transform.structured.match ops{["linalg.generic"]} in %h : (!transform.any_op) -> !transform.any_op
+    %inner_g, %inner_gl:1 = transform.structured.tile_using_for %gens_h tile_sizes [16]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %reds_h = transform.structured.match ops{["linalg.reduce"]} in %h : (!transform.any_op) -> !transform.any_op
+    %inner_r, %inner_rl:1 = transform.structured.tile_using_for %reds_h tile_sizes [16]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %fills_h = transform.structured.match ops{["linalg.fill"]} in %h : (!transform.any_op) -> !transform.any_op
+    %fill_scl = transform.structured.convert_to_loops %fills_h : (!transform.any_op) -> !transform.any_op
 
-    // Lower vector.multi_reduction to inner reduction loops
+    %vh = transform.air.herd_vectorize %h : (!transform.any_op) -> !transform.any_op
+    // Skip vector_type_cast for now -- let AIE backend handle type legalization
+
+    // Lower vector reductions: multi_reduction → contract → lower contract
     %func_final = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %func_final {
         transform.apply_patterns.vector.lower_multi_reduction lowering_strategy = "innerreduction"
+        transform.apply_patterns.vector.lower_contraction
+        transform.apply_patterns.vector.lower_transfer
     } : !transform.any_op
     transform.apply_cse to %func_final : !transform.any_op
 
