@@ -278,11 +278,20 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ):
         transform_ir_string = _get_transform_ir_string()
         transform_ir = Module.parse(transform_ir_string, context=air_context)
         run_transform(transform_ir, air_module)
-        # MLIR-AIR compilation step 2.5: NOT NEEDED when the transform
-        # pre-allocates all tensor ops to correct memory spaces via
-        # bufferize_to_allocation. The pre-pass (step 1) handles existing
-        # memrefs, and the relu pattern handles forall-internal allocs.
-        # Step 2.6: REMOVED -- type fix moved to step 3.5 (after air-par-to-launch).
+        # MLIR-AIR compilation step 2.5: fix memory spaces after transform.
+        # one_shot_bufferize creates memref.alloc at default memory_space 0.
+        # Override: herd allocs→2 (L1), func allocs→1 (L2).
+        # Requires mlir-air >= 76ed1b1 (exclusive scopes + convergence fix).
+        pm_ms = air.passmanager.PassManager.parse(
+            "builtin.module("
+            "air-override-memref-memory-space{scope=herd memory-space=2},"
+            "air-override-memref-memory-space{scope=func memory-space=1}"
+            ")",
+            context=air_context,
+        )
+        print("Step 2.5 starting...", flush=True)
+        pm_ms.run(air_module.operation)
+        print("Step 2.5 done", flush=True)
         # MLIR-AIR compilation step 3: converting to AIR
         pipeline = (
             "builtin.module("
@@ -305,6 +314,24 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ):
         )
         pm = air.passmanager.PassManager.parse(pipeline, context=air_context)
         pm.run(air_module.operation)
+        # Step 3.5: Remove self-DMAs (same src/dst buffer, same offsets).
+        # These are no-op copies from the pad pattern's copy_back_op.
+        import re
+        _ir = str(air_module)
+        # Match air.dma_memcpy_nd where src and dst use the same %argN
+        # Write step 3 output for debugging
+        with open(dst_path + ".step3", "w") as f:
+            f.write(_ir)
+        # Remove self-DMA lines: air.dma_memcpy_nd with same arg on both sides
+        _ir_fixed = re.sub(
+            r'\n[^\n]*air\.dma_memcpy_nd[^\n]*(%arg\d+)[^\n]*\1[^\n]*',
+            "",
+            _ir,
+        )
+        with open(dst_path + ".step35", "w") as f:
+            f.write(_ir_fixed)
+        # Re-parse the fixed IR
+        air_module = Module.parse(_ir_fixed, context=air_context)
         with open(dst_path, "w") as f:
             f.write(str(air_module))
         _dump_ir_if_needed([dst_path])

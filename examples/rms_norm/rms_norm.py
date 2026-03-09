@@ -3,7 +3,11 @@
 
 # RMS Normalization kernel for AMD XDNA NPU
 # Computes: y = x * rsqrt(mean(x^2) + eps) per row
-# Reference: mlir-air/programming_examples/rms_norm/
+#
+# Processes BLOCK_M rows per invocation (2D tiling) so the Linalg IR has
+# a row dimension that can be tiled at [1] (like softmax). This avoids
+# the scalar chain issue where tl.sum produces a scalar that can't be
+# fused into a forall.
 
 import torch
 import triton
@@ -23,47 +27,54 @@ def rms_norm_kernel(
     M,
     N: tl.constexpr,
     eps: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
-    row_idx = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_SIZE)
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_M
+    rows = row_start + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_N)
 
-    # Load the row
-    x = tl.load(X + row_idx * N + offsets)
+    # Load BLOCK_M rows at once (2D block)
+    offsets = rows[:, None] * N + cols[None, :]
+    x = tl.load(X + offsets)
 
-    # Compute mean of squares
-    x_sq = x * x
-    mean_sq = tl.sum(x_sq, axis=0) / N
+    # Compute mean of squares per row (reduce along axis=1, NOT axis=0)
+    x_f32 = x.to(tl.float32)
+    x_sq = x_f32 * x_f32
+    sum_sq = tl.sum(x_sq, axis=1)  # shape: [BLOCK_M] -- 1D tensor, NOT scalar!
 
-    # Compute rsqrt(mean_sq + eps)
-    # Use rsqrt directly -- AIE has native rsqrt intrinsic
-    rstd = tl.math.rsqrt(mean_sq + eps)
+    # Compute rsqrt per row (element-wise on 1D tensor, NO scalar chain)
+    mean_sq = sum_sq / N
+    rstd = tl.math.rsqrt(mean_sq + eps)  # shape: [BLOCK_M]
 
-    # Normalize
-    y = x * rstd
-    tl.store(Y + row_idx * N + offsets, y)
+    # Normalize: broadcast rstd from [BLOCK_M] to [BLOCK_M, BLOCK_N]
+    y = x_f32 * rstd[:, None]
+    y = y.to(x.dtype)
+    tl.store(Y + offsets, y)
 
 
 def bench_rms_norm(M, N, provider):
     device = "cpu"
     dtype = torch.bfloat16
+    BLOCK_M = 2  # Process 2 rows per invocation
     x = torch.randn(M, N, device=device, dtype=dtype)
     y = torch.empty(M, N, device=device, dtype=dtype)
     if provider == "torch" or provider == "test":
-        # Manual RMS norm reference
         x_f32 = x.float()
         mean_sq = (x_f32 * x_f32).mean(dim=-1, keepdim=True)
         rstd = torch.rsqrt(mean_sq + EPS)
         y_ref = (x_f32 * rstd).to(dtype)
     if provider == "triton" or provider == "test":
-        grid = (M,)
+        grid = (M // BLOCK_M,)
         compiled_kernel = rms_norm_kernel[grid](
             x,
             y,
             M,
             N,
             EPS,
-            BLOCK_SIZE=N,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=N,
         )
         with open("tt.shared.mlir", "w") as f:
             f.write(str(compiled_kernel.asm["ttsharedir"]))
@@ -73,7 +84,6 @@ def bench_rms_norm(M, N, provider):
 
 if __name__ == "__main__":
     benchmark.select_npu_backend()
-    # Test with various sizes
     for M in [32, 64]:
         for N in [64, 128]:
             bench_rms_norm(M, N, "test")
