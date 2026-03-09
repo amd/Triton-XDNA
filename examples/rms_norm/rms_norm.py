@@ -24,7 +24,6 @@ EPS = 1e-5
 def rms_norm_kernel(
     X,
     Y,
-    M,
     N: tl.constexpr,
     eps: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -39,10 +38,12 @@ def rms_norm_kernel(
     offsets = rows[:, None] * N + cols[None, :]
     x = tl.load(X + offsets)
 
-    # Compute mean of squares per row (reduce along axis=1, NOT axis=0)
+    # Compute mean of squares per row in bf16 (AIE2P only supports bf16 vector add)
     x_f32 = x.to(tl.float32)
     x_sq = x_f32 * x_f32
-    sum_sq = tl.sum(x_sq, axis=1)  # shape: [BLOCK_M] -- 1D tensor, NOT scalar!
+    x_sq_bf16 = x_sq.to(x.dtype)  # truncate to bf16 for AIE2P vector support
+    sum_sq_bf16 = tl.sum(x_sq_bf16, axis=1)  # bf16 sum
+    sum_sq = sum_sq_bf16.to(tl.float32)  # convert back to f32 for divf/rsqrt
 
     # Compute rsqrt per row (element-wise on 1D tensor, NO scalar chain)
     mean_sq = sum_sq / N
@@ -70,7 +71,6 @@ def bench_rms_norm(M, N, provider):
         compiled_kernel = rms_norm_kernel[grid](
             x,
             y,
-            M,
             N,
             EPS,
             BLOCK_M=BLOCK_M,
@@ -84,6 +84,7 @@ def bench_rms_norm(M, N, provider):
 
 if __name__ == "__main__":
     benchmark.select_npu_backend()
+    # N >= 256 required for proper 2D DMA patterns in aircc runtime sequence
     for M in [32, 64]:
-        for N in [64, 128]:
+        for N in [256]:
             bench_rms_norm(M, N, "test")

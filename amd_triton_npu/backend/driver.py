@@ -323,8 +323,9 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ):
         with open(dst_path + ".step3", "w") as f:
             f.write(_ir)
         # Remove self-DMA lines: air.dma_memcpy_nd with same arg on both sides
+        # Use word boundary \b to prevent partial matches (e.g. %arg2 matching %arg20)
         _ir_fixed = re.sub(
-            r'\n[^\n]*air\.dma_memcpy_nd[^\n]*(%arg\d+)[^\n]*\1[^\n]*',
+            r'\n[^\n]*air\.dma_memcpy_nd[^\n]*(%arg\d+)\b[^\n]*\1\b[^\n]*',
             "",
             _ir,
         )
