@@ -94,6 +94,12 @@ EXAMPLES = [
     },
     {
         "category": "Normalization",
+        "name": "Weighted RMS Normalization",
+        "path": "weighted_rms_norm",
+        "datatypes": "bf16",
+    },
+    {
+        "category": "Normalization",
         "name": "Softmax",
         "path": "test_softmax",
         "datatypes": "bf16",
