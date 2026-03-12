@@ -36,18 +36,23 @@ jobs:
 
       - name: Generate dashboard
         run: |
-          mkdir -p _site
           python3 examples/generate_readme.py \
-            --output _site/index.md \
+            --output index.md \
             --base-url https://github.com/amd/Triton-XDNA/tree/main/examples/ \
             --verify
 
       - name: Add Jekyll config
         run: |
-          cat > _site/_config.yml << 'EOF'
+          cat > _config.yml << 'EOF'
           title: Triton-XDNA Examples
           theme: jekyll-theme-cayman
           EOF
+
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./
+          destination: ./_site
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
