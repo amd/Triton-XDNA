@@ -731,7 +731,10 @@ def compile_module(launcher_src, kernel_placeholder_name):
                 ###### Compile to xclbin and runtime sequence
                 xclbin_path = os.path.join(air_proj_path, "aie.xclbin")
                 insts_path = os.path.join(air_proj_path, "insts.bin")
-                aircc_options = [
+                air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
+                aircc_bin = str(Path(aircc.__file__).resolve().parent.parent.parent.parent.parent / "bin" / "aircc")
+                aircc_cmd = [
+                    aircc_bin,
                     "--device",
                     detect_npu_version(),
                     "--no-xchesscc",
@@ -741,8 +744,9 @@ def compile_module(launcher_src, kernel_placeholder_name):
                     "-o",
                     xclbin_path,
                     "--peano" + " ",
+                    air_mlir_path,
                 ]
-                aircc.run(air_output, aircc_options)
+                subprocess.check_call(aircc_cmd)
 
                 with open(so_path, "rb") as f:
                     cache_path = cache.put(f.read(), filename, binary=True)
