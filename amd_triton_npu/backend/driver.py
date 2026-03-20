@@ -747,7 +747,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
                     insts_path,
                     "-o",
                     xclbin_path,
-                    "--peano" + " ",
+                    "--peano=",
                     air_mlir_path,
                 ]
                 subprocess.check_call(aircc_cmd)
