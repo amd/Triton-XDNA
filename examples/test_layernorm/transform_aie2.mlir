@@ -25,17 +25,10 @@ module attributes {transform.with_named_sequence} {
         
         // Run canonicalization
         // Apply initial canonicalization patterns to clean up the IR
-        %func0 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %func0 {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-            // CRITICAL: fold_unit_extent_dims_via_reshapes is essential.
-            // This pattern removes unit dimensions and simplifies tensor shapes, which is
-            // crucial for subsequent tiling and bufferization passes.
-            transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
-        } : !transform.any_op
-        transform.apply_cse to %func0 : !transform.any_op
+        // CRITICAL: fold_unit_extent_dims_via_reshapes is essential.
+        // This pattern removes unit dimensions and simplifies tensor shapes, which is
+        // crucial for subsequent tiling and bufferization passes.
+        transform.include @canonicalize_with_fold_dims failures(propagate) (%arg1) : (!transform.any_op) -> ()
 
         //===================================================================
         // PHASE 2: Elementwise Fusion and Reduction Transformation
@@ -58,12 +51,7 @@ module attributes {transform.with_named_sequence} {
         %transformed_reduces = transform.air.transpose_reduce %reduces : (!transform.any_op) -> !transform.any_op
 
         // Canonicalization after fusion and transformation
-        transform.apply_patterns to %fused_func {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        transform.apply_cse to %fused_func : !transform.any_op
+        transform.include @canonicalize_with_cse failures(propagate) (%arg1) : (!transform.any_op) -> ()
 
         // Data-flow navigation from linalg.reduce anchors.
         // Chain: generic1 -> reduce1 -> generic2 -> reduce2 -> output_generic
@@ -104,13 +92,7 @@ module attributes {transform.with_named_sequence} {
         // Clean up the IR after fusion to remove redundant operations
         
         // Run canonicalization after fusion
-        %func2 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %func2 {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        transform.apply_cse to %func2 : !transform.any_op
+        transform.include @canonicalize_with_cse failures(propagate) (%arg1) : (!transform.any_op) -> ()
         
         //===================================================================
         // PHASE 5: L2 Memory Allocation for Intermediate Buffers
@@ -157,13 +139,7 @@ module attributes {transform.with_named_sequence} {
         // Clean up the IR after L2 allocation and prepare for final bufferization
         
         // Run canonicalization after L2 memory allocation
-        %func5 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %func5 {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        transform.apply_cse to %func5 : !transform.any_op
+        transform.include @canonicalize_with_cse failures(propagate) (%arg1) : (!transform.any_op) -> ()
         
         //===================================================================
         // PHASE 7: Complete Bufferization
@@ -173,8 +149,7 @@ module attributes {transform.with_named_sequence} {
         // handles the remaining tensor-to-memref conversions.
         
         // Apply one-shot bufferization to convert remaining tensors to memrefs
-        %func_op = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %func_bufferized = transform.bufferization.one_shot_bufferize %func_op : (!transform.any_op) -> !transform.any_op
+        transform.include @one_shot_bufferize failures(propagate) (%arg1) : (!transform.any_op) -> ()
 
         //===================================================================
         // PHASE 8: Post-Bufferization Cleanup and Optimization
@@ -182,20 +157,15 @@ module attributes {transform.with_named_sequence} {
         // Assumption: Bufferization may introduce redundant memory operations
         // that need to be eliminated for optimal performance.
         
-        // Run canonicalization to remove redundant memcpy (with linalg.generic form) ops created, 
-        // which can be deleted by canonicalizer. We have to run it again because the memrefs are 
+        // Run canonicalization to remove redundant memcpy (with linalg.generic form) ops created,
+        // which can be deleted by canonicalizer. We have to run it again because the memrefs are
         // unified in CSE pass, so we can truly remove redundant memcpy.
+        transform.include @canonicalize_with_cse failures(propagate) (%arg1) : (!transform.any_op) -> ()
         %func6 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
         transform.apply_patterns to %func6 {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
             transform.apply_patterns.canonicalization
         } : !transform.any_op
-        transform.apply_cse to %func6 : !transform.any_op
-        transform.apply_patterns to %func6 {
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        
+
         // Remove uninitialized copy operations that may have been introduced
         %func_op_updated = transform.air.remove_uninitialized_copy %func6 : (!transform.any_op) -> !transform.any_op
         

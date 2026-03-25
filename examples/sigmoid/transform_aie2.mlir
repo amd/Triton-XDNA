@@ -2,172 +2,70 @@
 // SPDX-License-Identifier: MIT
 
 ////////////////////////////////////////////////////////////////////////////////
-// Transform Script for Sigmoid (AIE2P)
+// Transform Script for Sigmoid (AIE2)
 //
 // sigmoid(x) = 1 / (1 + exp(-x))
 //
-// AIE2P type mapping (from mlir-air/programming_examples/primitives):
-//   - math.exp:       bf16 ONLY (vector 16/32) -> needs vector_type_cast
-//   - arith.divf:     f32 ONLY  (vector 16/64) -> keep as f32!
-//   - arith.subf/addf/mulf: f32 OK (vector)
+// Strategy: fuse_elementwise_linalg -> unary pad+promote -> vectorize at 16
+// -> cast exp, subf, addf, mulf to bf16; divf stays f32.
 //
-// Strategy: fuse_elementwise_linalg (single generic, 2 L1 buffers),
-// vectorize at 16, cast ONLY exp to bf16, divf stays f32.
+// AIE2 requires extern_func.o linking for math.exp intrinsic.
+// Uses shared library sequences from transform_library.mlir (auto-injected).
 ////////////////////////////////////////////////////////////////////////////////
 
 module attributes {transform.with_named_sequence} {
-  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+  transform.named_sequence @__transform_main(
+      %arg1: !transform.any_op {transform.readonly}) {
 
-    //===================================================================
-    // PHASE 1: Canonicalization
-    //===================================================================
-    %func0 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %func0 {
-        transform.apply_patterns.linalg.tiling_canonicalization
-        transform.apply_patterns.scf.for_loop_canonicalization
-        transform.apply_patterns.canonicalization
-        transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
-    } : !transform.any_op
-    transform.apply_cse to %func0 : !transform.any_op
+    // Phase 1: Initial canonicalization
+    transform.include @canonicalize_with_fold_dims failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
 
-    //===================================================================
-    // PHASE 2: Fuse Elementwise Chain
-    //===================================================================
-    %func1 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %func1_fused = transform.air.fuse_elementwise_linalg %func1 : (!transform.any_op) -> !transform.any_op
+    // Phase 2: Fuse elementwise chain
+    transform.include @fuse_elementwise_and_canonicalize failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
 
-    %func1a = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %func1a {
-        transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %func1a : !transform.any_op
+    // Phase 3: Flatten + tile forall [256]
+    transform.include @flatten_tile_forall failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
 
-    //===================================================================
-    // PHASE 3: Vec-Add-Style Tiling
-    //===================================================================
-    %op = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %op_flattened = transform.structured.flatten_elementwise %op
-    : (!transform.any_op) -> !transform.any_op
+    // Phase 4: Canonicalization
+    transform.include @canonicalize_with_cse failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
 
-    %op_res_shared, %new_op = transform.structured.bufferize_to_allocation %op_flattened
-      {memory_space = 1, bufferize_destination_only, emit_dealloc} : !transform.any_op
+    // Phase 5: Pad and promote to L1 (unary: 1 input + 1 output)
+    transform.include @pad_and_promote_unary_bf16 failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
 
-    %op_1 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %tiled_op_1, %forall_op_1 =
-      transform.structured.tile_using_forall %op_1 tile_sizes [256] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // Phase 6: Canonicalization
+    transform.include @canonicalize_with_cse failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
 
-    //===================================================================
-    // PHASE 4: Canonicalization
-    //===================================================================
-    %func_2 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %func_2 {
-        transform.apply_patterns.linalg.tiling_canonicalization
-        transform.apply_patterns.scf.for_loop_canonicalization
-        transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %func_2 : !transform.any_op
+    // Phase 7: Bufferization
+    transform.include @one_shot_bufferize failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
 
-    //===================================================================
-    // PHASE 5: Pad and Promote to L1
-    //===================================================================
-    %op_2 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %padded_op, %pad_op, %__ = transform.structured.pad %op_2 {
-        padding_values=[0.0 : bf16, 0.0 : bf16],
-        padding_dimensions=[0, 1],
-        nofold_flags=[1, 1],
-        copy_back_op="linalg.copy"
-    } : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    // Phase 8: Post-bufferization cleanup
+    transform.include @post_bufferize_cleanup failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
 
-    %pad_dps = transform.structured.rewrite_in_destination_passing_style %pad_op : (!transform.any_op) -> !transform.any_op
-
-    %padded_input = transform.get_producer_of_operand %padded_op[0] : (!transform.any_op) -> (!transform.any_op)
-    %padded_input_buffer, %padded_input_new = transform.structured.bufferize_to_allocation %padded_input
-        {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
-
-    %padded_result = transform.get_producer_of_operand %padded_op[1] : (!transform.any_op) -> (!transform.any_op)
-    %padded_result_buffer, %padded_result_new = transform.structured.bufferize_to_allocation %padded_result
-        {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
-
-    //===================================================================
-    // PHASE 6: Canonicalization
-    //===================================================================
-    %func_3 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %func_3 {
-        transform.apply_patterns.linalg.tiling_canonicalization
-        transform.apply_patterns.scf.for_loop_canonicalization
-        transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %func_3 : !transform.any_op
-
-    //===================================================================
-    // PHASE 7: Bufferization
-    //===================================================================
-    %func_op = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %func_bufferized = transform.bufferization.one_shot_bufferize %func_op : (!transform.any_op) -> !transform.any_op
-
-    //===================================================================
-    // PHASE 8: Post-Bufferization Cleanup
-    //===================================================================
-    %func6 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %func6 {
-        transform.apply_patterns.linalg.tiling_canonicalization
-        transform.apply_patterns.scf.for_loop_canonicalization
-        transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %func6 : !transform.any_op
-    transform.apply_patterns to %func6 {
-        transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    %linalg_copies = transform.structured.match ops{["linalg.copy"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %memref_copies = transform.structured.linalg_copy_to_memref %linalg_copies : (!transform.any_op) -> !transform.any_op
-    %func_op_updated = transform.air.remove_uninitialized_copy %func6 : (!transform.any_op) -> !transform.any_op
-    %func_op_updated_1 = transform.air.eliminate_cascade_memcpy %func_op_updated : (!transform.any_op) -> !transform.any_op
-
-    //===================================================================
-    // PHASE 9: Vectorization (16-lane)
-    //===================================================================
-    %linalg_generics = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    // Phase 9: Vectorization tiling (16-lane for bf16)
+    %linalg_generics = transform.structured.match ops{["linalg.generic"]}
+        in %arg1 : (!transform.any_op) -> !transform.any_op
     %inner_most_generics, %vec_loops:1 =
-      transform.structured.tile_using_for %linalg_generics tile_sizes [16]
-      : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+        transform.structured.tile_using_for %linalg_generics tile_sizes [16]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
 
-    //===================================================================
-    // PHASE 10: AIR Constructs Mapping
-    //===================================================================
-    %forall_as_herd = transform.structured.match ops{["scf.forall"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %parallel = transform.loop.forall_to_parallel %forall_as_herd : (!transform.any_op) -> !transform.any_op
-    %herd = transform.air.par_to_herd %parallel : (!transform.any_op) -> !transform.any_op
+    // Phase 10: AIR herd mapping + vectorization (with extern_func.o for AIE2)
+    %vectorized_herd = transform.include
+        @air_herd_mapping_with_extern_and_vectorize
+        failures(propagate) (%arg1)
+        : (!transform.any_op) -> !transform.any_op
 
-    %extern_func_param = transform.param.constant "extern_func.o" -> !transform.any_param
-    transform.annotate %herd "link_with" = %extern_func_param : !transform.any_op, !transform.any_param
-
-    %copies_in_herd = transform.structured.match ops{["memref.copy", "linalg.copy"]} in %herd : (!transform.any_op) -> !transform.any_op
-    %dmas_from_copies = transform.air.copy_to_dma %copies_in_herd : (!transform.any_op) -> !transform.any_op
-
-    %vectorized_herd = transform.air.herd_vectorize %herd : (!transform.any_op) -> !transform.any_op
-
-    // AIE2P vector type mapping (from mlir-air/primitives):
-    //   bf16 ONLY: addf, subf, mulf, maximumf, cmpf, select, exp, tanh
-    //   f32 ONLY:  divf, rsqrt, reciprocal
-    // Cast all bf16-only ops from f32 to bf16 after vectorization.
-
-    // math.exp -> bf16
-    %vector_exps = transform.structured.match ops{["math.exp"]} in %vectorized_herd : (!transform.any_op) -> !transform.any_op
-    %exp_cast = transform.air.vector_type_cast %vector_exps {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
-
-    // arith.subf -> bf16
-    %vector_subs = transform.structured.match ops{["arith.subf"]} in %vectorized_herd : (!transform.any_op) -> !transform.any_op
-    %sub_cast = transform.air.vector_type_cast %vector_subs {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
-
-    // arith.addf -> bf16
-    %vector_adds = transform.structured.match ops{["arith.addf"]} in %vectorized_herd : (!transform.any_op) -> !transform.any_op
-    %add_cast = transform.air.vector_type_cast %vector_adds {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
-
-    // arith.mulf -> bf16 (needed for silu: x * sigmoid(x))
-    %vector_muls = transform.structured.match ops{["arith.mulf"]} in %vectorized_herd : (!transform.any_op) -> !transform.any_op
-    %mul_cast = transform.air.vector_type_cast %vector_muls {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
-
-    // arith.divf stays f32 (AIE2P supports f32 vector div)
+    // Cast bf16-only ops; divf stays f32
+    transform.foreach_match in %vectorized_herd
+        @match_bf16_only_op -> @action_cast_to_bf16
+        : (!transform.any_op) -> !transform.any_op
 
     transform.yield
   }

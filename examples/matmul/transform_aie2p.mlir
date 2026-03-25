@@ -140,13 +140,7 @@ module attributes {transform.with_named_sequence} {
 
     // Step 13: Canonicalization and CSE after tiling.
     // Purpose: Cleans up IR, merges redundant ops, and prepares for further transforms.
-        %func_2 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %func_2 {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        transform.apply_cse to %func_2 : !transform.any_op
+        transform.include @canonicalize_with_cse failures(propagate) (%arg1) : (!transform.any_op) -> ()
 
     //==========================================================================
     // PHASE 6: PROMOTE INPUTS TO L1 AND TILE PROLOGUE/EPILOGUE
@@ -187,13 +181,7 @@ module attributes {transform.with_named_sequence} {
 
     // Step 17: Canonicalization and CSE after buffer promotion.
     // Purpose: Merges redundant allocs/copies and simplifies the IR.
-        %func_3 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %func_3 {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        transform.apply_cse to %func_3 : !transform.any_op
+        transform.include @canonicalize_with_cse failures(propagate) (%arg1) : (!transform.any_op) -> ()
 
     //==========================================================================
     // PHASE 7: BUFFERIZATION AND AIR CLEANUP
@@ -202,8 +190,7 @@ module attributes {transform.with_named_sequence} {
 
     // Step 18: One-shot bufferization of the function.
     // Purpose: Converts all remaining tensors to memrefs for hardware execution.
-        %func_op = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %func_bufferized = transform.bufferization.one_shot_bufferize %func_op : (!transform.any_op) -> !transform.any_op
+        transform.include @one_shot_bufferize failures(propagate) (%arg1) : (!transform.any_op) -> ()
 
     // Step 19: AIR-specific cleanup and memory optimization.
     // Purpose: Removes uninitialized copies and eliminates redundant cascade memcpy patterns.
