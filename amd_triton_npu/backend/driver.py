@@ -202,7 +202,8 @@ def _inject_transform_library(user_script):
 
     Two mechanisms:
     1. transform.include calls are expanded inline (parameter substitution,
-       SSA renaming) to avoid enableExpensiveChecks segfaults in mlir-air.
+       SSA renaming) to avoid segfaults in mlir-air's transform interpreter
+       when resolving transform.include across region boundaries.
     2. foreach_match @name symbol references are resolved by injecting the
        referenced named_sequence definitions into the module (these cannot
        be inlined because foreach_match resolves symbols at runtime).
@@ -218,32 +219,35 @@ def _inject_transform_library(user_script):
     if not has_includes and not has_foreach_match:
         return user_script
 
-    lib_path = os.path.join(os.path.dirname(__file__), "transform_library.mlir")
-    if not os.path.isfile(lib_path):
+    # Load library content from transform_library/ directory
+    lib_dir = os.path.join(os.path.dirname(__file__), "transform_library")
+    if not os.path.isdir(lib_dir):
         return user_script
-
-    with open(lib_path, "r") as lib_f:
-        lib_content = lib_f.read()
+    parts = []
+    for fname in sorted(os.listdir(lib_dir)):
+        if fname.endswith(".mlir"):
+            with open(os.path.join(lib_dir, fname), "r") as f:
+                parts.append(f.read())
+    lib_content = "\n".join(parts)
 
     import re
 
-    # Parse library: full sequence text (for injection) and decomposed parts (for inlining)
-    # Match sequences with {transform.readonly} param (standard) or {transform.consumed} param
+    # Parse all named sequences: full text (for injection) and decomposed (for inlining)
     full_seq_pattern = re.compile(
-        r"((?://[^\n]*\n)*"  # optional leading comments
-        r"transform\.named_sequence\s+@(\w+)\s*\([^)]*\)"  # signature
-        r"(?:\s*->\s*!transform\.any_op)?"  # optional return
-        r"\s*\{.*?\n\})",  # body
+        r"((?://[^\n]*\n)*"
+        r"transform\.named_sequence\s+@(\w+)\s*\([^)]*\)"
+        r"(?:\s*->\s*!transform\.any_op)?"
+        r"\s*\{.*?\n\})",
         re.DOTALL,
     )
-    full_sequences = {}  # name -> full text (for injection)
+    full_sequences = {}
     for m in full_seq_pattern.finditer(lib_content):
         full_sequences[m.group(2)] = m.group(1)
 
-    # Parse inlinable sequences (readonly param only, for transform.include expansion)
+    # Parse inlinable sequences (readonly or consumed param, for transform.include)
     inline_seq_pattern = re.compile(
         r"transform\.named_sequence\s+@(\w+)\s*\(\s*"
-        r"%(\w+)\s*:\s*!transform\.any_op\s*\{transform\.readonly\}\s*\)"
+        r"%(\w+)\s*:\s*!transform\.any_op\s*\{transform\.(?:readonly|consumed)\}\s*\)"
         r"(\s*->\s*!transform\.any_op)?"
         r"\s*\{(.*?)\n\}",
         re.DOTALL,
@@ -256,10 +260,10 @@ def _inject_transform_library(user_script):
         body = match.group(4)
         sequences[name] = (param, body, has_result)
 
-    if not sequences:
+    if not sequences and not full_sequences:
         return user_script
 
-    # Match: [%result = ] transform.include @name failures(...) (%actual) : (...) -> (...)
+    # Inline transform.include calls to avoid mlir-air segfaults
     include_pattern = re.compile(
         r"(?:(%\w+)\s*=\s*)?"
         r"transform\.include\s+@(\w+)\s+"
@@ -269,11 +273,10 @@ def _inject_transform_library(user_script):
         r"(?:!transform\.any_op|\(\s*\))"
     )
 
-    max_depth = 20
     _counter = [0]
 
     def _expand(text, depth=0):
-        if depth > max_depth or "transform.include" not in text:
+        if depth > 20 or "transform.include" not in text:
             return text
 
         def _replace_include(m):
@@ -297,13 +300,9 @@ def _inject_transform_library(user_script):
                 if result_var and yielded_var:
                     expanded = expanded.replace(yielded_var, result_var)
 
-            # Unique suffix to avoid SSA name collisions across expansions
             suffix = f"_lib{_counter[0]}"
             _counter[0] += 1
             local_vars = set(re.findall(r"%(\w+)", expanded))
-            # Don't rename externally-scoped identifiers: the actual argument
-            # and the caller's result variable (if any) are defined outside
-            # the inlined body and must keep their original names.
             actual_name = actual_arg.lstrip("%")
             result_name = result_var.lstrip("%") if result_var else ""
             skip = {actual_name, result_name, "__", ""}
@@ -324,18 +323,22 @@ def _inject_transform_library(user_script):
 
     # Inject named sequences referenced by foreach_match (symbol references
     # that cannot be inlined — they must exist as definitions in the module).
-    if has_foreach_match:
-        # Extract foreach_match blocks (may span multiple lines)
-        # Match: transform.foreach_match ... @matcher -> @action ... : ...
-        foreach_refs = set()
-        fm_pattern = re.compile(
-            r"transform\.foreach_match.*?(?=transform\.|$)", re.DOTALL
-        )
-        for fm in fm_pattern.finditer(result):
-            foreach_refs.update(re.findall(r"@(\w+)", fm.group(0)))
-        # Remove __transform_main and any non-library refs
-        foreach_refs.discard("__transform_main")
-        needed = {n for n in foreach_refs if n in full_sequences}
+    if has_foreach_match or "foreach_match" in result:
+        all_refs = set(re.findall(r"@(\w+)", result))
+        all_refs.discard("__transform_main")
+        # Transitively resolve dependencies
+        needed = set()
+        worklist = [n for n in all_refs if n in full_sequences]
+        while worklist:
+            name = worklist.pop()
+            if name in needed:
+                continue
+            needed.add(name)
+            for dep in re.findall(r"@(\w+)", full_sequences[name]):
+                if dep in full_sequences and dep not in needed:
+                    worklist.append(dep)
+        # Inject definitions for all unresolved @name references
+        # (matchers/actions referenced by foreach_match, plus their deps)
         if needed:
             module_marker = "module attributes {transform.with_named_sequence} {"
             idx = result.find(module_marker)

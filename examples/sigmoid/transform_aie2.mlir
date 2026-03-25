@@ -50,22 +50,14 @@ module attributes {transform.with_named_sequence} {
         (%arg1) : (!transform.any_op) -> ()
 
     // Phase 9: Vectorization tiling (16-lane for bf16)
-    %linalg_generics = transform.structured.match ops{["linalg.generic"]}
-        in %arg1 : (!transform.any_op) -> !transform.any_op
-    %inner_most_generics, %vec_loops:1 =
-        transform.structured.tile_using_for %linalg_generics tile_sizes [16]
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.include @vectorize_generics_at_16 failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
 
     // Phase 10: AIR herd mapping + vectorization (with extern_func.o for AIE2)
-    %vectorized_herd = transform.include
-        @air_herd_mapping_with_extern_and_vectorize
-        failures(propagate) (%arg1)
-        : (!transform.any_op) -> !transform.any_op
-
-    // Cast bf16-only ops; divf stays f32
-    transform.foreach_match in %vectorized_herd
-        @match_bf16_only_op -> @action_cast_to_bf16
-        : (!transform.any_op) -> !transform.any_op
+    %vh = transform.include @air_herd_mapping_with_extern_and_vectorize
+        failures(propagate) (%arg1) : (!transform.any_op) -> !transform.any_op
+    transform.include @cast_bf16_only_ops failures(propagate)
+        (%vh) : (!transform.any_op) -> ()
 
     transform.yield
   }

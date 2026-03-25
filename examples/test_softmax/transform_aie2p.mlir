@@ -199,20 +199,8 @@ module attributes {transform.with_named_sequence} {
         // The canonicalizer removes redundant memcpy operations (represented as linalg.generic).
         // CSE unifies memrefs first, enabling the canonicalizer to identify and remove duplicates.
         
-        // Run canonicalization to remove redundant memcpy operations
-        %func6 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %func6 {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        transform.apply_cse to %func6 : !transform.any_op
-        transform.apply_patterns to %func6 {
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        
-        // Remove uninitialized copy operations that may have been introduced
-        %func_op_updated = transform.air.remove_uninitialized_copy %func6 : (!transform.any_op) -> !transform.any_op
+        transform.include @post_bufferize_cleanup failures(propagate)
+            (%arg1) : (!transform.any_op) -> ()
         
         //===================================================================
         // PHASE 9: Prepare Operations for AIE Vector Intrinsics
@@ -257,18 +245,8 @@ module attributes {transform.with_named_sequence} {
         %vector_exps_in_herd = transform.structured.match ops{["math.exp"]} in %vectorized_herd : (!transform.any_op) -> !transform.any_op
         %result11 = transform.air.vector_type_cast %vector_exps_in_herd {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
 
-        %func7 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-
-        // Convert size-1 vectors to scalars (downstream compiler cannot handle size-1 vectors)
-        %func7_transformed = transform.air.convert_size1_vector_to_scalar %func7 : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %func7_transformed {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-            transform.apply_patterns.vector.cast_away_vector_leading_one_dim
-            transform.apply_patterns.vector.lower_multi_reduction lowering_strategy = "innerreduction"
-        } : !transform.any_op
-        transform.apply_cse to %func7_transformed : !transform.any_op
+        transform.include @post_vectorize_reduce_cleanup failures(propagate)
+            (%arg1) : (!transform.any_op) -> ()
     transform.yield
   }
 }

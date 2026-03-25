@@ -29,18 +29,12 @@ module attributes {transform.with_named_sequence} {
     transform.include @post_bufferize_cleanup failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
 
-    %generics = transform.structured.match ops{["linalg.generic"]}
-        in %arg1 : (!transform.any_op) -> !transform.any_op
-    %tiled, %loops:1 = transform.structured.tile_using_for %generics
-        tile_sizes [16] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-
+    transform.include @vectorize_generics_at_16 failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
     %vh = transform.include @air_herd_mapping_and_vectorize
         failures(propagate) (%arg1) : (!transform.any_op) -> !transform.any_op
-
-    // Cast bf16-only ops
-    transform.foreach_match in %vh
-        @match_bf16_only_op -> @action_cast_to_bf16
-        : (!transform.any_op) -> !transform.any_op
+    transform.include @cast_bf16_only_ops failures(propagate)
+        (%vh) : (!transform.any_op) -> ()
 
     transform.yield
   }

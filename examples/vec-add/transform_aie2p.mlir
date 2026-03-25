@@ -27,13 +27,8 @@ module attributes {transform.with_named_sequence} {
     transform.include @post_bufferize_cleanup failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
 
-    // Vectorization tiling (32-lane for AIE2P)
-    %generics = transform.structured.match ops{["linalg.generic"]}
-        in %arg1 : (!transform.any_op) -> !transform.any_op
-    %tiled, %loops:1 = transform.structured.tile_using_for %generics
-        tile_sizes [32] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-
-    // AIR mapping (no type casts needed for vec-add)
+    transform.include @vectorize_generics_at_32 failures(propagate)
+        (%arg1) : (!transform.any_op) -> ()
     %vh = transform.include @air_herd_mapping_and_vectorize
         failures(propagate) (%arg1) : (!transform.any_op) -> !transform.any_op
 
