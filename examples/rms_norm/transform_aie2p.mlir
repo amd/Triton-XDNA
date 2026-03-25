@@ -51,8 +51,7 @@ module attributes {transform.with_named_sequence} {
     %f2c = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %f2c { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %f2c : !transform.any_op
-    %fop = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %fb = transform.bufferization.one_shot_bufferize %fop : (!transform.any_op) -> !transform.any_op
+    transform.include @one_shot_bufferize failures(propagate) (%arg1) : (!transform.any_op) -> ()
     %f6 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %f6 { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %f6 : !transform.any_op

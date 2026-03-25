@@ -43,17 +43,10 @@ module attributes {transform.with_named_sequence} {
     // CSE to merge duplicate X extract_slices from fuse_into_containing_op.
     // sq and out both slice from the same X tensor -- CSE merges them so
     // linalg_promote's promotedValueMap shares one L1 buffer.
-    %func_cse = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %func_cse {
-        transform.apply_patterns.linalg.tiling_canonicalization
-        transform.apply_patterns.scf.for_loop_canonicalization
-        transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %func_cse : !transform.any_op
+    transform.include @canonicalize_with_cse failures(propagate) (%arg1) : (!transform.any_op) -> ()
 
     // Bufferize
-    %fop = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %fb = transform.bufferization.one_shot_bufferize %fop : (!transform.any_op) -> !transform.any_op
+    transform.include @one_shot_bufferize failures(propagate) (%arg1) : (!transform.any_op) -> ()
     %f6 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %f6 { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %f6 : !transform.any_op

@@ -39,25 +39,8 @@ module attributes {transform.with_named_sequence} {
         // standard optimization patterns that simplify operations and remove
         // redundancies. This creates a clean foundation for tiling and fusion.
         
-        // Match the function containing all softmax operations
-        %func0 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        
-        // Apply comprehensive canonicalization patterns:
-        transform.apply_patterns to %func0 {
-            // Simplify tiling-related patterns (e.g., empty tensor operations)
-            transform.apply_patterns.linalg.tiling_canonicalization
-            // Optimize SCF for loops (e.g., loop bounds, step simplification)
-            transform.apply_patterns.scf.for_loop_canonicalization
-            // General MLIR canonicalization (constant folding, dead code elimination)
-            transform.apply_patterns.canonicalization
-            // CRITICAL: Remove unit dimensions and simplify tensor shapes
-            // This is essential for AIE hardware which has specific shape constraints
-            // and enables more efficient tiling patterns in subsequent phases
-            transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
-        } : !transform.any_op
-        
-        // Apply Common Subexpression Elimination to remove duplicate computations
-        transform.apply_cse to %func0 : !transform.any_op
+        transform.include @canonicalize_with_fold_dims failures(propagate)
+            (%arg1) : (!transform.any_op) -> ()
 
         //===================================================================
         // PHASE 2: Operation Fusion and Preparation
@@ -86,13 +69,8 @@ module attributes {transform.with_named_sequence} {
         %reduces = transform.structured.match ops{["linalg.reduce"]} in %fused_func  : (!transform.any_op) -> !transform.any_op
         %transformed_reduces = transform.air.transpose_reduce %reduces : (!transform.any_op) -> !transform.any_op
 
-        // Clean up IR after reduction transformation
-        transform.apply_patterns to %fused_func {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        transform.apply_cse to %fused_func : !transform.any_op
+        transform.include @canonicalize_with_cse failures(propagate)
+            (%arg1) : (!transform.any_op) -> ()
 
         // Data-flow navigation from linalg.reduce anchors.
         // After fuse_elementwise_linalg (without generalize), the IR has:
@@ -160,14 +138,8 @@ module attributes {transform.with_named_sequence} {
         //===================================================================
         // Clean up the IR after fusion to remove redundant operations
         
-        // Run canonicalization after fusion
-        %func2 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %func2 {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        transform.apply_cse to %func2 : !transform.any_op
+        transform.include @canonicalize_with_cse failures(propagate)
+            (%arg1) : (!transform.any_op) -> ()
         
         //===================================================================
         // PHASE 5: L1 Memory Allocation Strategy
@@ -207,14 +179,8 @@ module attributes {transform.with_named_sequence} {
         // PURPOSE: Clean up the IR after L1 allocation and prepare for complete
         // bufferization by removing redundant operations and simplifying patterns
         
-        // Run canonicalization after L1 memory allocation
-        %func5 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %func5 {
-            transform.apply_patterns.linalg.tiling_canonicalization
-            transform.apply_patterns.scf.for_loop_canonicalization
-            transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        transform.apply_cse to %func5 : !transform.any_op
+        transform.include @canonicalize_with_cse failures(propagate)
+            (%arg1) : (!transform.any_op) -> ()
         
         //===================================================================
         // PHASE 7: Complete Bufferization
@@ -223,9 +189,8 @@ module attributes {transform.with_named_sequence} {
         // operations for execution on AIE hardware. One-shot bufferization
         // handles the remaining tensor-to-memref conversions.
         
-        // Apply one-shot bufferization to convert remaining tensors to memrefs
-        %func_op = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %func_bufferized = transform.bufferization.one_shot_bufferize %func_op : (!transform.any_op) -> !transform.any_op
+        transform.include @one_shot_bufferize failures(propagate)
+            (%arg1) : (!transform.any_op) -> ()
 
         //===================================================================
         // PHASE 8: Post-Bufferization Cleanup and Optimization
