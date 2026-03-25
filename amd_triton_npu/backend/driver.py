@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import hashlib
+import json
 import tempfile
 import sys
 import sysconfig
@@ -194,6 +195,45 @@ def detect_npu_version():
         elif "Strix" in name:
             return "npu2"
     raise RuntimeError("Unsupported or unrecognized NPU device found.")
+
+
+def _get_output_format():
+    """Determine the output format for the NPU backend.
+
+    Checks AMD_TRITON_NPU_OUTPUT_FORMAT env var first.
+    If not set, defaults to "elf" on npu2 and "xclbin" on npu1.
+    ELF format is only supported on npu2 (AIE2P) devices.
+    """
+    npu_version = detect_npu_version()
+    env_format = os.getenv("AMD_TRITON_NPU_OUTPUT_FORMAT", "").lower()
+    if env_format in ("elf", "xclbin"):
+        if env_format == "elf" and npu_version == "npu1":
+            raise RuntimeError(
+                "ELF output format is not supported on npu1 (AIE2) devices. "
+                "Use 'xclbin' or unset AMD_TRITON_NPU_OUTPUT_FORMAT."
+            )
+        return env_format
+    # Auto-detect: ELF for npu2, xclbin for npu1
+    return "elf" if npu_version == "npu2" else "xclbin"
+
+
+def _extract_elf_kernel_name(config_json_path):
+    """Extract the ELF kernel name from full_elf_config.json.
+
+    The kernel name for XRT is "{kernel_name}:{instance_id}".
+    Looks for the "main" kernel entry (the runtime dispatch kernel)
+    and uses its first instance ID.
+    """
+    with open(config_json_path) as f:
+        config = json.load(f)
+    for kernel in config["xrt-kernels"]:
+        if kernel["name"] == "main" and kernel.get("instance"):
+            instance_id = kernel["instance"][0]["id"]
+            return f"main:{instance_id}"
+    # Fallback: use the last kernel entry (which is typically "main")
+    last_kernel = config["xrt-kernels"][-1]
+    instance_id = last_kernel["instance"][0]["id"]
+    return f"{last_kernel['name']}:{instance_id}"
 
 
 def _inject_transform_library(user_script):
@@ -802,7 +842,309 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
-def compile_module(launcher_src, kernel_placeholder_name):
+def _generate_elf_launcher(constants, signature, kernel_name):
+    """Generate C++ launcher code using XRT ELF APIs (for NPU2/AIE2P only)."""
+    arg_decls = ", ".join(f"{_ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
+    args_format = "".join(
+        [_format_of(_extracted_type(ty)) for ty in signature.values()]
+    )
+    format = "iiiOOOO" + args_format
+    args_list = (
+        ", " + ", ".join(f"&_arg{i}" for i, ty in signature.items())
+        if len(signature) > 0
+        else ""
+    )
+
+    global autotune_time
+
+    # Collect pointer (tensor) args excluding constants
+    ptr_args = [
+        (i, ty) for i, ty in signature.items() if i not in constants and ty[0] == "*"
+    ]
+    last_ptr_idx = next(
+        (
+            i
+            for i, ty in reversed(signature.items())
+            if i not in constants and ty[0] == "*"
+        ),
+        None,
+    )
+
+    # Build set_arg lines for kernel invocation
+    set_arg_lines = "\n    ".join(
+        f"run.set_arg({idx}, bo_{i});" for idx, (i, ty) in enumerate(ptr_args)
+    )
+
+    return f"""
+#include <assert.h>
+#include <fstream>
+#include <iostream>
+#include <stdbool.h>
+#include <Python.h>
+#include "ExecutionEngine/CRunnerUtils.h"
+#include "ExecutionEngine/CRunnerUtils.cpp"
+
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
+
+#include "xrt/xrt_bo.h"
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_kernel.h"
+#include <xrt/experimental/xrt_elf.h>
+#include <xrt/experimental/xrt_ext.h>
+
+static char elf_path[1024] = {{0}};
+static char elf_kernel_name[256] = {{0}};
+
+static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
+    const char* elf;
+    const char* kname;
+
+    if (!PyArg_ParseTuple(args, "ss", &elf, &kname)) {{
+        return NULL;
+    }}
+
+    strncpy(elf_path, elf, sizeof(elf_path) - 1);
+    elf_path[sizeof(elf_path) - 1] = '\\0';
+    strncpy(elf_kernel_name, kname, sizeof(elf_kernel_name) - 1);
+    elf_kernel_name[sizeof(elf_kernel_name) - 1] = '\\0';
+
+    Py_RETURN_NONE;
+}}
+
+// ELF-based XRT launch:
+static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in ptr_args)}, {arg_decls}) {{
+  if (gridX*gridY*gridZ > 0) {{
+
+    int verbosity = 1;
+
+    // Get a device handle
+    unsigned int device_index = 0;
+    auto device = xrt::device(device_index);
+
+    // Load the ELF
+    if (verbosity >= 1)
+        std::cout << "Loading ELF: " << elf_path << std::endl;
+    xrt::elf ctx_elf{{elf_path}};
+    xrt::hw_context context = xrt::hw_context(device, ctx_elf);
+
+    // Kernel name from ELF config (e.g., "main:vecadd")
+    std::string kernelName = elf_kernel_name;
+    if (verbosity >= 1)
+        std::cout << "Kernel name: " << kernelName << std::endl;
+    auto kernel = xrt::ext::kernel(context, kernelName);
+
+    // Create buffer objects using xrt::ext::bo (no group_id needed)
+    {' '.join(f'xrt::bo bo_{i} = xrt::ext::bo{{device, (size_t)size{i}}};' for i, ty in ptr_args)}
+
+    if (verbosity >= 1)
+        std::cout << "Writing data into buffer objects." << std::endl;
+    {' '.join(f'void *buf{i} = bo_{i}.map<void *>(); memcpy(buf{i}, arg{i}, size{i});' for i, ty in ptr_args)}
+
+    {' '.join(f'bo_{i}.sync(XCL_BO_SYNC_BO_TO_DEVICE);' for i, ty in ptr_args)}
+
+    if (verbosity >= 1)
+        std::cout << "Running Kernel." << std::endl;
+    {'auto start = std::chrono::high_resolution_clock::now();' if autotune_time else ''}
+    auto run = xrt::run(kernel);
+    {set_arg_lines}
+    run.start();
+    run.wait2();
+    {'auto stop = std::chrono::high_resolution_clock::now(); float npu_time = std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();' if autotune_time else ''}
+
+    {'std::ofstream file("data.txt"); file << npu_time << std::endl; file.close();' if autotune_time else ''}
+
+    if (verbosity >= 1)
+        std::cout << "Copying results." << std::endl;
+    // TODO: Assuming the last tensor is the only output tensor.
+    bo_{last_ptr_idx}.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    memcpy(arg{last_ptr_idx}, buf{last_ptr_idx}, size{last_ptr_idx});
+
+    if (verbosity >= 1)
+        std::cout << "Launch finished." << std::endl;
+  }}
+}}
+
+typedef struct _DevicePtrInfo {{
+  void *dev_ptr;
+  bool valid;
+}} DevicePtrInfo;
+
+static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
+  DevicePtrInfo ptr_info;
+  ptr_info.dev_ptr = 0;
+  ptr_info.valid = true;
+  if (PyLong_Check(obj)) {{
+    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(obj));
+    return ptr_info;
+  }}
+  if (obj == Py_None) {{
+    // valid nullptr
+    return ptr_info;
+  }}
+  PyObject *ptr = PyObject_GetAttrString(obj, "data_ptr");
+  if(ptr){{
+    PyObject *empty_tuple = PyTuple_New(0);
+    PyObject *ret = PyObject_Call(ptr, empty_tuple, NULL);
+    Py_DECREF(empty_tuple);
+    Py_DECREF(ptr);
+    if (!PyLong_Check(ret)) {{
+      PyErr_SetString(PyExc_TypeError, "data_ptr method of Pointer object must return 64-bit int");
+      ptr_info.valid = false;
+      return ptr_info;
+    }}
+    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));
+    if(!ptr_info.dev_ptr)
+      return ptr_info;
+    Py_DECREF(ret);  // Thanks ChatGPT!
+    return ptr_info;
+  }}
+  PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
+  return ptr_info;
+}}
+
+long getNumElements(PyObject *obj) {{
+    PyObject *shape = PyObject_GetAttrString(obj, "shape");
+    if (!shape) {{
+        PyErr_Print();
+        return -1;
+    }}
+
+    if (!PySequence_Check(shape)) {{
+        Py_DECREF(shape);
+        PyErr_SetString(PyExc_TypeError, "Attribute 'shape' is not a sequence.");
+        return -1;
+    }}
+
+    Py_ssize_t ndim = PySequence_Size(shape);
+    if (ndim < 0) {{
+        Py_DECREF(shape);
+        PyErr_Print();
+        return -1;
+    }}
+
+    long num_elements = 1;
+    for (Py_ssize_t i = 0; i < ndim; ++i) {{
+        PyObject *dim_obj = PySequence_GetItem(shape, i);
+        if (!dim_obj) {{
+            Py_DECREF(shape);
+            PyErr_Print();
+            return -1;
+        }}
+
+        long dim = PyLong_AsLong(dim_obj);
+        Py_DECREF(dim_obj);
+
+        if (dim == -1 && PyErr_Occurred()) {{
+            Py_DECREF(shape);
+            PyErr_Print();
+            return -1;
+        }}
+
+        num_elements *= dim;
+    }}
+
+    Py_DECREF(shape);
+    return num_elements;
+}}
+
+long getElementSizeInBytes(PyObject *obj) {{
+    if (!obj) return -1;
+
+    PyObject *dtype = PyObject_GetAttrString(obj, "dtype");
+    if (!dtype) {{
+        PyErr_Print();
+        return -1;
+    }}
+
+    PyObject *itemsize = PyObject_GetAttrString(dtype, "itemsize");
+    Py_DECREF(dtype);
+    if (!itemsize) {{
+        PyErr_Print();
+        return -1;
+    }}
+
+    long size = PyLong_AsLong(itemsize);
+    Py_DECREF(itemsize);
+
+    if (size == -1 && PyErr_Occurred()) {{
+        PyErr_Print();
+        return -1;
+    }}
+
+    return size;
+}}
+
+static PyObject* launch(PyObject* self, PyObject* args) {{
+  int gridX, gridY, gridZ;
+  PyObject *launch_enter_hook = NULL;
+  PyObject *launch_exit_hook = NULL;
+  PyObject *kernel_metadata = NULL;
+  PyObject *launch_metadata = NULL;
+  {' '.join([f"{_extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
+  if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ,
+                                           &kernel_metadata, &launch_metadata,
+                                           &launch_enter_hook, &launch_exit_hook {args_list})) {{
+    return NULL;
+  }}
+
+  // extract launch metadata
+  if (launch_enter_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_enter_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  // raise exception asap
+  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  {"; ".join([f"long tensor_volume{i} = getNumElements(_arg{i}) * getElementSizeInBytes(_arg{i}); if (tensor_volume{i} == -1) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  _launch(gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+
+  if (PyErr_Occurred()) {{
+    return NULL;
+  }}
+  if(launch_exit_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  // return None
+  Py_INCREF(Py_None);
+  return Py_None;
+}}
+
+static PyMethodDef ModuleMethods[] = {{
+  {{"launch", launch, METH_VARARGS, "Entry point for all kernels with this signature"}},
+  {{"set_paths", py_set_paths, METH_VARARGS, "Set path to ELF binary and kernel name"}},
+  {{NULL, NULL, 0, NULL}} // sentinel
+}};
+
+static struct PyModuleDef ModuleDef = {{
+  PyModuleDef_HEAD_INIT,
+  \"__npu_dispatch\",
+  NULL, //documentation
+  -1, //size
+  ModuleMethods
+}};
+
+PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
+  PyObject *m = PyModule_Create(&ModuleDef);
+  if(m == NULL) {{
+    return NULL;
+  }}
+  PyModule_AddFunctions(m, ModuleMethods);
+  return m;
+}}
+"""
+
+
+def compile_module(launcher_src, kernel_placeholder_name, output_format="xclbin"):
     py_version = sys.version_info
     if platform.system() == "Windows":
         py_include_dir = os.path.join(sys.base_prefix, "include")
@@ -850,86 +1192,135 @@ def compile_module(launcher_src, kernel_placeholder_name):
         with open(Path(os.path.join(air_proj_path, "asm_air_output.mlir")), "w") as f:
             f.write(str(air_output))
 
-        key_data = str(air_output) + f"_timing_{autotune_time}"
+        npu_version = detect_npu_version()
+        key_data = (
+            str(air_output)
+            + f"_timing_{autotune_time}"
+            + f"_format_{output_format}"
+            + f"_npu_{npu_version}"
+        )
         key = hashlib.md5(key_data.encode("utf-8")).hexdigest()
 
         cache = get_cache_manager(key)
         name = "__npu_dispatch"
         filename = f"{name}.so"
         cache_path = cache.get_file(filename)
-        cache_xclbin_path = cache.get_file("aie.xclbin")
-        cache_insts_path = cache.get_file("insts.bin")
+        if output_format == "elf":
+            cache_elf_path = cache.get_file("aie.elf")
+            cache_elf_kernel_path = cache.get_file("elf_kernel_name.txt")
+        else:
+            cache_xclbin_path = cache.get_file("aie.xclbin")
+            cache_insts_path = cache.get_file("insts.bin")
 
         if cache_path is None:
             with tempfile.TemporaryDirectory() as tmpdir:
                 launcher_src_path = os.path.join(tmpdir, "main.cxx")
                 so_path = os.path.join(tmpdir, "xrt_dispatch.exe")
                 Path(launcher_src_path).write_text(src)
-                # Compile it together.
-                subprocess.check_call(
-                    [
-                        "g++",
-                        "-std=c++23",
-                        launcher_src_path,
-                        f"-I{py_include_dir}",
-                        f"-I{include_dir}",
-                        f"-L{py_lib_dir}",
-                        "-shared",
-                        f"-l{py_lib}",
-                        "-fPIC",
-                        "-Wall",
-                        f"-I{os.path.join(xrt_dir, 'include')}",
-                        f"-L{os.path.join(xrt_dir, 'lib')}",
+                # Compile the launcher shared library.
+                compile_flags = [
+                    "g++",
+                    "-std=c++23",
+                    launcher_src_path,
+                    f"-I{py_include_dir}",
+                    f"-I{include_dir}",
+                    f"-L{py_lib_dir}",
+                    "-shared",
+                    f"-l{py_lib}",
+                    "-fPIC",
+                    "-Wall",
+                    f"-I{os.path.join(xrt_dir, 'include')}",
+                    f"-L{os.path.join(xrt_dir, 'lib')}",
+                    "-luuid",
+                    "-lxrt_coreutil",
+                    "-lrt",
+                    "-lstdc++",
+                ]
+                if output_format != "elf":
+                    # xclbin mode needs test_utils for loading instruction binary
+                    compile_flags += [
                         f"-I{os.path.join(aie_test_utils_dir, 'include')}",
                         f"-L{os.path.join(aie_test_utils_dir, 'lib')}",
-                        "-luuid",
-                        "-lxrt_coreutil",
-                        "-lrt",
-                        "-lstdc++",
                         "-lboost_program_options",
                         "-lboost_filesystem",
                         "-ltest_utils",
-                        "-o",
-                        so_path,
                     ]
-                )
+                compile_flags += ["-o", so_path]
+                subprocess.check_call(compile_flags)
 
-                ###### Compile to xclbin and runtime sequence
-                xclbin_path = os.path.join(air_proj_path, "aie.xclbin")
-                insts_path = os.path.join(air_proj_path, "insts.bin")
+                ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
                 aircc_bin = str(
                     Path(aircc.__file__).resolve().parent.parent.parent.parent.parent
                     / "bin"
                     / "aircc"
                 )
-                aircc_cmd = [
-                    aircc_bin,
-                    "--device",
-                    detect_npu_version(),
-                    "--no-xchesscc",
-                    "--no-xbridge",
-                    "-i",
-                    insts_path,
-                    "-o",
-                    xclbin_path,
-                    "--peano=",
-                    air_mlir_path,
-                ]
+
+                if output_format == "elf":
+                    elf_path = os.path.join(air_proj_path, "aie.elf")
+                    aircc_cmd = [
+                        aircc_bin,
+                        "--device",
+                        npu_version,
+                        "--no-xchesscc",
+                        "--no-xbridge",
+                        "--output-format",
+                        "elf",
+                        "--elf-name",
+                        elf_path,
+                        "--peano=",
+                        air_mlir_path,
+                    ]
+                else:
+                    xclbin_path = os.path.join(air_proj_path, "aie.xclbin")
+                    insts_path = os.path.join(air_proj_path, "insts.bin")
+                    aircc_cmd = [
+                        aircc_bin,
+                        "--device",
+                        npu_version,
+                        "--no-xchesscc",
+                        "--no-xbridge",
+                        "-i",
+                        insts_path,
+                        "-o",
+                        xclbin_path,
+                        "--peano=",
+                        air_mlir_path,
+                    ]
                 subprocess.check_call(aircc_cmd)
 
+                # Cache format-specific artifacts first, then the .so last.
+                # This avoids partial cache entries if aircc or kernel name
+                # extraction fails -- the .so is the gate for cache hits.
+                if output_format == "elf":
+                    with open(elf_path, "rb") as f:
+                        cache_elf_path = cache.put(f.read(), "aie.elf", binary=True)
+                    # Extract kernel name from ELF config.json
+                    config_json_path = os.path.join(
+                        air_proj_path, "full_elf_config.json"
+                    )
+                    elf_kernel_name = _extract_elf_kernel_name(config_json_path)
+                    cache_elf_kernel_path = cache.put(
+                        elf_kernel_name.encode(), "elf_kernel_name.txt"
+                    )
+                else:
+                    with open(xclbin_path, "rb") as f:
+                        cache_xclbin_path = cache.put(
+                            f.read(), "aie.xclbin", binary=True
+                        )
+                    with open(insts_path, "rb") as f:
+                        cache_insts_path = cache.put(f.read(), "insts.bin")
                 with open(so_path, "rb") as f:
                     cache_path = cache.put(f.read(), filename, binary=True)
-                with open(xclbin_path, "rb") as f:
-                    cache_xclbin_path = cache.put(f.read(), "aie.xclbin", binary=True)
-                with open(insts_path, "rb") as f:
-                    cache_insts_path = cache.put(f.read(), "insts.bin")
 
                 # Check for compile-only mode
                 if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
                     print(f"Compile-only mode: binaries cached at {cache_path}")
-                    print(f"  xclbin: {cache_xclbin_path}")
-                    print(f"  insts: {cache_insts_path}")
+                    if output_format == "elf":
+                        print(f"  elf: {cache_elf_path}")
+                    else:
+                        print(f"  xclbin: {cache_xclbin_path}")
+                        print(f"  insts: {cache_insts_path}")
                     return None
         else:
             print(
@@ -941,8 +1332,11 @@ def compile_module(launcher_src, kernel_placeholder_name):
             # Check for compile-only mode (cache hit)
             if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
                 print(f"Compile-only mode (cache hit): binaries at {cache_path}")
-                print(f"  xclbin: {cache_xclbin_path}")
-                print(f"  insts: {cache_insts_path}")
+                if output_format == "elf":
+                    print(f"  elf: {cache_elf_path}")
+                else:
+                    print(f"  xclbin: {cache_xclbin_path}")
+                    print(f"  insts: {cache_insts_path}")
                 return None
 
         # Load and launch the compiled kernel.
@@ -951,7 +1345,13 @@ def compile_module(launcher_src, kernel_placeholder_name):
             raise RuntimeError(f"Cannot find {name} module in {cache_path}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        mod.set_paths(cache_xclbin_path, cache_insts_path)
+        if output_format == "elf":
+            # Read the cached kernel name
+            with open(cache_elf_kernel_path) as f:
+                elf_kernel_name = f.read().strip()
+            mod.set_paths(cache_elf_path, elf_kernel_name)
+        else:
+            mod.set_paths(cache_xclbin_path, cache_insts_path)
         return mod.launch(
             gridX,
             gridY,
@@ -974,10 +1374,21 @@ class NPULauncher(object):
         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
         constants = {cst_key(key): value for key, value in constants.items()}
         signature = {cst_key(key): value for key, value in src.signature.items()}
-        launcher_src = _generate_launcher(constants, signature, kernel_placeholder_name)
+        # Detect output format: ELF for npu2, xclbin for npu1
+        self.output_format = _get_output_format()
+        if self.output_format == "elf":
+            launcher_src = _generate_elf_launcher(
+                constants, signature, kernel_placeholder_name
+            )
+        else:
+            launcher_src = _generate_launcher(
+                constants, signature, kernel_placeholder_name
+            )
         # Later KERNEL_NAME_PLACEHOLDER will be used to assign the kernel name
         # in the following launch function.
-        self.launch = compile_module(launcher_src, kernel_placeholder_name)
+        self.launch = compile_module(
+            launcher_src, kernel_placeholder_name, self.output_format
+        )
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):
         self.launch(gridX, gridY, gridZ, stream, function, *args)
