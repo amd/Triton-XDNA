@@ -460,7 +460,7 @@ def _get_transform_ir_string():
         """
 
 
-def _ttshared_to_air(mod, gridX, gridY, gridZ):
+def _ttshared_to_air(mod, gridX, gridY, gridZ, actual_sizes=None):
     # Get Triton-Shared-MLIR as string
     with tempfile.TemporaryDirectory() as tmpdir:
         dst_path = os.path.join(tmpdir, "airinput.mlir")
@@ -485,17 +485,14 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ):
         transform_ir = Module.parse(transform_ir_string, context=air_context)
         run_transform(transform_ir, air_module)
         # MLIR-AIR compilation step 3: converting to AIR
+        wrap_params = f"loop-bounds={gridX},{gridY},{gridZ}"
+        if actual_sizes:
+            wrap_params += f" actual-sizes={actual_sizes}"
         pipeline = (
             "builtin.module("
             + ",".join(
                 [
-                    "func.func(air-wrap-func-with-parallel{loop-bounds="
-                    + str(gridX)
-                    + ","
-                    + str(gridY)
-                    + ","
-                    + str(gridZ)
-                    + "})",
+                    f"func.func(air-wrap-func-with-parallel{{{wrap_params}}})",
                     "air-par-to-launch{depth=0 has-air-segment=true}",
                     "canonicalize",
                     "cse",
@@ -1144,7 +1141,8 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
-def compile_module(launcher_src, kernel_placeholder_name, output_format="xclbin"):
+def compile_module(launcher_src, kernel_placeholder_name, output_format="xclbin",
+                   actual_sizes=None):
     py_version = sys.version_info
     if platform.system() == "Windows":
         py_include_dir = os.path.join(sys.base_prefix, "include")
@@ -1188,7 +1186,8 @@ def compile_module(launcher_src, kernel_placeholder_name, output_format="xclbin"
         air_proj_path = _get_air_project_path()
         os.makedirs(air_proj_path, exist_ok=True)
         Path(os.path.join(air_proj_path, "asm_src.mlir")).write_bytes(asm_src)
-        air_output = _ttshared_to_air(asm_src, gridX, gridY, gridZ)
+        air_output = _ttshared_to_air(asm_src, gridX, gridY, gridZ,
+                                      actual_sizes=actual_sizes)
         with open(Path(os.path.join(air_proj_path, "asm_air_output.mlir")), "w") as f:
             f.write(str(air_output))
 
@@ -1198,6 +1197,7 @@ def compile_module(launcher_src, kernel_placeholder_name, output_format="xclbin"
             + f"_timing_{autotune_time}"
             + f"_format_{output_format}"
             + f"_npu_{npu_version}"
+            + f"_bf16emu_{os.getenv('AMD_TRITON_NPU_BF16_EMULATION', '0')}"
         )
         key = hashlib.md5(key_data.encode("utf-8")).hexdigest()
 
@@ -1287,6 +1287,10 @@ def compile_module(launcher_src, kernel_placeholder_name, output_format="xclbin"
                         "--peano=",
                         air_mlir_path,
                     ]
+                # Enable bf16 emulation: hardware truncates f32 -> bf16 before
+                # multiply, with f32 accumulation.
+                if os.getenv("AMD_TRITON_NPU_BF16_EMULATION", "0") == "1":
+                    aircc_cmd.insert(-1, "--bf16-emulation")
                 subprocess.check_call(aircc_cmd)
 
                 # Cache format-specific artifacts first, then the .so last.
@@ -1384,10 +1388,43 @@ class NPULauncher(object):
             launcher_src = _generate_launcher(
                 constants, signature, kernel_placeholder_name
             )
+
+        # Extract actual problem sizes from constexpr args for padding support.
+        # When the kernel has constexpr args named "M" and "N", their values
+        # are the actual (non-padded) problem dimensions. These are passed to
+        # air-wrap-func-with-parallel as actual-sizes to enable DMA padding
+        # via air-split-launch-for-padding on boundary tiles.
+        # Only set actual-sizes when dimensions are NOT tile-aligned (i.e.,
+        # M % BLOCK_SIZE_M != 0 or N % BLOCK_SIZE_N != 0), to avoid triggering
+        # the padding split path when it's not needed.
+        actual_sizes = None
+        if hasattr(src, "fn") and hasattr(src.fn, "arg_names"):
+            arg_names = src.fn.arg_names
+            raw_constants = src.constants if hasattr(src, "constants") else {}
+            if "M" in arg_names and "N" in arg_names:
+                m_idx = arg_names.index("M")
+                n_idx = arg_names.index("N")
+                m_val = raw_constants.get((m_idx,))
+                n_val = raw_constants.get((n_idx,))
+                if m_val is not None and n_val is not None:
+                    # Check if BLOCK_SIZE_M/N are available to determine alignment
+                    bsm_idx = (arg_names.index("BLOCK_SIZE_M")
+                               if "BLOCK_SIZE_M" in arg_names else None)
+                    bsn_idx = (arg_names.index("BLOCK_SIZE_N")
+                               if "BLOCK_SIZE_N" in arg_names else None)
+                    bsm = raw_constants.get((bsm_idx,)) if bsm_idx is not None else None
+                    bsn = raw_constants.get((bsn_idx,)) if bsn_idx is not None else None
+                    needs_padding = True
+                    if bsm is not None and bsn is not None:
+                        needs_padding = (m_val % bsm != 0) or (n_val % bsn != 0)
+                    if needs_padding:
+                        actual_sizes = f"{m_val},{n_val},1"
+
         # Later KERNEL_NAME_PLACEHOLDER will be used to assign the kernel name
         # in the following launch function.
         self.launch = compile_module(
-            launcher_src, kernel_placeholder_name, self.output_format
+            launcher_src, kernel_placeholder_name, self.output_format,
+            actual_sizes=actual_sizes,
         )
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):
