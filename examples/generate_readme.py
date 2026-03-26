@@ -34,6 +34,12 @@ EXAMPLES = [
     },
     {
         "category": "Matrix",
+        "name": "Padded Matrix Multiplication",
+        "path": "padded_matmul",
+        "datatypes": "f32 (bf16 emulation)",
+    },
+    {
+        "category": "Matrix",
         "name": "Matrix Multiplication (Autotune)",
         "path": "autotune-matmul",
         "datatypes": "bf16",
