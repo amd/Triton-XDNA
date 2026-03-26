@@ -41,9 +41,7 @@ M_actual = 500
 N_actual = 500
 K_val = 1024
 
-assert K_val % K_L2_TILE == 0, (
-    f"K={K_val} must be divisible by K_L2_TILE={K_L2_TILE}"
-)
+assert K_val % K_L2_TILE == 0, f"K={K_val} must be divisible by K_L2_TILE={K_L2_TILE}"
 
 # === Padded/allocated dimensions ===
 M_padded = math.ceil(M_actual / LAUNCH_TILE_M) * LAUNCH_TILE_M  # 512
@@ -175,9 +173,7 @@ def run_padded_matmul():
         if not np.isclose(actual, expected, rtol=0.1, atol=10.0):
             errors += 1
             if errors <= 5:
-                print(
-                    f"Mismatch at ({m}, {n}): actual={actual}, expected={expected}"
-                )
+                print(f"Mismatch at ({m}, {n}): actual={actual}, expected={expected}")
 
     total = len(sample_m)
     if errors == 0:

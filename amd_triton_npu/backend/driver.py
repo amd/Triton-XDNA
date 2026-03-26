@@ -1141,8 +1141,9 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
-def compile_module(launcher_src, kernel_placeholder_name, output_format="xclbin",
-                   actual_sizes=None):
+def compile_module(
+    launcher_src, kernel_placeholder_name, output_format="xclbin", actual_sizes=None
+):
     py_version = sys.version_info
     if platform.system() == "Windows":
         py_include_dir = os.path.join(sys.base_prefix, "include")
@@ -1186,8 +1187,9 @@ def compile_module(launcher_src, kernel_placeholder_name, output_format="xclbin"
         air_proj_path = _get_air_project_path()
         os.makedirs(air_proj_path, exist_ok=True)
         Path(os.path.join(air_proj_path, "asm_src.mlir")).write_bytes(asm_src)
-        air_output = _ttshared_to_air(asm_src, gridX, gridY, gridZ,
-                                      actual_sizes=actual_sizes)
+        air_output = _ttshared_to_air(
+            asm_src, gridX, gridY, gridZ, actual_sizes=actual_sizes
+        )
         with open(Path(os.path.join(air_proj_path, "asm_air_output.mlir")), "w") as f:
             f.write(str(air_output))
 
@@ -1408,10 +1410,16 @@ class NPULauncher(object):
                 n_val = raw_constants.get((n_idx,))
                 if m_val is not None and n_val is not None:
                     # Check if BLOCK_SIZE_M/N are available to determine alignment
-                    bsm_idx = (arg_names.index("BLOCK_SIZE_M")
-                               if "BLOCK_SIZE_M" in arg_names else None)
-                    bsn_idx = (arg_names.index("BLOCK_SIZE_N")
-                               if "BLOCK_SIZE_N" in arg_names else None)
+                    bsm_idx = (
+                        arg_names.index("BLOCK_SIZE_M")
+                        if "BLOCK_SIZE_M" in arg_names
+                        else None
+                    )
+                    bsn_idx = (
+                        arg_names.index("BLOCK_SIZE_N")
+                        if "BLOCK_SIZE_N" in arg_names
+                        else None
+                    )
                     bsm = raw_constants.get((bsm_idx,)) if bsm_idx is not None else None
                     bsn = raw_constants.get((bsn_idx,)) if bsn_idx is not None else None
                     needs_padding = True
@@ -1423,7 +1431,9 @@ class NPULauncher(object):
         # Later KERNEL_NAME_PLACEHOLDER will be used to assign the kernel name
         # in the following launch function.
         self.launch = compile_module(
-            launcher_src, kernel_placeholder_name, self.output_format,
+            launcher_src,
+            kernel_placeholder_name,
+            self.output_format,
             actual_sizes=actual_sizes,
         )
 
