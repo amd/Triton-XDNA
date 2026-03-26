@@ -8,7 +8,7 @@
 // Follows test 53's transform pattern: tile copies, pack [8,8,8], tile K,
 // tile forall for multi-core, vectorize, hoist.
 //
-// Target: 4×8 AIE core array (Strix/NPU2), BFP16 emulation
+// Target: 4×8 AIE core array (Strix/NPU2), BF16 emulation
 // Tile sizes: M=64, N=32, K_L2=16, pack [8,8,8]
 
 module attributes {transform.with_named_sequence} {

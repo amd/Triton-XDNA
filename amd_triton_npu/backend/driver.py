@@ -1403,30 +1403,29 @@ class NPULauncher(object):
         if hasattr(src, "fn") and hasattr(src.fn, "arg_names"):
             arg_names = src.fn.arg_names
             raw_constants = src.constants if hasattr(src, "constants") else {}
-            if "M" in arg_names and "N" in arg_names:
-                m_idx = arg_names.index("M")
-                n_idx = arg_names.index("N")
-                m_val = raw_constants.get((m_idx,))
-                n_val = raw_constants.get((n_idx,))
-                if m_val is not None and n_val is not None:
-                    # Check if BLOCK_SIZE_M/N are available to determine alignment
-                    bsm_idx = (
-                        arg_names.index("BLOCK_SIZE_M")
-                        if "BLOCK_SIZE_M" in arg_names
-                        else None
-                    )
-                    bsn_idx = (
-                        arg_names.index("BLOCK_SIZE_N")
-                        if "BLOCK_SIZE_N" in arg_names
-                        else None
-                    )
-                    bsm = raw_constants.get((bsm_idx,)) if bsm_idx is not None else None
-                    bsn = raw_constants.get((bsn_idx,)) if bsn_idx is not None else None
-                    needs_padding = True
-                    if bsm is not None and bsn is not None:
-                        needs_padding = (m_val % bsm != 0) or (n_val % bsn != 0)
-                    if needs_padding:
-                        actual_sizes = f"{m_val},{n_val},1"
+
+            def _get_constexpr(name):
+                """Look up a constexpr value by arg name, trying multiple key forms."""
+                if name not in arg_names:
+                    return None
+                idx = arg_names.index(name)
+                # src.constants uses tuple keys (idx,) per ASTSource.__init__,
+                # but check multiple forms for robustness across versions.
+                for key in [(idx,), idx, name]:
+                    if key in raw_constants:
+                        return raw_constants[key]
+                return None
+
+            m_val = _get_constexpr("M")
+            n_val = _get_constexpr("N")
+            if m_val is not None and n_val is not None:
+                bsm = _get_constexpr("BLOCK_SIZE_M")
+                bsn = _get_constexpr("BLOCK_SIZE_N")
+                needs_padding = True
+                if bsm is not None and bsn is not None:
+                    needs_padding = (m_val % bsm != 0) or (n_val % bsn != 0)
+                if needs_padding:
+                    actual_sizes = f"{m_val},{n_val},1"
 
         # Later KERNEL_NAME_PLACEHOLDER will be used to assign the kernel name
         # in the following launch function.
