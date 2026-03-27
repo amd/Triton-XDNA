@@ -94,7 +94,9 @@ module attributes {transform.with_named_sequence} {
     // Lower vector reductions
     %func_final = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %func_final {
-        transform.apply_patterns.vector.lower_multi_reduction lowering_strategy = "innerreduction"
+        transform.apply_patterns.vector.reorder_multi_reduction_dims lowering_strategy = "innerreduction"
+        transform.apply_patterns.vector.multi_reduction_flattening lowering_strategy = "innerreduction"
+        transform.apply_patterns.vector.multi_reduction_unrolling lowering_strategy = "innerreduction"
         transform.apply_patterns.vector.lower_contraction
         transform.apply_patterns.vector.lower_transfer
     } : !transform.any_op
