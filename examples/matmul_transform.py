@@ -77,15 +77,9 @@ def generate_matmul_transform(
     if bf16_emulation and contract_input_type is None:
         contract_input_type = "bf16"
 
-    assert l1_m % pack_m == 0, (
-        f"l1_m={l1_m} must be divisible by pack_m={pack_m}"
-    )
-    assert l1_n % pack_n == 0, (
-        f"l1_n={l1_n} must be divisible by pack_n={pack_n}"
-    )
-    assert l2_k % pack_k == 0, (
-        f"l2_k={l2_k} must be divisible by pack_k={pack_k}"
-    )
+    assert l1_m % pack_m == 0, f"l1_m={l1_m} must be divisible by pack_m={pack_m}"
+    assert l1_n % pack_n == 0, f"l1_n={l1_n} must be divisible by pack_n={pack_n}"
+    assert l2_k % pack_k == 0, f"l2_k={l2_k} must be divisible by pack_k={pack_k}"
 
     # Derived parameters
     forall_l1_m = l1_m // pack_m
@@ -394,9 +388,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--l1-n", type=int, default=64, help="L1 per-core tile N (default: 64)"
     )
-    parser.add_argument(
-        "--l2-k", type=int, default=64, help="L2 tile K (default: 64)"
-    )
+    parser.add_argument("--l2-k", type=int, default=64, help="L2 tile K (default: 64)")
     parser.add_argument(
         "--pack-sizes",
         type=int,
