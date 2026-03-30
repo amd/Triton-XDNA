@@ -114,8 +114,8 @@ Please make sure to run `source {path_to_xrt}/setup.sh` before running examples.
 The test also depends on PyTorch as CPU reference.
 
 ```
-cd examples/matmul
-AIR_TRANSFORM_TILING_SCRIPT=transform_aie2.mlir python matmul.py
+cd examples/matmul_bf16_m64_n64_k64
+AIR_TRANSFORM_TILING_SCRIPT=transform_aie2.mlir python matmul_bf16_m64_n64_k64.py
 ```
 
 **Note:** The `transform_aie2.mlir` transform dialect IR is specifically designed for the AIE2 architecture. For AIE2P architecture, use `transform_aie2p.mlir` instead.
