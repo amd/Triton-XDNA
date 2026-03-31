@@ -183,18 +183,30 @@ def get_npu_device_info():
         return []
 
 
+# Device name mappings aligned with mlir-aie (lit_config_helpers.py, iron_setup.py)
+NPU_MODELS = {
+    "npu1": ["npu1", "Phoenix"],
+    "npu2": ["npu4", "Strix", "npu5", "Strix Halo", "npu6", "Krackan"],
+}
+
+
 def detect_npu_version():
     """Map known device names to internal NPU version strings."""
     devices = get_npu_device_info()
     for device in devices:
         name = device["name"]
-        if "RyzenAI-npu1" in name:
-            return "npu1"
-        elif "NPU Phoenix" in name:
-            return "npu1"
-        elif "Strix" in name:
-            return "npu2"
-    raise RuntimeError("Unsupported or unrecognized NPU device found.")
+        for version, keywords in NPU_MODELS.items():
+            if any(kw.lower() in name.lower() for kw in keywords):
+                return version
+    if not devices:
+        raise RuntimeError(
+            "No NPU devices found. Ensure XRT is installed and xrt-smi is available."
+        )
+    device_names = [d["name"] for d in devices]
+    raise RuntimeError(
+        f"Unsupported NPU device(s): {device_names}. "
+        f"Supported models: {dict(NPU_MODELS)}"
+    )
 
 
 def _get_output_format():
