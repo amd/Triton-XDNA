@@ -45,8 +45,11 @@ except ImportError:
 # Platform Check
 # =============================================================================
 
-if sys.platform != "linux":
-    sys.exit("ERROR: triton-xdna currently only supports Linux.")
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform == "linux"
+
+if not (IS_LINUX or IS_WINDOWS):
+    sys.exit("ERROR: triton-xdna currently only supports Linux and Windows.")
 
 
 # =============================================================================
@@ -87,6 +90,7 @@ def find_triton_shared_opt_binary(triton_source_dir: Path = None) -> Path:
     if not build_dir.exists():
         return None
 
+    binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
     for cmake_dir in build_dir.glob("cmake.*"):
         binary_path = (
             cmake_dir
@@ -94,7 +98,7 @@ def find_triton_shared_opt_binary(triton_source_dir: Path = None) -> Path:
             / "triton_shared"
             / "tools"
             / "triton-shared-opt"
-            / "triton-shared-opt"
+            / binary_name
         )
         if binary_path.exists() and binary_path.is_file():
             return binary_path
@@ -360,22 +364,28 @@ class TritonXdnaBdistWheel(bdist_wheel):
         print(f"  TRITON_PLUGIN_DIRS={plugin_dirs}", file=sys.stderr)
         print(f"  Project root: {project_root}", file=sys.stderr)
 
-        # Set build flags
-        if check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
+        # Set build flags (clang+lld not used on Windows; MSVC is used instead)
+        if not IS_WINDOWS and check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
             env["TRITON_BUILD_WITH_CLANG_LLD"] = "true"
 
         triton_source = project_root / "third_party" / "triton"
 
         # Use subprocess with pip wheel - this properly inherits environment
         # Find a working Python with pip
-        python_candidates = [
-            sys.executable,
-            "/opt/python/cp313-cp313/bin/python",
-            "/opt/python/cp312-cp312/bin/python",
-            "/opt/python/cp311-cp311/bin/python",
-            "python3",
-            "python",
-        ]
+        if IS_WINDOWS:
+            python_candidates = [
+                sys.executable,
+                "python",
+            ]
+        else:
+            python_candidates = [
+                sys.executable,
+                "/opt/python/cp313-cp313/bin/python",
+                "/opt/python/cp312-cp312/bin/python",
+                "/opt/python/cp311-cp311/bin/python",
+                "python3",
+                "python",
+            ]
 
         python_exe = None
         for candidate in python_candidates:
@@ -462,8 +472,9 @@ class TritonXdnaBdistWheel(bdist_wheel):
         dst_binary = triton_shared_dst / "triton-shared-opt"
         shutil.copy2(triton_shared_opt_binary, dst_binary)
 
-        # Ensure the binary has execute permissions
-        os.chmod(dst_binary, 0o755)
+        # Ensure the binary has execute permissions (not needed on Windows)
+        if not IS_WINDOWS:
+            os.chmod(dst_binary, 0o755)
 
         print(f"  Copied triton-shared-opt to {dst_binary}", file=sys.stderr)
 
@@ -691,7 +702,7 @@ class TritonXdnaDevelop(develop):
         plugin_dirs = f"{TRITON_SHARED_DIR};{AMD_TRITON_NPU_DIR}"
         env["TRITON_PLUGIN_DIRS"] = plugin_dirs
 
-        if check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
+        if not IS_WINDOWS and check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
             env["TRITON_BUILD_WITH_CLANG_LLD"] = "true"
 
         # Install triton with plugins
@@ -736,9 +747,11 @@ class TritonXdnaDevelop(develop):
         triton_shared_dst = triton_dir / "triton_shared"
         triton_shared_dst.mkdir(parents=True, exist_ok=True)
 
-        dst_binary = triton_shared_dst / "triton-shared-opt"
+        binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+        dst_binary = triton_shared_dst / binary_name
         shutil.copy2(triton_shared_opt_binary, dst_binary)
-        os.chmod(dst_binary, 0o755)
+        if not IS_WINDOWS:
+            os.chmod(dst_binary, 0o755)
 
 
 class TritonXdnaInstall(install):
@@ -754,7 +767,7 @@ class TritonXdnaInstall(install):
 
         pip_install_target = env.get("PIP_INSTALL_TARGET")
 
-        if check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
+        if not IS_WINDOWS and check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
             env["TRITON_BUILD_WITH_CLANG_LLD"] = "true"
 
         # Install triton with plugins
@@ -786,9 +799,11 @@ class TritonXdnaInstall(install):
         if triton_shared_opt_binary is not None:
             triton_shared_dst = triton_dir / "triton_shared"
             triton_shared_dst.mkdir(parents=True, exist_ok=True)
-            dst_binary = triton_shared_dst / "triton-shared-opt"
+            binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+            dst_binary = triton_shared_dst / binary_name
             shutil.copy2(triton_shared_opt_binary, dst_binary)
-            os.chmod(dst_binary, 0o755)
+            if not IS_WINDOWS:
+                os.chmod(dst_binary, 0o755)
 
         super().run()
 
