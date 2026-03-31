@@ -198,7 +198,15 @@ def detect_npu_version():
         for version, keywords in NPU_MODELS.items():
             if any(kw.lower() in name.lower() for kw in keywords):
                 return version
-    raise RuntimeError("Unsupported or unrecognized NPU device found.")
+    if not devices:
+        raise RuntimeError(
+            "No NPU devices found. Ensure XRT is installed and xrt-smi is available."
+        )
+    device_names = [d["name"] for d in devices]
+    raise RuntimeError(
+        f"Unsupported NPU device(s): {device_names}. "
+        f"Supported models: {dict(NPU_MODELS)}"
+    )
 
 
 def _get_output_format():
