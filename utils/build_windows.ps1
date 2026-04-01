@@ -408,7 +408,13 @@ Write-Host " Build complete!" -ForegroundColor Green
 Write-Host ("=" * 60) -ForegroundColor Green
 Write-Host ""
 Write-Host "Environment variables to set in your shell:"
-Write-Host "  `$env:XILINX_XRT = `"$XrtDevDir`""
+$effectiveXrtDir = $XrtDir
+if (-not $effectiveXrtDir) {
+    $effectiveXrtDir = $env:XILINX_XRT
+}
+if ($effectiveXrtDir) {
+    Write-Host "  `$env:XILINX_XRT = `"$effectiveXrtDir`""
+}
 if ($llvmAieDir) {
     Write-Host "  `$env:LLVM_BINARY_DIR = `"$llvmAieDir\bin`""
 }
