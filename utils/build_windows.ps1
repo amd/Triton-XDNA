@@ -345,7 +345,7 @@ echo Build complete!
     Write-Host "  (This may take 15-30 minutes)"
     Write-Host ""
 
-    cmd /c $batPath
+    & $batPath
     if ($LASTEXITCODE -ne 0) {
         Write-Error "mlir-air build failed. Check output above."
         exit 1
