@@ -469,7 +469,9 @@ class TritonXdnaBdistWheel(bdist_wheel):
         triton_shared_dst = unpack_dir / "triton" / "triton_shared"
         triton_shared_dst.mkdir(parents=True, exist_ok=True)
 
-        dst_binary = triton_shared_dst / "triton-shared-opt"
+        # Use a platform-appropriate binary name (Windows requires .exe)
+        binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+        dst_binary = triton_shared_dst / binary_name
         shutil.copy2(triton_shared_opt_binary, dst_binary)
 
         # Ensure the binary has execute permissions (not needed on Windows)
