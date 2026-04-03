@@ -448,7 +448,10 @@ def _get_output_format():
                 "Use 'xclbin' or unset AMD_TRITON_NPU_OUTPUT_FORMAT."
             )
         return env_format
-    # Auto-detect: ELF for npu2, xclbin for npu1
+    # Auto-detect: xclbin on Windows (ELF flow has stoul bug in NPU driver),
+    # ELF for npu2 on Linux, xclbin for npu1 everywhere.
+    if IS_WINDOWS:
+        return "xclbin"
     return "elf" if npu_version == "npu2" else "xclbin"
 
 
@@ -782,11 +785,10 @@ def _generate_launcher(constants, signature, kernel_name):
 #include "ExecutionEngine/CRunnerUtils.h"
 #include "ExecutionEngine/CRunnerUtils.cpp"
 
-#include "test_utils.h"
-
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <sstream>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -814,8 +816,21 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 // Call to XRT goes here:
 static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
-    std::vector<uint32_t> instr_v =
-        test_utils::load_instr_binary(insts_path);
+    // Load instruction binary (inlined, replaces test_utils dependency)
+    std::vector<uint32_t> instr_v;
+    {{
+        std::ifstream instr_file(insts_path, std::ios::binary);
+        if (!instr_file.is_open())
+            throw std::runtime_error(std::string("Failed to open instr file: ") + insts_path);
+        instr_file.seekg(0, std::ios::end);
+        std::streamsize fsize = instr_file.tellg();
+        instr_file.seekg(0, std::ios::beg);
+        if (fsize % 4 != 0)
+            throw std::runtime_error("Instruction file size is not a multiple of 4 bytes");
+        instr_v.resize(fsize / 4);
+        if (!instr_file.read(reinterpret_cast<char*>(instr_v.data()), fsize))
+            throw std::runtime_error("Failed to read instruction file");
+    }}
 
     int verbosity = 1;
     if (verbosity >= 1)
@@ -1523,21 +1538,9 @@ def compile_module(
                         "xrt_coreutil.lib",
                     ]
                     if output_format != "elf":
-                        # xclbin mode needs test_utils for loading instruction binary:
-                        # add its includes, LIBPATH, and libraries.
-                        # Insert test_utils include before /link so it applies to compilation.
-                        link_idx = compile_flags.index("/link")
-                        compile_flags.insert(
-                            link_idx,
-                            f"/I{os.path.join(aie_test_utils_dir, 'include')}",
-                        )
-                        # Add test_utils library path and dependent Boost libraries for linking.
-                        compile_flags += [
-                            f"/LIBPATH:{os.path.join(aie_test_utils_dir, 'lib')}",
-                            "boost_program_options.lib",
-                            "boost_filesystem.lib",
-                            "test_utils.lib",
-                        ]
+                        # xclbin mode previously needed test_utils for loading
+                        # instruction binary, but that has been inlined.
+                        pass
                 else:
                     msvc_env = None
                     compile_flags = [
@@ -1559,14 +1562,9 @@ def compile_module(
                         "-lstdc++",
                     ]
                     if output_format != "elf":
-                        # xclbin mode needs test_utils for loading instruction binary
-                        compile_flags += [
-                            f"-I{os.path.join(aie_test_utils_dir, 'include')}",
-                            f"-L{os.path.join(aie_test_utils_dir, 'lib')}",
-                            "-lboost_program_options",
-                            "-lboost_filesystem",
-                            "-ltest_utils",
-                        ]
+                        # xclbin mode previously needed test_utils for loading
+                        # instruction binary, but that has been inlined.
+                        pass
                     compile_flags += ["-o", so_path]
                 _quiet = os.getenv("TRITON_NPU_QUIET", "0") != "0"
                 _devnull = subprocess.DEVNULL if _quiet else None
