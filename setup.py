@@ -247,6 +247,46 @@ def get_version():
     return f"{release_version}.{timestamp}+{commit_hash}"
 
 
+def _get_installed_version(pkg_name):
+    """Return the installed version of a package, or None if not installed."""
+    try:
+        from importlib.metadata import version as _ver
+        return _ver(pkg_name)
+    except Exception:
+        return None
+
+
+def _is_locally_available(pkg_name):
+    """Check if a package is locally available via .pth file (built from source)."""
+    import site
+    pth_name = f"{pkg_name}.pth"
+    for sp in site.getsitepackages():
+        if os.path.exists(os.path.join(sp, pth_name)):
+            return True
+    return False
+
+
+def _make_version_spec(pkg_name, version, timestamp, short_commit, suffix=""):
+    """Build a pip version specifier for a package.
+
+    On Windows the CI publishes wheels with timestamps that may differ by ±1
+    from the value recorded in the hash file.  If the package is already
+    installed (via pip) we pin to its exact version.  If it is locally
+    available via a .pth file (built from source) we skip it entirely.
+    Otherwise we list the hash-file version so Linux CI keeps working.
+
+    Returns the version spec string, or None if the package should be
+    omitted from install_requires.
+    """
+    installed = _get_installed_version(pkg_name)
+    if installed is not None:
+        return f"{pkg_name}=={installed}"
+    if _is_locally_available(pkg_name):
+        return None  # available via .pth, no pip requirement needed
+    full = f"{version}.{timestamp}+{short_commit}{suffix}"
+    return f"{pkg_name}=={full}"
+
+
 def get_install_requires():
     """Build install_requires list from hash files."""
     mlir_aie_hash_file = BASE_DIR / "utils" / "mlir-aie-hash.txt"
@@ -258,30 +298,36 @@ def get_install_requires():
     mlir_aie_timestamp = parse_hash_file(mlir_aie_hash_file, "Timestamp")
     mlir_aie_commit = parse_hash_file(mlir_aie_hash_file, "Commit")
     mlir_aie_short_commit = mlir_aie_commit[:7]
-    mlir_aie_full_version = (
-        f"{mlir_aie_version}.{mlir_aie_timestamp}+{mlir_aie_short_commit}.no.rtti"
-    )
 
     # Parse llvm-aie version
     llvm_aie_version = parse_hash_file(llvm_aie_hash_file, "Version")
     llvm_aie_timestamp = parse_hash_file(llvm_aie_hash_file, "Timestamp")
     llvm_aie_commit = parse_hash_file(llvm_aie_hash_file, "Commit")
-    llvm_aie_full_version = f"{llvm_aie_version}.{llvm_aie_timestamp}+{llvm_aie_commit}"
 
     # Parse mlir-air version
     mlir_air_version = parse_hash_file(mlir_air_hash_file, "Version")
     mlir_air_timestamp = parse_hash_file(mlir_air_hash_file, "Timestamp")
     mlir_air_commit = parse_hash_file(mlir_air_hash_file, "Commit")
     mlir_air_short_commit = mlir_air_commit[:7]
-    mlir_air_full_version = (
-        f"{mlir_air_version}.{mlir_air_timestamp}+{mlir_air_short_commit}.no.rtti"
-    )
 
-    return [
-        f"mlir-aie=={mlir_aie_full_version}",
-        f"llvm-aie=={llvm_aie_full_version}",
-        f"mlir-air=={mlir_air_full_version}",
+    specs = [
+        _make_version_spec(
+            "mlir-aie",
+            mlir_aie_version, mlir_aie_timestamp,
+            mlir_aie_short_commit, ".no.rtti",
+        ),
+        _make_version_spec(
+            "llvm-aie",
+            llvm_aie_version, llvm_aie_timestamp,
+            llvm_aie_commit,
+        ),
+        _make_version_spec(
+            "mlir-air",
+            mlir_air_version, mlir_air_timestamp,
+            mlir_air_short_commit, ".no.rtti",
+        ),
     ]
+    return [s for s in specs if s is not None]
 
 
 # =============================================================================
@@ -469,7 +515,9 @@ class TritonXdnaBdistWheel(bdist_wheel):
         triton_shared_dst = unpack_dir / "triton" / "triton_shared"
         triton_shared_dst.mkdir(parents=True, exist_ok=True)
 
-        dst_binary = triton_shared_dst / "triton-shared-opt"
+        # Use a platform-appropriate binary name (Windows requires .exe)
+        binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+        dst_binary = triton_shared_dst / binary_name
         shutil.copy2(triton_shared_opt_binary, dst_binary)
 
         # Ensure the binary has execute permissions (not needed on Windows)

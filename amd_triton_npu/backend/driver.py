@@ -9,6 +9,7 @@ import sysconfig
 
 import os, subprocess, tempfile, platform
 import importlib.util
+import importlib.metadata
 import shutil
 
 from pathlib import Path
@@ -26,15 +27,6 @@ import air.passmanager
 IS_WINDOWS = sys.platform == "win32"
 
 autotune_time = False
-
-# Global cache: maps input hash -> (loaded .pyd module, launch function)
-# Persists across all NPULauncher instances for the process lifetime.
-# Bypasses the expensive MLIR pipeline on repeated dispatches of the same kernel.
-_global_module_cache = {}
-
-# Last dispatched module — set after each dispatch so callers can capture it
-# for direct fast-path calls (bypassing Triton JIT entirely).
-_last_dispatched_module = None
 
 
 # -------------------- Launcher ----------------------------
@@ -88,31 +80,64 @@ def _format_of(ty):
     }[ty]
 
 
-def _get_air_opt_path() -> str:
-    """
-    Get the path to air-opt binary from pip-installed mlir-air package.
+def _find_mlir_air_binary(binary_name: str) -> str:
+    """Locate a binary inside the mlir-air install prefix.
 
-    Uses the aircc module's location to find the mlir_air package root,
-    then locates the air-opt binary in the bin/ directory.
+    Search order:
+    1. MLIR_AIR_INSTALL_DIR environment variable
+    2. mlir-air .pth file (when built from source on Windows)
+    3. pip-wheel layout: navigate up from aircc module location
+    4. shutil.which() (PATH lookup)
 
     Returns:
-        str: Path to air-opt binary
+        str: Absolute path to the binary
 
     Raises:
-        RuntimeError: If air-opt binary not found
+        RuntimeError: If not found
     """
-    # aircc.__file__ gives: /path/to/mlir_air/python/air/compiler/aircc/main.py
-    # We need: /path/to/mlir_air/bin/air-opt
+    candidates = []
+
+    # 1. Explicit env var
+    mlir_air_env = os.environ.get("MLIR_AIR_INSTALL_DIR")
+    if mlir_air_env:
+        candidates.append(Path(mlir_air_env) / "bin" / binary_name)
+
+    # 2. .pth file: points to <install>/python, so <install>/bin has binaries
+    import site
+    for sp in site.getsitepackages():
+        pth = os.path.join(sp, "mlir-air.pth")
+        if os.path.exists(pth):
+            with open(pth) as f:
+                pth_dir = f.read().strip()
+            if pth_dir:
+                candidates.append(Path(pth_dir).resolve().parent / "bin" / binary_name)
+
+    # 3. pip-wheel layout: aircc.__file__ -> .../mlir_air/python/air/compiler/aircc/main.py
     aircc_path = Path(aircc.__file__).resolve()
-    # Navigate from .../mlir_air/python/air/compiler/aircc/main.py to .../mlir_air/
-    mlir_air_root = aircc_path.parent.parent.parent.parent.parent
+    candidates.append(aircc_path.parent.parent.parent.parent.parent / "bin" / binary_name)
+    # Also try 3 levels up (namespace package: air/compiler/aircc/main.py -> site-packages)
+    candidates.append(aircc_path.parent.parent.parent / "bin" / binary_name)
+
+    for c in candidates:
+        if c.exists():
+            return str(c)
+
+    # 4. Fall back to PATH
+    found = shutil.which(binary_name)
+    if found:
+        return found
+
+    tried = "\n  ".join(str(c) for c in candidates)
+    raise RuntimeError(
+        f"Could not find {binary_name}. Searched:\n  {tried}\n"
+        f"Set MLIR_AIR_INSTALL_DIR to the mlir-air install prefix."
+    )
+
+
+def _get_air_opt_path() -> str:
+    """Get the path to the air-opt binary."""
     binary_name = "air-opt.exe" if IS_WINDOWS else "air-opt"
-    air_opt_path = mlir_air_root / "bin" / binary_name
-
-    if not air_opt_path.exists():
-        raise RuntimeError(f"Could not find air-opt binary at {air_opt_path}")
-
-    return str(air_opt_path)
+    return _find_mlir_air_binary(binary_name)
 
 
 def _get_xrt_path() -> str:
@@ -120,59 +145,201 @@ def _get_xrt_path() -> str:
 
     Search order:
     1. XILINX_XRT environment variable (standard on both Linux and Windows)
-    2. (Windows) XRT_DEV_DIR env var — points at a directory with include/ and lib/
-    3. (Windows) Auto-detect: C:\\RyzenAI\\<version>\\xrt, common Program Files paths
-    4. (Linux) /opt/xilinx/xrt
+    2. (Windows) C:\\Program Files\\AMD\\xrt  (recommended install location)
+    3. (Linux) /opt/xilinx/xrt
 
-    On Windows the Ryzen AI SDK ships only the runtime DLL.  The development
-    headers and import library (xrt_coreutil.lib) must be prepared separately
-    (see utils/setup_xrt_dev.ps1).  Set XILINX_XRT or XRT_DEV_DIR to point
-    at the directory that contains include/ and lib/ sub-directories.
+    The returned directory must contain the SDK components (include/xrt headers
+    and lib/) needed for JIT compilation.  A runtime-only installation (e.g.
+    DLLs from the NPU driver) is not sufficient.
+
+    On Windows, download xrt_windows_sdk.zip from the Xilinx/XRT releases page
+    and extract the xrt/ directory to C:\\Program Files\\AMD\\xrt.
     """
-    path = os.getenv("XILINX_XRT", "")
-    if path and os.path.isdir(path):
-        return path
+    def _validate_xrt_sdk(path: str, source: str) -> str:
+        """Ensure *path* contains the SDK components needed for compilation."""
+        has_headers = os.path.isdir(os.path.join(path, "include", "xrt"))
+        has_lib = os.path.isdir(os.path.join(path, "lib"))
+        if has_headers and has_lib:
+            return path
+        if os.path.isdir(path):
+            # Directory exists but is missing SDK pieces – give a targeted hint.
+            missing = []
+            if not has_headers:
+                missing.append("include/xrt (headers)")
+            if not has_lib:
+                missing.append("lib (import libraries)")
+            raise Exception(
+                f"XRT directory found via {source} at {path}, but it appears to "
+                f"be a runtime-only installation — missing: {', '.join(missing)}. "
+                "Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases "
+                "and extract the full xrt/ directory (with include/ and lib/) to that location."
+            )
+        return ""  # path doesn't exist at all
+
+    env_path = os.getenv("XILINX_XRT", "")
+    if env_path:
+        result = _validate_xrt_sdk(env_path, "XILINX_XRT environment variable")
+        if result:
+            return result
 
     if IS_WINDOWS:
-        # Check dedicated dev-dir env var
-        dev_dir = os.getenv("XRT_DEV_DIR", "")
-        if dev_dir and os.path.isdir(dev_dir):
-            return dev_dir
-
-        # Auto-detect common installation / dev paths
         program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
-        default_paths = [
-            os.path.join(program_files, "AMD", "XDNA", "xrt"),
-            os.path.join(program_files, "Xilinx", "XRT"),
-        ]
-
-        # Also search C:\RyzenAI\<latest>\xrt
-        ryzenai_root = "C:\\RyzenAI"
-        if os.path.isdir(ryzenai_root):
-            versions = sorted(os.listdir(ryzenai_root), reverse=True)
-            for v in versions:
-                default_paths.insert(0, os.path.join(ryzenai_root, v, "xrt"))
-
-        for p in default_paths:
-            # Prefer directories that contain the development files
-            # (include/xrt/ and lib/) needed for JIT compilation
-            if os.path.isdir(os.path.join(p, "include", "xrt")):
-                return p
-
-        # Fallback: accept any existing path (runtime-only SDK)
-        for p in default_paths:
-            if os.path.isdir(p):
-                return p
+        default_path = os.path.join(program_files, "AMD", "xrt")
+        result = _validate_xrt_sdk(default_path, "default location")
+        if result:
+            return result
     else:
-        # Linux default
-        if os.path.isdir("/opt/xilinx/xrt"):
-            return "/opt/xilinx/xrt"
+        result = _validate_xrt_sdk("/opt/xilinx/xrt", "default location")
+        if result:
+            return result
 
     raise Exception(
-        "XILINX_XRT is not set and XRT could not be auto-detected. "
-        "Please install XRT or set XILINX_XRT / XRT_DEV_DIR to the "
-        "directory containing include/ and lib/ sub-directories."
+        "XRT development files not found. "
+        "Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases "
+        "and extract the xrt/ directory to C:\\Program Files\\AMD\\xrt "
+        "(or set the XILINX_XRT environment variable to its location)."
     )
+
+
+def _find_msvc_cl() -> str:
+    """Locate cl.exe for JIT compilation on Windows.
+
+    Search order:
+    1. cl.exe already on PATH (e.g. running from a VS Developer Command Prompt)
+    2. vswhere.exe to discover Visual Studio installations, then use the
+       latest MSVC toolset's Hostx64/x64/cl.exe
+
+    Returns the absolute path to cl.exe.
+    Raises Exception with setup instructions if MSVC cannot be found.
+    """
+    # 1. Already on PATH?
+    cl_on_path = shutil.which("cl.exe") or shutil.which("cl")
+    if cl_on_path:
+        return cl_on_path
+
+    # 2. Discover via vswhere
+    program_files_x86 = os.environ.get(
+        "ProgramFiles(x86)", "C:\\Program Files (x86)"
+    )
+    vswhere = os.path.join(
+        program_files_x86,
+        "Microsoft Visual Studio",
+        "Installer",
+        "vswhere.exe",
+    )
+    if os.path.isfile(vswhere):
+        try:
+            vs_path = (
+                subprocess.check_output(
+                    [
+                        vswhere,
+                        "-latest",
+                        "-products", "*",
+                        "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                        "-property", "installationPath",
+                    ],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                )
+                .strip()
+                .splitlines()[0]
+            )
+        except (subprocess.CalledProcessError, IndexError):
+            vs_path = ""
+
+        if vs_path:
+            # Find the latest MSVC toolset version
+            msvc_root = os.path.join(vs_path, "VC", "Tools", "MSVC")
+            if os.path.isdir(msvc_root):
+                versions = sorted(os.listdir(msvc_root), reverse=True)
+                for ver in versions:
+                    candidate = os.path.join(
+                        msvc_root, ver, "bin", "Hostx64", "x64", "cl.exe"
+                    )
+                    if os.path.isfile(candidate):
+                        return candidate
+
+    raise Exception(
+        "MSVC compiler (cl.exe) not found. Triton-XDNA needs MSVC for JIT "
+        "compilation of NPU dispatch code on Windows.\n"
+        "Options:\n"
+        "  1. Run from a 'x64 Native Tools Command Prompt for VS 2022'\n"
+        "  2. Install Visual Studio 2022 with the 'Desktop development with C++' workload\n"
+        "     (https://visualstudio.microsoft.com/)\n"
+        "  3. Install the Build Tools for Visual Studio 2022\n"
+        "     (https://visualstudio.microsoft.com/visual-cpp-build-tools/)"
+    )
+
+
+def _get_msvc_env(cl_path: str) -> dict:
+    """Build the environment variables needed for cl.exe to find headers and libs.
+
+    If INCLUDE and LIB are already set (e.g. from vcvars), returns the current
+    environment unchanged.  Otherwise, derives them from the cl.exe location
+    and the Windows SDK.
+    """
+    env = os.environ.copy()
+
+    # If INCLUDE is already set, assume the environment is already configured
+    if env.get("INCLUDE"):
+        return env
+
+    # Derive MSVC paths from cl.exe location:
+    #   .../VC/Tools/MSVC/<ver>/bin/Hostx64/x64/cl.exe
+    cl_dir = os.path.dirname(cl_path)  # .../bin/Hostx64/x64
+    msvc_ver_dir = os.path.normpath(
+        os.path.join(cl_dir, "..", "..", "..")
+    )  # .../VC/Tools/MSVC/<ver>
+
+    msvc_include = os.path.join(msvc_ver_dir, "include")
+    msvc_lib = os.path.join(msvc_ver_dir, "lib", "x64")
+
+    if not os.path.isdir(msvc_include):
+        raise Exception(
+            f"Found cl.exe at {cl_path} but could not locate MSVC include "
+            f"directory at {msvc_include}. Run from a VS Developer Command Prompt "
+            "or ensure INCLUDE/LIB environment variables are set."
+        )
+
+    # Find Windows SDK
+    sdk_root = os.environ.get(
+        "WindowsSdkDir",
+        os.path.join(
+            os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            "Windows Kits",
+            "10",
+        ),
+    )
+    sdk_version = os.environ.get("WindowsSDKVersion", "").rstrip("\\")
+    if not sdk_version:
+        # Auto-detect latest SDK version
+        sdk_inc_root = os.path.join(sdk_root, "Include")
+        if os.path.isdir(sdk_inc_root):
+            versions = sorted(
+                [d for d in os.listdir(sdk_inc_root) if d.startswith("10.")],
+                reverse=True,
+            )
+            sdk_version = versions[0] if versions else ""
+
+    include_paths = [msvc_include]
+    lib_paths = [msvc_lib]
+
+    if sdk_version:
+        sdk_inc = os.path.join(sdk_root, "Include", sdk_version)
+        sdk_lib = os.path.join(sdk_root, "Lib", sdk_version)
+        for subdir in ["ucrt", "shared", "um"]:
+            p = os.path.join(sdk_inc, subdir)
+            if os.path.isdir(p):
+                include_paths.append(p)
+        for subdir in ["ucrt", "um"]:
+            p = os.path.join(sdk_lib, subdir, "x64")
+            if os.path.isdir(p):
+                lib_paths.append(p)
+
+    env["INCLUDE"] = ";".join(include_paths)
+    env["LIB"] = ";".join(lib_paths)
+    env["PATH"] = os.path.dirname(cl_path) + ";" + env.get("PATH", "")
+    return env
 
 
 def _get_aie_test_utils_path() -> str:
@@ -221,20 +388,8 @@ def get_npu_device_info():
     try:
         import re
 
-        xrt_smi = "xrt-smi"
-        if IS_WINDOWS:
-            xrt_smi = shutil.which("xrt-smi") or shutil.which("xrt-smi.exe")
-            if not xrt_smi:
-                # Check known AMD system directory
-                amd_dir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "AMD")
-                candidate = os.path.join(amd_dir, "xrt-smi.exe")
-                if os.path.isfile(candidate):
-                    xrt_smi = candidate
-                else:
-                    xrt_smi = "xrt-smi.exe"
-
         result = subprocess.run(
-            [xrt_smi, "examine"],
+            ["xrt-smi", "examine"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True,
@@ -502,7 +657,8 @@ def _get_transform_ir_string():
                 f"Use an absolute path or run from the directory containing the script."
             )
         with open(custom_script_path, "r") as f:
-            print(f"Using custom tiling script from: {custom_script_path}")
+            if os.getenv("TRITON_NPU_QUIET", "0") == "0":
+                print(f"Using custom tiling script from: {custom_script_path}")
             user_script = f.read()
         return _inject_transform_library(user_script)
 
@@ -589,202 +745,6 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ, actual_sizes=None):
         return air_module
 
 
-def _generate_launch_cpp(signature, constants, arg_decls, autotune_time):
-    """Generate C++ code for _launch with persistent XRT state caching.
-
-    Instead of creating a new XRT device, hw_context, kernel, and buffer objects
-    on every dispatch, this caches them as static variables. The context is only
-    recreated when the xclbin path changes. Buffer objects are only reallocated
-    when tensor sizes change.
-
-    Optimizations:
-    - Skip sync-to-device for output buffer (last pointer arg) — NPU writes it
-    - Cache xrt::run object and reuse with start()/wait() instead of kernel()
-    - Cache BO map<void*> pointers to avoid repeated virtual address lookups
-    - Optional per-section profiling via AMD_TRITON_NPU_PROFILE_DISPATCH env var
-    """
-    ptr_args = [(i, ty) for i, ty in signature.items()
-                if i not in constants and ty[0] == "*"]
-    last_ptr_idx = ptr_args[-1][0] if ptr_args else 0
-    input_ptr_args = ptr_args[:-1]  # all except output (last)
-
-    # Static BO declarations (one per pointer arg) + cached map pointers
-    bo_statics = "\n".join(
-        f"static xrt::bo* _p_bo_{i} = nullptr; static long _cached_size_{i} = 0; "
-        f"static void* _p_map_{i} = nullptr;"
-        for i, _ in ptr_args
-    )
-    # Cleanup code (delete all cached BOs)
-    bo_cleanup = " ".join(
-        f"delete _p_bo_{i}; _p_bo_{i} = nullptr; _cached_size_{i} = 0; _p_map_{i} = nullptr;"
-        for i, _ in ptr_args
-    )
-    # BO reallocation checks (only when size changes) — also update cached map ptr
-    bo_realloc = "\n    ".join(
-        f"if (_cached_size_{i} != size{i}) "
-        f"{{ delete _p_bo_{i}; "
-        f"_p_bo_{i} = new xrt::bo(device, size{i}, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({i+3})); "
-        f"_cached_size_{i} = size{i}; _p_map_{i} = _p_bo_{i}->map<void*>(); "
-        f"_run_args_dirty = true; }}"
-        for i, _ in ptr_args
-    )
-    # Data copy-in: only INPUT buffers (not output) get synced to device
-    data_copy_in = "\n    ".join(
-        f"memcpy(_p_map_{i}, arg{i}, size{i}); "
-        f"_p_bo_{i}->sync(XCL_BO_SYNC_BO_TO_DEVICE);"
-        for i, _ in input_ptr_args
-    )
-    # Kernel call arguments
-    bo_args = ", ".join(f"*_p_bo_{i}" for i, _ in ptr_args)
-    # Size parameters for function signature
-    size_params = ", ".join(f"long size{i}" for i, _ in ptr_args)
-
-    # set_arg lines for cached run (indices: 0=opcode, 1=instr_bo, 2=instr_count, 3+=data BOs)
-    set_run_args = "\n        ".join(
-        f"_p_run->set_arg({idx+3}, *_p_bo_{i});"
-        for idx, (i, _) in enumerate(ptr_args)
-    )
-
-    # Optional timing code
-    time_start = "auto start = std::chrono::high_resolution_clock::now();" if autotune_time else ""
-    time_stop = ("auto stop = std::chrono::high_resolution_clock::now(); "
-                 "float npu_time = std::chrono::duration_cast<std::chrono::microseconds>"
-                 "(stop - start).count();" if autotune_time else "")
-    time_write = ('std::ofstream file("data.txt"); file << npu_time << std::endl; '
-                  'file.close();' if autotune_time else "")
-
-    code = []
-    code.append("")
-    code.append("// ---- Persistent XRT state (cached across dispatches) ----")
-    code.append("static bool _xrt_device_init = false;")
-    code.append("static xrt::device* _p_device = nullptr;")
-    code.append("static xrt::hw_context* _p_ctx = nullptr;")
-    code.append("static xrt::kernel* _p_kernel = nullptr;")
-    code.append("static xrt::run* _p_run = nullptr;")
-    code.append("static bool _run_args_dirty = true;")
-    code.append("static xrt::bo* _p_bo_instr = nullptr;")
-    code.append("static size_t _cached_instr_count = 0;")
-    code.append("static char _cached_aie_path[1024] = {0};")
-    code.append("static char _cached_insts_path[1024] = {0};")
-    code.append(bo_statics)
-    code.append("static bool _profile_dispatch = false;")
-    code.append("static bool _profile_checked = false;")
-    code.append("")
-    code.append(f"static void _launch(int gridX, int gridY, int gridZ, {size_params}, {arg_decls}) {{")
-    code.append("  if (gridX*gridY*gridZ > 0) {")
-    code.append("")
-    code.append("    // --- Check profiling env var (once) ---")
-    code.append("    if (!_profile_checked) {")
-    code.append("        const char* p = getenv(\"AMD_TRITON_NPU_PROFILE_DISPATCH\");")
-    code.append("        _profile_dispatch = (p && p[0] == '1');")
-    code.append("        _profile_checked = true;")
-    code.append("    }")
-    code.append("    auto _t0 = std::chrono::high_resolution_clock::now();")
-    code.append("    auto _t1 = _t0, _t2 = _t0, _t3 = _t0, _t4 = _t0, _t5 = _t0;")
-    code.append("")
-    code.append("    // --- One-time device init ---")
-    code.append("    if (!_xrt_device_init) {")
-    code.append("        _p_device = new xrt::device(0);")
-    code.append("        _xrt_device_init = true;")
-    code.append("    }")
-    code.append("    auto& device = *_p_device;")
-    code.append("")
-    code.append("    // --- Reinit context only if xclbin changed ---")
-    code.append("    if (_p_ctx == nullptr || strcmp(_cached_aie_path, aie_path) != 0) {")
-    code.append(f"        {bo_cleanup}")
-    code.append("        delete _p_bo_instr; _p_bo_instr = nullptr;")
-    code.append("        delete _p_run; _p_run = nullptr;")
-    code.append("        delete _p_kernel; _p_kernel = nullptr;")
-    code.append("        delete _p_ctx; _p_ctx = nullptr;")
-    code.append("")
-    code.append("        auto xclbin = xrt::xclbin(std::string(aie_path));")
-    code.append('        std::string Node = "MLIR_AIE";')
-    code.append("        auto xkernels = xclbin.get_kernels();")
-    code.append("        auto xkernel = *std::find_if(xkernels.begin(), xkernels.end(),")
-    code.append("            [Node](xrt::xclbin::kernel &k) { return k.get_name().rfind(Node, 0) == 0; });")
-    code.append("")
-    code.append("        device.register_xclbin(xclbin);")
-    code.append("        _p_ctx = new xrt::hw_context(device, xclbin.get_uuid());")
-    code.append("        _p_kernel = new xrt::kernel(*_p_ctx, xkernel.get_name());")
-    code.append("        strncpy(_cached_aie_path, aie_path, sizeof(_cached_aie_path) - 1);")
-    code.append("        _cached_insts_path[0] = '\\0';")
-    code.append("        _run_args_dirty = true;")
-    code.append('        std::cerr << "[XRT] hw_context created" << std::endl;')
-    code.append("    }")
-    code.append("    auto& kernel = *_p_kernel;")
-    code.append("")
-    code.append("    // --- Reload instructions only if path changed ---")
-    code.append("    if (_p_bo_instr == nullptr || strcmp(_cached_insts_path, insts_path) != 0) {")
-    code.append("        delete _p_bo_instr; _p_bo_instr = nullptr;")
-    code.append("        std::vector<uint32_t> instr_v = test_utils::load_instr_binary(insts_path);")
-    code.append("        _cached_instr_count = instr_v.size();")
-    code.append("        _p_bo_instr = new xrt::bo(device, instr_v.size() * sizeof(int),")
-    code.append("                                  XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));")
-    code.append("        void* bufI = _p_bo_instr->map<void*>();")
-    code.append("        memcpy(bufI, instr_v.data(), instr_v.size() * sizeof(int));")
-    code.append("        _p_bo_instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);")
-    code.append("        strncpy(_cached_insts_path, insts_path, sizeof(_cached_insts_path) - 1);")
-    code.append("        _run_args_dirty = true;")
-    code.append("    }")
-    code.append("")
-    code.append("    // --- Reallocate data BOs only when sizes change ---")
-    code.append(f"    {bo_realloc}")
-    code.append("")
-    code.append("    // --- Create/update xrt::run if args changed ---")
-    code.append("    if (_p_run == nullptr) {")
-    code.append("        _p_run = new xrt::run(kernel);")
-    code.append("        _run_args_dirty = true;")
-    code.append("    }")
-    code.append("    if (_run_args_dirty) {")
-    code.append("        unsigned int opcode = 3;")
-    code.append("        _p_run->set_arg(0, opcode);")
-    code.append("        _p_run->set_arg(1, *_p_bo_instr);")
-    code.append("        unsigned int ic = (unsigned int)_cached_instr_count;")
-    code.append("        _p_run->set_arg(2, ic);")
-    code.append(f"        {set_run_args}")
-    code.append("        _run_args_dirty = false;")
-    code.append("    }")
-    code.append("")
-    code.append("    _t1 = std::chrono::high_resolution_clock::now();")
-    code.append("")
-    code.append("    // --- Copy INPUTS to device (skip output buffer) ---")
-    code.append(f"    {data_copy_in}")
-    code.append("")
-    code.append("    _t2 = std::chrono::high_resolution_clock::now();")
-    code.append("")
-    code.append("    // --- Run kernel (reuse cached run object) ---")
-    if time_start:
-        code.append(f"    {time_start}")
-    code.append("    _p_run->start();")
-    code.append("    _p_run->wait();")
-    if time_stop:
-        code.append(f"    {time_stop}")
-    if time_write:
-        code.append(f"    {time_write}")
-    code.append("")
-    code.append("    _t3 = std::chrono::high_resolution_clock::now();")
-    code.append("")
-    code.append("    // --- Copy output back (last tensor only) ---")
-    code.append(f"    _p_bo_{last_ptr_idx}->sync(XCL_BO_SYNC_BO_FROM_DEVICE);")
-    code.append(f"    memcpy(arg{last_ptr_idx}, _p_map_{last_ptr_idx}, size{last_ptr_idx});")
-    code.append("")
-    code.append("    _t4 = std::chrono::high_resolution_clock::now();")
-    code.append("")
-    code.append("    if (_profile_dispatch) {")
-    code.append('        auto us = [](auto a, auto b) { return std::chrono::duration_cast<std::chrono::microseconds>(b-a).count(); };')
-    code.append('        std::cerr << "[DISPATCH] setup=" << us(_t0,_t1)')
-    code.append('                  << "us copy_in=" << us(_t1,_t2)')
-    code.append('                  << "us run=" << us(_t2,_t3)')
-    code.append('                  << "us copy_out=" << us(_t3,_t4)')
-    code.append('                  << "us total=" << us(_t0,_t4) << "us" << std::endl;')
-    code.append("    }")
-    code.append("  }")
-    code.append("}")
-    code.append("")
-
-    return "\n".join(code)
-
-
 def _generate_launcher(constants, signature, kernel_name):
     arg_decls = ", ".join(f"{_ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
     args_format = "".join(
@@ -826,7 +786,6 @@ def _generate_launcher(constants, signature, kernel_name):
 
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <ctime>
 
 #include "xrt/xrt_bo.h"
@@ -852,7 +811,91 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
     Py_RETURN_NONE;
 }}
 
-{_generate_launch_cpp(signature, constants, arg_decls, autotune_time)}
+// Call to XRT goes here:
+static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {arg_decls}) {{
+  if (gridX*gridY*gridZ > 0) {{
+    std::vector<uint32_t> instr_v =
+        test_utils::load_instr_binary(insts_path);
+
+    int verbosity = 1;
+    if (verbosity >= 1)
+        std::cout << "Sequence instr count: " << instr_v.size() << std::endl;
+
+    // Start the XRT test code
+    // Get a device handle
+    unsigned int device_index = 0;
+    auto device = xrt::device(device_index);
+
+    // Load the xclbin
+    if (verbosity >= 1)
+        std::cout << "Loading xclbin." << std::endl;
+    auto xclbin = xrt::xclbin(std::string(aie_path));
+
+    if (verbosity >= 1)
+        std::cout << "Kernel opcode: " << "MLIR_AIE" << std::endl;
+    std::string Node = "MLIR_AIE";
+
+    // Get the kernel from the xclbin
+    auto xkernels = xclbin.get_kernels();
+    auto xkernel = *std::find_if(xkernels.begin(), xkernels.end(),
+                                    [Node](xrt::xclbin::kernel &k) {{
+                                    auto name = k.get_name();
+                                    std::cout << "Name: " << name << std::endl;
+                                    return name.rfind(Node, 0) == 0;
+                                    }});
+    auto kernelName = xkernel.get_name();
+
+    if (verbosity >= 1)
+        std::cout << "Registering xclbin." << std::endl;
+
+    device.register_xclbin(xclbin);
+
+    // get a hardware context
+    if (verbosity >= 1)
+        std::cout << "Getting hardware context." << std::endl;
+    xrt::hw_context context(device, xclbin.get_uuid());
+
+    // get a kernel handle
+    if (verbosity >= 1)
+        std::cout << "Getting handle to kernel:" << kernelName << std::endl;
+    auto kernel = xrt::kernel(context, kernelName);
+
+    // get instruction sequence
+    auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(int),
+                            XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
+    
+    {' '.join(f'auto bo_{i} = xrt::bo(device, size{i}, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({i+3}));' for i, ty in signature.items() if i not in constants and ty[0] == "*")}
+
+    if (verbosity >= 1)
+        std::cout << "Writing data into buffer objects." << std::endl;
+    {' '.join(f'void *buf{i} = bo_{i}.map<void *>(); memcpy(buf{i}, arg{i}, size{i});' for i, ty in signature.items() if i not in constants and ty[0] == "*")}
+
+    void *bufInstr = bo_instr.map<void *>();
+    memcpy(bufInstr, instr_v.data(), instr_v.size() * sizeof(int));
+
+    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    {' '.join(f'bo_{i}.sync(XCL_BO_SYNC_BO_TO_DEVICE);' for i, ty in signature.items() if i not in constants and ty[0] == "*")}
+
+    if (verbosity >= 1)
+        std::cout << "Running Kernel." << std::endl;
+    unsigned int opcode = 3;
+    {'auto start = std::chrono::high_resolution_clock::now();' if autotune_time else ''} 
+    auto run = kernel(opcode, bo_instr, instr_v.size(), {','.join(f'bo_{i}' for i, ty in signature.items() if i not in constants and ty[0] == "*")});
+    run.wait();
+    {'auto stop = std::chrono::high_resolution_clock::now(); float npu_time = std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();' if autotune_time else ''}
+
+    {'std::ofstream file("data.txt"); file << npu_time << std::endl; file.close();' if autotune_time else ''}
+
+    if (verbosity >= 1)
+        std::cout << "Copying results." << std::endl;
+    // TODO: Assuming the last tensor is the only output tensor.
+    bo_{next((i for i, ty in reversed(signature.items()) if i not in constants and ty[0] == "*"), None)}.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    memcpy(arg{next((i for i, ty in reversed(signature.items()) if i not in constants and ty[0] == "*"), None)}, buf{next((i for i, ty in reversed(signature.items()) if i not in constants and ty[0] == "*"), None)}, size{next((i for i, ty in reversed(signature.items()) if i not in constants and ty[0] == "*"), None)});
+
+    if (verbosity >= 1)
+        std::cout << "Launch finished." << std::endl;
+  }}
+}}
 
 typedef struct _DevicePtrInfo {{
   void *dev_ptr;
@@ -1078,6 +1121,7 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <stdexcept>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -1107,17 +1151,23 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 // ELF-based XRT launch:
 static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in ptr_args)}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
+    try {{
 
     int verbosity = 1;
 
     // Get a device handle
     unsigned int device_index = 0;
+    if (verbosity >= 1)
+        std::cout << "Opening device " << device_index << "..." << std::endl;
     auto device = xrt::device(device_index);
 
     // Load the ELF
     if (verbosity >= 1)
         std::cout << "Loading ELF: " << elf_path << std::endl;
     xrt::elf ctx_elf{{elf_path}};
+
+    if (verbosity >= 1)
+        std::cout << "Creating hw_context..." << std::endl;
     xrt::hw_context context = xrt::hw_context(device, ctx_elf);
 
     // Kernel name from ELF config (e.g., "main:vecadd")
@@ -1154,6 +1204,11 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
 
     if (verbosity >= 1)
         std::cout << "Launch finished." << std::endl;
+
+    }} catch (const std::exception& e) {{
+        std::string msg = std::string("XRT runtime error: ") + e.what();
+        PyErr_SetString(PyExc_RuntimeError, msg.c_str());
+    }}
   }}
 }}
 
@@ -1335,6 +1390,16 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
+# Global cache: maps input hash -> (loaded .pyd module, launch function)
+# Persists across all NPULauncher instances for the process lifetime.
+# Bypasses the expensive MLIR pipeline on repeated dispatches of the same kernel.
+_global_module_cache = {}
+
+# Last dispatched module — set after each dispatch so callers can capture it
+# for direct fast-path calls (bypassing Triton JIT entirely).
+_last_dispatched_module = None
+
+
 def compile_module(
     launcher_src, kernel_placeholder_name, output_format="xclbin", actual_sizes=None
 ):
@@ -1438,9 +1503,10 @@ def compile_module(
                 Path(launcher_src_path).write_text(src)
                 # Compile the launcher shared library.
                 if IS_WINDOWS:
-                    # Use MSVC (cl.exe) on Windows
+                    cl_path = _find_msvc_cl()
+                    msvc_env = _get_msvc_env(cl_path)
                     compile_flags = [
-                        "cl.exe",
+                        cl_path,
                         "/std:c++latest",
                         "/Zc:__cplusplus",
                         "/EHsc",
@@ -1457,10 +1523,23 @@ def compile_module(
                         "xrt_coreutil.lib",
                     ]
                     if output_format != "elf":
-                        # Insert test_utils include before /link
+                        # xclbin mode needs test_utils for loading instruction binary:
+                        # add its includes, LIBPATH, and libraries.
+                        # Insert test_utils include before /link so it applies to compilation.
                         link_idx = compile_flags.index("/link")
-                        compile_flags.insert(link_idx, f"/I{os.path.join(aie_test_utils_dir, 'include')}")
+                        compile_flags.insert(
+                            link_idx,
+                            f"/I{os.path.join(aie_test_utils_dir, 'include')}",
+                        )
+                        # Add test_utils library path and dependent Boost libraries for linking.
+                        compile_flags += [
+                            f"/LIBPATH:{os.path.join(aie_test_utils_dir, 'lib')}",
+                            "boost_program_options.lib",
+                            "boost_filesystem.lib",
+                            "test_utils.lib",
+                        ]
                 else:
+                    msvc_env = None
                     compile_flags = [
                         "g++",
                         "-std=c++23",
@@ -1489,16 +1568,19 @@ def compile_module(
                             "-ltest_utils",
                         ]
                     compile_flags += ["-o", so_path]
-                subprocess.check_call(compile_flags)
+                _quiet = os.getenv("TRITON_NPU_QUIET", "0") != "0"
+                _devnull = subprocess.DEVNULL if _quiet else None
+                subprocess.check_call(
+                    compile_flags,
+                    stdout=_devnull,
+                    stderr=_devnull,
+                    env=msvc_env if msvc_env else None,
+                )
 
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
                 aircc_binary_name = "aircc.exe" if IS_WINDOWS else "aircc"
-                aircc_bin = str(
-                    Path(aircc.__file__).resolve().parent.parent.parent.parent.parent
-                    / "bin"
-                    / aircc_binary_name
-                )
+                aircc_bin = _find_mlir_air_binary(aircc_binary_name)
 
                 # On Windows, construct peano path from llvm-aie package and
                 # add mlir_aie/bin to PATH so aircc can find aiecc.exe
@@ -1508,6 +1590,20 @@ def compile_module(
                     if peano_dir:
                         # LLVM_BINARY_DIR points to bin/, peano wants parent
                         peano_flag = f"--peano={str(Path(peano_dir).parent)}"
+                    else:
+                        # Auto-detect from pip-installed llvm-aie package
+                        try:
+                            dist = importlib.metadata.distribution("llvm-aie")
+                            llvm_aie_root = Path(dist._path.parent) / "llvm-aie"
+                            if (llvm_aie_root / "bin" / "opt.exe").exists():
+                                peano_flag = f"--peano={llvm_aie_root}"
+                        except Exception:
+                            pass
+                    # Also check PEANO_INSTALL_DIR env var
+                    if peano_flag == "--peano=":
+                        peano_env = os.environ.get("PEANO_INSTALL_DIR", "")
+                        if peano_env and os.path.isdir(peano_env):
+                            peano_flag = f"--peano={peano_env}"
                     # Ensure aiecc is findable
                     try:
                         import mlir_aie
@@ -1558,49 +1654,17 @@ def compile_module(
                 # default changed from [4,4] to [] in mlir-air #1470).
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
-                subprocess.check_call(aircc_cmd)
+                subprocess.check_call(aircc_cmd, stdout=_devnull, stderr=_devnull)
 
-                # On Windows, aiecc may skip xclbin generation if xclbinutil is
-                # not found. In that case, assemble the xclbin from JSON/PDI
-                # artifacts using our minimal Python assembler.
+                # Verify xclbin was generated (requires xclbinutil on PATH).
+                # On Windows, get xclbinutil from the XRT Windows SDK:
+                # https://github.com/Xilinx/XRT/releases (xrt_windows_sdk.zip)
                 if output_format != "elf" and not os.path.exists(xclbin_path):
-                    import glob as _glob
-                    json_dir = air_proj_path
-                    mem_files = _glob.glob(os.path.join(json_dir, "*_mem_topology.json"))
-                    kern_files = _glob.glob(os.path.join(json_dir, "*_kernels.json"))
-                    part_files = _glob.glob(os.path.join(json_dir, "*_aie_partition.json"))
-                    if mem_files and kern_files and part_files:
-                        import json as _json
-                        # Use the helper from utils/xclbin_assemble.py
-                        _xclbin_asm_path = os.path.join(
-                            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                            "utils", "xclbin_assemble.py"
-                        )
-                        # Also check relative to TRITON_XDNA_ROOT if set
-                        if not os.path.exists(_xclbin_asm_path):
-                            _triton_xdna_root = os.getenv("TRITON_XDNA_ROOT", "")
-                            if _triton_xdna_root:
-                                _xclbin_asm_path = os.path.join(_triton_xdna_root, "utils", "xclbin_assemble.py")
-                        # Also check CWD parent (common during development)
-                        if not os.path.exists(_xclbin_asm_path):
-                            _xclbin_asm_path = os.path.join(os.getcwd(), "utils", "xclbin_assemble.py")
-                        if os.path.exists(_xclbin_asm_path):
-                            subprocess.check_call([
-                                sys.executable, _xclbin_asm_path,
-                                "--mem-topology", mem_files[0],
-                                "--kernels", kern_files[0],
-                                "--aie-partition", part_files[0],
-                                "-o", xclbin_path,
-                            ])
-                        else:
-                            raise RuntimeError(
-                                f"xclbin not generated by aiecc (xclbinutil not found) "
-                                f"and xclbin_assemble.py not found at {_xclbin_asm_path}"
-                            )
-                    else:
-                        raise RuntimeError(
-                            f"xclbin not generated and JSON artifacts not found in {json_dir}"
-                        )
+                    raise RuntimeError(
+                        f"xclbin not generated at {xclbin_path}. "
+                        f"Ensure xclbinutil is on PATH. On Windows, download "
+                        f"xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases"
+                    )
 
                 # Cache format-specific artifacts first, then the .so last.
                 # This avoids partial cache entries if aircc or kernel name
@@ -1636,12 +1700,6 @@ def compile_module(
                         print(f"  insts: {cache_insts_path}")
                     return None
         else:
-            print(
-                "got cache path: "
-                + cache_path
-                + " compilation is therefore skipped (delete cache path to force recompile)."
-            )
-
             # Check for compile-only mode (cache hit)
             if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
                 print(f"Compile-only mode (cache hit): binaries at {cache_path}")
@@ -1662,9 +1720,21 @@ def compile_module(
             # Read the cached kernel name
             with open(cache_elf_kernel_path) as f:
                 elf_kernel_name = f.read().strip()
-            mod.set_paths(cache_elf_path, elf_kernel_name)
+            # Strip Windows extended-length path prefix (\\?\) which
+            # confuses XRT's internal path parsing (stoul error).
+            elf_path_str = cache_elf_path
+            if IS_WINDOWS and elf_path_str.startswith("\\\\?\\"):
+                elf_path_str = elf_path_str[4:]
+            mod.set_paths(elf_path_str, elf_kernel_name)
         else:
-            mod.set_paths(cache_xclbin_path, cache_insts_path)
+            xclbin_path_str = cache_xclbin_path
+            insts_path_str = cache_insts_path
+            if IS_WINDOWS:
+                if xclbin_path_str.startswith("\\\\?\\"):
+                    xclbin_path_str = xclbin_path_str[4:]
+                if insts_path_str.startswith("\\\\?\\"):
+                    insts_path_str = insts_path_str[4:]
+            mod.set_paths(xclbin_path_str, insts_path_str)
 
         # Cache the loaded module for fast subsequent dispatches
         _global_module_cache[input_key] = mod

@@ -13,7 +13,7 @@
 #   - Visual Studio 2022 (or Build Tools) with C++ workload
 #   - CMake (3.20+), Ninja, Git
 #   - Python 3.13 venv activated
-#   - XRT dev files prepared (run utils\setup_xrt_dev.ps1 first)
+#   - XRT Windows SDK (download xrt_windows_sdk.zip from Xilinx/XRT releases)
 #
 # Usage:
 #   cd C:\projects\Triton-XDNA
@@ -25,8 +25,8 @@ param(
     [switch]$SkipInstallWheels,
     [switch]$SkipBuildMlirAir,
     [int]$Jobs = 0,           # 0 = auto-detect
-    [string]$BuildDir = "C:\projects\mlir-air-build",
-    [string]$XrtDevDir = "C:\projects\xrt-dev"
+    [string]$BuildDir = "$PSScriptRoot\..\mlir-air-build",
+    [string]$XrtDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -230,13 +230,41 @@ if (-not $SkipBuildMlirAir) {
 
         # Extract the wheel (it's a zip)
         $mlirWhl = Get-ChildItem "$mlirWheelDir\mlir-*.whl" | Select-Object -First 1
-        Write-Host "  Extracting $($mlirWhl.Name)..."
-        Expand-Archive $mlirWhl.FullName -DestinationPath $BuildDir -Force
+        if (-not $mlirWhl) {
+            Write-Error "No MLIR wheel matching 'mlir-*.whl' was found in $mlirWheelDir."
+            Write-Host "Contents of ${mlirWheelDir}:" -ForegroundColor Yellow
+            $dirContents = Get-ChildItem $mlirWheelDir -ErrorAction SilentlyContinue
+            if ($dirContents) {
+                $dirContents | ForEach-Object { Write-Host "  $($_.Name)" }
+            } else {
+                Write-Host "  (directory is empty)"
+            }
+            Write-Error "Please verify that 'pip download' produced an MLIR wheel and that its name matches the expected pattern."
+            exit 1
+        } else {
+            Write-Host "  Extracting $($mlirWhl.Name)..."
+            Expand-Archive $mlirWhl.FullName -DestinationPath $BuildDir -Force
+        }
 
         if (-not (Test-Path "$mlirDir\lib\cmake\mlir")) {
             Write-Error "MLIR extraction failed — lib\cmake\mlir not found in $mlirDir"
             exit 1
         }
+
+        # The MLIR distro wheel was built with a specific VS edition (e.g. Enterprise).
+        # Patch hardcoded DIA SDK paths to match the local VS installation.
+        $llvmExports = "$mlirDir\lib\cmake\llvm\LLVMExports.cmake"
+        if (Test-Path $llvmExports) {
+            $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+            $localDiaLib = "$vsPath/DIA SDK/lib/amd64/diaguids.lib" -replace '\\','/'
+            $exportContent = Get-Content $llvmExports -Raw
+            if ($exportContent -match 'C:/Program Files/Microsoft Visual Studio/2022/[^/]+/DIA SDK/lib/amd64/diaguids\.lib') {
+                $exportContent = $exportContent -replace 'C:/Program Files/Microsoft Visual Studio/2022/[^/]+/DIA SDK/lib/amd64/diaguids\.lib', $localDiaLib
+                $exportContent | Set-Content $llvmExports -NoNewline
+                Write-Host "  Patched DIA SDK path in LLVMExports.cmake to match local VS"
+            }
+        }
+
         Write-Host "  MLIR distro extracted to $mlirDir" -ForegroundColor Green
     } else {
         Write-Host "MLIR distro already present at $mlirDir"
@@ -271,13 +299,73 @@ if (-not $SkipBuildMlirAir) {
 
     # Run CMake configure + build inside a MSVC Developer environment
     # We create a batch script that sets up vcvars64 and runs cmake+ninja
+
+    # CMake requires forward slashes in paths to avoid escape-character issues
+    $cmakeAirSrcDir    = $airSrcDir    -replace '\\','/'
+    $cmakeAirBuildDir  = $airBuildDir  -replace '\\','/'
+    $cmakeModulesDirFw = $cmakeModulesDir -replace '\\','/'
+    $cmakeMlirDir      = $mlirDir      -replace '\\','/'
+    $cmakeAieDir       = $mlirAieDir   -replace '\\','/'
+    $cmakeLitPath      = $litPath      -replace '\\','/'
+    $cmakeAirInstDir   = $airInstallDir -replace '\\','/'
+    $cmakePythonExe    = (python -c "import sys; print(sys.executable)").Trim() -replace '\\','/'
+
+    # ── MSVC linker RSP fix ─────────────────────────────────────────────
+    # CMake+Ninja generates response files (.rsp) where LINK_LIBRARIES is
+    # space-separated on a SINGLE 100K+ char line.  MSVC link.exe silently
+    # truncates / corrupts paths on such extreme lines, resulting in
+    # LNK1181 errors with mangled filenames.
+    #
+    # fix_rsp.ps1  – converts spaces to newlines (quote-aware) in an RSP.
+    # patch_rules.ps1 – injects a call to fix_rsp.ps1 into every Ninja
+    #                   linker rule *command* so the fix runs automatically
+    #                   each time Ninja regenerates the RSP.
+    # ────────────────────────────────────────────────────────────────────
+
+    $fixRspContent = @'
+param([string]$RspFile)
+if (-not $RspFile -or -not (Test-Path $RspFile)) { exit 0 }
+$c = [IO.File]::ReadAllText($RspFile)
+$sb = [System.Text.StringBuilder]::new($c.Length)
+$inQuote = $false
+for ($i = 0; $i -lt $c.Length; $i++) {
+    $ch = $c[$i]
+    if ($ch -eq '"') {
+        $inQuote = -not $inQuote; [void]$sb.Append($ch)
+    } elseif ($ch -eq ' ' -and -not $inQuote) {
+        [void]$sb.Append([char]10)
+    } else {
+        [void]$sb.Append($ch)
+    }
+}
+[IO.File]::WriteAllText($RspFile, $sb.ToString())
+'@
+    Set-Content "$airBuildDir\fix_rsp.ps1" -Value $fixRspContent -Force
+
+    $fixRspAbsolute = "$airBuildDir\fix_rsp.ps1" -replace '\\','/'
+    $patchRulesContent = @"
+`$rulesFile = "CMakeFiles\rules.ninja"
+if (-not (Test-Path `$rulesFile)) { Write-Host "  rules.ninja not found, skipping patch"; exit 0 }
+`$content = [IO.File]::ReadAllText(`$rulesFile)
+`$old = 'cmd.exe /C "`$PRE_LINK'
+`$new = 'cmd.exe /C "powershell -NoProfile -File $fixRspAbsolute `$RSP_FILE && `$PRE_LINK'
+if (`$content.Contains(`$old)) {
+    `$content = `$content.Replace(`$old, `$new)
+    [IO.File]::WriteAllText(`$rulesFile, `$content)
+    Write-Host "  Patched rules.ninja for MSVC RSP file compatibility"
+} else {
+    Write-Host "  rules.ninja already patched or pattern not found"
+}
+"@
+    Set-Content "$airBuildDir\patch_rules.ps1" -Value $patchRulesContent -Force
+
     $cmakeConfig = @"
 @echo off
 call "$vcvars" >nul 2>&1
 
 cd /d "$airBuildDir"
 
-cmake "$airSrcDir" ^
+cmake "$cmakeAirSrcDir" ^
     -G Ninja ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_C_COMPILER=cl ^
@@ -286,13 +374,13 @@ cmake "$airSrcDir" ^
     -DCMAKE_VISIBILITY_INLINES_HIDDEN=ON ^
     -DCMAKE_C_VISIBILITY_PRESET=hidden ^
     -DCMAKE_CXX_VISIBILITY_PRESET=hidden ^
-    -DCMAKE_MODULE_PATH="$cmakeModulesDir" ^
-    -DMLIR_DIR="$mlirDir\lib\cmake\mlir" ^
-    -DLLVM_DIR="$mlirDir\lib\cmake\llvm" ^
-    -DAIE_DIR="$mlirAieDir\lib\cmake\aie" ^
-    -DLLVM_EXTERNAL_LIT="$litPath" ^
-    -DPython3_EXECUTABLE="$(python -c "import sys; print(sys.executable)")" ^
-    -DCMAKE_INSTALL_PREFIX="$airInstallDir" ^
+    -DCMAKE_MODULE_PATH="$cmakeModulesDirFw" ^
+    -DMLIR_DIR="$cmakeMlirDir/lib/cmake/mlir" ^
+    -DLLVM_DIR="$cmakeMlirDir/lib/cmake/llvm" ^
+    -DAIE_DIR="$cmakeAieDir/lib/cmake/aie" ^
+    -DLLVM_EXTERNAL_LIT="$cmakeLitPath" ^
+    -DPython3_EXECUTABLE="$cmakePythonExe" ^
+    -DCMAKE_INSTALL_PREFIX="$cmakeAirInstDir" ^
     -DLLVM_ENABLE_RTTI=OFF ^
     -DBUILD_SHARED_LIBS=OFF ^
     -DAIR_RUNTIME_TARGETS="" ^
@@ -302,6 +390,10 @@ if %ERRORLEVEL% neq 0 (
     echo CMake configure failed!
     exit /b 1
 )
+
+echo.
+echo Patching build rules for MSVC linker RSP compatibility...
+powershell -NoProfile -File patch_rules.ps1
 
 echo.
 echo Building with $Jobs parallel jobs...
@@ -332,7 +424,7 @@ echo Build complete!
     Write-Host "  (This may take 15-30 minutes)"
     Write-Host ""
 
-    cmd /c $batPath
+    & $batPath
     if ($LASTEXITCODE -ne 0) {
         Write-Error "mlir-air build failed. Check output above."
         exit 1
@@ -361,14 +453,15 @@ echo Build complete!
 # ══════════════════════════════════════════════════════════════════════════
 Write-Step 4 "Setting environment variables"
 
-# XRT development files
-if (-not $env:XILINX_XRT) {
-    if (Test-Path "$XrtDevDir\include\xrt\xrt_bo.h") {
-        $env:XILINX_XRT = $XrtDevDir
-        Write-Host "  XILINX_XRT = $env:XILINX_XRT"
-    } else {
-        Write-Warning "XRT dev dir not found at $XrtDevDir. Run utils\setup_xrt_dev.ps1 first."
-    }
+# XRT development files — auto-detected from C:\Program Files\AMD\xrt
+$xrtDefault = Join-Path $env:PROGRAMFILES "AMD\xrt"
+if ($XrtDir -and (Test-Path "$XrtDir\include\xrt\xrt_bo.h")) {
+    Write-Host "  XRT SDK (override): $XrtDir"
+} elseif (Test-Path (Join-Path $xrtDefault "include\xrt\xrt_bo.h")) {
+    Write-Host "  XRT SDK: $xrtDefault"
+} else {
+    Write-Warning "XRT SDK not found. Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases"
+    Write-Warning "and extract the xrt/ directory to $xrtDefault"
 }
 
 # LLVM binary dir (for llc, etc.)
@@ -407,12 +500,12 @@ Write-Host ("=" * 60) -ForegroundColor Green
 Write-Host " Build complete!" -ForegroundColor Green
 Write-Host ("=" * 60) -ForegroundColor Green
 Write-Host ""
-Write-Host "Environment variables to set in your shell:"
-Write-Host "  `$env:XILINX_XRT = `"$XrtDevDir`""
+
 if ($llvmAieDir) {
+    Write-Host "Environment variables to set in your shell:"
     Write-Host "  `$env:LLVM_BINARY_DIR = `"$llvmAieDir\bin`""
+    Write-Host ""
 }
-Write-Host ""
 Write-Host "To test:"
 Write-Host "  cd $PROJECT_ROOT\examples\vec-add"
 Write-Host "  `$env:AIR_TRANSFORM_TILING_SCRIPT = `"transform_aie2p.mlir`""

@@ -87,7 +87,9 @@ def bench_matmul(M, N, K, provider):
 
 if __name__ == "__main__":
     benchmark.select_npu_backend()
-    for M in [2**i for i in range(8, 14, 2)]:  # change to "in range(9, 14, 2)" if BLOCK_SIZE_M=512
+    for M in [
+        2**i for i in range(8, 14, 2)
+    ]:  # change to "in range(9, 14, 2)" if BLOCK_SIZE_M=512
         for N in [2**i for i in range(8, 14, 2)]:
             for K in [2**i for i in range(8, 14, 2)]:
                 bench_matmul(M, N, K, "test")

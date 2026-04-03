@@ -28,15 +28,27 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 EXAMPLES = [
     {
         "category": "Matrix",
-        "name": "Matrix Multiplication",
-        "path": "matmul",
+        "name": "Matrix Multiplication (BF16)",
+        "path": "matmul_bf16_m64_n64_k64",
         "datatypes": "bf16",
     },
     {
         "category": "Matrix",
-        "name": "Padded Matrix Multiplication",
-        "path": "padded_matmul",
+        "name": "Padded Matrix Multiplication (F32, A Transposed)",
+        "path": "matmul_f32_m64_n32_k16_padded_atransposed",
         "datatypes": "f32 (bf16 emulation)",
+    },
+    {
+        "category": "Matrix",
+        "name": "Matrix Multiplication (INT8)",
+        "path": "matmul_i8_m64_n64_k64",
+        "datatypes": "i8",
+    },
+    {
+        "category": "Matrix",
+        "name": "Matrix Multiplication (INT8, Large Tile)",
+        "path": "matmul_i8_m128_n64_k64",
+        "datatypes": "i8",
     },
     {
         "category": "Matrix",
@@ -214,11 +226,11 @@ is active (see top-level [README](../README.md)):
 source /opt/xilinx/xrt/setup.sh
 
 # Run an example on AIE2 (NPU1):
-cd matmul
-AIR_TRANSFORM_TILING_SCRIPT=transform_aie2.mlir python matmul.py
+cd matmul_bf16_m64_n64_k64
+AIR_TRANSFORM_TILING_SCRIPT=transform_aie2.mlir python matmul_bf16_m64_n64_k64.py
 
 # Run on AIE2P (NPU2):
-AIR_TRANSFORM_TILING_SCRIPT=transform_aie2p.mlir python matmul.py
+AIR_TRANSFORM_TILING_SCRIPT=transform_aie2p.mlir python matmul_bf16_m64_n64_k64.py
 ```
 
 ## Running All Tests

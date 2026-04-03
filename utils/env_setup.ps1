@@ -68,19 +68,12 @@ Write-Host "Environment setup complete."
 # =============================================================================
 # XRT Development Files
 # =============================================================================
-# The Ryzen AI SDK ships only the runtime DLL. Triton-XDNA needs headers and
-# an import library for JIT compilation. Run setup_xrt_dev.ps1 to prepare them:
-#
-#   .\utils\setup_xrt_dev.ps1
-#
-# Then set the environment variable (the script prints the path):
-#   $env:XILINX_XRT = "<path_to_xrt_dev>"
-if (-not $env:XILINX_XRT -and -not $env:XRT_DEV_DIR) {
-    $xrtDevDefault = Join-Path $ScriptDir "..\xrt-dev"
-    if (Test-Path (Join-Path $xrtDevDefault "include\xrt\xrt_bo.h")) {
-        $env:XILINX_XRT = (Resolve-Path $xrtDevDefault).Path
-        Write-Host "Auto-detected XRT dev dir: $env:XILINX_XRT"
-    } else {
-        Write-Warning "XILINX_XRT / XRT_DEV_DIR not set. Run .\utils\setup_xrt_dev.ps1 first."
-    }
+# Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases
+# and extract the xrt/ directory to C:\Program Files\AMD\xrt.
+# The driver.py auto-detect will find it there without any env var.
+$xrtDefault = Join-Path $env:PROGRAMFILES "AMD\xrt"
+if (Test-Path (Join-Path $xrtDefault "include\xrt\xrt_bo.h")) {
+    Write-Host "XRT SDK found at: $xrtDefault"
+} else {
+    Write-Warning "XRT SDK not found at $xrtDefault. Download xrt_windows_sdk.zip from XRT releases and extract xrt/ there."
 }
