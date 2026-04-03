@@ -7,6 +7,11 @@ __pycache__/
 *.pyo
 *.so
 *.a
+*.obj
+*.lib
+*.exp
+*.dll
+*.pyd
 
 # Wheel files
 *.whl
