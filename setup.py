@@ -45,8 +45,11 @@ except ImportError:
 # Platform Check
 # =============================================================================
 
-if sys.platform != "linux":
-    sys.exit("ERROR: triton-xdna currently only supports Linux.")
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform == "linux"
+
+if not (IS_LINUX or IS_WINDOWS):
+    sys.exit("ERROR: triton-xdna currently only supports Linux and Windows.")
 
 
 # =============================================================================
@@ -87,6 +90,7 @@ def find_triton_shared_opt_binary(triton_source_dir: Path = None) -> Path:
     if not build_dir.exists():
         return None
 
+    binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
     for cmake_dir in build_dir.glob("cmake.*"):
         binary_path = (
             cmake_dir
@@ -94,7 +98,7 @@ def find_triton_shared_opt_binary(triton_source_dir: Path = None) -> Path:
             / "triton_shared"
             / "tools"
             / "triton-shared-opt"
-            / "triton-shared-opt"
+            / binary_name
         )
         if binary_path.exists() and binary_path.is_file():
             return binary_path
@@ -243,41 +247,99 @@ def get_version():
     return f"{release_version}.{timestamp}+{commit_hash}"
 
 
+def _get_installed_version(pkg_name):
+    """Return the installed version of a package, or None if not installed."""
+    try:
+        from importlib.metadata import version as _ver
+        return _ver(pkg_name)
+    except Exception:
+        return None
+
+
+def _is_locally_available(pkg_name):
+    """Check if a package is locally available via .pth file (built from source)."""
+    import site
+    pth_name = f"{pkg_name}.pth"
+    for sp in site.getsitepackages():
+        if os.path.exists(os.path.join(sp, pth_name)):
+            return True
+    return False
+
+
+def _make_version_spec(pkg_name, version, timestamp, short_commit, suffix=""):
+    """Build a pip version specifier for a package.
+
+    On Windows the CI publishes wheels with timestamps that may differ by ±1
+    from the value recorded in the hash file.  If the package is already
+    installed (via pip) we pin to its exact version.  If it is locally
+    available via a .pth file (built from source) we skip it entirely.
+    Otherwise we list the hash-file version so Linux CI keeps working.
+
+    Returns the version spec string, or None if the package should be
+    omitted from install_requires.
+    """
+    installed = _get_installed_version(pkg_name)
+    if installed is not None:
+        return f"{pkg_name}=={installed}"
+    if _is_locally_available(pkg_name):
+        return None  # available via .pth, no pip requirement needed
+    full = f"{version}.{timestamp}+{short_commit}{suffix}"
+    return f"{pkg_name}=={full}"
+
+
 def get_install_requires():
     """Build install_requires list from hash files."""
-    mlir_aie_hash_file = BASE_DIR / "utils" / "mlir-aie-hash.txt"
-    mlir_air_hash_file = BASE_DIR / "utils" / "mlir-air-hash.txt"
-    llvm_aie_hash_file = BASE_DIR / "utils" / "llvm-aie-hash.txt"
+    # Use platform-specific hash files on Windows
+    if IS_WINDOWS:
+        mlir_aie_hash_file = BASE_DIR / "utils" / "mlir-aie-hash-windows.txt"
+        mlir_air_hash_file = BASE_DIR / "utils" / "mlir-air-hash-windows.txt"
+        llvm_aie_hash_file = BASE_DIR / "utils" / "llvm-aie-hash-windows.txt"
+    else:
+        mlir_aie_hash_file = BASE_DIR / "utils" / "mlir-aie-hash.txt"
+        mlir_air_hash_file = BASE_DIR / "utils" / "mlir-air-hash.txt"
+        llvm_aie_hash_file = BASE_DIR / "utils" / "llvm-aie-hash.txt"
 
     # Parse mlir-aie version
     mlir_aie_version = parse_hash_file(mlir_aie_hash_file, "Version")
     mlir_aie_timestamp = parse_hash_file(mlir_aie_hash_file, "Timestamp")
     mlir_aie_commit = parse_hash_file(mlir_aie_hash_file, "Commit")
     mlir_aie_short_commit = mlir_aie_commit[:7]
-    mlir_aie_full_version = (
-        f"{mlir_aie_version}.{mlir_aie_timestamp}+{mlir_aie_short_commit}.no.rtti"
-    )
 
     # Parse llvm-aie version
     llvm_aie_version = parse_hash_file(llvm_aie_hash_file, "Version")
     llvm_aie_timestamp = parse_hash_file(llvm_aie_hash_file, "Timestamp")
     llvm_aie_commit = parse_hash_file(llvm_aie_hash_file, "Commit")
-    llvm_aie_full_version = f"{llvm_aie_version}.{llvm_aie_timestamp}+{llvm_aie_commit}"
 
     # Parse mlir-air version
     mlir_air_version = parse_hash_file(mlir_air_hash_file, "Version")
     mlir_air_timestamp = parse_hash_file(mlir_air_hash_file, "Timestamp")
     mlir_air_commit = parse_hash_file(mlir_air_hash_file, "Commit")
     mlir_air_short_commit = mlir_air_commit[:7]
-    mlir_air_full_version = (
-        f"{mlir_air_version}.{mlir_air_timestamp}+{mlir_air_short_commit}.no.rtti"
-    )
 
-    return [
-        f"mlir-aie=={mlir_aie_full_version}",
-        f"llvm-aie=={llvm_aie_full_version}",
-        f"mlir-air=={mlir_air_full_version}",
+    specs = [
+        _make_version_spec(
+            "mlir-aie",
+            mlir_aie_version, mlir_aie_timestamp,
+            mlir_aie_short_commit, ".no.rtti",
+        ),
+        _make_version_spec(
+            "llvm-aie",
+            llvm_aie_version, llvm_aie_timestamp,
+            llvm_aie_commit,
+        ),
+        _make_version_spec(
+            "mlir-air",
+            mlir_air_version, mlir_air_timestamp,
+            mlir_air_short_commit, ".no.rtti",
+        ),
     ]
+    deps = [s for s in specs if s is not None]
+
+    # On Windows, use triton-windows wheel; on Linux, triton is built from source
+    if IS_WINDOWS:
+        deps.append("triton-windows")
+
+    return deps
 
 
 # =============================================================================
@@ -360,22 +422,28 @@ class TritonXdnaBdistWheel(bdist_wheel):
         print(f"  TRITON_PLUGIN_DIRS={plugin_dirs}", file=sys.stderr)
         print(f"  Project root: {project_root}", file=sys.stderr)
 
-        # Set build flags
-        if check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
+        # Set build flags (clang+lld not used on Windows; MSVC is used instead)
+        if not IS_WINDOWS and check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
             env["TRITON_BUILD_WITH_CLANG_LLD"] = "true"
 
         triton_source = project_root / "third_party" / "triton"
 
         # Use subprocess with pip wheel - this properly inherits environment
         # Find a working Python with pip
-        python_candidates = [
-            sys.executable,
-            "/opt/python/cp313-cp313/bin/python",
-            "/opt/python/cp312-cp312/bin/python",
-            "/opt/python/cp311-cp311/bin/python",
-            "python3",
-            "python",
-        ]
+        if IS_WINDOWS:
+            python_candidates = [
+                sys.executable,
+                "python",
+            ]
+        else:
+            python_candidates = [
+                sys.executable,
+                "/opt/python/cp313-cp313/bin/python",
+                "/opt/python/cp312-cp312/bin/python",
+                "/opt/python/cp311-cp311/bin/python",
+                "python3",
+                "python",
+            ]
 
         python_exe = None
         for candidate in python_candidates:
@@ -459,11 +527,14 @@ class TritonXdnaBdistWheel(bdist_wheel):
         triton_shared_dst = unpack_dir / "triton" / "triton_shared"
         triton_shared_dst.mkdir(parents=True, exist_ok=True)
 
-        dst_binary = triton_shared_dst / "triton-shared-opt"
+        # Use a platform-appropriate binary name (Windows requires .exe)
+        binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+        dst_binary = triton_shared_dst / binary_name
         shutil.copy2(triton_shared_opt_binary, dst_binary)
 
-        # Ensure the binary has execute permissions
-        os.chmod(dst_binary, 0o755)
+        # Ensure the binary has execute permissions (not needed on Windows)
+        if not IS_WINDOWS:
+            os.chmod(dst_binary, 0o755)
 
         print(f"  Copied triton-shared-opt to {dst_binary}", file=sys.stderr)
 
@@ -680,34 +751,89 @@ class TritonXdnaBdistWheel(bdist_wheel):
         print(f"  Final wheel: {final_path}", file=sys.stderr)
 
 
+def _is_triton_installed():
+    """Check if triton (or triton-windows) is already installed."""
+    try:
+        import triton
+        return True
+    except Exception:
+        return False
+
+
+def _copy_backend_to_triton(backend_src, backend_name):
+    """Copy a backend directory into the installed triton's backends dir."""
+    import triton
+    triton_dir = Path(triton.__file__).parent
+    dst = triton_dir / "backends" / backend_name
+    dst.mkdir(parents=True, exist_ok=True)
+
+    # Copy Python files
+    for py_file in ["compiler.py", "driver.py"]:
+        src_file = backend_src / py_file
+        if src_file.exists():
+            shutil.copy2(src_file, dst / py_file)
+
+    # Ensure __init__.py exists (may not be in source tree)
+    init_file = backend_src / "__init__.py"
+    if init_file.exists():
+        shutil.copy2(init_file, dst / "__init__.py")
+    else:
+        (dst / "__init__.py").touch()
+
+    # Copy name.conf
+    name_conf = backend_src / "name.conf"
+    if name_conf.exists():
+        shutil.copy2(name_conf, dst / "name.conf")
+
+    # Copy include/ and transform_library/ directories
+    for subdir in ["include", "transform_library"]:
+        src_subdir = backend_src / subdir
+        if src_subdir.exists():
+            dst_subdir = dst / subdir
+            if dst_subdir.exists():
+                shutil.rmtree(dst_subdir)
+            shutil.copytree(src_subdir, dst_subdir)
+
+    # Copy xclbin_assemble.py if it exists
+    xclbin_file = backend_src / "xclbin_assemble.py"
+    if xclbin_file.exists():
+        shutil.copy2(xclbin_file, dst / "xclbin_assemble.py")
+
+    print(f"Copied {backend_name} backend to {dst}")
+
+
 class TritonXdnaDevelop(develop):
     """Development install - uses pip install on triton like before."""
 
     def run(self):
-        # Apply patches before building
-        apply_submodule_patches()
+        if _is_triton_installed():
+            # Triton (or triton-windows) is already installed as a wheel.
+            # Just copy the backend files into triton's backends directory.
+            print("Found pre-installed triton, copying backend files...")
+            backend_src = AMD_TRITON_NPU_DIR / "backend"
+            _copy_backend_to_triton(backend_src, "amd_triton_npu")
+            self._copy_triton_shared_opt()
+        else:
+            # Build triton from source with plugins
+            apply_submodule_patches()
+            env = os.environ.copy()
+            plugin_dirs = f"{TRITON_SHARED_DIR};{AMD_TRITON_NPU_DIR}"
+            env["TRITON_PLUGIN_DIRS"] = plugin_dirs
 
-        env = os.environ.copy()
-        plugin_dirs = f"{TRITON_SHARED_DIR};{AMD_TRITON_NPU_DIR}"
-        env["TRITON_PLUGIN_DIRS"] = plugin_dirs
+            if not IS_WINDOWS and check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
+                env["TRITON_BUILD_WITH_CLANG_LLD"] = "true"
 
-        if check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
-            env["TRITON_BUILD_WITH_CLANG_LLD"] = "true"
-
-        # Install triton with plugins
-        cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            str(TRITON_SOURCE_DIR),
-            "--no-build-isolation",
-            "-v",
-        ]
-        subprocess.check_call(cmd, env=env)
-
-        # Copy triton-shared-opt
-        self._copy_triton_shared_opt()
+            cmd = [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                str(TRITON_SOURCE_DIR),
+                "--no-build-isolation",
+                "-v",
+            ]
+            subprocess.check_call(cmd, env=env)
+            self._copy_triton_shared_opt()
 
         super().run()
 
@@ -736,59 +862,80 @@ class TritonXdnaDevelop(develop):
         triton_shared_dst = triton_dir / "triton_shared"
         triton_shared_dst.mkdir(parents=True, exist_ok=True)
 
-        dst_binary = triton_shared_dst / "triton-shared-opt"
+        binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+        dst_binary = triton_shared_dst / binary_name
         shutil.copy2(triton_shared_opt_binary, dst_binary)
-        os.chmod(dst_binary, 0o755)
+        if not IS_WINDOWS:
+            os.chmod(dst_binary, 0o755)
 
 
 class TritonXdnaInstall(install):
     """Custom install that builds triton with plugins."""
 
     def run(self):
-        # Apply patches before building
-        apply_submodule_patches()
+        if _is_triton_installed():
+            # Triton (or triton-windows) is already installed as a wheel.
+            # Just copy the backend files into triton's backends directory.
+            print("Found pre-installed triton, copying backend files...")
+            backend_src = AMD_TRITON_NPU_DIR / "backend"
+            _copy_backend_to_triton(backend_src, "amd_triton_npu")
 
-        env = os.environ.copy()
-        plugin_dirs = f"{TRITON_SHARED_DIR};{AMD_TRITON_NPU_DIR}"
-        env["TRITON_PLUGIN_DIRS"] = plugin_dirs
-
-        pip_install_target = env.get("PIP_INSTALL_TARGET")
-
-        if check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
-            env["TRITON_BUILD_WITH_CLANG_LLD"] = "true"
-
-        # Install triton with plugins
-        cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            str(TRITON_SOURCE_DIR),
-            "--no-build-isolation",
-            "-v",
-        ]
-
-        if pip_install_target:
-            cmd += ["--target", pip_install_target]
-
-        subprocess.check_call(cmd, env=env)
-
-        # Copy triton-shared-opt
-        if pip_install_target:
-            triton_dir = Path(pip_install_target) / "triton"
-        else:
+            # Copy triton-shared-opt
             import triton
-
             triton_dir = Path(triton.__file__).parent
+            triton_shared_opt_binary = find_triton_shared_opt_binary()
+            if triton_shared_opt_binary is not None:
+                triton_shared_dst = triton_dir / "triton_shared"
+                triton_shared_dst.mkdir(parents=True, exist_ok=True)
+                binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+                dst_binary = triton_shared_dst / binary_name
+                shutil.copy2(triton_shared_opt_binary, dst_binary)
+                if not IS_WINDOWS:
+                    os.chmod(dst_binary, 0o755)
+        else:
+            # Build triton from source with plugins
+            apply_submodule_patches()
 
-        triton_shared_opt_binary = find_triton_shared_opt_binary()
+            env = os.environ.copy()
+            plugin_dirs = f"{TRITON_SHARED_DIR};{AMD_TRITON_NPU_DIR}"
+            env["TRITON_PLUGIN_DIRS"] = plugin_dirs
 
-        if triton_shared_opt_binary is not None:
-            triton_shared_dst = triton_dir / "triton_shared"
-            triton_shared_dst.mkdir(parents=True, exist_ok=True)
-            dst_binary = triton_shared_dst / "triton-shared-opt"
-            shutil.copy2(triton_shared_opt_binary, dst_binary)
-            os.chmod(dst_binary, 0o755)
+            pip_install_target = env.get("PIP_INSTALL_TARGET")
+
+            if not IS_WINDOWS and check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
+                env["TRITON_BUILD_WITH_CLANG_LLD"] = "true"
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                str(TRITON_SOURCE_DIR),
+                "--no-build-isolation",
+                "-v",
+            ]
+
+            if pip_install_target:
+                cmd += ["--target", pip_install_target]
+
+            subprocess.check_call(cmd, env=env)
+
+            # Copy triton-shared-opt
+            if pip_install_target:
+                triton_dir = Path(pip_install_target) / "triton"
+            else:
+                import triton
+                triton_dir = Path(triton.__file__).parent
+
+            triton_shared_opt_binary = find_triton_shared_opt_binary()
+            if triton_shared_opt_binary is not None:
+                triton_shared_dst = triton_dir / "triton_shared"
+                triton_shared_dst.mkdir(parents=True, exist_ok=True)
+                binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+                dst_binary = triton_shared_dst / binary_name
+                shutil.copy2(triton_shared_opt_binary, dst_binary)
+                if not IS_WINDOWS:
+                    os.chmod(dst_binary, 0o755)
 
         super().run()
 

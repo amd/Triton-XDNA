@@ -13,14 +13,18 @@ import re
 import shutil
 import subprocess
 import functools
+import sys
 from pathlib import Path
+
+IS_WINDOWS = sys.platform == "win32"
 
 
 def _get_amd_triton_npu_opt_path() -> str:
+    binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
     path = (
         Path(__file__).resolve().parent.parent.parent
         / "triton_shared"
-        / "triton-shared-opt"
+        / binary_name
     )
     if not os.path.isdir(path.parent):
         raise RuntimeError(f"Could not find triton-shared binaries at {path}")
@@ -31,6 +35,8 @@ def _get_llvm_bin_path(bin_name: str) -> str:
     path = os.getenv("LLVM_BINARY_DIR", "")
     if path == "":
         raise Exception("LLVM_BINARY_DIR is not set.")
+    if IS_WINDOWS and not bin_name.endswith(".exe"):
+        bin_name += ".exe"
     return os.path.join(path, bin_name)
 
 
