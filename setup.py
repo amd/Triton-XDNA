@@ -28,6 +28,9 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from email.parser import Parser
+import tarfile
+import urllib.request
+import shlex
 
 from setuptools import setup
 from setuptools.command.build_py import build_py
@@ -79,6 +82,8 @@ def find_triton_shared_opt_binary(triton_source_dir: Path = None) -> Path:
     The binary is located at:
     triton/build/cmake.*/third_party/triton_shared/tools/triton-shared-opt/triton-shared-opt
 
+    triton\\build\\lib.win-amd64-cpython-312\\triton\\_C\\triton-shared-opt.exe
+
     Returns:
         Path to the binary if found, None otherwise.
     """
@@ -89,19 +94,29 @@ def find_triton_shared_opt_binary(triton_source_dir: Path = None) -> Path:
 
     if not build_dir.exists():
         return None
-
-    binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
-    for cmake_dir in build_dir.glob("cmake.*"):
-        binary_path = (
-            cmake_dir
-            / "third_party"
-            / "triton_shared"
-            / "tools"
-            / "triton-shared-opt"
-            / binary_name
-        )
+    
+    if IS_WINDOWS:
+        for lib_dir in build_dir.glob("lib.*"):
+            binary_path = (
+                lib_dir
+                / "triton"
+                / "_C"
+                / "triton-shared-opt.exe"
+            )
         if binary_path.exists() and binary_path.is_file():
             return binary_path
+    else:
+        for cmake_dir in build_dir.glob("cmake.*"):
+            binary_path = (
+                cmake_dir
+                / "third_party"
+                / "triton_shared"
+                / "tools"
+                / "triton-shared-opt"
+                / "triton-shared-opt"
+            )
+            if binary_path.exists() and binary_path.is_file():
+                return binary_path
 
     return None
 
@@ -342,6 +357,83 @@ def get_install_requires():
     return deps
 
 
+LLVM_BASE_URL = "https://oaitriton.blob.core.windows.net/public/llvm-builds"
+
+
+def get_triton_windows_llvm_hash(triton_dir: Path) -> str:
+    """Read the LLVM hash from triton-windows cmake/llvm-hash.txt."""
+    hash_file = triton_dir / "cmake" / "llvm-hash.txt"
+    if not hash_file.exists():
+        raise RuntimeError(f"LLVM hash file not found: {hash_file}")
+    return hash_file.read_text().strip()
+
+
+def download_llvm_for_triton_windows(triton_dir: Path) -> Path:
+    """Download and extract pre-built LLVM binaries for triton-windows.
+
+    triton-windows requires a specific LLVM version that matches the hash
+    in cmake/llvm-hash.txt. Pre-built binaries are hosted at oaitriton.blob.core.windows.net.
+    """
+    full_hash = get_triton_windows_llvm_hash(triton_dir)
+    short_hash = full_hash[:8]
+
+    llvm_dir = triton_dir.parent / f"llvm-{short_hash}-windows-x64"
+    llvm_hash_marker = llvm_dir / ".llvm-hash"
+
+    if llvm_hash_marker.exists():
+        installed_hash = llvm_hash_marker.read_text().strip()
+        if installed_hash == full_hash:
+            print(f"LLVM already downloaded: {llvm_dir}")
+            return llvm_dir
+
+    if llvm_dir.exists():
+        shutil.rmtree(llvm_dir)
+
+    filename = f"llvm-{short_hash}-windows-x64.tar.gz"
+    download_url = f"{LLVM_BASE_URL}/{filename}"
+
+    print(f"Downloading LLVM for triton-windows...")
+    print(f"  Hash: {short_hash}")
+    print(f"  URL: {download_url}")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        download_path = Path(temp_dir) / filename
+
+        print("  Downloading (this may take a few minutes, ~500MB)...")
+        try:
+            urllib.request.urlretrieve(download_url, download_path)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to download LLVM from {download_url}: {e}\n"
+                "You may need to download manually and extract to "
+                f"{llvm_dir}"
+            )
+
+        print("  Extracting...")
+        with tarfile.open(download_path, "r:gz") as tar:
+            tar.extractall(triton_dir.parent, filter="data")
+
+        if not llvm_dir.exists():
+            raise RuntimeError(f"Extracted LLVM directory not found: {llvm_dir}")
+
+        llvm_hash_marker.write_text(full_hash)
+
+    print(f"  LLVM downloaded to: {llvm_dir}")
+    return llvm_dir
+
+
+def run_command(args: list[str | Path], cwd: Path, env: dict[str, str] | None = None):
+    args = [str(arg) for arg in args]
+    full_env = dict(os.environ)
+    print(f"++ Exec [{cwd}]$ {shlex.join(args)}")
+    if env:
+        print(f":: Env:")
+        for k, v in env.items():
+            print(f"  {k}={v}")
+        full_env.update(env)
+    subprocess.check_call(args, cwd=str(cwd), env=full_env)
+
+
 # =============================================================================
 # Wheel Building
 # =============================================================================
@@ -370,7 +462,7 @@ class TritonXdnaBdistWheel(bdist_wheel):
             tmpdir = Path(tmpdir)
 
             # Step 1: Build triton wheel with plugins
-            triton_wheel = self._build_triton_wheel(tmpdir)
+            triton_wheel = self._build_triton_windows(tmpdir)
 
             # Step 2: Unpack the wheel
             unpack_dir = tmpdir / "unpacked"
@@ -394,6 +486,73 @@ class TritonXdnaBdistWheel(bdist_wheel):
         print("=" * 60, file=sys.stderr)
         print("Triton XDNA wheel build complete!", file=sys.stderr)
         print("=" * 60, file=sys.stderr)
+
+    def _build_triton_windows(self, tmpdir: Path) -> Path:
+        """Build triton wheel with external plugins."""
+        print("\n[1/5] Building triton wheel with plugins...", file=sys.stderr)
+
+        wheel_dir = tmpdir / "triton_wheel"
+        wheel_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get the project root (works both on host and in container)
+        # Use the current working directory if it looks like a container mount
+        cwd = Path.cwd()
+        if (cwd / "third_party" / "triton").exists():
+            project_root = cwd
+        else:
+            project_root = BASE_DIR
+
+                    # Set plugin directories relative to project root
+        triton_shared_dir = project_root / "third_party" / "triton_shared"
+        triton_dir = project_root / "third_party" / "triton"
+        amd_npu_dir = project_root / "amd_triton_npu"
+
+        plugin_dirs = f"{triton_shared_dir};{amd_npu_dir}"
+        print(f"  TRITON_PLUGIN_DIRS={plugin_dirs}", file=sys.stderr)
+        print(f"  Project root: {project_root}", file=sys.stderr)
+
+        llvm_build_dir = download_llvm_for_triton_windows(triton_dir)
+
+        # Prepare environment for triton-windows build.
+        # Note: MSVC environment (vcvars64.bat) must already be set up.
+        windows_env = dict(os.environ)
+        windows_env.update(
+            {
+                "PYTHONUTF8": "1",
+                "LLVM_BUILD_DIR": str(llvm_build_dir),
+                "LLVM_INCLUDE_DIRS": str(llvm_build_dir / "include"),
+                "LLVM_LIBRARY_DIR": str(llvm_build_dir / "lib"),
+                "LLVM_SYSPATH": str(llvm_build_dir),
+                "TRITON_BUILD_PROTON": "OFF",
+                "TRITON_APPEND_CMAKE_ARGS": "-DCMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH=FALSE",
+                "TRITON_PLUGIN_DIRS": plugin_dirs,
+                # Override package name to "triton" for consistency with Linux
+                "TRITON_WHEEL_NAME": "triton",
+            }
+        )
+
+        print("+++ Installing build dependencies:")
+        run_command(
+            [sys.executable, "-m", "pip", "install", "build", "wheel"],
+            cwd=triton_dir,
+        )
+
+        print("+++ Building triton:")
+        run_command(
+            [sys.executable, "-m", "build", "--wheel", "-v"],
+            cwd=triton_dir,
+            env=windows_env,
+        )
+
+        # Find the built wheel
+        wheel_dir = triton_dir / "dist"
+        wheels = list(wheel_dir.glob("triton-*.whl"))
+        if not wheels:
+            raise RuntimeError(f"No triton wheel found in {wheel_dir}")
+
+        triton_wheel = wheels[0]
+        print(f"  Built: {triton_wheel.name}", file=sys.stderr)
+        return triton_wheel
 
     def _build_triton_wheel(self, tmpdir: Path) -> Path:
         """Build triton wheel with external plugins."""
