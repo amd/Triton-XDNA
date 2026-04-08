@@ -1255,8 +1255,6 @@ def compile_module(
                     compile_flags += [
                         f"-I{os.path.join(aie_test_utils_dir, 'include')}",
                         f"-L{os.path.join(aie_test_utils_dir, 'lib')}",
-                        "-lboost_program_options",
-                        "-lboost_filesystem",
                         "-ltest_utils",
                     ]
                 compile_flags += ["-o", so_path]

@@ -15,7 +15,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # MLIR-AIE build requirements  
     build-essential ninja-build cmake python3 python3-dev python3.12-venv python3-pip unzip \
-    libssl-dev libboost-dev libboost-filesystem-dev libboost-program-options-dev uuid-dev \
+    libssl-dev uuid-dev \
     # Required by MHA kernel
     llvm-18 \
     # Clang toolchain for Triton build
