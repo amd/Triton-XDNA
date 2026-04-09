@@ -1351,7 +1351,8 @@ def compile_module(
         else:
             logger.info(
                 "got cache path: %s compilation is therefore skipped "
-                "(delete cache path to force recompile).", cache_path
+                "(delete cache path to force recompile).",
+                cache_path,
             )
 
             # Check for compile-only mode (cache hit)
