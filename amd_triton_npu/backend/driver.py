@@ -1469,10 +1469,16 @@ class NPULauncher(object):
 def get_npu_cache_dir(compiled_kernel):
     """Return the NPU binary cache directory for a compiled kernel.
 
-    The NPU backend stores hardware-specific artifacts (aie.xclbin or
-    aie.elf, insts.bin, __npu_dispatch.so) in a separate cache directory
-    from Triton's main compiler cache.  This function returns the path
-    to that directory.
+    The NPU backend stores hardware-specific artifacts in a separate cache
+    directory from Triton's main compiler cache. Depending on the selected
+    output format, the directory contains either:
+
+    * xclbin output: ``aie.xclbin``, ``insts.bin``, and
+      ``__npu_dispatch.so``
+    * elf output: ``aie.elf``, ``elf_kernel_name.txt``, and
+      ``__npu_dispatch.so``
+
+    This function returns the path to that directory.
 
     The directory is only populated after the first kernel invocation,
     since NPU binary compilation is deferred to launch time.
@@ -1483,10 +1489,12 @@ def get_npu_cache_dir(compiled_kernel):
 
     Returns:
         str | None: Absolute path to the NPU binary cache directory, or
-            None if the kernel has not been launched yet.
+            None if the kernel has not been launched yet or does not expose
+            an NPU launcher via ``_run``.
 
     Raises:
-        TypeError: If the compiled kernel was not compiled for the NPU backend.
+        TypeError: If ``compiled_kernel._run`` exists but is not an
+            ``NPULauncher`` instance.
 
     Example::
 
