@@ -191,7 +191,20 @@ NPU_MODELS = {
 
 
 def detect_npu_version():
-    """Map known device names to internal NPU version strings."""
+    """Map known device names to internal NPU version strings.
+
+    If AMD_TRITON_NPU_TARGET is set, use that value directly
+    (must be 'npu1' or 'npu2'). This enables cross-compilation
+    without local NPU hardware.
+    """
+    target = os.getenv("AMD_TRITON_NPU_TARGET", "").lower()
+    if target:
+        if target not in NPU_MODELS:
+            raise RuntimeError(
+                f"Invalid AMD_TRITON_NPU_TARGET='{target}'. "
+                f"Supported values: {list(NPU_MODELS.keys())}"
+            )
+        return target
     devices = get_npu_device_info()
     for device in devices:
         name = device["name"]
