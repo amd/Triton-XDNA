@@ -1362,7 +1362,9 @@ def compile_module(
 
             # Check for compile-only mode (cache hit)
             if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
-                logger.debug("Compile-only mode (cache hit): binaries at %s", cache_path)
+                logger.debug(
+                    "Compile-only mode (cache hit): binaries at %s", cache_path
+                )
                 if output_format == "elf":
                     logger.debug("  elf: %s", cache_elf_path)
                 else:
