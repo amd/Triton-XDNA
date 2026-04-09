@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import logging
 import tempfile
 import sys
 import sysconfig
@@ -22,6 +23,11 @@ import air.compiler.aircc.main as aircc
 from air.compiler.util import run_transform
 from air.ir import *
 import air.passmanager
+
+logger = logging.getLogger(__name__)
+if os.getenv("AMD_TRITON_NPU_DEBUG", "0") == "1":
+    logging.basicConfig()
+    logger.setLevel(logging.DEBUG)
 
 autotune_time = False
 
@@ -176,10 +182,10 @@ def get_npu_device_info():
         return devices
 
     except subprocess.CalledProcessError as e:
-        print("Failed to run xrt-smi:", e.stderr)
+        logger.warning("Failed to run xrt-smi: %s", e.stderr)
         return []
     except Exception as e:
-        print("Unexpected error:", str(e))
+        logger.warning("Unexpected error: %s", e)
         return []
 
 
@@ -434,7 +440,7 @@ def _get_transform_ir_string():
                 f"Use an absolute path or run from the directory containing the script."
             )
         with open(custom_script_path, "r") as f:
-            print(f"Using custom tiling script from: {custom_script_path}")
+            logger.info("Using custom tiling script from: %s", custom_script_path)
             user_script = f.read()
         return _inject_transform_library(user_script)
 
@@ -1335,28 +1341,27 @@ def compile_module(
 
                 # Check for compile-only mode
                 if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
-                    print(f"Compile-only mode: binaries cached at {cache_path}")
+                    logger.info("Compile-only mode: binaries cached at %s", cache_path)
                     if output_format == "elf":
-                        print(f"  elf: {cache_elf_path}")
+                        logger.info("  elf: %s", cache_elf_path)
                     else:
-                        print(f"  xclbin: {cache_xclbin_path}")
-                        print(f"  insts: {cache_insts_path}")
+                        logger.info("  xclbin: %s", cache_xclbin_path)
+                        logger.info("  insts: %s", cache_insts_path)
                     return None
         else:
-            print(
-                "got cache path: "
-                + cache_path
-                + " compilation is therefore skipped (delete cache path to force recompile)."
+            logger.info(
+                "got cache path: %s compilation is therefore skipped "
+                "(delete cache path to force recompile).", cache_path
             )
 
             # Check for compile-only mode (cache hit)
             if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
-                print(f"Compile-only mode (cache hit): binaries at {cache_path}")
+                logger.info("Compile-only mode (cache hit): binaries at %s", cache_path)
                 if output_format == "elf":
-                    print(f"  elf: {cache_elf_path}")
+                    logger.info("  elf: %s", cache_elf_path)
                 else:
-                    print(f"  xclbin: {cache_xclbin_path}")
-                    print(f"  insts: {cache_insts_path}")
+                    logger.info("  xclbin: %s", cache_xclbin_path)
+                    logger.info("  insts: %s", cache_insts_path)
                 return None
 
         # Load and launch the compiled kernel.
