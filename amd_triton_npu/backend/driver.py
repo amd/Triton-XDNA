@@ -1154,8 +1154,11 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 
 
 def compile_module(
-    launcher_src, kernel_placeholder_name, output_format="xclbin", actual_sizes=None,
-    on_cache_resolved=None
+    launcher_src,
+    kernel_placeholder_name,
+    output_format="xclbin",
+    actual_sizes=None,
+    on_cache_resolved=None,
 ):
     py_version = sys.version_info
     if platform.system() == "Windows":
