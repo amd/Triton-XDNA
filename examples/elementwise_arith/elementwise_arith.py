@@ -174,14 +174,18 @@ if __name__ == "__main__":
     if cfg["bf16_emulation"]:
         os.environ["AMD_TRITON_NPU_BF16_EMULATION"] = "1"
 
-    # Select the right transform script based on op arity.
+    # Select the right transform script based on op arity and NPU version.
     # If AIR_TRANSFORM_TILING_SCRIPT is already set, respect it.
     if not os.environ.get("AIR_TRANSFORM_TILING_SCRIPT"):
+        from triton.backends.amd_triton_npu.driver import detect_npu_version
+
         is_unary = args.op == "square"
         script_dir = os.path.dirname(os.path.abspath(__file__))
         arity = "unary" if is_unary else "binary"
+        npu = detect_npu_version()
+        suffix = "aie2" if npu == "npu1" else "aie2p"
         os.environ["AIR_TRANSFORM_TILING_SCRIPT"] = os.path.join(
-            script_dir, f"transform_{arity}_aie2p.mlir"
+            script_dir, f"transform_{arity}_{suffix}.mlir"
         )
 
     benchmark.select_npu_backend()

@@ -161,10 +161,13 @@ VERIFY_IGNORE = {"__pycache__"}
 def get_device_support(example_dir):
     """Check which device targets have transform files.
 
+    Checks for both exact names (transform_aie2.mlir) and prefixed
+    variants (transform_*_aie2.mlir) used by multi-op examples.
+
     Returns (has_aie2, has_aie2p) as booleans.
     """
-    has_aie2 = (example_dir / "transform_aie2.mlir").exists()
-    has_aie2p = (example_dir / "transform_aie2p.mlir").exists()
+    has_aie2 = bool(list(example_dir.glob("transform*_aie2.mlir")))
+    has_aie2p = bool(list(example_dir.glob("transform*_aie2p.mlir")))
     return has_aie2, has_aie2p
 
 
