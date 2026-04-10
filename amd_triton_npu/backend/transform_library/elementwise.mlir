@@ -66,6 +66,85 @@ transform.named_sequence @pad_and_promote_unary_bf16(
   transform.yield
 }
 
+// Unary variant for f32: 1 input + 1 output = 2 operands.
+// Used with bf16-emulation (f32 data, bf16 compute on AIE cores).
+transform.named_sequence @pad_and_promote_unary_f32(
+    %module: !transform.any_op {transform.readonly}) {
+  %op = transform.structured.match ops{["linalg.generic"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %padded_op, %pad_op, %__ = transform.structured.pad %op {
+      padding_values=[0.0 : f32, 0.0 : f32],
+      padding_dimensions=[0, 1],
+      nofold_flags=[1, 1],
+      copy_back_op="linalg.copy"
+  } : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+  %pad_dps = transform.structured.rewrite_in_destination_passing_style %pad_op
+      : (!transform.any_op) -> !transform.any_op
+  %padded_input = transform.get_producer_of_operand %padded_op[0]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_input_buffer, %padded_input_new =
+      transform.structured.bufferize_to_allocation %padded_input
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_result = transform.get_producer_of_operand %padded_op[1]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_result_buffer, %padded_result_new =
+      transform.structured.bufferize_to_allocation %padded_result
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  transform.yield
+}
+
+// Unary variant for i8: 1 input + 1 output = 2 operands.
+transform.named_sequence @pad_and_promote_unary_i8(
+    %module: !transform.any_op {transform.readonly}) {
+  %op = transform.structured.match ops{["linalg.generic"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %padded_op, %pad_op, %__ = transform.structured.pad %op {
+      padding_values=[0 : i8, 0 : i8],
+      padding_dimensions=[0, 1],
+      nofold_flags=[1, 1],
+      copy_back_op="linalg.copy"
+  } : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+  %pad_dps = transform.structured.rewrite_in_destination_passing_style %pad_op
+      : (!transform.any_op) -> !transform.any_op
+  %padded_input = transform.get_producer_of_operand %padded_op[0]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_input_buffer, %padded_input_new =
+      transform.structured.bufferize_to_allocation %padded_input
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_result = transform.get_producer_of_operand %padded_op[1]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_result_buffer, %padded_result_new =
+      transform.structured.bufferize_to_allocation %padded_result
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  transform.yield
+}
+
+// Unary variant for i16: 1 input + 1 output = 2 operands.
+transform.named_sequence @pad_and_promote_unary_i16(
+    %module: !transform.any_op {transform.readonly}) {
+  %op = transform.structured.match ops{["linalg.generic"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %padded_op, %pad_op, %__ = transform.structured.pad %op {
+      padding_values=[0 : i16, 0 : i16],
+      padding_dimensions=[0, 1],
+      nofold_flags=[1, 1],
+      copy_back_op="linalg.copy"
+  } : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+  %pad_dps = transform.structured.rewrite_in_destination_passing_style %pad_op
+      : (!transform.any_op) -> !transform.any_op
+  %padded_input = transform.get_producer_of_operand %padded_op[0]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_input_buffer, %padded_input_new =
+      transform.structured.bufferize_to_allocation %padded_input
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_result = transform.get_producer_of_operand %padded_op[1]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_result_buffer, %padded_result_new =
+      transform.structured.bufferize_to_allocation %padded_result
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  transform.yield
+}
+
 // Binary variant: 2 inputs + 1 output = 3 operands (vec-add, axpy, swiglu).
 transform.named_sequence @pad_and_promote_binary_bf16(
     %module: !transform.any_op {transform.readonly}) {

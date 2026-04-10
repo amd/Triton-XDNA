@@ -60,7 +60,7 @@ EXAMPLES = [
         "category": "Element-wise",
         "name": "ReLU",
         "path": "relu",
-        "datatypes": "bf16",
+        "datatypes": "bf16, f32, i8, i16",
     },
     {
         "category": "Element-wise",
@@ -96,7 +96,7 @@ EXAMPLES = [
         "category": "Element-wise",
         "name": "AXPY",
         "path": "axpy",
-        "datatypes": "bf16",
+        "datatypes": "bf16, f32, i8, i16",
     },
     {
         "category": "Element-wise",
