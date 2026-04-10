@@ -102,7 +102,7 @@ EXAMPLES = [
         "category": "Element-wise",
         "name": "Vector Add",
         "path": "vec-add",
-        "datatypes": "bf16",
+        "datatypes": "bf16, f32, i8, i16",
     },
     {
         "category": "Normalization",
