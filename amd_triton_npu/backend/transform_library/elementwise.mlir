@@ -96,3 +96,97 @@ transform.named_sequence @pad_and_promote_binary_bf16(
       {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
   transform.yield
 }
+
+// Binary variant for f32: 2 inputs + 1 output = 3 operands.
+// Used with bf16-emulation (f32 data, bf16 compute on AIE cores).
+transform.named_sequence @pad_and_promote_binary_f32(
+    %module: !transform.any_op {transform.readonly}) {
+  %op = transform.structured.match ops{["linalg.generic"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %padded_op, %pad_op, %__ = transform.structured.pad %op {
+      padding_values=[0.0 : f32, 0.0 : f32, 0.0 : f32],
+      padding_dimensions=[0, 1, 2],
+      nofold_flags=[1, 1, 1],
+      copy_back_op="linalg.copy"
+  } : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+  %pad_dps = transform.structured.rewrite_in_destination_passing_style %pad_op
+      : (!transform.any_op) -> !transform.any_op
+  %padded_lhs = transform.get_producer_of_operand %padded_op[0]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_lhs_buffer, %padded_lhs_new =
+      transform.structured.bufferize_to_allocation %padded_lhs
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_rhs = transform.get_producer_of_operand %padded_op[1]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_rhs_buffer, %padded_rhs_new =
+      transform.structured.bufferize_to_allocation %padded_rhs
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_result = transform.get_producer_of_operand %padded_op[2]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_result_buffer, %padded_result_new =
+      transform.structured.bufferize_to_allocation %padded_result
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  transform.yield
+}
+
+// Binary variant for i8: 2 inputs + 1 output = 3 operands.
+transform.named_sequence @pad_and_promote_binary_i8(
+    %module: !transform.any_op {transform.readonly}) {
+  %op = transform.structured.match ops{["linalg.generic"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %padded_op, %pad_op, %__ = transform.structured.pad %op {
+      padding_values=[0 : i8, 0 : i8, 0 : i8],
+      padding_dimensions=[0, 1, 2],
+      nofold_flags=[1, 1, 1],
+      copy_back_op="linalg.copy"
+  } : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+  %pad_dps = transform.structured.rewrite_in_destination_passing_style %pad_op
+      : (!transform.any_op) -> !transform.any_op
+  %padded_lhs = transform.get_producer_of_operand %padded_op[0]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_lhs_buffer, %padded_lhs_new =
+      transform.structured.bufferize_to_allocation %padded_lhs
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_rhs = transform.get_producer_of_operand %padded_op[1]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_rhs_buffer, %padded_rhs_new =
+      transform.structured.bufferize_to_allocation %padded_rhs
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_result = transform.get_producer_of_operand %padded_op[2]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_result_buffer, %padded_result_new =
+      transform.structured.bufferize_to_allocation %padded_result
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  transform.yield
+}
+
+// Binary variant for i16: 2 inputs + 1 output = 3 operands.
+transform.named_sequence @pad_and_promote_binary_i16(
+    %module: !transform.any_op {transform.readonly}) {
+  %op = transform.structured.match ops{["linalg.generic"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %padded_op, %pad_op, %__ = transform.structured.pad %op {
+      padding_values=[0 : i16, 0 : i16, 0 : i16],
+      padding_dimensions=[0, 1, 2],
+      nofold_flags=[1, 1, 1],
+      copy_back_op="linalg.copy"
+  } : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+  %pad_dps = transform.structured.rewrite_in_destination_passing_style %pad_op
+      : (!transform.any_op) -> !transform.any_op
+  %padded_lhs = transform.get_producer_of_operand %padded_op[0]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_lhs_buffer, %padded_lhs_new =
+      transform.structured.bufferize_to_allocation %padded_lhs
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_rhs = transform.get_producer_of_operand %padded_op[1]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_rhs_buffer, %padded_rhs_new =
+      transform.structured.bufferize_to_allocation %padded_rhs
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_result = transform.get_producer_of_operand %padded_op[2]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_result_buffer, %padded_result_new =
+      transform.structured.bufferize_to_allocation %padded_result
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  transform.yield
+}
