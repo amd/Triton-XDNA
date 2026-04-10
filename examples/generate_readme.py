@@ -146,6 +146,12 @@ EXAMPLES = [
         "path": "multi_drivers",
         "datatypes": "bf16",
     },
+    {
+        "category": "Element-wise",
+        "name": "Elementwise Arith (sub, mul, div, square)",
+        "path": "elementwise_arith",
+        "datatypes": "bf16, f32",
+    },
 ]
 
 # Directories to ignore when verifying registry completeness
