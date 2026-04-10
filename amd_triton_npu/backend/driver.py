@@ -24,6 +24,8 @@ from air.compiler.util import run_transform
 from air.ir import *
 import air.passmanager
 
+from .config import npu_config
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.CRITICAL)
 if os.getenv("AMD_TRITON_NPU_DEBUG", "0") == "1":
@@ -131,30 +133,14 @@ def _get_aie_test_utils_path() -> str:
     return path
 
 
-def _get_air_project_path() -> Path:
-    """
-    Get the path for air_project directory.
-
-    If AMD_TRITON_NPU_AIR_PROJECT_PATH is set, use that path.
-    Otherwise, default to 'air_project' in the current working directory.
-
-    Returns:
-        Path: The path to the air_project directory
-    """
-    custom_path = os.getenv("AMD_TRITON_NPU_AIR_PROJECT_PATH")
-    if custom_path:
-        return Path(custom_path)
-    return Path(os.getcwd()) / "air_project"
-
-
 def _dump_ir_if_needed(files):
     """
     Dump intermediate IR files to the air_project directory.
 
     Files are always dumped to the air_project path (controlled by
-    AMD_TRITON_NPU_AIR_PROJECT_PATH or defaulting to ./air_project/).
+    ``npu_config.air_project_path`` or defaulting to ./air_project/).
     """
-    air_proj_path = _get_air_project_path()
+    air_proj_path = npu_config.air_project_path
     os.makedirs(air_proj_path, exist_ok=True)
     for f in files:
         shutil.copy(f, os.path.join(air_proj_path, os.path.basename(f)))
@@ -236,19 +222,20 @@ def detect_npu_version():
 def _get_output_format():
     """Determine the output format for the NPU backend.
 
-    Checks AMD_TRITON_NPU_OUTPUT_FORMAT env var first.
+    Checks ``npu_config.output_format`` first (which itself falls back to
+    the ``AMD_TRITON_NPU_OUTPUT_FORMAT`` env var).
     If not set, defaults to "elf" on npu2 and "xclbin" on npu1.
     ELF format is only supported on npu2 (AIE2P) devices.
     """
     npu_version = detect_npu_version()
-    env_format = os.getenv("AMD_TRITON_NPU_OUTPUT_FORMAT", "").lower()
-    if env_format in ("elf", "xclbin"):
-        if env_format == "elf" and npu_version == "npu1":
+    configured_format = npu_config.output_format
+    if configured_format is not None:
+        if configured_format == "elf" and npu_version == "npu1":
             raise RuntimeError(
                 "ELF output format is not supported on npu1 (AIE2) devices. "
-                "Use 'xclbin' or unset AMD_TRITON_NPU_OUTPUT_FORMAT."
+                "Use 'xclbin' or set npu_config.output_format = None."
             )
-        return env_format
+        return configured_format
     # Auto-detect: ELF for npu2, xclbin for npu1
     return "elf" if npu_version == "npu2" else "xclbin"
 
@@ -438,9 +425,9 @@ def _get_transform_ir_string():
     """
     Get the transform IR string for tiling operations.
 
-    If the environment variable AIR_TRANSFORM_TILING_SCRIPT is set,
-    read the transform IR from that file. Otherwise, use the default
-    hardcoded transform IR string.
+    If ``npu_config.transform_tiling_script`` is set (or the
+    ``AIR_TRANSFORM_TILING_SCRIPT`` env var), read the transform IR from
+    that file. Otherwise, use the default hardcoded transform IR string.
 
     If the script uses `transform.include`, the shared transform library
     (transform_library.mlir) is automatically injected.
@@ -448,12 +435,12 @@ def _get_transform_ir_string():
     Returns:
         str: The transform IR string to use for tiling
     """
-    custom_script_path = os.getenv("AIR_TRANSFORM_TILING_SCRIPT")
+    custom_script_path = npu_config.transform_tiling_script
 
     if custom_script_path:
         if not os.path.isfile(custom_script_path):
             raise FileNotFoundError(
-                f"AIR_TRANSFORM_TILING_SCRIPT is set to '{custom_script_path}' "
+                f"transform_tiling_script is set to '{custom_script_path}' "
                 f"but the file was not found (cwd: {os.getcwd()}). "
                 f"Use an absolute path or run from the directory containing the script."
             )
@@ -1222,9 +1209,7 @@ def compile_module(
         kernel_name = kernel_metadata[6]  # see pack_metadata in compiler.py
         src = launcher_src.replace(kernel_placeholder_name, kernel_name)
 
-        # Get air_project path (controlled by AMD_TRITON_NPU_AIR_PROJECT_PATH
-        # or defaults to ./air_project/)
-        air_proj_path = _get_air_project_path()
+        air_proj_path = npu_config.air_project_path
         os.makedirs(air_proj_path, exist_ok=True)
         Path(os.path.join(air_proj_path, "asm_src.mlir")).write_bytes(asm_src)
         air_output = _ttshared_to_air(
@@ -1239,7 +1224,7 @@ def compile_module(
             + f"_timing_{autotune_time}"
             + f"_format_{output_format}"
             + f"_npu_{npu_version}"
-            + f"_bf16emu_{os.getenv('AMD_TRITON_NPU_BF16_EMULATION', '0')}"
+            + f"_bf16emu_{npu_config.bf16_emulation}"
         )
         key = hashlib.md5(key_data.encode("utf-8")).hexdigest()
 
@@ -1331,7 +1316,7 @@ def compile_module(
                     ]
                 # Enable bf16 emulation: hardware truncates f32 -> bf16 before
                 # multiply, with f32 accumulation.
-                if os.getenv("AMD_TRITON_NPU_BF16_EMULATION", "0") == "1":
+                if npu_config.bf16_emulation:
                     aircc_cmd.insert(-1, "--bf16-emulation")
                 # Explicitly set runtime loop tiling sizes to [4,4] (aircc
                 # default changed from [4,4] to [] in mlir-air #1470).
@@ -1364,7 +1349,7 @@ def compile_module(
                     cache_path = cache.put(f.read(), filename, binary=True)
 
                 # Check for compile-only mode
-                if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
+                if npu_config.compile_only:
                     logger.debug("Compile-only mode: binaries cached at %s", cache_path)
                     if output_format == "elf":
                         logger.debug("  elf: %s", cache_elf_path)
@@ -1380,7 +1365,7 @@ def compile_module(
             )
 
             # Check for compile-only mode (cache hit)
-            if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
+            if npu_config.compile_only:
                 logger.debug(
                     "Compile-only mode (cache hit): binaries at %s", cache_path
                 )
