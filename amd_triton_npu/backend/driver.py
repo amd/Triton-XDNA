@@ -411,15 +411,16 @@ def _inject_transform_library(user_script):
 
 
 def _detect_element_type(ir_str):
-    """Detect the primary element type from the Linalg IR function signature.
+    """Detect the primary element type from the provided Linalg IR string.
 
-    Scans memref types in the first func.func line for the element type.
-    Returns the MLIR type string (e.g., "bf16", "f32", "i8", "i16").
+    Searches the IR text for the first ``memref<...xTYPE>`` occurrence and
+    returns the captured MLIR element type string (for example, ``"bf16"``,
+    ``"f32"``, ``"i8"``, or ``"i16"``).
     Falls back to "bf16" if detection fails.
     """
     import re
 
-    # Match memref<...xTYPE> in the function signature
+    # Match the first memref<...xTYPE> occurrence in the provided IR text.
     match = re.search(r"memref<[^>]*x(\w+)>", ir_str)
     if match:
         return match.group(1)
@@ -451,7 +452,12 @@ def _substitute_dtype_placeholders(script, dtype, npu_version):
         return script
     info = _DTYPE_PLACEHOLDER_INFO.get(dtype)
     if info is None:
-        return script
+        raise ValueError(
+            f"Unsupported element type '{dtype}' for transform script placeholder "
+            f"substitution. Supported types: {list(_DTYPE_PLACEHOLDER_INFO.keys())}. "
+            f"The script contains @DTYPE@/@PAD_VAL@/@VECTOR_SIZE@ placeholders that "
+            f"require a supported element type."
+        )
     script = script.replace("@DTYPE@", dtype)
     script = script.replace("@PAD_VAL@", info["pad_val"])
     script = script.replace(
@@ -492,11 +498,14 @@ def _get_transform_ir_string(ir_str=None):
         with open(custom_script_path, "r") as f:
             print(f"Using custom tiling script from: {custom_script_path}")
             user_script = f.read()
-        if ir_str is not None:
+        _PLACEHOLDERS = ("@DTYPE@", "@PAD_VAL@", "@VECTOR_SIZE@")
+        if ir_str is not None and any(p in user_script for p in _PLACEHOLDERS):
             dtype = _detect_element_type(
                 ir_str if isinstance(ir_str, str) else str(ir_str)
             )
-            npu_version = detect_npu_version()
+            npu_version = (
+                detect_npu_version() if "@VECTOR_SIZE@" in user_script else None
+            )
             user_script = _substitute_dtype_placeholders(
                 user_script, dtype, npu_version
             )
