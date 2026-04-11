@@ -1154,7 +1154,11 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 
 
 def compile_module(
-    launcher_src, kernel_placeholder_name, output_format="xclbin", actual_sizes=None
+    launcher_src,
+    kernel_placeholder_name,
+    output_format="xclbin",
+    actual_sizes=None,
+    on_cache_resolved=None,
 ):
     py_version = sys.version_info
     if platform.system() == "Windows":
@@ -1216,6 +1220,8 @@ def compile_module(
         key = hashlib.md5(key_data.encode("utf-8")).hexdigest()
 
         cache = get_cache_manager(key)
+        if on_cache_resolved is not None:
+            on_cache_resolved(cache.cache_dir)
         name = "__npu_dispatch"
         filename = f"{name}.so"
         cache_path = cache.get_file(filename)
@@ -1443,15 +1449,68 @@ class NPULauncher(object):
 
         # Later KERNEL_NAME_PLACEHOLDER will be used to assign the kernel name
         # in the following launch function.
+        self.npu_cache_dir = None
+
+        def _on_cache_resolved(cache_dir):
+            self.npu_cache_dir = cache_dir
+
         self.launch = compile_module(
             launcher_src,
             kernel_placeholder_name,
             self.output_format,
             actual_sizes=actual_sizes,
+            on_cache_resolved=_on_cache_resolved,
         )
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):
         self.launch(gridX, gridY, gridZ, stream, function, *args)
+
+
+def get_npu_cache_dir(compiled_kernel):
+    """Return the NPU binary cache directory for a compiled kernel.
+
+    The NPU backend stores hardware-specific artifacts in a separate cache
+    directory from Triton's main compiler cache. Depending on the selected
+    output format, the directory contains either:
+
+    * xclbin output: ``aie.xclbin``, ``insts.bin``, and
+      ``__npu_dispatch.so``
+    * elf output: ``aie.elf``, ``elf_kernel_name.txt``, and
+      ``__npu_dispatch.so``
+
+    This function returns the path to that directory.
+
+    The directory is only populated after the first kernel invocation,
+    since NPU binary compilation is deferred to launch time.
+
+    Args:
+        compiled_kernel: A triton.compiler.compiler.CompiledKernel instance
+            compiled for the NPU backend.
+
+    Returns:
+        str | None: Absolute path to the NPU binary cache directory, or
+            None if the kernel has not been launched yet or does not expose
+            an NPU launcher via ``_run``.
+
+    Raises:
+        TypeError: If ``compiled_kernel._run`` exists but is not an
+            ``NPULauncher`` instance.
+
+    Example::
+
+        compiled_kernel = my_kernel[grid](a, b, c, N, BLOCK_SIZE_N=1024)
+        npu_cache = get_npu_cache_dir(compiled_kernel)
+        print(f"NPU artifacts at: {npu_cache}")
+    """
+    launcher = getattr(compiled_kernel, "_run", None)
+    if launcher is None:
+        return None
+    if not isinstance(launcher, NPULauncher):
+        raise TypeError(
+            f"Expected an NPULauncher but got {type(launcher).__name__}. "
+            "Is the NPU backend active?"
+        )
+    return launcher.npu_cache_dir
 
 
 class NPUUtils(object):
