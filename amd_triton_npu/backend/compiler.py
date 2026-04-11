@@ -15,6 +15,8 @@ import subprocess
 import functools
 from pathlib import Path
 
+from .config import npu_config
+
 
 def _get_amd_triton_npu_opt_path() -> str:
     path = (
@@ -34,30 +36,14 @@ def _get_llvm_bin_path(bin_name: str) -> str:
     return os.path.join(path, bin_name)
 
 
-def _get_air_project_path():
-    """
-    Get the path for air_project directory.
-
-    If AMD_TRITON_NPU_AIR_PROJECT_PATH is set, use that path.
-    Otherwise, default to 'air_project' in the current working directory.
-
-    Returns:
-        Path: The path to the air_project directory
-    """
-    custom_path = os.getenv("AMD_TRITON_NPU_AIR_PROJECT_PATH")
-    if custom_path:
-        return Path(custom_path)
-    return Path(os.getcwd()) / "air_project"
-
-
 def _dump_ir_if_needed(files):
     """
     Dump intermediate IR files to the air_project directory.
 
     Files are always dumped to the air_project path (controlled by
-    AMD_TRITON_NPU_AIR_PROJECT_PATH or defaulting to ./air_project/).
+    ``npu_config.air_project_path`` or defaulting to ./air_project/).
     """
-    air_proj_path = _get_air_project_path()
+    air_proj_path = npu_config.air_project_path
     os.makedirs(air_proj_path, exist_ok=True)
     for f in files:
         shutil.copy(f, os.path.join(air_proj_path, os.path.basename(f)))
