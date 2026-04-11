@@ -25,7 +25,7 @@ from air.ir import *
 import air.passmanager
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.CRITICAL)
 if os.getenv("AMD_TRITON_NPU_DEBUG", "0") == "1":
     logger.setLevel(logging.DEBUG)
 if not logger.handlers:
@@ -187,10 +187,10 @@ def get_npu_device_info():
         return devices
 
     except subprocess.CalledProcessError as e:
-        logger.warning("Failed to run xrt-smi: %s", e.stderr)
+        logger.error("Failed to run xrt-smi: %s", e.stderr)
         return []
     except Exception as e:
-        logger.warning("Unexpected error: %s", e)
+        logger.exception("Unexpected error during NPU device detection")
         return []
 
 
