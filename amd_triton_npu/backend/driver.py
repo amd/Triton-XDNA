@@ -233,7 +233,8 @@ def _get_output_format():
         if configured_format == "elf" and npu_version == "npu1":
             raise RuntimeError(
                 "ELF output format is not supported on npu1 (AIE2) devices. "
-                "Use 'xclbin' or set npu_config.output_format = None."
+                "Unset or change AMD_TRITON_NPU_OUTPUT_FORMAT, or set "
+                "npu_config.output_format to 'xclbin' or None."
             )
         return configured_format
     # Auto-detect: ELF for npu2, xclbin for npu1
@@ -440,9 +441,10 @@ def _get_transform_ir_string():
     if custom_script_path:
         if not os.path.isfile(custom_script_path):
             raise FileNotFoundError(
-                f"transform_tiling_script is set to '{custom_script_path}' "
-                f"but the file was not found (cwd: {os.getcwd()}). "
-                f"Use an absolute path or run from the directory containing the script."
+                f"transform_tiling_script / AIR_TRANSFORM_TILING_SCRIPT is set to "
+                f"'{custom_script_path}' but the file was not found "
+                f"(cwd: {os.getcwd()}). Use an absolute path or run from the "
+                f"directory containing the script."
             )
         with open(custom_script_path, "r") as f:
             logger.debug("Using custom tiling script from: %s", custom_script_path)

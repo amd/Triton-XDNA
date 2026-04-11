@@ -148,6 +148,9 @@ class _NPUConfig:
 
     @air_project_path.setter
     def air_project_path(self, value):
+        if value is None:
+            self._air_project_path = _UNSET
+            return
         self._air_project_path = value
 
     # ---- utilities ----
@@ -198,16 +201,10 @@ def config_context(**kwargs):
         with config_context(compile_only=True):
             kernel[grid](a, b, c)
     """
-    saved = {
-        "_compile_only": npu_config._compile_only,
-        "_transform_tiling_script": npu_config._transform_tiling_script,
-        "_bf16_emulation": npu_config._bf16_emulation,
-        "_output_format": npu_config._output_format,
-        "_air_project_path": npu_config._air_project_path,
-    }
+    saved = npu_config.__dict__.copy()
     try:
         set_config(**kwargs)
         yield npu_config
     finally:
-        for attr, val in saved.items():
-            object.__setattr__(npu_config, attr, val)
+        npu_config.__dict__.clear()
+        npu_config.__dict__.update(saved)
