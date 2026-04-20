@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 from types import ModuleType
 import hashlib
+import sys
 import tempfile
 import os
 import re
@@ -15,6 +16,8 @@ import subprocess
 import functools
 import sys
 from pathlib import Path
+
+from .config import npu_config
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -40,30 +43,14 @@ def _get_llvm_bin_path(bin_name: str) -> str:
     return os.path.join(path, bin_name)
 
 
-def _get_air_project_path():
-    """
-    Get the path for air_project directory.
-
-    If AMD_TRITON_NPU_AIR_PROJECT_PATH is set, use that path.
-    Otherwise, default to 'air_project' in the current working directory.
-
-    Returns:
-        Path: The path to the air_project directory
-    """
-    custom_path = os.getenv("AMD_TRITON_NPU_AIR_PROJECT_PATH")
-    if custom_path:
-        return Path(custom_path)
-    return Path(os.getcwd()) / "air_project"
-
-
 def _dump_ir_if_needed(files):
     """
     Dump intermediate IR files to the air_project directory.
 
     Files are always dumped to the air_project path (controlled by
-    AMD_TRITON_NPU_AIR_PROJECT_PATH or defaulting to ./air_project/).
+    ``npu_config.air_project_path`` or defaulting to ./air_project/).
     """
-    air_proj_path = _get_air_project_path()
+    air_proj_path = npu_config.air_project_path
     os.makedirs(air_proj_path, exist_ok=True)
     for f in files:
         shutil.copy(f, os.path.join(air_proj_path, os.path.basename(f)))
@@ -77,16 +64,32 @@ def _ttir_to_ttsharedir(mod):
         dst_path = os.path.join(tmpdir, "ttshared.mlir")
         Path(src_path).write_text(ttir_code)
         amd_triton_npu_opt_path = _get_amd_triton_npu_opt_path()
-        subprocess.check_call(
-            [
-                amd_triton_npu_opt_path,
-                src_path,
-                "--triton-to-linalg-experimental",
-                "--mlir-print-debuginfo",
-                "-o",
-                dst_path,
-            ]
-        )
+        cmd = [
+            amd_triton_npu_opt_path,
+            src_path,
+            "--triton-to-linalg-experimental",
+            "--mlir-print-debuginfo",
+            "-o",
+            dst_path,
+        ]
+        if npu_config.debug:
+            subprocess.check_call(cmd)
+        else:
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            )
+            if result.returncode != 0:
+                if result.stdout:
+                    stderr_buf = getattr(sys.stderr, "buffer", None)
+                    if stderr_buf is not None:
+                        stderr_buf.write(result.stdout)
+                    else:
+                        sys.stderr.write(
+                            result.stdout.decode("utf-8", errors="replace")
+                        )
+                raise subprocess.CalledProcessError(
+                    result.returncode, cmd, output=result.stdout
+                )
         _dump_ir_if_needed([src_path])
         return Path(dst_path).read_text()
 
@@ -193,7 +196,6 @@ class NPUBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
-        passes.ttir.add_rewrite_tensor_pointer(pm)
         passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)

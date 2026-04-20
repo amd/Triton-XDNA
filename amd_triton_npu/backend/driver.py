@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import logging
 import tempfile
 import sys
 import sysconfig
@@ -24,7 +25,19 @@ from air.compiler.util import run_transform
 from air.ir import *
 import air.passmanager
 
+from .config import npu_config
+
 IS_WINDOWS = sys.platform == "win32"
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.CRITICAL)
+if npu_config.debug:
+    logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_handler)
+logger.propagate = False
 
 autotune_time = False
 
@@ -355,30 +368,14 @@ def _get_aie_test_utils_path() -> str:
     return path
 
 
-def _get_air_project_path() -> Path:
-    """
-    Get the path for air_project directory.
-
-    If AMD_TRITON_NPU_AIR_PROJECT_PATH is set, use that path.
-    Otherwise, default to 'air_project' in the current working directory.
-
-    Returns:
-        Path: The path to the air_project directory
-    """
-    custom_path = os.getenv("AMD_TRITON_NPU_AIR_PROJECT_PATH")
-    if custom_path:
-        return Path(custom_path)
-    return Path(os.getcwd()) / "air_project"
-
-
 def _dump_ir_if_needed(files):
     """
     Dump intermediate IR files to the air_project directory.
 
     Files are always dumped to the air_project path (controlled by
-    AMD_TRITON_NPU_AIR_PROJECT_PATH or defaulting to ./air_project/).
+    ``npu_config.air_project_path`` or defaulting to ./air_project/).
     """
-    air_proj_path = _get_air_project_path()
+    air_proj_path = npu_config.air_project_path
     os.makedirs(air_proj_path, exist_ok=True)
     for f in files:
         shutil.copy(f, os.path.join(air_proj_path, os.path.basename(f)))
@@ -411,43 +408,70 @@ def get_npu_device_info():
         return devices
 
     except subprocess.CalledProcessError as e:
-        print("Failed to run xrt-smi:", e.stderr)
+        logger.error("Failed to run xrt-smi: %s", e.stderr)
         return []
     except Exception as e:
-        print("Unexpected error:", str(e))
+        logger.exception("Unexpected error during NPU device detection")
         return []
+
+
+# Device name mappings aligned with mlir-aie (lit_config_helpers.py, iron_setup.py)
+NPU_MODELS = {
+    "npu1": ["npu1", "Phoenix"],
+    "npu2": ["npu4", "Strix", "npu5", "Strix Halo", "npu6", "Krackan"],
+}
 
 
 def detect_npu_version():
-    """Map known device names to internal NPU version strings."""
+    """Map known device names to internal NPU version strings.
+
+    If AMD_TRITON_NPU_TARGET is set, use that value directly
+    (must be 'npu1' or 'npu2'). This enables cross-compilation
+    without local NPU hardware.
+    """
+    target = os.getenv("AMD_TRITON_NPU_TARGET", "").lower()
+    if target:
+        if target not in NPU_MODELS:
+            raise RuntimeError(
+                f"Invalid AMD_TRITON_NPU_TARGET='{target}'. "
+                f"Supported values: {list(NPU_MODELS.keys())}"
+            )
+        return target
     devices = get_npu_device_info()
     for device in devices:
         name = device["name"]
-        if "RyzenAI-npu1" in name:
-            return "npu1"
-        elif "NPU Phoenix" in name:
-            return "npu1"
-        elif "Strix" in name:
-            return "npu2"
-    raise RuntimeError("Unsupported or unrecognized NPU device found.")
+        for version, keywords in NPU_MODELS.items():
+            if any(kw.lower() in name.lower() for kw in keywords):
+                return version
+    if not devices:
+        raise RuntimeError(
+            "No NPU devices found. Ensure XRT is installed and xrt-smi is available."
+        )
+    device_names = [d["name"] for d in devices]
+    raise RuntimeError(
+        f"Unsupported NPU device(s): {device_names}. "
+        f"Supported models: {dict(NPU_MODELS)}"
+    )
 
 
 def _get_output_format():
     """Determine the output format for the NPU backend.
 
-    Checks AMD_TRITON_NPU_OUTPUT_FORMAT env var first.
+    Checks ``npu_config.output_format`` first (which itself falls back to
+    the ``AMD_TRITON_NPU_OUTPUT_FORMAT`` env var).
     If not set, defaults to "elf" on npu2 and "xclbin" on npu1.
     ELF format is only supported on npu2 (AIE2P) devices.
     """
     npu_version = detect_npu_version()
-    env_format = os.getenv("AMD_TRITON_NPU_OUTPUT_FORMAT", "").lower()
-    if env_format in ("elf", "xclbin"):
-        if env_format == "elf" and npu_version == "npu1":
+    configured_format = npu_config.output_format
+    if configured_format is not None:
+        if configured_format == "elf" and npu_version == "npu1":
             raise RuntimeError(
                 "ELF output format is not supported on npu1 (AIE2) devices. "
-                "Use 'xclbin' or unset AMD_TRITON_NPU_OUTPUT_FORMAT."
+                "Unset or change AMD_TRITON_NPU_OUTPUT_FORMAT, or set "
+                "npu_config.output_format to 'xclbin' or None."
             )
-        return env_format
+        return configured_format
     # Auto-detect: ELF for npu2, xclbin for npu1
     return "elf" if npu_version == "npu2" else "xclbin"
 
@@ -637,9 +661,9 @@ def _get_transform_ir_string():
     """
     Get the transform IR string for tiling operations.
 
-    If the environment variable AIR_TRANSFORM_TILING_SCRIPT is set,
-    read the transform IR from that file. Otherwise, use the default
-    hardcoded transform IR string.
+    If ``npu_config.transform_tiling_script`` is set (or the
+    ``AIR_TRANSFORM_TILING_SCRIPT`` env var), read the transform IR from
+    that file. Otherwise, use the default hardcoded transform IR string.
 
     If the script uses `transform.include`, the shared transform library
     (transform_library.mlir) is automatically injected.
@@ -647,18 +671,18 @@ def _get_transform_ir_string():
     Returns:
         str: The transform IR string to use for tiling
     """
-    custom_script_path = os.getenv("AIR_TRANSFORM_TILING_SCRIPT")
+    custom_script_path = npu_config.transform_tiling_script
 
     if custom_script_path:
         if not os.path.isfile(custom_script_path):
             raise FileNotFoundError(
-                f"AIR_TRANSFORM_TILING_SCRIPT is set to '{custom_script_path}' "
-                f"but the file was not found (cwd: {os.getcwd()}). "
-                f"Use an absolute path or run from the directory containing the script."
+                f"transform_tiling_script / AIR_TRANSFORM_TILING_SCRIPT is set to "
+                f"'{custom_script_path}' but the file was not found "
+                f"(cwd: {os.getcwd()}). Use an absolute path or run from the "
+                f"directory containing the script."
             )
         with open(custom_script_path, "r") as f:
-            if os.getenv("TRITON_NPU_QUIET", "0") == "0":
-                print(f"Using custom tiling script from: {custom_script_path}")
+            logger.debug("Using custom tiling script from: %s", custom_script_path)
             user_script = f.read()
         return _inject_transform_library(user_script)
 
@@ -817,7 +841,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
     std::vector<uint32_t> instr_v =
         test_utils::load_instr_binary(insts_path);
 
-    int verbosity = 1;
+    int verbosity = {1 if npu_config.debug else 0};
     if (verbosity >= 1)
         std::cout << "Sequence instr count: " << instr_v.size() << std::endl;
 
@@ -838,9 +862,9 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
     // Get the kernel from the xclbin
     auto xkernels = xclbin.get_kernels();
     auto xkernel = *std::find_if(xkernels.begin(), xkernels.end(),
-                                    [Node](xrt::xclbin::kernel &k) {{
+                                    [Node, verbosity](xrt::xclbin::kernel &k) {{
                                     auto name = k.get_name();
-                                    std::cout << "Name: " << name << std::endl;
+                                    if (verbosity >= 1) std::cout << "Name: " << name << std::endl;
                                     return name.rfind(Node, 0) == 0;
                                     }});
     auto kernelName = xkernel.get_name();
@@ -1153,7 +1177,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
   if (gridX*gridY*gridZ > 0) {{
     try {{
 
-    int verbosity = 1;
+    int verbosity = {1 if npu_config.debug else 0};
 
     // Get a device handle
     unsigned int device_index = 0;
@@ -1391,7 +1415,11 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 
 
 def compile_module(
-    launcher_src, kernel_placeholder_name, output_format="xclbin", actual_sizes=None
+    launcher_src,
+    kernel_placeholder_name,
+    output_format="xclbin",
+    actual_sizes=None,
+    on_cache_resolved=None,
 ):
     py_version = sys.version_info
     if platform.system() == "Windows":
@@ -1431,9 +1459,7 @@ def compile_module(
         kernel_name = kernel_metadata[6]  # see pack_metadata in compiler.py
         src = launcher_src.replace(kernel_placeholder_name, kernel_name)
 
-        # Get air_project path (controlled by AMD_TRITON_NPU_AIR_PROJECT_PATH
-        # or defaults to ./air_project/)
-        air_proj_path = _get_air_project_path()
+        air_proj_path = npu_config.air_project_path
         os.makedirs(air_proj_path, exist_ok=True)
         Path(os.path.join(air_proj_path, "asm_src.mlir")).write_bytes(asm_src)
         air_output = _ttshared_to_air(
@@ -1448,11 +1474,13 @@ def compile_module(
             + f"_timing_{autotune_time}"
             + f"_format_{output_format}"
             + f"_npu_{npu_version}"
-            + f"_bf16emu_{os.getenv('AMD_TRITON_NPU_BF16_EMULATION', '0')}"
+            + f"_bf16emu_{npu_config.bf16_emulation}"
         )
         key = hashlib.md5(key_data.encode("utf-8")).hexdigest()
 
         cache = get_cache_manager(key)
+        if on_cache_resolved is not None:
+            on_cache_resolved(cache.cache_dir)
         name = "__npu_dispatch"
         filename = f"{name}.pyd" if IS_WINDOWS else f"{name}.so"
         cache_path = cache.get_file(filename)
@@ -1546,6 +1574,54 @@ def compile_module(
                     stderr=_devnull,
                     env=msvc_env if msvc_env else None,
                 )
+                compile_flags = [
+                    "g++",
+                    "-std=c++23",
+                    launcher_src_path,
+                    f"-I{py_include_dir}",
+                    f"-I{include_dir}",
+                    f"-L{py_lib_dir}",
+                    "-shared",
+                    f"-l{py_lib}",
+                    "-fPIC",
+                    "-Wall",
+                    f"-I{os.path.join(xrt_dir, 'include')}",
+                    f"-L{os.path.join(xrt_dir, 'lib')}",
+                    "-luuid",
+                    "-lxrt_coreutil",
+                    "-lrt",
+                    "-lstdc++",
+                ]
+                if output_format != "elf":
+                    # xclbin mode needs test_utils for loading instruction binary
+                    compile_flags += [
+                        f"-I{os.path.join(aie_test_utils_dir, 'include')}",
+                        f"-L{os.path.join(aie_test_utils_dir, 'lib')}",
+                        "-ltest_utils",
+                    ]
+                compile_flags += ["-o", so_path]
+                if npu_config.debug:
+                    subprocess.check_call(compile_flags)
+                else:
+                    result = subprocess.run(
+                        compile_flags,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+                    if result.returncode != 0:
+                        if result.stdout:
+                            stderr_buf = getattr(sys.stderr, "buffer", None)
+                            if stderr_buf is not None:
+                                stderr_buf.write(result.stdout)
+                            else:
+                                sys.stderr.write(
+                                    result.stdout.decode("utf-8", errors="replace")
+                                )
+                        raise subprocess.CalledProcessError(
+                            result.returncode,
+                            compile_flags,
+                            output=result.stdout,
+                        )
 
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
@@ -1618,7 +1694,7 @@ def compile_module(
                     ]
                 # Enable bf16 emulation: hardware truncates f32 -> bf16 before
                 # multiply, with f32 accumulation.
-                if os.getenv("AMD_TRITON_NPU_BF16_EMULATION", "0") == "1":
+                if npu_config.bf16_emulation:
                     aircc_cmd.insert(-1, "--bf16-emulation")
                 # Explicitly set runtime loop tiling sizes to [4,4] (aircc
                 # default changed from [4,4] to [] in mlir-air #1470).
@@ -1635,6 +1711,28 @@ def compile_module(
                         f"Ensure xclbinutil is on PATH. On Windows, download "
                         f"xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases"
                     )
+                if npu_config.debug:
+                    subprocess.check_call(aircc_cmd)
+                else:
+                    result = subprocess.run(
+                        aircc_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+                    if result.returncode != 0:
+                        if result.stdout:
+                            stderr_buf = getattr(sys.stderr, "buffer", None)
+                            if stderr_buf is not None:
+                                stderr_buf.write(result.stdout)
+                            else:
+                                sys.stderr.write(
+                                    result.stdout.decode("utf-8", errors="replace")
+                                )
+                        raise subprocess.CalledProcessError(
+                            result.returncode,
+                            aircc_cmd,
+                            output=result.stdout,
+                        )
 
                 # Cache format-specific artifacts first, then the .so last.
                 # This avoids partial cache entries if aircc or kernel name
@@ -1661,23 +1759,31 @@ def compile_module(
                     cache_path = cache.put(f.read(), filename, binary=True)
 
                 # Check for compile-only mode
-                if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
-                    print(f"Compile-only mode: binaries cached at {cache_path}")
+                if npu_config.compile_only:
+                    logger.debug("Compile-only mode: binaries cached at %s", cache_path)
                     if output_format == "elf":
-                        print(f"  elf: {cache_elf_path}")
+                        logger.debug("  elf: %s", cache_elf_path)
                     else:
-                        print(f"  xclbin: {cache_xclbin_path}")
-                        print(f"  insts: {cache_insts_path}")
+                        logger.debug("  xclbin: %s", cache_xclbin_path)
+                        logger.debug("  insts: %s", cache_insts_path)
                     return None
         else:
+            logger.debug(
+                "got cache path: %s compilation is therefore skipped "
+                "(delete cache path to force recompile).",
+                cache_path,
+            )
+
             # Check for compile-only mode (cache hit)
-            if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
-                print(f"Compile-only mode (cache hit): binaries at {cache_path}")
+            if npu_config.compile_only:
+                logger.debug(
+                    "Compile-only mode (cache hit): binaries at %s", cache_path
+                )
                 if output_format == "elf":
-                    print(f"  elf: {cache_elf_path}")
+                    logger.debug("  elf: %s", cache_elf_path)
                 else:
-                    print(f"  xclbin: {cache_xclbin_path}")
-                    print(f"  insts: {cache_insts_path}")
+                    logger.debug("  xclbin: %s", cache_xclbin_path)
+                    logger.debug("  insts: %s", cache_insts_path)
                 return None
 
         # Load and launch the compiled kernel.
@@ -1776,15 +1882,68 @@ class NPULauncher(object):
 
         # Later KERNEL_NAME_PLACEHOLDER will be used to assign the kernel name
         # in the following launch function.
+        self.npu_cache_dir = None
+
+        def _on_cache_resolved(cache_dir):
+            self.npu_cache_dir = cache_dir
+
         self.launch = compile_module(
             launcher_src,
             kernel_placeholder_name,
             self.output_format,
             actual_sizes=actual_sizes,
+            on_cache_resolved=_on_cache_resolved,
         )
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):
         self.launch(gridX, gridY, gridZ, stream, function, *args)
+
+
+def get_npu_cache_dir(compiled_kernel):
+    """Return the NPU binary cache directory for a compiled kernel.
+
+    The NPU backend stores hardware-specific artifacts in a separate cache
+    directory from Triton's main compiler cache. Depending on the selected
+    output format, the directory contains either:
+
+    * xclbin output: ``aie.xclbin``, ``insts.bin``, and
+      ``__npu_dispatch.so``
+    * elf output: ``aie.elf``, ``elf_kernel_name.txt``, and
+      ``__npu_dispatch.so``
+
+    This function returns the path to that directory.
+
+    The directory is only populated after the first kernel invocation,
+    since NPU binary compilation is deferred to launch time.
+
+    Args:
+        compiled_kernel: A triton.compiler.compiler.CompiledKernel instance
+            compiled for the NPU backend.
+
+    Returns:
+        str | None: Absolute path to the NPU binary cache directory, or
+            None if the kernel has not been launched yet or does not expose
+            an NPU launcher via ``_run``.
+
+    Raises:
+        TypeError: If ``compiled_kernel._run`` exists but is not an
+            ``NPULauncher`` instance.
+
+    Example::
+
+        compiled_kernel = my_kernel[grid](a, b, c, N, BLOCK_SIZE_N=1024)
+        npu_cache = get_npu_cache_dir(compiled_kernel)
+        print(f"NPU artifacts at: {npu_cache}")
+    """
+    launcher = getattr(compiled_kernel, "_run", None)
+    if launcher is None:
+        return None
+    if not isinstance(launcher, NPULauncher):
+        raise TypeError(
+            f"Expected an NPULauncher but got {type(launcher).__name__}. "
+            "Is the NPU backend active?"
+        )
+    return launcher.npu_cache_dir
 
 
 class NPUUtils(object):
