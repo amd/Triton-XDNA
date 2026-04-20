@@ -74,7 +74,13 @@ def _ttir_to_ttsharedir(mod):
             )
             if result.returncode != 0:
                 if result.stdout:
-                    sys.stderr.buffer.write(result.stdout)
+                    stderr_buf = getattr(sys.stderr, "buffer", None)
+                    if stderr_buf is not None:
+                        stderr_buf.write(result.stdout)
+                    else:
+                        sys.stderr.write(
+                            result.stdout.decode("utf-8", errors="replace")
+                        )
                 raise subprocess.CalledProcessError(
                     result.returncode, cmd, output=result.stdout
                 )
