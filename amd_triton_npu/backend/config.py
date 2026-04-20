@@ -191,12 +191,22 @@ class _NPUConfig:
 
         Set to ``None`` for auto-detection from installed hardware.
 
-        Env var fallback: ``AMD_TRITON_NPU_TARGET``.
+        Env var fallback: ``AMD_TRITON_NPU_TARGET``.  If the environment
+        variable is set to a non-empty unsupported value, a ``ValueError``
+        is raised.
         """
         if self._target is not _UNSET:
             return self._target
-        v = os.getenv("AMD_TRITON_NPU_TARGET", "").lower()
-        return v if v in _VALID_TARGETS else None
+        v = os.getenv("AMD_TRITON_NPU_TARGET", "")
+        if not v:
+            return None
+        v = v.lower()
+        if v not in _VALID_TARGETS:
+            raise ValueError(
+                f"AMD_TRITON_NPU_TARGET must be one of {sorted(_VALID_TARGETS)} "
+                f"or empty/unset; got {v!r}"
+            )
+        return v
 
     @target.setter
     def target(self, value):

@@ -199,7 +199,8 @@ def detect_npu_version():
     if target is not None:
         if target not in NPU_MODELS:
             raise RuntimeError(
-                f"Invalid target='{target}'. "
+                f"Invalid target='{target}' from npu_config.target "
+                f"(or AMD_TRITON_NPU_TARGET). "
                 f"Supported values: {list(NPU_MODELS.keys())}"
             )
         return target
