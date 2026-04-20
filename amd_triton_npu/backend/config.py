@@ -30,6 +30,7 @@ Usage::
 """
 
 import contextlib
+import logging
 import os
 from pathlib import Path
 
@@ -50,6 +51,7 @@ class _NPUConfig:
         self._bf16_emulation = _UNSET
         self._output_format = _UNSET
         self._air_project_path = _UNSET
+        self._debug = _UNSET
 
     # ---- compile_only ----
 
@@ -153,6 +155,26 @@ class _NPUConfig:
             return
         self._air_project_path = value
 
+    # ---- debug ----
+
+    @property
+    def debug(self) -> bool:
+        """If True, enable verbose logging from subprocesses and the C++ launcher.
+
+        Env var fallback: ``AMD_TRITON_NPU_DEBUG`` (``"1"`` to enable).
+        """
+        if self._debug is not _UNSET:
+            return self._debug
+        return os.getenv("AMD_TRITON_NPU_DEBUG", "0") == "1"
+
+    @debug.setter
+    def debug(self, value: bool):
+        self._debug = bool(value)
+        # Keep the driver logger level in sync so logger.debug() calls
+        # are enabled/suppressed when the flag is toggled programmatically.
+        _drv = logging.getLogger("triton.backends.amd_triton_npu.driver")
+        _drv.setLevel(logging.DEBUG if self._debug else logging.CRITICAL)
+
     # ---- utilities ----
 
     def reset(self):
@@ -162,6 +184,7 @@ class _NPUConfig:
         self._bf16_emulation = _UNSET
         self._output_format = _UNSET
         self._air_project_path = _UNSET
+        self._debug = _UNSET
 
 
 # Module-level singleton
@@ -179,6 +202,7 @@ def set_config(**kwargs):
     """
     valid_keys = {
         "compile_only",
+        "debug",
         "transform_tiling_script",
         "bf16_emulation",
         "output_format",

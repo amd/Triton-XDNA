@@ -28,7 +28,7 @@ from .config import npu_config
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.CRITICAL)
-if os.getenv("AMD_TRITON_NPU_DEBUG", "0") == "1":
+if npu_config.debug:
     logger.setLevel(logging.DEBUG)
 if not logger.handlers:
     _handler = logging.StreamHandler()
@@ -606,7 +606,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
     std::vector<uint32_t> instr_v =
         test_utils::load_instr_binary(insts_path);
 
-    int verbosity = 1;
+    int verbosity = {1 if npu_config.debug else 0};
     if (verbosity >= 1)
         std::cout << "Sequence instr count: " << instr_v.size() << std::endl;
 
@@ -627,9 +627,9 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
     // Get the kernel from the xclbin
     auto xkernels = xclbin.get_kernels();
     auto xkernel = *std::find_if(xkernels.begin(), xkernels.end(),
-                                    [Node](xrt::xclbin::kernel &k) {{
+                                    [Node, verbosity](xrt::xclbin::kernel &k) {{
                                     auto name = k.get_name();
-                                    std::cout << "Name: " << name << std::endl;
+                                    if (verbosity >= 1) std::cout << "Name: " << name << std::endl;
                                     return name.rfind(Node, 0) == 0;
                                     }});
     auto kernelName = xkernel.get_name();
@@ -939,7 +939,7 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in ptr_args)}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
 
-    int verbosity = 1;
+    int verbosity = {1 if npu_config.debug else 0};
 
     // Get a device handle
     unsigned int device_index = 0;
@@ -1275,7 +1275,28 @@ def compile_module(
                         "-ltest_utils",
                     ]
                 compile_flags += ["-o", so_path]
-                subprocess.check_call(compile_flags)
+                if npu_config.debug:
+                    subprocess.check_call(compile_flags)
+                else:
+                    result = subprocess.run(
+                        compile_flags,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+                    if result.returncode != 0:
+                        if result.stdout:
+                            stderr_buf = getattr(sys.stderr, "buffer", None)
+                            if stderr_buf is not None:
+                                stderr_buf.write(result.stdout)
+                            else:
+                                sys.stderr.write(
+                                    result.stdout.decode("utf-8", errors="replace")
+                                )
+                        raise subprocess.CalledProcessError(
+                            result.returncode,
+                            compile_flags,
+                            output=result.stdout,
+                        )
 
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
@@ -1324,7 +1345,28 @@ def compile_module(
                 # default changed from [4,4] to [] in mlir-air #1470).
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
-                subprocess.check_call(aircc_cmd)
+                if npu_config.debug:
+                    subprocess.check_call(aircc_cmd)
+                else:
+                    result = subprocess.run(
+                        aircc_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+                    if result.returncode != 0:
+                        if result.stdout:
+                            stderr_buf = getattr(sys.stderr, "buffer", None)
+                            if stderr_buf is not None:
+                                stderr_buf.write(result.stdout)
+                            else:
+                                sys.stderr.write(
+                                    result.stdout.decode("utf-8", errors="replace")
+                                )
+                        raise subprocess.CalledProcessError(
+                            result.returncode,
+                            aircc_cmd,
+                            output=result.stdout,
+                        )
 
                 # Cache format-specific artifacts first, then the .so last.
                 # This avoids partial cache entries if aircc or kernel name
