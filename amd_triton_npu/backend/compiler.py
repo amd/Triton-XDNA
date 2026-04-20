@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 from types import ModuleType
 import hashlib
+import sys
 import tempfile
 import os
 import re
@@ -57,16 +58,26 @@ def _ttir_to_ttsharedir(mod):
         dst_path = os.path.join(tmpdir, "ttshared.mlir")
         Path(src_path).write_text(ttir_code)
         amd_triton_npu_opt_path = _get_amd_triton_npu_opt_path()
-        subprocess.check_call(
-            [
-                amd_triton_npu_opt_path,
-                src_path,
-                "--triton-to-linalg-experimental",
-                "--mlir-print-debuginfo",
-                "-o",
-                dst_path,
-            ]
-        )
+        cmd = [
+            amd_triton_npu_opt_path,
+            src_path,
+            "--triton-to-linalg-experimental",
+            "--mlir-print-debuginfo",
+            "-o",
+            dst_path,
+        ]
+        if npu_config.debug:
+            subprocess.check_call(cmd)
+        else:
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            )
+            if result.returncode != 0:
+                if result.stdout:
+                    sys.stderr.buffer.write(result.stdout)
+                raise subprocess.CalledProcessError(
+                    result.returncode, cmd, output=result.stdout
+                )
         _dump_ir_if_needed([src_path])
         return Path(dst_path).read_text()
 
