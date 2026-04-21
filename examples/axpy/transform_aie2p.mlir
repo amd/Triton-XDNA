@@ -3,8 +3,8 @@
 
 ////////////////////////////////////////////////////////////////////////////////
 // Transform Script for AXPY (AIE2P): out = alpha * x + y
-// Binary op (2 inputs: x, y). Cast mulf and addf to bf16.
-// No extern_func.o needed (native mulf/addf).
+// Binary op (2 inputs: x, y). Cast mulf and addf to bf16 when float.
+// Dtype-generic: uses @DTYPE@ and @VECTOR_SIZE@ placeholders.
 // Uses shared library sequences from transform_library.mlir (auto-injected).
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -20,7 +20,7 @@ module attributes {transform.with_named_sequence} {
         (%arg1) : (!transform.any_op) -> ()
     transform.include @canonicalize_with_cse failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
-    transform.include @pad_and_promote_binary_bf16 failures(propagate)
+    transform.include @pad_and_promote_binary_@DTYPE@ failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
     transform.include @canonicalize_with_cse failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
@@ -29,7 +29,7 @@ module attributes {transform.with_named_sequence} {
     transform.include @post_bufferize_cleanup failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
 
-    transform.include @vectorize_generics_at_16 failures(propagate)
+    transform.include @vectorize_generics_at_@VECTOR_SIZE@ failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
     %vh = transform.include @air_herd_mapping_and_vectorize
         failures(propagate) (%arg1) : (!transform.any_op) -> !transform.any_op
