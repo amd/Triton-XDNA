@@ -1347,6 +1347,10 @@ def compile_module(
                 # default changed from [4,4] to [] in mlir-air #1470).
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
+                # Increase core stack size to 2048 bytes to accommodate
+                # deeper call chains in register-intensive kernels.
+                aircc_cmd.insert(-1, "--stack-size")
+                aircc_cmd.insert(-1, "2048")
                 if npu_config.debug:
                     subprocess.check_call(aircc_cmd)
                 else:
