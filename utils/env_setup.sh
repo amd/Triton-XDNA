@@ -24,15 +24,8 @@ export PATH=${MLIR_AIE_INSTALL_DIR}/bin:${PATH}
 export PYTHONPATH=${MLIR_AIE_INSTALL_DIR}/python:${PYTHONPATH}
 export LD_LIBRARY_PATH=${MLIR_AIE_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}
 
-# Install llvm-aie
-LLVM_AIE_HASH_FILE="$(dirname ${SCRIPT_PATH})/llvm-aie-hash.txt"
-LLVM_AIE_COMMIT_HASH=$(awk -v kw="Commit:" '$0 ~ kw {for (i=1; i<NF; i++) if ($i == kw) print $(i+1)}' "$LLVM_AIE_HASH_FILE")
-echo "Using llvm-aie hash: $LLVM_AIE_COMMIT_HASH"
-LLVM_AIE_VERSION=$(awk -v kw="Version:" '$0 ~ kw {for (i=1; i<NF; i++) if ($i == kw) print $(i+1)}' "$LLVM_AIE_HASH_FILE")
-echo "llvm-aie version: $LLVM_AIE_VERSION"
-LLVM_AIE_TIMESTAMP=$(awk -v kw="Timestamp:" '$0 ~ kw {for (i=1; i<NF; i++) if ($i == kw) print $(i+1)}' "$LLVM_AIE_HASH_FILE")
-echo "llvm-aie timestamp: $LLVM_AIE_TIMESTAMP"
-python3 -m pip install llvm_aie==$LLVM_AIE_VERSION.$LLVM_AIE_TIMESTAMP+$LLVM_AIE_COMMIT_HASH -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+# Install llvm-aie (latest nightly)
+python3 -m pip install --upgrade --force-reinstall llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 
 # Install mlir-air
 MLIR_AIR_HASH_FILE="$(dirname ${SCRIPT_PATH})/mlir-air-hash.txt"

@@ -247,7 +247,6 @@ def get_install_requires():
     """Build install_requires list from hash files."""
     mlir_aie_hash_file = BASE_DIR / "utils" / "mlir-aie-hash.txt"
     mlir_air_hash_file = BASE_DIR / "utils" / "mlir-air-hash.txt"
-    llvm_aie_hash_file = BASE_DIR / "utils" / "llvm-aie-hash.txt"
 
     # Parse mlir-aie version
     mlir_aie_version = parse_hash_file(mlir_aie_hash_file, "Version")
@@ -257,12 +256,6 @@ def get_install_requires():
     mlir_aie_full_version = (
         f"{mlir_aie_version}.{mlir_aie_timestamp}+{mlir_aie_short_commit}.no.rtti"
     )
-
-    # Parse llvm-aie version
-    llvm_aie_version = parse_hash_file(llvm_aie_hash_file, "Version")
-    llvm_aie_timestamp = parse_hash_file(llvm_aie_hash_file, "Timestamp")
-    llvm_aie_commit = parse_hash_file(llvm_aie_hash_file, "Commit")
-    llvm_aie_full_version = f"{llvm_aie_version}.{llvm_aie_timestamp}+{llvm_aie_commit}"
 
     # Parse mlir-air version
     mlir_air_version = parse_hash_file(mlir_air_hash_file, "Version")
@@ -275,7 +268,7 @@ def get_install_requires():
 
     return [
         f"mlir-aie=={mlir_aie_full_version}",
-        f"llvm-aie=={llvm_aie_full_version}",
+        "llvm-aie",
         f"mlir-air=={mlir_air_full_version}",
     ]
 
