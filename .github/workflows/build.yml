@@ -64,6 +64,7 @@ jobs:
       python3 -m pip install mlir_air==$MLIR_AIR_VERSION.$MLIR_AIR_TIMESTAMP+$SHORT_MLIR_AIR_COMMIT_HASH.no.rtti -f https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
       # Install llvm-aie (latest nightly)
       python3 -m pip install --upgrade --force-reinstall llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+      python3 -m pip show llvm-aie
       # Set environmental variable "MLIR_AIE_INSTALL_DIR"
       MLIR_AIE_INSTALL_DIR_STR="$(python3 -m pip show mlir_aie | grep ^Location: | awk '{print $2}')/mlir_aie"
       echo "MLIR_AIE_INSTALL_DIR=$MLIR_AIE_INSTALL_DIR_STR" >> $GITHUB_ENV

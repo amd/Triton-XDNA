@@ -25,7 +25,7 @@ export PYTHONPATH=${MLIR_AIE_INSTALL_DIR}/python:${PYTHONPATH}
 export LD_LIBRARY_PATH=${MLIR_AIE_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}
 
 # Install llvm-aie (latest nightly)
-python3 -m pip install --upgrade --force-reinstall llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+python3 -m pip install --upgrade llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 
 # Install mlir-air
 MLIR_AIR_HASH_FILE="$(dirname ${SCRIPT_PATH})/mlir-air-hash.txt"
