@@ -928,11 +928,6 @@ def _copy_backend_to_triton(backend_src, backend_name):
                 shutil.rmtree(dst_subdir)
             shutil.copytree(src_subdir, dst_subdir)
 
-    # Copy xclbin_assemble.py if it exists
-    xclbin_file = backend_src / "xclbin_assemble.py"
-    if xclbin_file.exists():
-        shutil.copy2(xclbin_file, dst / "xclbin_assemble.py")
-
     print(f"Copied {backend_name} backend to {dst}")
 
 
