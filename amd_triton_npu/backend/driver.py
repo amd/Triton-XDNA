@@ -1599,12 +1599,13 @@ def compile_module(
                 _quiet = os.getenv("TRITON_NPU_QUIET", "0") != "0"
                 _devnull = subprocess.DEVNULL if _quiet else None
                 if npu_config.debug:
-                    subprocess.check_call(compile_flags)
+                    subprocess.check_call(compile_flags, env=msvc_env)
                 else:
                     result = subprocess.run(
                         compile_flags,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
+                        env=msvc_env,
                     )
                     if result.returncode != 0:
                         if result.stdout:
