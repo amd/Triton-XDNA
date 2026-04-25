@@ -424,15 +424,17 @@ NPU_MODELS = {
 def detect_npu_version():
     """Map known device names to internal NPU version strings.
 
-    If AMD_TRITON_NPU_TARGET is set, use that value directly
+    If ``npu_config.target`` is set (programmatically or via the
+    ``AMD_TRITON_NPU_TARGET`` env var), use that value directly
     (must be 'npu1' or 'npu2'). This enables cross-compilation
     without local NPU hardware.
     """
-    target = os.getenv("AMD_TRITON_NPU_TARGET", "").lower()
-    if target:
+    target = npu_config.target
+    if target is not None:
         if target not in NPU_MODELS:
             raise RuntimeError(
-                f"Invalid AMD_TRITON_NPU_TARGET='{target}'. "
+                f"Invalid target='{target}' from npu_config.target "
+                f"(or AMD_TRITON_NPU_TARGET). "
                 f"Supported values: {list(NPU_MODELS.keys())}"
             )
         return target
@@ -1696,17 +1698,10 @@ def compile_module(
                 # default changed from [4,4] to [] in mlir-air #1470).
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
-                subprocess.check_call(aircc_cmd, stdout=_devnull, stderr=_devnull)
-
-                # Verify xclbin was generated (requires xclbinutil on PATH).
-                # On Windows, get xclbinutil from the XRT Windows SDK:
-                # https://github.com/Xilinx/XRT/releases (xrt_windows_sdk.zip)
-                if output_format != "elf" and not os.path.exists(xclbin_path):
-                    raise RuntimeError(
-                        f"xclbin not generated at {xclbin_path}. "
-                        f"Ensure xclbinutil is on PATH. On Windows, download "
-                        f"xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases"
-                    )
+                # Increase core stack size to 2048 bytes to accommodate
+                # deeper call chains in register-intensive kernels.
+                aircc_cmd.insert(-1, "--stack-size")
+                aircc_cmd.insert(-1, "2048")
                 if npu_config.debug:
                     subprocess.check_call(aircc_cmd)
                 else:

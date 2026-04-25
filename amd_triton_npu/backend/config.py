@@ -16,17 +16,18 @@ Usage::
     # Direct attribute assignment
     npu_config.bf16_emulation = True
     npu_config.compile_only = True
+    npu_config.target = "npu2"  # cross-compile for npu2
 
     # Or dict-style
-    set_config(bf16_emulation=True, compile_only=False)
+    set_config(bf16_emulation=True, compile_only=False, target="npu1")
 
     # Temporary overrides via context manager
     from triton.backends.amd_triton_npu.config import config_context
-    with config_context(compile_only=True):
+    with config_context(compile_only=True, target="npu2"):
         kernel[grid](a, b, c)
 
     # Environment variables still work as fallback
-    # AMD_TRITON_NPU_BF16_EMULATION=1 python my_script.py
+    # AMD_TRITON_NPU_TARGET=npu2 python my_script.py
 """
 
 import contextlib
@@ -35,6 +36,8 @@ import os
 from pathlib import Path
 
 _UNSET = object()
+
+_VALID_TARGETS = frozenset(("npu1", "npu2"))
 
 
 class _NPUConfig:
@@ -52,6 +55,7 @@ class _NPUConfig:
         self._output_format = _UNSET
         self._air_project_path = _UNSET
         self._debug = _UNSET
+        self._target = _UNSET
 
     # ---- compile_only ----
 
@@ -175,6 +179,46 @@ class _NPUConfig:
         _drv = logging.getLogger("triton.backends.amd_triton_npu.driver")
         _drv.setLevel(logging.DEBUG if self._debug else logging.CRITICAL)
 
+    # ---- target ----
+
+    @property
+    def target(self):
+        """Force the NPU target to ``"npu1"`` or ``"npu2"``.
+
+        When set, ``detect_npu_version()`` uses this value instead of
+        querying hardware via xrt-smi.  This enables cross-compilation
+        without local NPU hardware.
+
+        Set to ``None`` for auto-detection from installed hardware.
+
+        Env var fallback: ``AMD_TRITON_NPU_TARGET``.  If the environment
+        variable is set to a non-empty unsupported value, a ``ValueError``
+        is raised.
+        """
+        if self._target is not _UNSET:
+            return self._target
+        v = os.getenv("AMD_TRITON_NPU_TARGET", "")
+        if not v:
+            return None
+        v = v.lower()
+        if v not in _VALID_TARGETS:
+            raise ValueError(
+                f"AMD_TRITON_NPU_TARGET must be one of {sorted(_VALID_TARGETS)} "
+                f"or empty/unset; got {v!r}"
+            )
+        return v
+
+    @target.setter
+    def target(self, value):
+        if value is not None:
+            value = value.lower()
+            if value not in _VALID_TARGETS:
+                raise ValueError(
+                    f"target must be one of {sorted(_VALID_TARGETS)} or None; "
+                    f"got {value!r}"
+                )
+        self._target = value
+
     # ---- utilities ----
 
     def reset(self):
@@ -185,6 +229,7 @@ class _NPUConfig:
         self._output_format = _UNSET
         self._air_project_path = _UNSET
         self._debug = _UNSET
+        self._target = _UNSET
 
 
 # Module-level singleton
@@ -207,6 +252,7 @@ def set_config(**kwargs):
         "bf16_emulation",
         "output_format",
         "air_project_path",
+        "target",
     }
     for key, value in kwargs.items():
         if key not in valid_keys:

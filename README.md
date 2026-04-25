@@ -89,7 +89,7 @@ This will automatically install all required dependencies:
 - llvm-aie
 - mlir-air
 
-The versions are managed in `utils/mlir-aie-hash.txt`, `utils/llvm-aie-hash.txt`, and `utils/mlir-air-hash.txt`.
+The versions of mlir-aie and mlir-air are managed in `utils/mlir-aie-hash.txt` and `utils/mlir-air-hash.txt`. llvm-aie uses the latest nightly release.
 
 #### Option 3: Build from Source (Using Cmake)
 

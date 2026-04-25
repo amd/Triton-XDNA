@@ -305,48 +305,32 @@ def _make_version_spec(pkg_name, version, timestamp, short_commit, suffix=""):
 
 def get_install_requires():
     """Build install_requires list from hash files."""
-    # Use platform-specific hash files on Windows
     mlir_aie_hash_file = BASE_DIR / "utils" / "mlir-aie-hash.txt"
     mlir_air_hash_file = BASE_DIR / "utils" / "mlir-air-hash.txt"
-    llvm_aie_hash_file = BASE_DIR / "utils" / "llvm-aie-hash.txt"
 
     # Parse mlir-aie version
     mlir_aie_version = parse_hash_file(mlir_aie_hash_file, "Version")
     mlir_aie_timestamp = parse_hash_file(mlir_aie_hash_file, "Timestamp")
     mlir_aie_commit = parse_hash_file(mlir_aie_hash_file, "Commit")
     mlir_aie_short_commit = mlir_aie_commit[:7]
-
-    # Parse llvm-aie version
-    llvm_aie_version = parse_hash_file(llvm_aie_hash_file, "Version")
-    llvm_aie_timestamp = parse_hash_file(llvm_aie_hash_file, "Timestamp")
-    llvm_aie_commit = parse_hash_file(llvm_aie_hash_file, "Commit")
+    mlir_aie_full_version = (
+        f"{mlir_aie_version}.{mlir_aie_timestamp}+{mlir_aie_short_commit}.no.rtti"
+    )
 
     # Parse mlir-air version
     mlir_air_version = parse_hash_file(mlir_air_hash_file, "Version")
     mlir_air_timestamp = parse_hash_file(mlir_air_hash_file, "Timestamp")
     mlir_air_commit = parse_hash_file(mlir_air_hash_file, "Commit")
     mlir_air_short_commit = mlir_air_commit[:7]
+    mlir_air_full_version = (
+        f"{mlir_air_version}.{mlir_air_timestamp}+{mlir_air_short_commit}.no.rtti"
+    )
 
-    specs = [
-        _make_version_spec(
-            "mlir-aie",
-            mlir_aie_version, mlir_aie_timestamp,
-            mlir_aie_short_commit, ".no.rtti",
-        ),
-        _make_version_spec(
-            "llvm-aie",
-            llvm_aie_version, llvm_aie_timestamp,
-            llvm_aie_commit,
-        ),
-        _make_version_spec(
-            "mlir-air",
-            mlir_air_version, mlir_air_timestamp,
-            mlir_air_short_commit, ".no.rtti",
-        ),
+    return [
+        f"mlir-aie=={mlir_aie_full_version}",
+        "llvm-aie",
+        f"mlir-air=={mlir_air_full_version}",
     ]
-    deps = [s for s in specs if s is not None]
-
-    return deps
 
 
 def get_triton_windows_llvm_hash(triton_dir: Path) -> str:
