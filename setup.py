@@ -64,6 +64,9 @@ THIRD_PARTY_DIR = BASE_DIR / "third_party"
 TRITON_SOURCE_DIR = THIRD_PARTY_DIR / ("triton-windows" if IS_WINDOWS else "triton")
 TRITON_SHARED_DIR = THIRD_PARTY_DIR / "triton_shared"
 AMD_TRITON_NPU_DIR = BASE_DIR / "amd_triton_npu"
+
+# same strategy as used in TheRock
+# https://github.com/ROCm/TheRock/pull/4006/changes#diff-6812ec4cd824b4a56416cd4ca74afdece86fe8d39c813300eddc0d17194b9e80R153-R155
 LLVM_BASE_URL = "https://oaitriton.blob.core.windows.net/public/llvm-builds"
 
 # Patch configuration: (submodule_name, patch_file)
