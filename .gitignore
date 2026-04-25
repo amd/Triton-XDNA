@@ -36,3 +36,6 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+
+# air projects
+air_project/

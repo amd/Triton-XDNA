@@ -61,13 +61,14 @@ if not (IS_LINUX or IS_WINDOWS):
 
 BASE_DIR = Path(__file__).parent.resolve()
 THIRD_PARTY_DIR = BASE_DIR / "third_party"
-TRITON_SOURCE_DIR = THIRD_PARTY_DIR / "triton"
+TRITON_SOURCE_DIR = THIRD_PARTY_DIR / ("triton-windows" if IS_WINDOWS else "triton")
 TRITON_SHARED_DIR = THIRD_PARTY_DIR / "triton_shared"
 AMD_TRITON_NPU_DIR = BASE_DIR / "amd_triton_npu"
+LLVM_BASE_URL = "https://oaitriton.blob.core.windows.net/public/llvm-builds"
 
 # Patch configuration: (submodule_name, patch_file)
 PATCHES = [
-    ("triton", "triton.patch"),
+    ("triton-windows", "triton-windows.patch") if IS_WINDOWS else ("triton", "triton.patch"),
     ("triton_shared", "triton_shared.patch"),
 ]
 
@@ -305,14 +306,9 @@ def _make_version_spec(pkg_name, version, timestamp, short_commit, suffix=""):
 def get_install_requires():
     """Build install_requires list from hash files."""
     # Use platform-specific hash files on Windows
-    if IS_WINDOWS:
-        mlir_aie_hash_file = BASE_DIR / "utils" / "mlir-aie-hash-windows.txt"
-        mlir_air_hash_file = BASE_DIR / "utils" / "mlir-air-hash-windows.txt"
-        llvm_aie_hash_file = BASE_DIR / "utils" / "llvm-aie-hash-windows.txt"
-    else:
-        mlir_aie_hash_file = BASE_DIR / "utils" / "mlir-aie-hash.txt"
-        mlir_air_hash_file = BASE_DIR / "utils" / "mlir-air-hash.txt"
-        llvm_aie_hash_file = BASE_DIR / "utils" / "llvm-aie-hash.txt"
+    mlir_aie_hash_file = BASE_DIR / "utils" / "mlir-aie-hash.txt"
+    mlir_air_hash_file = BASE_DIR / "utils" / "mlir-air-hash.txt"
+    llvm_aie_hash_file = BASE_DIR / "utils" / "llvm-aie-hash.txt"
 
     # Parse mlir-aie version
     mlir_aie_version = parse_hash_file(mlir_aie_hash_file, "Version")
@@ -350,14 +346,7 @@ def get_install_requires():
     ]
     deps = [s for s in specs if s is not None]
 
-    # On Windows, use triton-windows wheel; on Linux, triton is built from source
-    if IS_WINDOWS:
-        deps.append("triton-windows")
-
     return deps
-
-
-LLVM_BASE_URL = "https://oaitriton.blob.core.windows.net/public/llvm-builds"
 
 
 def get_triton_windows_llvm_hash(triton_dir: Path) -> str:
@@ -462,7 +451,10 @@ class TritonXdnaBdistWheel(bdist_wheel):
             tmpdir = Path(tmpdir)
 
             # Step 1: Build triton wheel with plugins
-            triton_wheel = self._build_triton_windows(tmpdir)
+            if IS_WINDOWS:
+                triton_wheel = self._build_triton_windows(tmpdir)
+            else:
+                triton_wheel = self._build_triton_wheel(tmpdir)
 
             # Step 2: Unpack the wheel
             unpack_dir = tmpdir / "unpacked"
@@ -497,14 +489,14 @@ class TritonXdnaBdistWheel(bdist_wheel):
         # Get the project root (works both on host and in container)
         # Use the current working directory if it looks like a container mount
         cwd = Path.cwd()
-        if (cwd / "third_party" / "triton").exists():
+        if (cwd / "third_party" / "triton-windows").exists():
             project_root = cwd
         else:
             project_root = BASE_DIR
 
-                    # Set plugin directories relative to project root
+        # Set plugin directories relative to project root
         triton_shared_dir = project_root / "third_party" / "triton_shared"
-        triton_dir = project_root / "third_party" / "triton"
+        triton_dir = project_root / "third_party" / "triton-windows"
         amd_npu_dir = project_root / "amd_triton_npu"
 
         plugin_dirs = f"{triton_shared_dir};{amd_npu_dir}"
@@ -528,6 +520,9 @@ class TritonXdnaBdistWheel(bdist_wheel):
                 "TRITON_PLUGIN_DIRS": plugin_dirs,
                 # Override package name to "triton" for consistency with Linux
                 "TRITON_WHEEL_NAME": "triton",
+                # cl MUST be used or it will fail with a -fPIC error
+                "CC": "cl.exe",
+                "CXX": "cl.exe"
             }
         )
 
@@ -663,19 +658,12 @@ class TritonXdnaBdistWheel(bdist_wheel):
         """Add triton-shared-opt binary to the unpacked wheel."""
         print("\n[3/7] Adding triton-shared-opt binary...", file=sys.stderr)
 
-        # Get project root
-        cwd = Path.cwd()
-        if (cwd / "third_party" / "triton").exists():
-            project_root = cwd
-        else:
-            project_root = BASE_DIR
-
-        triton_source = project_root / "third_party" / "triton"
-        triton_shared_opt_binary = find_triton_shared_opt_binary(triton_source)
+        triton_shared_opt_binary = find_triton_shared_opt_binary(TRITON_SOURCE_DIR)
 
         if triton_shared_opt_binary is None:
+            # Warning: triton-shared-opt binary not found in D:\winxdna\third_party\triton/build/
             print(
-                f"  Warning: triton-shared-opt binary not found in {triton_source}/build/",
+                f"  Warning: triton-shared-opt binary not found in {TRITON_SOURCE_DIR}/build/",
                 file=sys.stderr,
             )
             return

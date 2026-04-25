@@ -6,7 +6,6 @@ import json
 import logging
 import tempfile
 import sys
-import sysconfig
 
 import os, subprocess, tempfile, platform
 import importlib.util
@@ -1492,7 +1491,7 @@ def compile_module(
             cache_insts_path = cache.get_file("insts.bin")
 
         if cache_path is None:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with tempfile.TemporaryDirectory(delete=False) as tmpdir:
                 launcher_src_path = os.path.join(tmpdir, "main.cxx")
                 if IS_WINDOWS:
                     so_path = os.path.join(tmpdir, "xrt_dispatch.pyd")
@@ -1506,6 +1505,7 @@ def compile_module(
                     compile_flags = [
                         cl_path,
                         "/std:c++latest",
+                        "/MD",
                         "/Zc:__cplusplus",
                         "/EHsc",
                         "/LD",
@@ -1532,8 +1532,6 @@ def compile_module(
                         # Add test_utils library path and dependent Boost libraries for linking.
                         compile_flags += [
                             f"/LIBPATH:{os.path.join(aie_test_utils_dir, 'lib')}",
-                            "boost_program_options.lib",
-                            "boost_filesystem.lib",
                             "test_utils.lib",
                         ]
                 else:
@@ -1561,45 +1559,14 @@ def compile_module(
                         compile_flags += [
                             f"-I{os.path.join(aie_test_utils_dir, 'include')}",
                             f"-L{os.path.join(aie_test_utils_dir, 'lib')}",
-                            "-lboost_program_options",
-                            "-lboost_filesystem",
                             "-ltest_utils",
                         ]
+                if IS_WINDOWS:
+                    compile_flags += ["/OUT:"+so_path]
+                else:
                     compile_flags += ["-o", so_path]
                 _quiet = os.getenv("TRITON_NPU_QUIET", "0") != "0"
                 _devnull = subprocess.DEVNULL if _quiet else None
-                subprocess.check_call(
-                    compile_flags,
-                    stdout=_devnull,
-                    stderr=_devnull,
-                    env=msvc_env if msvc_env else None,
-                )
-                compile_flags = [
-                    "g++",
-                    "-std=c++23",
-                    launcher_src_path,
-                    f"-I{py_include_dir}",
-                    f"-I{include_dir}",
-                    f"-L{py_lib_dir}",
-                    "-shared",
-                    f"-l{py_lib}",
-                    "-fPIC",
-                    "-Wall",
-                    f"-I{os.path.join(xrt_dir, 'include')}",
-                    f"-L{os.path.join(xrt_dir, 'lib')}",
-                    "-luuid",
-                    "-lxrt_coreutil",
-                    "-lrt",
-                    "-lstdc++",
-                ]
-                if output_format != "elf":
-                    # xclbin mode needs test_utils for loading instruction binary
-                    compile_flags += [
-                        f"-I{os.path.join(aie_test_utils_dir, 'include')}",
-                        f"-L{os.path.join(aie_test_utils_dir, 'lib')}",
-                        "-ltest_utils",
-                    ]
-                compile_flags += ["-o", so_path]
                 if npu_config.debug:
                     subprocess.check_call(compile_flags)
                 else:

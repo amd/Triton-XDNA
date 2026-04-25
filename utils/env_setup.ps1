@@ -99,7 +99,7 @@ if (-not (Test-Path $TritonSharedDst)) {
 }
 
 # =============================================================================
-# Install PyTorch (CPU)
+# Install PyTorch (CPU) or TheRock PyTorch (iGPU)
 # =============================================================================
 
 Write-Host "Installing PyTorch (CPU)..."
