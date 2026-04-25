@@ -42,3 +42,6 @@ air_project/
 *.mlir.tmp
 tt.shared.mlir
 xrt-dev/
+
+# llvm windows prebuilt images
+third_party/llvm-*

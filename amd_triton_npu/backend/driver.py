@@ -1536,7 +1536,7 @@ def compile_module(
             cache_insts_path = cache.get_file("insts.bin")
 
         if cache_path is None:
-            with tempfile.TemporaryDirectory(delete=False) as tmpdir:
+            with tempfile.TemporaryDirectory() as tmpdir:
                 launcher_src_path = os.path.join(tmpdir, "main.cxx")
                 if IS_WINDOWS:
                     so_path = os.path.join(tmpdir, "xrt_dispatch.pyd")
