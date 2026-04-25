@@ -4,9 +4,6 @@
 [submodule "third_party/triton_shared"]
 	path = third_party/triton_shared
 	url = https://github.com/facebookincubator/triton-shared.git
-[submodule "triton-windows"]
-	path = triton-windows
-	url = https://github.com/triton-lang/triton-windows.git
 [submodule "third_party/triton-windows"]
 	path = third_party/triton-windows
 	url = https://github.com/triton-lang/triton-windows.git
