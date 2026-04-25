@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "pip", "build", "pybind11", "cmake>=3.20", "ninja"]
+requires = ["setuptools>=70.1", "wheel", "pip", "build", "pybind11", "cmake>=3.20", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -22,6 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
 ]
 
 # Installation command:

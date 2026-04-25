@@ -6,10 +6,10 @@ import json
 import logging
 import tempfile
 import sys
-import sysconfig
 
 import os, subprocess, tempfile, platform
 import importlib.util
+import importlib.metadata
 import shutil
 
 from pathlib import Path
@@ -25,6 +25,8 @@ from air.ir import *
 import air.passmanager
 
 from .config import npu_config
+
+IS_WINDOWS = sys.platform == "win32"
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.CRITICAL)
@@ -90,40 +92,272 @@ def _format_of(ty):
     }[ty]
 
 
-def _get_air_opt_path() -> str:
-    """
-    Get the path to air-opt binary from pip-installed mlir-air package.
+def _find_mlir_air_binary(binary_name: str) -> str:
+    """Locate a binary inside the mlir-air install prefix.
 
-    Uses the aircc module's location to find the mlir_air package root,
-    then locates the air-opt binary in the bin/ directory.
+    Search order:
+    1. MLIR_AIR_INSTALL_DIR environment variable
+    2. mlir-air .pth file (when built from source on Windows)
+    3. pip-wheel layout: navigate up from aircc module location
+    4. shutil.which() (PATH lookup)
 
     Returns:
-        str: Path to air-opt binary
+        str: Absolute path to the binary
 
     Raises:
-        RuntimeError: If air-opt binary not found
+        RuntimeError: If not found
     """
-    # aircc.__file__ gives: /path/to/mlir_air/python/air/compiler/aircc/main.py
-    # We need: /path/to/mlir_air/bin/air-opt
+    candidates = []
+
+    # 1. Explicit env var
+    mlir_air_env = os.environ.get("MLIR_AIR_INSTALL_DIR")
+    if mlir_air_env:
+        candidates.append(Path(mlir_air_env) / "bin" / binary_name)
+
+    # 2. .pth file: points to <install>/python, so <install>/bin has binaries
+    import site
+    for sp in site.getsitepackages():
+        pth = os.path.join(sp, "mlir-air.pth")
+        if os.path.exists(pth):
+            with open(pth) as f:
+                pth_dir = f.read().strip()
+            if pth_dir:
+                candidates.append(Path(pth_dir).resolve().parent / "bin" / binary_name)
+
+    # 3. pip-wheel layout: aircc.__file__ -> .../mlir_air/python/air/compiler/aircc/main.py
     aircc_path = Path(aircc.__file__).resolve()
-    # Navigate from .../mlir_air/python/air/compiler/aircc/main.py to .../mlir_air/
-    mlir_air_root = aircc_path.parent.parent.parent.parent.parent
-    air_opt_path = mlir_air_root / "bin" / "air-opt"
+    candidates.append(aircc_path.parent.parent.parent.parent.parent / "bin" / binary_name)
+    # Also try 3 levels up (namespace package: air/compiler/aircc/main.py -> site-packages)
+    candidates.append(aircc_path.parent.parent.parent / "bin" / binary_name)
 
-    if not air_opt_path.exists():
-        raise RuntimeError(f"Could not find air-opt binary at {air_opt_path}")
+    for c in candidates:
+        if c.exists():
+            return str(c)
 
-    return str(air_opt_path)
+    # 4. Fall back to PATH
+    found = shutil.which(binary_name)
+    if found:
+        return found
+
+    tried = "\n  ".join(str(c) for c in candidates)
+    raise RuntimeError(
+        f"Could not find {binary_name}. Searched:\n  {tried}\n"
+        f"Set MLIR_AIR_INSTALL_DIR to the mlir-air install prefix."
+    )
+
+
+def _get_air_opt_path() -> str:
+    """Get the path to the air-opt binary."""
+    binary_name = "air-opt.exe" if IS_WINDOWS else "air-opt"
+    return _find_mlir_air_binary(binary_name)
 
 
 def _get_xrt_path() -> str:
-    path = os.getenv("XILINX_XRT", "")
-    if path == "":
-        raise Exception("XILINX_XRT is not set. Is xrt installed in system?")
-    return path
+    """Get the path to the XRT development directory (headers + import lib).
+
+    Search order:
+    1. XILINX_XRT environment variable (standard on both Linux and Windows)
+    2. (Windows) C:\\Program Files\\AMD\\xrt  (recommended install location)
+    3. (Linux) /opt/xilinx/xrt
+
+    The returned directory must contain the SDK components (include/xrt headers
+    and lib/) needed for JIT compilation.  A runtime-only installation (e.g.
+    DLLs from the NPU driver) is not sufficient.
+
+    On Windows, download xrt_windows_sdk.zip from the Xilinx/XRT releases page
+    and extract the xrt/ directory to C:\\Program Files\\AMD\\xrt.
+    """
+    def _validate_xrt_sdk(path: str, source: str) -> str:
+        """Ensure *path* contains the SDK components needed for compilation."""
+        has_headers = os.path.isdir(os.path.join(path, "include", "xrt"))
+        has_lib = os.path.isdir(os.path.join(path, "lib"))
+        if has_headers and has_lib:
+            return path
+        if os.path.isdir(path):
+            # Directory exists but is missing SDK pieces – give a targeted hint.
+            missing = []
+            if not has_headers:
+                missing.append("include/xrt (headers)")
+            if not has_lib:
+                missing.append("lib (import libraries)")
+            raise Exception(
+                f"XRT directory found via {source} at {path}, but it appears to "
+                f"be a runtime-only installation — missing: {', '.join(missing)}. "
+                "Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases "
+                "and extract the full xrt/ directory (with include/ and lib/) to that location."
+            )
+        return ""  # path doesn't exist at all
+
+    env_path = os.getenv("XILINX_XRT", "")
+    if env_path:
+        result = _validate_xrt_sdk(env_path, "XILINX_XRT environment variable")
+        if result:
+            return result
+
+    if IS_WINDOWS:
+        program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
+        default_path = os.path.join(program_files, "AMD", "xrt")
+        result = _validate_xrt_sdk(default_path, "default location")
+        if result:
+            return result
+    else:
+        result = _validate_xrt_sdk("/opt/xilinx/xrt", "default location")
+        if result:
+            return result
+
+    raise Exception(
+        "XRT development files not found. "
+        "Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases "
+        "and extract the xrt/ directory to C:\\Program Files\\AMD\\xrt "
+        "(or set the XILINX_XRT environment variable to its location)."
+    )
+
+
+def _find_msvc_cl() -> str:
+    """Locate cl.exe for JIT compilation on Windows.
+
+    Search order:
+    1. cl.exe already on PATH (e.g. running from a VS Developer Command Prompt)
+    2. vswhere.exe to discover Visual Studio installations, then use the
+       latest MSVC toolset's Hostx64/x64/cl.exe
+
+    Returns the absolute path to cl.exe.
+    Raises Exception with setup instructions if MSVC cannot be found.
+    """
+    # 1. Already on PATH?
+    cl_on_path = shutil.which("cl.exe") or shutil.which("cl")
+    if cl_on_path:
+        return cl_on_path
+
+    # 2. Discover via vswhere
+    program_files_x86 = os.environ.get(
+        "ProgramFiles(x86)", "C:\\Program Files (x86)"
+    )
+    vswhere = os.path.join(
+        program_files_x86,
+        "Microsoft Visual Studio",
+        "Installer",
+        "vswhere.exe",
+    )
+    if os.path.isfile(vswhere):
+        try:
+            vs_path = (
+                subprocess.check_output(
+                    [
+                        vswhere,
+                        "-latest",
+                        "-products", "*",
+                        "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                        "-property", "installationPath",
+                    ],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                )
+                .strip()
+                .splitlines()[0]
+            )
+        except (subprocess.CalledProcessError, IndexError):
+            vs_path = ""
+
+        if vs_path:
+            # Find the latest MSVC toolset version
+            msvc_root = os.path.join(vs_path, "VC", "Tools", "MSVC")
+            if os.path.isdir(msvc_root):
+                versions = sorted(os.listdir(msvc_root), reverse=True)
+                for ver in versions:
+                    candidate = os.path.join(
+                        msvc_root, ver, "bin", "Hostx64", "x64", "cl.exe"
+                    )
+                    if os.path.isfile(candidate):
+                        return candidate
+
+    raise Exception(
+        "MSVC compiler (cl.exe) not found. Triton-XDNA needs MSVC for JIT "
+        "compilation of NPU dispatch code on Windows.\n"
+        "Options:\n"
+        "  1. Run from a 'x64 Native Tools Command Prompt for VS 2022'\n"
+        "  2. Install Visual Studio 2022 with the 'Desktop development with C++' workload\n"
+        "     (https://visualstudio.microsoft.com/)\n"
+        "  3. Install the Build Tools for Visual Studio 2022\n"
+        "     (https://visualstudio.microsoft.com/visual-cpp-build-tools/)"
+    )
+
+
+def _get_msvc_env(cl_path: str) -> dict:
+    """Build the environment variables needed for cl.exe to find headers and libs.
+
+    If INCLUDE and LIB are already set (e.g. from vcvars), returns the current
+    environment unchanged.  Otherwise, derives them from the cl.exe location
+    and the Windows SDK.
+    """
+    env = os.environ.copy()
+
+    # If INCLUDE is already set, assume the environment is already configured
+    if env.get("INCLUDE"):
+        return env
+
+    # Derive MSVC paths from cl.exe location:
+    #   .../VC/Tools/MSVC/<ver>/bin/Hostx64/x64/cl.exe
+    cl_dir = os.path.dirname(cl_path)  # .../bin/Hostx64/x64
+    msvc_ver_dir = os.path.normpath(
+        os.path.join(cl_dir, "..", "..", "..")
+    )  # .../VC/Tools/MSVC/<ver>
+
+    msvc_include = os.path.join(msvc_ver_dir, "include")
+    msvc_lib = os.path.join(msvc_ver_dir, "lib", "x64")
+
+    if not os.path.isdir(msvc_include):
+        raise Exception(
+            f"Found cl.exe at {cl_path} but could not locate MSVC include "
+            f"directory at {msvc_include}. Run from a VS Developer Command Prompt "
+            "or ensure INCLUDE/LIB environment variables are set."
+        )
+
+    # Find Windows SDK
+    sdk_root = os.environ.get(
+        "WindowsSdkDir",
+        os.path.join(
+            os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            "Windows Kits",
+            "10",
+        ),
+    )
+    sdk_version = os.environ.get("WindowsSDKVersion", "").rstrip("\\")
+    if not sdk_version:
+        # Auto-detect latest SDK version
+        sdk_inc_root = os.path.join(sdk_root, "Include")
+        if os.path.isdir(sdk_inc_root):
+            versions = sorted(
+                [d for d in os.listdir(sdk_inc_root) if d.startswith("10.")],
+                reverse=True,
+            )
+            sdk_version = versions[0] if versions else ""
+
+    include_paths = [msvc_include]
+    lib_paths = [msvc_lib]
+
+    if sdk_version:
+        sdk_inc = os.path.join(sdk_root, "Include", sdk_version)
+        sdk_lib = os.path.join(sdk_root, "Lib", sdk_version)
+        for subdir in ["ucrt", "shared", "um"]:
+            p = os.path.join(sdk_inc, subdir)
+            if os.path.isdir(p):
+                include_paths.append(p)
+        for subdir in ["ucrt", "um"]:
+            p = os.path.join(sdk_lib, subdir, "x64")
+            if os.path.isdir(p):
+                lib_paths.append(p)
+
+    env["INCLUDE"] = ";".join(include_paths)
+    env["LIB"] = ";".join(lib_paths)
+    env["PATH"] = os.path.dirname(cl_path) + ";" + env.get("PATH", "")
+    return env
 
 
 def _get_aie_test_utils_path() -> str:
+    custom = os.getenv("AIE_TEST_UTILS_DIR")
+    if custom:
+        return custom
     path = (
         Path(aiecc.__file__).parent.parent.parent.parent.parent
         / "runtime_lib"
@@ -239,7 +473,10 @@ def _get_output_format():
                 "npu_config.output_format to 'xclbin' or None."
             )
         return configured_format
-    # Auto-detect: ELF for npu2, xclbin for npu1
+    # Auto-detect: xclbin on Windows (ELF flow has stoul bug in NPU driver),
+    # ELF for npu2 on Linux, xclbin for npu1 everywhere.
+    if IS_WINDOWS:
+        return "xclbin"
     return "elf" if npu_version == "npu2" else "xclbin"
 
 
@@ -573,11 +810,10 @@ def _generate_launcher(constants, signature, kernel_name):
 #include "ExecutionEngine/CRunnerUtils.h"
 #include "ExecutionEngine/CRunnerUtils.cpp"
 
-#include "test_utils.h"
-
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <sstream>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -605,8 +841,21 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 // Call to XRT goes here:
 static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
-    std::vector<uint32_t> instr_v =
-        test_utils::load_instr_binary(insts_path);
+    // Load instruction binary (inlined, replaces test_utils dependency)
+    std::vector<uint32_t> instr_v;
+    {{
+        std::ifstream instr_file(insts_path, std::ios::binary);
+        if (!instr_file.is_open())
+            throw std::runtime_error(std::string("Failed to open instr file: ") + insts_path);
+        instr_file.seekg(0, std::ios::end);
+        std::streamsize fsize = instr_file.tellg();
+        instr_file.seekg(0, std::ios::beg);
+        if (fsize % 4 != 0)
+            throw std::runtime_error("Instruction file size is not a multiple of 4 bytes");
+        instr_v.resize(fsize / 4);
+        if (!instr_file.read(reinterpret_cast<char*>(instr_v.data()), fsize))
+            throw std::runtime_error("Failed to read instruction file");
+    }}
 
     int verbosity = {1 if npu_config.debug else 0};
     if (verbosity >= 1)
@@ -910,7 +1159,9 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
+#include <stdexcept>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -940,17 +1191,23 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 // ELF-based XRT launch:
 static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in ptr_args)}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
+    try {{
 
     int verbosity = {1 if npu_config.debug else 0};
 
     // Get a device handle
     unsigned int device_index = 0;
+    if (verbosity >= 1)
+        std::cout << "Opening device " << device_index << "..." << std::endl;
     auto device = xrt::device(device_index);
 
     // Load the ELF
     if (verbosity >= 1)
         std::cout << "Loading ELF: " << elf_path << std::endl;
     xrt::elf ctx_elf{{elf_path}};
+
+    if (verbosity >= 1)
+        std::cout << "Creating hw_context..." << std::endl;
     xrt::hw_context context = xrt::hw_context(device, ctx_elf);
 
     // Kernel name from ELF config (e.g., "main:vecadd")
@@ -987,6 +1244,11 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
 
     if (verbosity >= 1)
         std::cout << "Launch finished." << std::endl;
+
+    }} catch (const std::exception& e) {{
+        std::string msg = std::string("XRT runtime error: ") + e.what();
+        PyErr_SetString(PyExc_RuntimeError, msg.c_str());
+    }}
   }}
 }}
 
@@ -1168,6 +1430,16 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
+# Global cache: maps input hash -> (loaded .pyd module, launch function)
+# Persists across all NPULauncher instances for the process lifetime.
+# Bypasses the expensive MLIR pipeline on repeated dispatches of the same kernel.
+_global_module_cache = {}
+
+# Last dispatched module — set after each dispatch so callers can capture it
+# for direct fast-path calls (bypassing Triton JIT entirely).
+_last_dispatched_module = None
+
+
 def compile_module(
     launcher_src,
     kernel_placeholder_name,
@@ -1209,8 +1481,28 @@ def compile_module(
         launch_exit_hook,
         *args,
     ):
+        global _global_module_cache, _last_dispatched_module
         asm_src = cu_function
         kernel_name = kernel_metadata[6]  # see pack_metadata in compiler.py
+
+        # Fast path: check if we've already loaded the .pyd for this kernel
+        input_key = hashlib.md5(
+            asm_src
+            + f"_{gridX}_{gridY}_{gridZ}_{kernel_name}"
+            f"_{autotune_time}_{output_format}"
+            f"_{os.getenv('AMD_TRITON_NPU_BF16_EMULATION', '0')}".encode()
+        ).hexdigest()
+
+        if input_key in _global_module_cache:
+            mod = _global_module_cache[input_key]
+            _last_dispatched_module = mod
+            return mod.launch(
+                gridX, gridY, gridZ,
+                kernel_metadata, launch_metadata,
+                launch_enter_hook, launch_exit_hook,
+                *args,
+            )
+
         src = launcher_src.replace(kernel_placeholder_name, kernel_name)
 
         air_proj_path = npu_config.air_project_path
@@ -1236,7 +1528,7 @@ def compile_module(
         if on_cache_resolved is not None:
             on_cache_resolved(cache.cache_dir)
         name = "__npu_dispatch"
-        filename = f"{name}.so"
+        filename = f"{name}.pyd" if IS_WINDOWS else f"{name}.so"
         cache_path = cache.get_file(filename)
         if output_format == "elf":
             cache_elf_path = cache.get_file("aie.elf")
@@ -1248,42 +1540,72 @@ def compile_module(
         if cache_path is None:
             with tempfile.TemporaryDirectory() as tmpdir:
                 launcher_src_path = os.path.join(tmpdir, "main.cxx")
-                so_path = os.path.join(tmpdir, "xrt_dispatch.exe")
+                if IS_WINDOWS:
+                    so_path = os.path.join(tmpdir, "xrt_dispatch.pyd")
+                else:
+                    so_path = os.path.join(tmpdir, "xrt_dispatch.exe")
                 Path(launcher_src_path).write_text(src)
                 # Compile the launcher shared library.
-                compile_flags = [
-                    "g++",
-                    "-std=c++23",
-                    launcher_src_path,
-                    f"-I{py_include_dir}",
-                    f"-I{include_dir}",
-                    f"-L{py_lib_dir}",
-                    "-shared",
-                    f"-l{py_lib}",
-                    "-fPIC",
-                    "-Wall",
-                    f"-I{os.path.join(xrt_dir, 'include')}",
-                    f"-L{os.path.join(xrt_dir, 'lib')}",
-                    "-luuid",
-                    "-lxrt_coreutil",
-                    "-lrt",
-                    "-lstdc++",
-                ]
-                if output_format != "elf":
-                    # xclbin mode needs test_utils for loading instruction binary
-                    compile_flags += [
-                        f"-I{os.path.join(aie_test_utils_dir, 'include')}",
-                        f"-L{os.path.join(aie_test_utils_dir, 'lib')}",
-                        "-ltest_utils",
+                if IS_WINDOWS:
+                    cl_path = _find_msvc_cl()
+                    msvc_env = _get_msvc_env(cl_path)
+                    compile_flags = [
+                        cl_path,
+                        "/std:c++latest",
+                        "/MD",
+                        "/Zc:__cplusplus",
+                        "/EHsc",
+                        "/LD",
+                        f"/Fe:{so_path}",
+                        launcher_src_path,
+                        f"/I{py_include_dir}",
+                        f"/I{include_dir}",
+                        f"/I{os.path.join(xrt_dir, 'include')}",
+                        f"/link",
+                        f"/LIBPATH:{py_lib_dir}",
+                        f"/LIBPATH:{os.path.join(xrt_dir, 'lib')}",
+                        f"{py_lib}",
+                        "xrt_coreutil.lib",
                     ]
-                compile_flags += ["-o", so_path]
+                    if output_format != "elf":
+                        # xclbin mode previously needed test_utils for loading
+                        # instruction binary, but that has been inlined.
+                        pass
+                else:
+                    msvc_env = None
+                    compile_flags = [
+                        "g++",
+                        "-std=c++23",
+                        launcher_src_path,
+                        f"-I{py_include_dir}",
+                        f"-I{include_dir}",
+                        f"-L{py_lib_dir}",
+                        "-shared",
+                        f"-l{py_lib}",
+                        "-fPIC",
+                        "-Wall",
+                        f"-I{os.path.join(xrt_dir, 'include')}",
+                        f"-L{os.path.join(xrt_dir, 'lib')}",
+                        "-luuid",
+                        "-lxrt_coreutil",
+                        "-lrt",
+                        "-lstdc++",
+                    ]
+                    if output_format != "elf":
+                        # xclbin mode previously needed test_utils for loading
+                        # instruction binary, but that has been inlined.
+                        pass
+                    compile_flags += ["-o", so_path]
+                _quiet = os.getenv("TRITON_NPU_QUIET", "0") != "0"
+                _devnull = subprocess.DEVNULL if _quiet else None
                 if npu_config.debug:
-                    subprocess.check_call(compile_flags)
+                    subprocess.check_call(compile_flags, env=msvc_env)
                 else:
                     result = subprocess.run(
                         compile_flags,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
+                        env=msvc_env,
                     )
                     if result.returncode != 0:
                         if result.stdout:
@@ -1302,11 +1624,39 @@ def compile_module(
 
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
-                aircc_bin = str(
-                    Path(aircc.__file__).resolve().parent.parent.parent.parent.parent
-                    / "bin"
-                    / "aircc"
-                )
+                aircc_binary_name = "aircc.exe" if IS_WINDOWS else "aircc"
+                aircc_bin = _find_mlir_air_binary(aircc_binary_name)
+
+                # On Windows, construct peano path from llvm-aie package and
+                # add mlir_aie/bin to PATH so aircc can find aiecc.exe
+                peano_flag = "--peano="
+                if IS_WINDOWS:
+                    peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
+                    if peano_dir:
+                        # LLVM_BINARY_DIR points to bin/, peano wants parent
+                        peano_flag = f"--peano={str(Path(peano_dir).parent)}"
+                    else:
+                        # Auto-detect from pip-installed llvm-aie package
+                        try:
+                            dist = importlib.metadata.distribution("llvm-aie")
+                            llvm_aie_root = Path(dist._path.parent) / "llvm-aie"
+                            if (llvm_aie_root / "bin" / "opt.exe").exists():
+                                peano_flag = f"--peano={llvm_aie_root}"
+                        except Exception:
+                            pass
+                    # Also check PEANO_INSTALL_DIR env var
+                    if peano_flag == "--peano=":
+                        peano_env = os.environ.get("PEANO_INSTALL_DIR", "")
+                        if peano_env and os.path.isdir(peano_env):
+                            peano_flag = f"--peano={peano_env}"
+                    # Ensure aiecc is findable
+                    try:
+                        import mlir_aie
+                        mlir_aie_bin = str(Path(mlir_aie.__path__[0]) / "bin")
+                    except ImportError:
+                        mlir_aie_bin = str(Path(aircc.__file__).resolve().parent.parent.parent / "mlir_aie" / "bin")
+                    if os.path.isdir(mlir_aie_bin) and mlir_aie_bin not in os.environ.get("PATH", ""):
+                        os.environ["PATH"] = mlir_aie_bin + os.pathsep + os.environ.get("PATH", "")
 
                 if output_format == "elf":
                     elf_path = os.path.join(air_proj_path, "aie.elf")
@@ -1320,7 +1670,7 @@ def compile_module(
                         "elf",
                         "--elf-name",
                         elf_path,
-                        "--peano=",
+                        peano_flag,
                         air_mlir_path,
                     ]
                 else:
@@ -1332,11 +1682,13 @@ def compile_module(
                         npu_version,
                         "--no-xchesscc",
                         "--no-xbridge",
+                        "--output-format",
+                        "xclbin",
                         "-i",
                         insts_path,
                         "-o",
                         xclbin_path,
-                        "--peano=",
+                        peano_flag,
                         air_mlir_path,
                     ]
                 # Enable bf16 emulation: hardware truncates f32 -> bf16 before
@@ -1436,9 +1788,26 @@ def compile_module(
             # Read the cached kernel name
             with open(cache_elf_kernel_path) as f:
                 elf_kernel_name = f.read().strip()
-            mod.set_paths(cache_elf_path, elf_kernel_name)
+            # Strip Windows extended-length path prefix (\\?\) which
+            # confuses XRT's internal path parsing (stoul error).
+            elf_path_str = cache_elf_path
+            if IS_WINDOWS and elf_path_str.startswith("\\\\?\\"):
+                elf_path_str = elf_path_str[4:]
+            mod.set_paths(elf_path_str, elf_kernel_name)
         else:
-            mod.set_paths(cache_xclbin_path, cache_insts_path)
+            xclbin_path_str = cache_xclbin_path
+            insts_path_str = cache_insts_path
+            if IS_WINDOWS:
+                if xclbin_path_str.startswith("\\\\?\\"):
+                    xclbin_path_str = xclbin_path_str[4:]
+                if insts_path_str.startswith("\\\\?\\"):
+                    insts_path_str = insts_path_str[4:]
+            mod.set_paths(xclbin_path_str, insts_path_str)
+
+        # Cache the loaded module for fast subsequent dispatches
+        _global_module_cache[input_key] = mod
+        _last_dispatched_module = mod
+
         return mod.launch(
             gridX,
             gridY,
