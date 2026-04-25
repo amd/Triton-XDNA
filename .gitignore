@@ -37,5 +37,8 @@ env/
 .DS_Store
 Thumbs.db
 
-# air projects
+# Triton-XDNA runtime artifacts
 air_project/
+*.mlir.tmp
+tt.shared.mlir
+xrt-dev/

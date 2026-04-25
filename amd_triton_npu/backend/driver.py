@@ -471,7 +471,10 @@ def _get_output_format():
                 "npu_config.output_format to 'xclbin' or None."
             )
         return configured_format
-    # Auto-detect: ELF for npu2, xclbin for npu1
+    # Auto-detect: xclbin on Windows (ELF flow has stoul bug in NPU driver),
+    # ELF for npu2 on Linux, xclbin for npu1 everywhere.
+    if IS_WINDOWS:
+        return "xclbin"
     return "elf" if npu_version == "npu2" else "xclbin"
 
 
@@ -805,11 +808,10 @@ def _generate_launcher(constants, signature, kernel_name):
 #include "ExecutionEngine/CRunnerUtils.h"
 #include "ExecutionEngine/CRunnerUtils.cpp"
 
-#include "test_utils.h"
-
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <sstream>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -837,8 +839,21 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 // Call to XRT goes here:
 static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
-    std::vector<uint32_t> instr_v =
-        test_utils::load_instr_binary(insts_path);
+    // Load instruction binary (inlined, replaces test_utils dependency)
+    std::vector<uint32_t> instr_v;
+    {{
+        std::ifstream instr_file(insts_path, std::ios::binary);
+        if (!instr_file.is_open())
+            throw std::runtime_error(std::string("Failed to open instr file: ") + insts_path);
+        instr_file.seekg(0, std::ios::end);
+        std::streamsize fsize = instr_file.tellg();
+        instr_file.seekg(0, std::ios::beg);
+        if (fsize % 4 != 0)
+            throw std::runtime_error("Instruction file size is not a multiple of 4 bytes");
+        instr_v.resize(fsize / 4);
+        if (!instr_file.read(reinterpret_cast<char*>(instr_v.data()), fsize))
+            throw std::runtime_error("Failed to read instruction file");
+    }}
 
     int verbosity = {1 if npu_config.debug else 0};
     if (verbosity >= 1)
@@ -1413,6 +1428,16 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
+# Global cache: maps input hash -> (loaded .pyd module, launch function)
+# Persists across all NPULauncher instances for the process lifetime.
+# Bypasses the expensive MLIR pipeline on repeated dispatches of the same kernel.
+_global_module_cache = {}
+
+# Last dispatched module — set after each dispatch so callers can capture it
+# for direct fast-path calls (bypassing Triton JIT entirely).
+_last_dispatched_module = None
+
+
 def compile_module(
     launcher_src,
     kernel_placeholder_name,
@@ -1454,8 +1479,28 @@ def compile_module(
         launch_exit_hook,
         *args,
     ):
+        global _global_module_cache, _last_dispatched_module
         asm_src = cu_function
         kernel_name = kernel_metadata[6]  # see pack_metadata in compiler.py
+
+        # Fast path: check if we've already loaded the .pyd for this kernel
+        input_key = hashlib.md5(
+            asm_src
+            + f"_{gridX}_{gridY}_{gridZ}_{kernel_name}"
+            f"_{autotune_time}_{output_format}"
+            f"_{os.getenv('AMD_TRITON_NPU_BF16_EMULATION', '0')}".encode()
+        ).hexdigest()
+
+        if input_key in _global_module_cache:
+            mod = _global_module_cache[input_key]
+            _last_dispatched_module = mod
+            return mod.launch(
+                gridX, gridY, gridZ,
+                kernel_metadata, launch_metadata,
+                launch_enter_hook, launch_exit_hook,
+                *args,
+            )
+
         src = launcher_src.replace(kernel_placeholder_name, kernel_name)
 
         air_proj_path = npu_config.air_project_path
@@ -1521,19 +1566,9 @@ def compile_module(
                         "xrt_coreutil.lib",
                     ]
                     if output_format != "elf":
-                        # xclbin mode needs test_utils for loading instruction binary:
-                        # add its includes, LIBPATH, and libraries.
-                        # Insert test_utils include before /link so it applies to compilation.
-                        link_idx = compile_flags.index("/link")
-                        compile_flags.insert(
-                            link_idx,
-                            f"/I{os.path.join(aie_test_utils_dir, 'include')}",
-                        )
-                        # Add test_utils library path and dependent Boost libraries for linking.
-                        compile_flags += [
-                            f"/LIBPATH:{os.path.join(aie_test_utils_dir, 'lib')}",
-                            "test_utils.lib",
-                        ]
+                        # xclbin mode previously needed test_utils for loading
+                        # instruction binary, but that has been inlined.
+                        pass
                 else:
                     msvc_env = None
                     compile_flags = [
@@ -1555,15 +1590,9 @@ def compile_module(
                         "-lstdc++",
                     ]
                     if output_format != "elf":
-                        # xclbin mode needs test_utils for loading instruction binary
-                        compile_flags += [
-                            f"-I{os.path.join(aie_test_utils_dir, 'include')}",
-                            f"-L{os.path.join(aie_test_utils_dir, 'lib')}",
-                            "-ltest_utils",
-                        ]
-                if IS_WINDOWS:
-                    compile_flags += ["/OUT:"+so_path]
-                else:
+                        # xclbin mode previously needed test_utils for loading
+                        # instruction binary, but that has been inlined.
+                        pass
                     compile_flags += ["-o", so_path]
                 _quiet = os.getenv("TRITON_NPU_QUIET", "0") != "0"
                 _devnull = subprocess.DEVNULL if _quiet else None
@@ -1778,6 +1807,11 @@ def compile_module(
                 if insts_path_str.startswith("\\\\?\\"):
                     insts_path_str = insts_path_str[4:]
             mod.set_paths(xclbin_path_str, insts_path_str)
+
+        # Cache the loaded module for fast subsequent dispatches
+        _global_module_cache[input_key] = mod
+        _last_dispatched_module = mod
+
         return mod.launch(
             gridX,
             gridY,
