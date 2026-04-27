@@ -7,4 +7,4 @@
 [submodule "third_party/triton-windows"]
 	path = third_party/triton-windows
 	url = https://github.com/triton-lang/triton-windows.git
-	branch = main-windows
+	branch = release/3.7.x-windows
