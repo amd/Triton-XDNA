@@ -37,7 +37,6 @@ from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
 from setuptools.command.install import install
 
-
 try:
     from wheel.bdist_wheel import bdist_wheel
 except ImportError:
@@ -71,7 +70,11 @@ LLVM_BASE_URL = "https://oaitriton.blob.core.windows.net/public/llvm-builds"
 
 # Patch configuration: (submodule_name, patch_file)
 PATCHES = [
-    ("triton-windows", "triton-windows.patch") if IS_WINDOWS else ("triton", "triton.patch"),
+    (
+        ("triton-windows", "triton-windows.patch")
+        if IS_WINDOWS
+        else ("triton", "triton.patch")
+    ),
     ("triton_shared", "triton_shared.patch"),
 ]
 
@@ -98,15 +101,10 @@ def find_triton_shared_opt_binary(triton_source_dir: Path = None) -> Path:
 
     if not build_dir.exists():
         return None
-    
+
     if IS_WINDOWS:
         for lib_dir in build_dir.glob("lib.*"):
-            binary_path = (
-                lib_dir
-                / "triton"
-                / "_C"
-                / "triton-shared-opt.exe"
-            )
+            binary_path = lib_dir / "triton" / "_C" / "triton-shared-opt.exe"
         if binary_path.exists() and binary_path.is_file():
             return binary_path
     else:
@@ -270,6 +268,7 @@ def _get_installed_version(pkg_name):
     """Return the installed version of a package, or None if not installed."""
     try:
         from importlib.metadata import version as _ver
+
         return _ver(pkg_name)
     except Exception:
         return None
@@ -278,6 +277,7 @@ def _get_installed_version(pkg_name):
 def _is_locally_available(pkg_name):
     """Check if a package is locally available via .pth file (built from source)."""
     import site
+
     pth_name = f"{pkg_name}.pth"
     for sp in site.getsitepackages():
         if os.path.exists(os.path.join(sp, pth_name)):
@@ -509,7 +509,7 @@ class TritonXdnaBdistWheel(bdist_wheel):
                 "TRITON_WHEEL_NAME": "triton",
                 # cl MUST be used or it will fail with a -fPIC error
                 "CC": "cl.exe",
-                "CXX": "cl.exe"
+                "CXX": "cl.exe",
             }
         )
 
@@ -889,6 +889,7 @@ def _is_triton_installed():
     """Check if triton (or triton-windows) is already installed."""
     try:
         import triton
+
         return True
     except Exception:
         return False
@@ -897,6 +898,7 @@ def _is_triton_installed():
 def _copy_backend_to_triton(backend_src, backend_name):
     """Copy a backend directory into the installed triton's backends dir."""
     import triton
+
     triton_dir = Path(triton.__file__).parent
     dst = triton_dir / "backends" / backend_name
     dst.mkdir(parents=True, exist_ok=True)
@@ -1011,12 +1013,15 @@ class TritonXdnaInstall(install):
 
             # Copy triton-shared-opt
             import triton
+
             triton_dir = Path(triton.__file__).parent
             triton_shared_opt_binary = find_triton_shared_opt_binary()
             if triton_shared_opt_binary is not None:
                 triton_shared_dst = triton_dir / "triton_shared"
                 triton_shared_dst.mkdir(parents=True, exist_ok=True)
-                binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+                binary_name = (
+                    "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+                )
                 dst_binary = triton_shared_dst / binary_name
                 shutil.copy2(triton_shared_opt_binary, dst_binary)
                 if not IS_WINDOWS:
@@ -1054,13 +1059,16 @@ class TritonXdnaInstall(install):
                 triton_dir = Path(pip_install_target) / "triton"
             else:
                 import triton
+
                 triton_dir = Path(triton.__file__).parent
 
             triton_shared_opt_binary = find_triton_shared_opt_binary()
             if triton_shared_opt_binary is not None:
                 triton_shared_dst = triton_dir / "triton_shared"
                 triton_shared_dst.mkdir(parents=True, exist_ok=True)
-                binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+                binary_name = (
+                    "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
+                )
                 dst_binary = triton_shared_dst / binary_name
                 shutil.copy2(triton_shared_opt_binary, dst_binary)
                 if not IS_WINDOWS:
