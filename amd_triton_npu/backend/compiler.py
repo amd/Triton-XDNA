@@ -24,11 +24,7 @@ IS_WINDOWS = sys.platform == "win32"
 
 def _get_amd_triton_npu_opt_path() -> str:
     binary_name = "triton-shared-opt.exe" if IS_WINDOWS else "triton-shared-opt"
-    path = (
-        Path(__file__).resolve().parent.parent.parent
-        / "triton_shared"
-        / binary_name
-    )
+    path = Path(__file__).resolve().parent.parent.parent / "triton_shared" / binary_name
     if not os.path.isdir(path.parent):
         raise RuntimeError(f"Could not find triton-shared binaries at {path}")
     return path

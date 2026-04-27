@@ -116,6 +116,7 @@ def _find_mlir_air_binary(binary_name: str) -> str:
 
     # 2. .pth file: points to <install>/python, so <install>/bin has binaries
     import site
+
     for sp in site.getsitepackages():
         pth = os.path.join(sp, "mlir-air.pth")
         if os.path.exists(pth):
@@ -126,7 +127,9 @@ def _find_mlir_air_binary(binary_name: str) -> str:
 
     # 3. pip-wheel layout: aircc.__file__ -> .../mlir_air/python/air/compiler/aircc/main.py
     aircc_path = Path(aircc.__file__).resolve()
-    candidates.append(aircc_path.parent.parent.parent.parent.parent / "bin" / binary_name)
+    candidates.append(
+        aircc_path.parent.parent.parent.parent.parent / "bin" / binary_name
+    )
     # Also try 3 levels up (namespace package: air/compiler/aircc/main.py -> site-packages)
     candidates.append(aircc_path.parent.parent.parent / "bin" / binary_name)
 
@@ -167,6 +170,7 @@ def _get_xrt_path() -> str:
     On Windows, download xrt_windows_sdk.zip from the Xilinx/XRT releases page
     and extract the xrt/ directory to C:\\Program Files\\AMD\\xrt.
     """
+
     def _validate_xrt_sdk(path: str, source: str) -> str:
         """Ensure *path* contains the SDK components needed for compilation."""
         has_headers = os.path.isdir(os.path.join(path, "include", "xrt"))
@@ -230,9 +234,7 @@ def _find_msvc_cl() -> str:
         return cl_on_path
 
     # 2. Discover via vswhere
-    program_files_x86 = os.environ.get(
-        "ProgramFiles(x86)", "C:\\Program Files (x86)"
-    )
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
     vswhere = os.path.join(
         program_files_x86,
         "Microsoft Visual Studio",
@@ -246,9 +248,12 @@ def _find_msvc_cl() -> str:
                     [
                         vswhere,
                         "-latest",
-                        "-products", "*",
-                        "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                        "-property", "installationPath",
+                        "-products",
+                        "*",
+                        "-requires",
+                        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                        "-property",
+                        "installationPath",
                     ],
                     text=True,
                     stderr=subprocess.DEVNULL,
@@ -1487,8 +1492,7 @@ def compile_module(
 
         # Fast path: check if we've already loaded the .pyd for this kernel
         input_key = hashlib.md5(
-            asm_src
-            + f"_{gridX}_{gridY}_{gridZ}_{kernel_name}"
+            asm_src + f"_{gridX}_{gridY}_{gridZ}_{kernel_name}"
             f"_{autotune_time}_{output_format}"
             f"_{os.getenv('AMD_TRITON_NPU_BF16_EMULATION', '0')}".encode()
         ).hexdigest()
@@ -1497,9 +1501,13 @@ def compile_module(
             mod = _global_module_cache[input_key]
             _last_dispatched_module = mod
             return mod.launch(
-                gridX, gridY, gridZ,
-                kernel_metadata, launch_metadata,
-                launch_enter_hook, launch_exit_hook,
+                gridX,
+                gridY,
+                gridZ,
+                kernel_metadata,
+                launch_metadata,
+                launch_enter_hook,
+                launch_exit_hook,
                 *args,
             )
 
@@ -1652,11 +1660,20 @@ def compile_module(
                     # Ensure aiecc is findable
                     try:
                         import mlir_aie
+
                         mlir_aie_bin = str(Path(mlir_aie.__path__[0]) / "bin")
                     except ImportError:
-                        mlir_aie_bin = str(Path(aircc.__file__).resolve().parent.parent.parent / "mlir_aie" / "bin")
-                    if os.path.isdir(mlir_aie_bin) and mlir_aie_bin not in os.environ.get("PATH", ""):
-                        os.environ["PATH"] = mlir_aie_bin + os.pathsep + os.environ.get("PATH", "")
+                        mlir_aie_bin = str(
+                            Path(aircc.__file__).resolve().parent.parent.parent
+                            / "mlir_aie"
+                            / "bin"
+                        )
+                    if os.path.isdir(
+                        mlir_aie_bin
+                    ) and mlir_aie_bin not in os.environ.get("PATH", ""):
+                        os.environ["PATH"] = (
+                            mlir_aie_bin + os.pathsep + os.environ.get("PATH", "")
+                        )
 
                 if output_format == "elf":
                     elf_path = os.path.join(air_proj_path, "aie.elf")
