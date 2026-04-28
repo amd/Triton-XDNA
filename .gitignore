@@ -7,6 +7,11 @@ __pycache__/
 *.pyo
 *.so
 *.a
+*.obj
+*.lib
+*.exp
+*.dll
+*.pyd
 
 # Wheel files
 *.whl
@@ -31,3 +36,12 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Triton-XDNA runtime artifacts
+air_project/
+*.mlir.tmp
+tt.shared.mlir
+xrt-dev/
+
+# llvm windows prebuilt images
+third_party/llvm-*

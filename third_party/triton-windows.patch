@@ -1,0 +1,46 @@
+From 756a069476911f81175159d3bad4b1876597ef62 Mon Sep 17 00:00:00 2001
+From: Emily Furst <emifurst@amd.com>
+Date: Thu, 4 Sep 2025 21:21:01 -0700
+Subject: [PATCH] update autotuner to recognize backend changes and retune
+
+---
+ python/triton/runtime/autotuner.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
+index 0c4d71049..538912ddf 100644
+--- a/python/triton/runtime/autotuner.py
++++ b/python/triton/runtime/autotuner.py
+@@ -119,7 +119,7 @@ class Autotuner(KernelInterface):
+             )
+             return
+ 
+-    @cached_property
++    @property
+     def do_bench(self):
+         if self._do_bench is None:
+             return driver.active.get_benchmarker()
+@@ -220,6 +220,8 @@ class Autotuner(KernelInterface):
+                 if hasattr(arg, "dtype"):
+                     key.append(str(arg.dtype))
+             key = tuple(key)
++            # Include backend in the key so switching backends triggers retune 
++            key = (driver.active.get_current_target().backend, *key)
+             if key not in self.cache:
+                 used_cached_result = False
+                 pruned_configs = self.prune_configs(kwargs)
+-- 
+2.48.1
+diff --git a/setup.py b/setup.py
+index 643f000c1..5e6bf54d0 100644
+--- a/setup.py
++++ b/setup.py
+@@ -901,7 +901,7 @@ setup(
+     package_dir=dict(get_package_dirs()),
+     entry_points=get_entry_points(),
+     package_data=dict(get_package_data()),
+-    # include_package_data=True,
++    include_package_data=True,
+     ext_modules=[CMakeExtension("triton", "triton/_C/")],
+     cmdclass={
+         "bdist_wheel": plugin_bdist_wheel,

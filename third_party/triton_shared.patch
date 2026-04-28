@@ -69,11 +69,43 @@ index a4ac9ef..69f50b3 100644
  
      def get_device_capability(self):
          return ("cpu", 0)
-diff --git a/triton-hash.txt b/triton-hash.txt
-index 0f8e9fb..58bb9a7 100644
---- a/triton-hash.txt
-+++ b/triton-hash.txt
-@@ -1 +1 @@
--787955000d61355a94c2cd2d04be8b1d8d3648d2
+diff --git a/lib/Analysis/PtrAnalysis.cpp b/lib/Analysis/PtrAnalysis.cpp
+index 0fe5f84..b387759 100644
+--- a/lib/Analysis/PtrAnalysis.cpp
++++ b/lib/Analysis/PtrAnalysis.cpp
+@@ -1051,7 +1051,7 @@ void PtrAnalysis::visitOperandUnrealizedCast(
+ struct ModuloChunkInitArg {
+   Value reinterpretCast = nullptr;
+   // where in the init args is the first chunk placed
+-  size_t initArgIndex = -1;
++  size_t initArgIndex = ~0ULL;
+ };
+ 
+ void PtrAnalysis::rewriteForOp(
+diff --git a/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt b/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt
+index 904e6a1..485cb7a 100644
+--- a/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt
++++ b/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt
+@@ -1,12 +1,17 @@
+ add_library(SanitizerAttributes SHARED SanitizerAttributes.cpp)
+ 
+-# Allow undefined symbols in shared objects on Darwin (this is the default
+-# behaviour on Linux)
+-target_link_libraries(SanitizerAttributes "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>")
++if(MSVC)
++  # can't have undefined symbols
++  target_link_libraries(SanitizerAttributes PRIVATE LLVMCore;LLVMBitReader)
++else()
++  # Allow undefined symbols in shared objects on Darwin (this is the default
++  # behaviour on Linux)
++  target_link_libraries(SanitizerAttributes "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>")
++endif()
+ 
+ # This is set to -fvisibility=hidden in the top level CMake file
+ # which causes the llvmGetPassPluginInfo symbol to be hidden and
+ # an "entry point not found" error. Reset it just for this target
+ if(NOT MSVC)
+   target_compile_options(SanitizerAttributes PRIVATE -fvisibility=default -fno-rtti)
+-endif()
 \ No newline at end of file
-+787955000d61355a94c2cd2d04be8b1d8d3648d2
++endif()
