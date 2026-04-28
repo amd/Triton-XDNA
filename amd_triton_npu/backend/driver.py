@@ -666,7 +666,63 @@ def _inject_transform_library(user_script):
     return result
 
 
-def _get_transform_ir_string():
+def _detect_element_type(ir_str):
+    """Detect the primary element type from the provided Linalg IR string.
+
+    Searches the IR text for the first ``memref<...xTYPE>`` occurrence and
+    returns the captured MLIR element type string (for example, ``"bf16"``,
+    ``"f32"``, ``"i8"``, or ``"i16"``).
+    Falls back to "bf16" if detection fails.
+    """
+    import re
+
+    # Match the first memref<...xTYPE> occurrence in the provided IR text.
+    match = re.search(r"memref<[^>]*x(\w+)>", ir_str)
+    if match:
+        return match.group(1)
+    return "bf16"
+
+
+# Dtype-aware placeholder info: padding value and default vector size per NPU.
+_DTYPE_PLACEHOLDER_INFO = {
+    "bf16": {"pad_val": "0.0 : bf16", "vector_size": {"npu1": 16, "npu2": 32}},
+    "f32": {"pad_val": "0.0 : f32", "vector_size": {"npu1": 16, "npu2": 16}},
+    "i8": {"pad_val": "0 : i8", "vector_size": {"npu1": 32, "npu2": 32}},
+    "i16": {"pad_val": "0 : i16", "vector_size": {"npu1": 32, "npu2": 32}},
+    "i32": {"pad_val": "0 : i32", "vector_size": {"npu1": 16, "npu2": 16}},
+}
+
+
+def _substitute_dtype_placeholders(script, dtype, npu_version):
+    """Substitute dtype-aware placeholders in a transform script.
+
+    Replaces @DTYPE@, @PAD_VAL@, and @VECTOR_SIZE@ with values derived
+    from the detected element type and target NPU version.
+    No-op if the script contains no placeholders (backward compatible).
+    """
+    if (
+        "@DTYPE@" not in script
+        and "@PAD_VAL@" not in script
+        and "@VECTOR_SIZE@" not in script
+    ):
+        return script
+    info = _DTYPE_PLACEHOLDER_INFO.get(dtype)
+    if info is None:
+        raise ValueError(
+            f"Unsupported element type '{dtype}' for transform script placeholder "
+            f"substitution. Supported types: {list(_DTYPE_PLACEHOLDER_INFO.keys())}. "
+            f"The script contains @DTYPE@/@PAD_VAL@/@VECTOR_SIZE@ placeholders that "
+            f"require a supported element type."
+        )
+    script = script.replace("@DTYPE@", dtype)
+    script = script.replace("@PAD_VAL@", info["pad_val"])
+    script = script.replace(
+        "@VECTOR_SIZE@", str(info["vector_size"].get(npu_version, 16))
+    )
+    return script
+
+
+def _get_transform_ir_string(ir_str=None):
     """
     Get the transform IR string for tiling operations.
 
@@ -676,6 +732,12 @@ def _get_transform_ir_string():
 
     If the script uses `transform.include`, the shared transform library
     (transform_library.mlir) is automatically injected.
+
+    If ir_str is provided, dtype-aware placeholders (@DTYPE@, @PAD_VAL@,
+    @VECTOR_SIZE@) are substituted before library injection.
+
+    Args:
+        ir_str: Optional Linalg IR string for dtype detection.
 
     Returns:
         str: The transform IR string to use for tiling
@@ -693,6 +755,17 @@ def _get_transform_ir_string():
         with open(custom_script_path, "r") as f:
             logger.debug("Using custom tiling script from: %s", custom_script_path)
             user_script = f.read()
+        _PLACEHOLDERS = ("@DTYPE@", "@PAD_VAL@", "@VECTOR_SIZE@")
+        if ir_str is not None and any(p in user_script for p in _PLACEHOLDERS):
+            dtype = _detect_element_type(
+                ir_str if isinstance(ir_str, str) else str(ir_str)
+            )
+            npu_version = (
+                detect_npu_version() if "@VECTOR_SIZE@" in user_script else None
+            )
+            user_script = _substitute_dtype_placeholders(
+                user_script, dtype, npu_version
+            )
         return _inject_transform_library(user_script)
 
     # Default hardcoded transform IR string
@@ -750,7 +823,7 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ, actual_sizes=None):
         pm = air.passmanager.PassManager.parse(pipeline, context=air_context)
         pm.run(air_module.operation)
         # MLIR-AIR compilation step 2: tiling the launch body
-        transform_ir_string = _get_transform_ir_string()
+        transform_ir_string = _get_transform_ir_string(ir_str=mod)
         transform_ir = Module.parse(transform_ir_string, context=air_context)
         run_transform(transform_ir, air_module)
         # MLIR-AIR compilation step 3: converting to AIR
