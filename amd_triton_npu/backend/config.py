@@ -26,6 +26,11 @@ Usage::
     with config_context(compile_only=True, target="npu2"):
         kernel[grid](a, b, c)
 
+    # Forward an optional value: pass dataclasses.MISSING to mean "don't override"
+    from dataclasses import MISSING
+    with config_context(transform_tiling_script=user_opts.get("script", MISSING)):
+        kernel[grid](a, b, c)
+
     # Environment variables still work as fallback
     # AMD_TRITON_NPU_TARGET=npu2 python my_script.py
 """
@@ -33,9 +38,8 @@ Usage::
 import contextlib
 import logging
 import os
+from dataclasses import MISSING
 from pathlib import Path
-
-_UNSET = object()
 
 _VALID_TARGETS = frozenset(("npu1", "npu2"))
 
@@ -49,13 +53,13 @@ class _NPUConfig:
     """
 
     def __init__(self):
-        self._compile_only = _UNSET
-        self._transform_tiling_script = _UNSET
-        self._bf16_emulation = _UNSET
-        self._output_format = _UNSET
-        self._air_project_path = _UNSET
-        self._debug = _UNSET
-        self._target = _UNSET
+        self._compile_only = MISSING
+        self._transform_tiling_script = MISSING
+        self._bf16_emulation = MISSING
+        self._output_format = MISSING
+        self._air_project_path = MISSING
+        self._debug = MISSING
+        self._target = MISSING
 
     # ---- compile_only ----
 
@@ -65,7 +69,7 @@ class _NPUConfig:
 
         Env var fallback: ``AMD_TRITON_NPU_COMPILE_ONLY`` (``"1"`` to enable).
         """
-        if self._compile_only is not _UNSET:
+        if self._compile_only is not MISSING:
             return self._compile_only
         return os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1"
 
@@ -84,7 +88,7 @@ class _NPUConfig:
 
         Env var fallback: ``AIR_TRANSFORM_TILING_SCRIPT``.
         """
-        if self._transform_tiling_script is not _UNSET:
+        if self._transform_tiling_script is not MISSING:
             return self._transform_tiling_script
         return os.getenv("AIR_TRANSFORM_TILING_SCRIPT")
 
@@ -103,7 +107,7 @@ class _NPUConfig:
 
         Env var fallback: ``AMD_TRITON_NPU_BF16_EMULATION`` (``"1"`` to enable).
         """
-        if self._bf16_emulation is not _UNSET:
+        if self._bf16_emulation is not MISSING:
             return self._bf16_emulation
         return os.getenv("AMD_TRITON_NPU_BF16_EMULATION", "0") == "1"
 
@@ -122,7 +126,7 @@ class _NPUConfig:
 
         Env var fallback: ``AMD_TRITON_NPU_OUTPUT_FORMAT``.
         """
-        if self._output_format is not _UNSET:
+        if self._output_format is not MISSING:
             return self._output_format
         v = os.getenv("AMD_TRITON_NPU_OUTPUT_FORMAT", "").lower()
         return v if v in ("elf", "xclbin") else None
@@ -145,7 +149,7 @@ class _NPUConfig:
 
         Env var fallback: ``AMD_TRITON_NPU_AIR_PROJECT_PATH``.
         """
-        if self._air_project_path is not _UNSET:
+        if self._air_project_path is not MISSING:
             return Path(self._air_project_path)
         custom = os.getenv("AMD_TRITON_NPU_AIR_PROJECT_PATH")
         if custom:
@@ -155,7 +159,7 @@ class _NPUConfig:
     @air_project_path.setter
     def air_project_path(self, value):
         if value is None:
-            self._air_project_path = _UNSET
+            self._air_project_path = MISSING
             return
         self._air_project_path = value
 
@@ -167,7 +171,7 @@ class _NPUConfig:
 
         Env var fallback: ``AMD_TRITON_NPU_DEBUG`` (``"1"`` to enable).
         """
-        if self._debug is not _UNSET:
+        if self._debug is not MISSING:
             return self._debug
         return os.getenv("AMD_TRITON_NPU_DEBUG", "0") == "1"
 
@@ -195,7 +199,7 @@ class _NPUConfig:
         variable is set to a non-empty unsupported value, a ``ValueError``
         is raised.
         """
-        if self._target is not _UNSET:
+        if self._target is not MISSING:
             return self._target
         v = os.getenv("AMD_TRITON_NPU_TARGET", "")
         if not v:
@@ -223,13 +227,13 @@ class _NPUConfig:
 
     def reset(self):
         """Clear all programmatic overrides, reverting to env var / default values."""
-        self._compile_only = _UNSET
-        self._transform_tiling_script = _UNSET
-        self._bf16_emulation = _UNSET
-        self._output_format = _UNSET
-        self._air_project_path = _UNSET
-        self._debug = _UNSET
-        self._target = _UNSET
+        self._compile_only = MISSING
+        self._transform_tiling_script = MISSING
+        self._bf16_emulation = MISSING
+        self._output_format = MISSING
+        self._air_project_path = MISSING
+        self._debug = MISSING
+        self._target = MISSING
 
 
 # Module-level singleton
@@ -242,6 +246,11 @@ def set_config(**kwargs):
     Example::
 
         set_config(compile_only=True, bf16_emulation=True)
+
+    Values equal to ``dataclasses.MISSING`` are skipped, so callers can
+    forward optional overrides without branching::
+
+        set_config(target=user_opts.get("target", MISSING))
 
     Raises ``ValueError`` for unknown keys.
     """
@@ -259,6 +268,8 @@ def set_config(**kwargs):
             raise ValueError(
                 f"Unknown config key: {key!r}. Valid keys: {sorted(valid_keys)}"
             )
+        if value is MISSING:
+            continue
         setattr(npu_config, key, value)
 
 
