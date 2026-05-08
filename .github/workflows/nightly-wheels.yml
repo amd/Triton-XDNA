@@ -218,6 +218,14 @@ jobs:
           Remove-Item xrt_windows_sdk.zip
           Remove-Item -Recurse -Force $tempDir
 
+      - name: Set up MSVC developer environment
+        # cibuildwheel doesn't activate vcvars on Windows; without this step
+        # cmake fails with "Could not find compiler set in environment
+        # variable CXX: cl.exe" because PATH/INCLUDE/LIB aren't populated.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install cibuildwheel
         # Use `python -m pip` instead of `pip` because Windows can't replace
         # the running pip.exe wrapper while it holds the file open.
