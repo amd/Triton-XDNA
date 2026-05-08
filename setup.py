@@ -708,12 +708,21 @@ class TritonXdnaBdistWheel(bdist_wheel):
                     new_lines.append("Name: triton-xdna\n")
                 elif line.startswith("Version: "):
                     new_lines.append(f"Version: {our_version}\n")
+                elif line.startswith("Author: "):
+                    new_lines.append("Author: Erwei Wang\n")
+                elif line.startswith("Author-email: "):
+                    new_lines.append("Author-email: erwei.wang@amd.com\n")
+                elif line.startswith("Home-page: "):
+                    new_lines.append("Home-page: https://github.com/amd/Triton-XDNA\n")
                 else:
                     new_lines.append(line)
 
             with open(metadata_path, "w") as f:
                 f.writelines(new_lines)
-            print("  Updated Name and Version in METADATA", file=sys.stderr)
+            print(
+                "  Updated Name/Version/Author/Author-email/Home-page in METADATA",
+                file=sys.stderr,
+            )
 
         # Update WHEEL file if needed (usually doesn't need changes)
         wheel_path = new_dist_info / "WHEEL"
