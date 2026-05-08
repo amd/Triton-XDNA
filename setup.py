@@ -307,20 +307,15 @@ def _make_version_spec(pkg_name, version, timestamp, short_commit, suffix=""):
 
 
 def get_install_requires():
-    """Build install_requires list from hash files."""
-    mlir_aie_hash_file = BASE_DIR / "utils" / "mlir-aie-hash.txt"
+    """Build install_requires list from hash files.
+
+    Only mlir-air is pinned here. The mlir-air wheel exposes an [aie] extra
+    that pins the matching mlir-aie commit and requires llvm-aie, so we get a
+    guaranteed-compatible mlir-aie transitively without having to pin it
+    ourselves.
+    """
     mlir_air_hash_file = BASE_DIR / "utils" / "mlir-air-hash.txt"
 
-    # Parse mlir-aie version
-    mlir_aie_version = parse_hash_file(mlir_aie_hash_file, "Version")
-    mlir_aie_timestamp = parse_hash_file(mlir_aie_hash_file, "Timestamp")
-    mlir_aie_commit = parse_hash_file(mlir_aie_hash_file, "Commit")
-    mlir_aie_short_commit = mlir_aie_commit[:7]
-    mlir_aie_full_version = (
-        f"{mlir_aie_version}.{mlir_aie_timestamp}+{mlir_aie_short_commit}.no.rtti"
-    )
-
-    # Parse mlir-air version
     mlir_air_version = parse_hash_file(mlir_air_hash_file, "Version")
     mlir_air_timestamp = parse_hash_file(mlir_air_hash_file, "Timestamp")
     mlir_air_commit = parse_hash_file(mlir_air_hash_file, "Commit")
@@ -330,9 +325,7 @@ def get_install_requires():
     )
 
     return [
-        f"mlir-aie=={mlir_aie_full_version}",
-        "llvm-aie",
-        f"mlir-air=={mlir_air_full_version}",
+        f"mlir-air[aie]=={mlir_air_full_version}",
     ]
 
 
