@@ -1,3 +1,0 @@
-Commit: 5b5376b
-Timestamp: 2026040821
-Version: 0.0.1
