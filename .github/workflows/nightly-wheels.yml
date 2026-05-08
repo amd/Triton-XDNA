@@ -170,3 +170,132 @@ jobs:
           replacesArtifacts: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
           makeLatest: ${{ github.event_name == 'push' }}
           prerelease: ${{ github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/') }}
+
+  build-wheels-windows:
+    name: Build triton wheel Windows (Python ${{ matrix.python_version }})
+    needs: [check-changes]
+    if: >-
+      always() &&
+      (needs.check-changes.result == 'skipped' ||
+       needs.check-changes.outputs.has_new_commits == 'true')
+
+    runs-on: windows-latest
+
+    permissions:
+      id-token: write
+      contents: write
+      packages: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Python matrix is narrower than Linux: Xilinx publishes mlir-air
+        # Windows wheels only for cp310/cp311/cp312 (no cp313/cp314).
+        python_version: ["3.10", "3.11", "3.12"]
+
+    env:
+      # Pinned XRT Windows SDK release. Provides headers, xrt_coreutil.lib,
+      # and xclbinutil/aiebu-asm. The build expects the SDK at
+      # C:\Program Files\AMD\xrt (see utils/env_setup.ps1).
+      XRT_WINDOWS_SDK_URL: "https://github.com/Xilinx/XRT/releases/download/2.21.75/xrt_windows_sdk.zip"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          submodules: recursive
+
+      - name: Set up Python ${{ matrix.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_version }}
+
+      - name: Get commit info
+        id: commit-info
+        run: |
+          if [ -n "${{ inputs.TRITON_XDNA_COMMIT }}" ]; then
+            COMMIT="${{ inputs.TRITON_XDNA_COMMIT }}"
+          else
+            COMMIT=$(git rev-parse --short=7 HEAD)
+          fi
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+          echo "datetime=$(date +%Y%m%d%H)" >> $GITHUB_OUTPUT
+          echo "Building triton-xdna commit: $COMMIT"
+
+      - name: Install XRT Windows SDK
+        shell: pwsh
+        run: |
+          Write-Host "Downloading $env:XRT_WINDOWS_SDK_URL"
+          Invoke-WebRequest -Uri $env:XRT_WINDOWS_SDK_URL -OutFile xrt_windows_sdk.zip
+          New-Item -ItemType Directory -Force -Path "C:\Program Files\AMD" | Out-Null
+          Expand-Archive -Path xrt_windows_sdk.zip -DestinationPath "C:\Program Files\AMD\" -Force
+          $hdr = "C:\Program Files\AMD\xrt\include\xrt\xrt_bo.h"
+          if (-not (Test-Path $hdr)) {
+            Write-Error "XRT SDK extraction failed: $hdr not found"
+            exit 1
+          }
+          Write-Host "XRT SDK installed at C:\Program Files\AMD\xrt"
+          Remove-Item xrt_windows_sdk.zip
+
+      - name: Install cibuildwheel
+        run: |
+          pip install --upgrade pip
+          pip install cibuildwheel
+
+      - name: Build wheels with cibuildwheel
+        env:
+          TRITON_XDNA_PROJECT_COMMIT: ${{ steps.commit-info.outputs.commit }}
+          DATETIME: ${{ steps.commit-info.outputs.datetime }}
+          XILINX_XRT: "C:\\Program Files\\AMD\\xrt"
+        run: |
+          # Convert python version (e.g., "3.11" -> "cp311")
+          PY_VERSION="${{ matrix.python_version }}"
+          CIBW_BUILD="cp${PY_VERSION//./}-win_amd64"
+          echo "Building for: $CIBW_BUILD"
+
+          CIBW_BUILD="$CIBW_BUILD" cibuildwheel --platform windows --output-dir wheelhouse
+
+      - name: List built wheels
+        run: |
+          ls -la wheelhouse/
+          echo "Built wheels:"
+          ls wheelhouse/*.whl
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton-wheel-windows-py${{ matrix.python_version }}
+          path: wheelhouse/*.whl
+
+      - name: Release wheels
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          github.event_name == 'schedule' ||
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+        uses: ncipollo/release-action@v1.12.0
+        with:
+          artifacts: wheelhouse/*.whl
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          tag: ${{ github.event_name == 'push' && github.ref_name || 'latest-wheels' }}
+          name: ${{ github.event_name == 'push' && github.ref_name || 'Nightly Wheels' }}
+          body: |
+            ## Triton XDNA Wheels
+
+            **Commit:** ${{ steps.commit-info.outputs.commit }}
+            **Build Date:** ${{ steps.commit-info.outputs.datetime }}
+            **Python Version:** ${{ matrix.python_version }} (Windows x64)
+
+            ### Installation
+
+            ```powershell
+            pip install triton-xdna `
+              --find-links https://github.com/${{ github.repository }}/releases/expanded_assets/latest-wheels `
+              --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti `
+              --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly `
+              --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
+            ```
+          allowUpdates: true
+          replacesArtifacts: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+          makeLatest: ${{ github.event_name == 'push' }}
+          prerelease: ${{ github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/') }}

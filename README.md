@@ -129,7 +129,7 @@ compilation pipeline (Triton → MLIR → xclbin → XRT dispatch) runs natively
 
 - **Windows 10/11** (x64)
 - **Visual Studio 2022** with "Desktop development with C++" workload
-- **Python 3.12+**
+- **Python 3.10, 3.11, or 3.12** (Xilinx Windows wheels do not yet support 3.13+)
 - **CMake 3.20+** and **Ninja** (via pip or standalone)
 - **AMD NPU driver** (installs `xrt_coreutil.dll` runtime)
 
@@ -155,44 +155,36 @@ and extract the `xrt/` directory to `C:\Program Files\AMD\xrt`:
 #   C:\Program Files\AMD\xrt\lib\xrt_coreutil.lib
 ```
 
-Run the automated build:
+Run the automated environment setup (must be dot-sourced so PATH/env vars
+persist in the current shell):
 
 ```powershell
-.\utils\build_windows.ps1
+. .\utils\env_setup.ps1
 ```
 
-This installs pre-built wheels (triton-windows, mlir-aie, llvm-aie), builds mlir-air
-from source, and installs the Triton-XDNA backend. Takes approximately 30–60 minutes.
+This installs the pre-built wheels (`triton-windows`, `mlir-air[aie]` which
+transitively pulls `mlir-aie` and `llvm-aie`) and the Triton-XDNA backend.
 
 ### Windows Manual Build
+
+Install build tools, PyTorch, and the MLIR-AIE/AIR/LLVM-AIE stack. The
+`mlir_air[aie]` extra transitively pins matching `mlir-aie` and pulls
+`llvm-aie`, so a single resolver pass installs the whole stack from the
+Xilinx release pages:
 
 ```powershell
 pip install cmake ninja lit numpy PyYAML nanobind scipy
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install triton-windows
-pip install mlir-aie -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti
-pip install llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+pip install "mlir_air[aie]" `
+  -f https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti `
+  -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti `
+  -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 ```
 
-mlir-air must be built from source (no Windows wheels yet):
-
-```powershell
-git clone https://github.com/Xilinx/mlir-air.git
-cd mlir-air
-git checkout <commit-from-utils/mlir-air-hash.txt>
-git submodule update --init --recursive
-
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release `
-  -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
-  -DMLIR_DIR=<mlir-distro>/lib/cmake/mlir `
-  -DLLVM_DIR=<mlir-distro>/lib/cmake/llvm `
-  -DAIE_DIR=<mlir-aie-python-pkg>/lib/cmake/aie `
-  -DLLVM_ENABLE_RTTI=OFF -DBUILD_SHARED_LIBS=OFF `
-  -DAIR_RUNTIME_TARGETS="" -DAIR_ENABLE_GPU=OFF `
-  -B build -S .
-ninja -C build -j $env:NUMBER_OF_PROCESSORS
-ninja -C build install
-```
+To pin a specific mlir-air version, use the values from
+`utils/mlir-air-hash.txt`:
+`mlir_air[aie]==<Version>.<Timestamp>+<short-commit>.no.rtti`.
 
 Install Triton-XDNA:
 
@@ -228,6 +220,7 @@ python vec-add.py
 
 ### Windows Known Limitations
 
-- mlir-air must be built from source (no Windows wheels published)
+- Python 3.10, 3.11, and 3.12 only — Xilinx does not publish `mlir-air` /
+  `mlir-aie` Windows wheels for 3.13+ yet
 - xclbinutil and aiebu-asm must be on PATH (from XRT Windows SDK)
 - NPU driver must be installed
