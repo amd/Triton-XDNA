@@ -57,6 +57,9 @@ jobs:
           -f https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti \
           -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti \
           -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+      # The [aie] extra requires llvm-aie without a version pin. Force an
+      # upgrade so we always test against the latest nightly wheel.
+      python3 -m pip install --upgrade --force-reinstall llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
       python3 -m pip show llvm-aie
       python3 -m pip show mlir_aie
       # Set environmental variable "MLIR_AIE_INSTALL_DIR"
