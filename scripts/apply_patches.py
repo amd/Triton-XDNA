@@ -77,8 +77,11 @@ def check_patch_applicable(patch_file: Path, target_dir: Path) -> tuple[bool, st
     Returns:
         (can_apply, reason) tuple
     """
+    # --ignore-whitespace tolerates CRLF/LF differences in context lines,
+    # which matters on Windows where git checkout converts text files to
+    # CRLF by default but our patches were generated with LF.
     result = run_git(
-        ["apply", "--check", str(patch_file)],
+        ["apply", "--check", "--ignore-whitespace", str(patch_file)],
         cwd=target_dir,
         check=False,
     )
@@ -88,7 +91,7 @@ def check_patch_applicable(patch_file: Path, target_dir: Path) -> tuple[bool, st
 
     # Check if patch is already applied by trying reverse
     result_reverse = run_git(
-        ["apply", "--check", "--reverse", str(patch_file)],
+        ["apply", "--check", "--reverse", "--ignore-whitespace", str(patch_file)],
         cwd=target_dir,
         check=False,
     )
@@ -102,7 +105,7 @@ def check_patch_applicable(patch_file: Path, target_dir: Path) -> tuple[bool, st
 def apply_patch(patch_file: Path, target_dir: Path) -> bool:
     """Apply a patch file to the target directory."""
     try:
-        run_git(["apply", str(patch_file)], cwd=target_dir)
+        run_git(["apply", "--ignore-whitespace", str(patch_file)], cwd=target_dir)
         return True
     except subprocess.CalledProcessError as e:
         print(f"  ✗ Failed to apply patch: {e.stderr}", file=sys.stderr)
