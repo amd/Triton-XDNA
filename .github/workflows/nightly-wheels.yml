@@ -139,11 +139,192 @@ jobs:
           name: triton-wheel-py${{ matrix.python_version }}
           path: wheelhouse/*.whl
 
-      - name: Release wheels
-        if: |
-          github.event_name == 'workflow_dispatch' ||
-          github.event_name == 'schedule' ||
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+  build-wheels-windows:
+    name: Build triton wheel Windows (Python ${{ matrix.python_version }})
+    needs: [check-changes]
+    if: >-
+      always() &&
+      (needs.check-changes.result == 'skipped' ||
+       needs.check-changes.outputs.has_new_commits == 'true')
+
+    runs-on: windows-latest
+
+    permissions:
+      id-token: write
+      contents: write
+      packages: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Python matrix is narrower than Linux: Xilinx publishes mlir-air
+        # Windows wheels only for cp310/cp311/cp312 (no cp313/cp314).
+        python_version: ["3.10", "3.11", "3.12"]
+
+    env:
+      # Pinned XRT Windows SDK release. Provides headers, xrt_coreutil.lib,
+      # and xclbinutil/aiebu-asm. The build expects the SDK at
+      # C:\Program Files\AMD\xrt (see utils/env_setup.ps1).
+      XRT_WINDOWS_SDK_URL: "https://github.com/Xilinx/XRT/releases/download/2.21.75/xrt_windows_sdk.zip"
+
+    steps:
+      - name: Disable Git CRLF conversion
+        # Must run before checkout. windows-latest defaults to
+        # core.autocrlf=true, which rewrites text files to CRLF on
+        # checkout. The third_party/triton_shared.patch hunks were
+        # generated with LF context lines, so the rewrite makes
+        # `git apply --check` fail and apply_patches.py aborts —
+        # the build then dies with a C2397 narrowing-conversion
+        # error in PtrAnalysis.cpp that the patch was supposed to
+        # fix. Forcing LF avoids the conversion entirely.
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          submodules: recursive
+
+      - name: Set up Python ${{ matrix.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_version }}
+
+      - name: Get commit info
+        id: commit-info
+        run: |
+          if [ -n "${{ inputs.TRITON_XDNA_COMMIT }}" ]; then
+            COMMIT="${{ inputs.TRITON_XDNA_COMMIT }}"
+          else
+            COMMIT=$(git rev-parse --short=7 HEAD)
+          fi
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+          echo "datetime=$(date +%Y%m%d%H)" >> $GITHUB_OUTPUT
+          echo "Building triton-xdna commit: $COMMIT"
+
+      - name: Install XRT Windows SDK
+        shell: pwsh
+        run: |
+          Write-Host "Downloading $env:XRT_WINDOWS_SDK_URL"
+          Invoke-WebRequest -Uri $env:XRT_WINDOWS_SDK_URL -OutFile xrt_windows_sdk.zip
+          # Zip layout is xrt_sdk/xrt/{include,lib,...}; extract to a temp
+          # location and move the inner xrt/ folder to where the build
+          # expects it (C:\Program Files\AMD\xrt).
+          $tempDir = Join-Path $env:RUNNER_TEMP "xrt_extract"
+          New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+          Expand-Archive -Path xrt_windows_sdk.zip -DestinationPath $tempDir -Force
+          $srcXrt = Join-Path $tempDir "xrt_sdk\xrt"
+          if (-not (Test-Path $srcXrt)) {
+            Write-Error "Unexpected SDK zip layout: $srcXrt not found"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path "C:\Program Files\AMD" | Out-Null
+          Move-Item -Path $srcXrt -Destination "C:\Program Files\AMD\xrt" -Force
+          $hdr = "C:\Program Files\AMD\xrt\include\xrt\xrt_bo.h"
+          if (-not (Test-Path $hdr)) {
+            Write-Error "XRT SDK extraction failed: $hdr not found"
+            exit 1
+          }
+          Write-Host "XRT SDK installed at C:\Program Files\AMD\xrt"
+          Remove-Item xrt_windows_sdk.zip
+          Remove-Item -Recurse -Force $tempDir
+
+      - name: Set up MSVC developer environment
+        # cibuildwheel doesn't activate vcvars on Windows; without this step
+        # cmake fails with "Could not find compiler set in environment
+        # variable CXX: cl.exe" because PATH/INCLUDE/LIB aren't populated.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install cibuildwheel
+        # Use `python -m pip` instead of `pip` because Windows can't replace
+        # the running pip.exe wrapper while it holds the file open.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install cibuildwheel
+
+      - name: Build wheels with cibuildwheel
+        env:
+          TRITON_XDNA_PROJECT_COMMIT: ${{ steps.commit-info.outputs.commit }}
+          DATETIME: ${{ steps.commit-info.outputs.datetime }}
+          XILINX_XRT: "C:\\Program Files\\AMD\\xrt"
+        run: |
+          # Convert python version (e.g., "3.11" -> "cp311")
+          PY_VERSION="${{ matrix.python_version }}"
+          CIBW_BUILD="cp${PY_VERSION//./}-win_amd64"
+          echo "Building for: $CIBW_BUILD"
+
+          CIBW_BUILD="$CIBW_BUILD" cibuildwheel --platform windows --output-dir wheelhouse
+
+      - name: List built wheels
+        run: |
+          ls -la wheelhouse/
+          echo "Built wheels:"
+          ls wheelhouse/*.whl
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton-wheel-windows-py${{ matrix.python_version }}
+          path: wheelhouse/*.whl
+
+  publish-release:
+    name: Publish wheels to GitHub release
+    needs: [build-wheels, build-wheels-windows]
+    # Run after both build matrices finish, regardless of partial failures —
+    # publish whatever wheels did build. Skipped on pull_request / merge_group
+    # to avoid mutating release tags from non-mainline events.
+    if: |
+      always() &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'schedule' ||
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+      ) &&
+      (
+        needs.build-wheels.result == 'success' ||
+        needs.build-wheels-windows.result == 'success'
+      )
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Get commit info
+        id: commit-info
+        run: |
+          if [ -n "${{ inputs.TRITON_XDNA_COMMIT }}" ]; then
+            COMMIT="${{ inputs.TRITON_XDNA_COMMIT }}"
+          else
+            COMMIT=$(git rev-parse --short=7 HEAD)
+          fi
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+          echo "datetime=$(date +%Y%m%d%H)" >> $GITHUB_OUTPUT
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: triton-wheel-*
+          merge-multiple: true
+          path: wheelhouse
+
+      - name: List collected wheels
+        run: |
+          ls -la wheelhouse/
+          echo "Wheel count: $(ls wheelhouse/*.whl 2>/dev/null | wc -l)"
+
+      - name: Publish release
         uses: ncipollo/release-action@v1.12.0
         with:
           artifacts: wheelhouse/*.whl
@@ -155,15 +336,27 @@ jobs:
 
             **Commit:** ${{ steps.commit-info.outputs.commit }}
             **Build Date:** ${{ steps.commit-info.outputs.datetime }}
-            **Python Version:** ${{ matrix.python_version }}
 
-            ### Installation
+            Linux wheels: Python 3.10–3.14 (manylinux_x86_64)
+            Windows wheels: Python 3.10–3.12 (win_amd64)
+
+            ### Installation (Linux)
 
             ```bash
             pip install triton-xdna \
               --find-links https://github.com/${{ github.repository }}/releases/expanded_assets/latest-wheels \
               --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti \
               --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
+              --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
+            ```
+
+            ### Installation (Windows)
+
+            ```powershell
+            pip install triton-xdna `
+              --find-links https://github.com/${{ github.repository }}/releases/expanded_assets/latest-wheels `
+              --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti `
+              --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly `
               --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
             ```
           allowUpdates: true

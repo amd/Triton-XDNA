@@ -5,13 +5,25 @@
 # Usage: . .\utils\env_setup.ps1
 #
 # Prerequisites:
-#   - Python 3.12 (required by mlir-air Windows wheel)
-#   - A virtual environment activated (e.g. python -m venv venv312 && .\venv312\Scripts\Activate.ps1)
+#   - Python 3.10, 3.11, or 3.12 (Xilinx Windows wheels do not yet support 3.13+)
+#   - A virtual environment activated (e.g. python -m venv venv && .\venv\Scripts\Activate.ps1)
 #   - XRT SDK at C:\Program Files\AMD\xrt (download xrt_windows_sdk.zip from XRT releases)
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = Split-Path -Parent $ScriptDir
+
+function Read-HashField {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string]$Field
+    )
+    $line = Select-String -Path $Path -Pattern "^${Field}:" | Select-Object -First 1
+    if (-not $line) {
+        throw "Field '${Field}' not found in $Path"
+    }
+    return ($line.Line -split ":\s+", 2)[1].Trim()
+}
 
 # =============================================================================
 # Install triton-windows
@@ -27,11 +39,11 @@ python -m pip install triton-windows
 # so a single pip install resolves the whole MLIR-AIE/AIR/LLVM-AIE stack with
 # a guaranteed-compatible mlir-aie.
 
-$HashFile = Join-Path $ScriptDir "mlir-air-hash.txt"
-$MLIR_AIR_COMMIT = (Select-String -Path $HashFile -Pattern "^Commit:" | ForEach-Object { ($_ -split ":\s+")[1] }).Trim()
-$SHORT_AIR_COMMIT = $MLIR_AIR_COMMIT.Substring(0, 7)
-$MLIR_AIR_VERSION = (Select-String -Path $HashFile -Pattern "^Version:" | ForEach-Object { ($_ -split ":\s+")[1] }).Trim()
-$MLIR_AIR_TIMESTAMP = (Select-String -Path $HashFile -Pattern "^Timestamp:" | ForEach-Object { ($_ -split ":\s+")[1] }).Trim()
+$HashFile           = Join-Path $ScriptDir "mlir-air-hash.txt"
+$MLIR_AIR_COMMIT    = Read-HashField -Path $HashFile -Field "Commit"
+$SHORT_AIR_COMMIT   = $MLIR_AIR_COMMIT.Substring(0, 7)
+$MLIR_AIR_VERSION   = Read-HashField -Path $HashFile -Field "Version"
+$MLIR_AIR_TIMESTAMP = Read-HashField -Path $HashFile -Field "Timestamp"
 
 Write-Host "Using mlir-air hash: $SHORT_AIR_COMMIT"
 Write-Host "mlir-air version: $MLIR_AIR_VERSION"
@@ -80,7 +92,7 @@ if (-not (Test-Path $TritonSharedDst)) {
 }
 
 # =============================================================================
-# Install PyTorch (CPU) or TheRock PyTorch (iGPU)
+# Install PyTorch (CPU)
 # =============================================================================
 
 Write-Host "Installing PyTorch (CPU)..."
@@ -92,12 +104,12 @@ Write-Host "Environment setup complete."
 # =============================================================================
 # XRT Development Files
 # =============================================================================
-# Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases
-# and extract the xrt/ directory to C:\Program Files\AMD\xrt.
-# The driver.py auto-detect will find it there without any env var.
+# Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases and
+# extract the inner xrt_sdk/xrt/ directory to C:\Program Files\AMD\xrt
+# (the zip's top-level folder is xrt_sdk/, not xrt/).
 $xrtDefault = Join-Path $env:PROGRAMFILES "AMD\xrt"
 if (Test-Path (Join-Path $xrtDefault "include\xrt\xrt_bo.h")) {
     Write-Host "XRT SDK found at: $xrtDefault"
 } else {
-    Write-Warning "XRT SDK not found at $xrtDefault. Download xrt_windows_sdk.zip from XRT releases and extract xrt/ there."
+    Write-Warning "XRT SDK not found at $xrtDefault. Download xrt_windows_sdk.zip from XRT releases and move the inner xrt_sdk/xrt/ folder there."
 }

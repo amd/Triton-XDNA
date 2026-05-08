@@ -380,7 +380,14 @@ def download_llvm_for_triton_windows(triton_dir: Path) -> Path:
 
         print("  Extracting...")
         with tarfile.open(download_path, "r:gz") as tar:
-            tar.extractall(triton_dir.parent, filter="data")
+            # filter="data" requires Python 3.12+ (PEP 706) or a backport
+            # patch release (3.10.12+, 3.11.4+). cibuildwheel's bundled
+            # nuget-cpython for 3.10/3.11 isn't always a backported version,
+            # so guard the kwarg.
+            if sys.version_info >= (3, 12):
+                tar.extractall(triton_dir.parent, filter="data")
+            else:
+                tar.extractall(triton_dir.parent)
 
         if not llvm_dir.exists():
             raise RuntimeError(f"Extracted LLVM directory not found: {llvm_dir}")
@@ -701,12 +708,21 @@ class TritonXdnaBdistWheel(bdist_wheel):
                     new_lines.append("Name: triton-xdna\n")
                 elif line.startswith("Version: "):
                     new_lines.append(f"Version: {our_version}\n")
+                elif line.startswith("Author: "):
+                    new_lines.append("Author: Erwei Wang\n")
+                elif line.startswith("Author-email: "):
+                    new_lines.append("Author-email: erwei.wang@amd.com\n")
+                elif line.startswith("Home-page: "):
+                    new_lines.append("Home-page: https://github.com/amd/Triton-XDNA\n")
                 else:
                     new_lines.append(line)
 
             with open(metadata_path, "w") as f:
                 f.writelines(new_lines)
-            print("  Updated Name and Version in METADATA", file=sys.stderr)
+            print(
+                "  Updated Name/Version/Author/Author-email/Home-page in METADATA",
+                file=sys.stderr,
+            )
 
         # Update WHEEL file if needed (usually doesn't need changes)
         wheel_path = new_dist_info / "WHEEL"
