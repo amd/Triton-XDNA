@@ -168,6 +168,20 @@ jobs:
       XRT_WINDOWS_SDK_URL: "https://github.com/Xilinx/XRT/releases/download/2.21.75/xrt_windows_sdk.zip"
 
     steps:
+      - name: Disable Git CRLF conversion
+        # Must run before checkout. windows-latest defaults to
+        # core.autocrlf=true, which rewrites text files to CRLF on
+        # checkout. The third_party/triton_shared.patch hunks were
+        # generated with LF context lines, so the rewrite makes
+        # `git apply --check` fail and apply_patches.py aborts —
+        # the build then dies with a C2397 narrowing-conversion
+        # error in PtrAnalysis.cpp that the patch was supposed to
+        # fix. Forcing LF avoids the conversion entirely.
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
