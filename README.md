@@ -54,7 +54,7 @@ python3 -m pip install --upgrade pip
 # Install triton-xdna from GitHub Releases
 pip install triton-xdna \
   --find-links https://github.com/amd/Triton-XDNA/releases/expanded_assets/latest-wheels \
-  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti \
+  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
   --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
   --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
 ```
@@ -62,7 +62,7 @@ pip install triton-xdna \
 **Note:** To install from a local wheel file:
 ```bash
 pip install /path/to/triton_xdna-*.whl \
-  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti \
+  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
   --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
   --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
 ```
@@ -79,7 +79,7 @@ pip install cmake pybind11 nanobind wheel ninja pytest setuptools Cython
 
 # Install triton-xdna from source and all dependencies automatically
 pip install . --no-build-isolation \
-  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti \
+  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
   --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
   --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
 ```
@@ -179,7 +179,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install triton-windows
 pip install "mlir_air[aie]" `
   -f https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti `
-  -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti `
+  -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 `
   -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 ```
 
