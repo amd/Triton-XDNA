@@ -18,7 +18,7 @@ MLIR_AIR_TIMESTAMP=$(awk -v kw="Timestamp:" '$0 ~ kw {for (i=1; i<NF; i++) if ($
 echo "mlir-air timestamp: $MLIR_AIR_TIMESTAMP"
 python3 -m pip install "mlir_air[aie]==$MLIR_AIR_VERSION.$MLIR_AIR_TIMESTAMP+$SHORT_MLIR_AIR_COMMIT_HASH.no.rtti" \
     -f https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti \
-    -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti \
+    -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
     -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 
 # The [aie] extra requires llvm-aie without a version pin. To track the

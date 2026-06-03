@@ -345,7 +345,7 @@ jobs:
             ```bash
             pip install triton-xdna \
               --find-links https://github.com/${{ github.repository }}/releases/expanded_assets/latest-wheels \
-              --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti \
+              --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
               --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
               --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
             ```
@@ -355,7 +355,7 @@ jobs:
             ```powershell
             pip install triton-xdna `
               --find-links https://github.com/${{ github.repository }}/releases/expanded_assets/latest-wheels `
-              --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti `
+              --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 `
               --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly `
               --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
             ```
