@@ -478,10 +478,7 @@ def _get_output_format():
                 "npu_config.output_format to 'xclbin' or None."
             )
         return configured_format
-    # Auto-detect: xclbin on Windows (ELF flow has stoul bug in NPU driver),
-    # ELF for npu2 on Linux, xclbin for npu1 everywhere.
-    if IS_WINDOWS:
-        return "xclbin"
+    # Auto-detect: ELF for npu2, xclbin for npu1.
     return "elf" if npu_version == "npu2" else "xclbin"
 
 
