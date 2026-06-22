@@ -1,16 +1,50 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-# this is a benchmark for adding vectors with maximum block size
-# to check the performance of tl.dot operation
+# Vector addition benchmark supporting multiple data types.
+# Supports bf16 (default), f32 (via bf16-emulation), i8, and i16.
 
+import argparse
 import torch
 import triton
 import triton.language as tl
-import sys, os
+import sys
+import os
 
 sys.path.append(os.path.abspath(".."))
 import benchmark
+
+# Dtype configuration: torch type, whether it's a float, tolerances.
+DTYPE_CONFIG = {
+    "bf16": {
+        "torch_dtype": torch.bfloat16,
+        "is_float": True,
+        "atol": 1e-2,
+        "rtol": 1e-2,
+        "bf16_emulation": False,
+    },
+    "f32": {
+        "torch_dtype": torch.float32,
+        "is_float": True,
+        "atol": 1e-1,
+        "rtol": 5e-2,
+        "bf16_emulation": True,  # f32 addf not native on AIE; requires bf16-emulation
+    },
+    "i8": {
+        "torch_dtype": torch.int8,
+        "is_float": False,
+        "atol": 0,
+        "rtol": 0,
+        "bf16_emulation": False,
+    },
+    "i16": {
+        "torch_dtype": torch.int16,
+        "is_float": False,
+        "atol": 0,
+        "rtol": 0,
+        "bf16_emulation": False,
+    },
+}
 
 
 @triton.jit
@@ -25,8 +59,6 @@ def vecadd(
     block_start = pid * BLOCK_SIZE_N
     offsets = block_start + tl.arange(0, BLOCK_SIZE_N)
 
-    # mask = offsets < n_elements    #AMK - in triton example, do we need?
-
     a_block = tl.load(A + offsets[:])
     b_block = tl.load(B + offsets[:])
 
@@ -35,35 +67,69 @@ def vecadd(
     tl.store(C + offsets[:], c_block)
 
 
-# @benchmark.measure()
-def bench_vecadd(N, provider):
+def bench_vecadd(N, provider, cfg):
     device = "cpu"
-    dtype_in = torch.bfloat16
-    dtype_out = (
-        torch.bfloat16
-    )  # torch.float32 won't work due to unsupported `%33 = fpext <8 x bfloat> %32 to <8 x float>`
-    a = torch.randn(N, device=device, dtype=dtype_in)
-    b = torch.randn(N, device=device, dtype=dtype_in)
-    c = torch.empty(N, device=device, dtype=dtype_out)
+    torch_dtype = cfg["torch_dtype"]
+
+    if cfg["is_float"]:
+        a = torch.randn(N, device=device, dtype=torch_dtype)
+        b = torch.randn(N, device=device, dtype=torch_dtype)
+    else:
+        # Clamp to half-max to avoid overflow on addition
+        iinfo = torch.iinfo(torch_dtype)
+        half_max = iinfo.max // 2
+        a = torch.randint(0, half_max, (N,), device=device, dtype=torch_dtype)
+        b = torch.randint(0, half_max, (N,), device=device, dtype=torch_dtype)
+
+    c = torch.empty(N, device=device, dtype=torch_dtype)
+
     if provider == "torch" or provider == "test":
         c_ref = torch.add(a, b)
     if provider == "triton" or provider == "test":
-        # 2D launch kernel where each block gets its own program.
         grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE_N"]),)
         compiled_kernel = vecadd[grid](
             a,
             b,
             c,
             N,
-            BLOCK_SIZE_N=1024,  # TODO: small tile sizes currently face errors due to lock race condition at memtiles
+            BLOCK_SIZE_N=1024,
         )
         with open("tt.shared.mlir", "w") as f:
             f.write(str(compiled_kernel.asm["ttsharedir"]))
         if provider == "test":
-            torch.testing.assert_close(c, c_ref, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(c, c_ref, atol=cfg["atol"], rtol=cfg["rtol"])
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Vector addition benchmark for AMD NPU"
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        choices=list(DTYPE_CONFIG.keys()),
+        default="bf16",
+        help="Element data type (default: bf16)",
+    )
+    parser.add_argument(
+        "--bf16-emulation",
+        dest="bf16_emulation",
+        default=False,
+        action="store_true",
+        help="Use f32 data type with bf16 emulation on AIE cores",
+    )
+    args = parser.parse_args()
+
+    # --bf16-emulation is shorthand for --dtype f32
+    if args.bf16_emulation:
+        args.dtype = "f32"
+
+    cfg = DTYPE_CONFIG[args.dtype]
+
+    # Enable bf16 emulation env var when needed
+    if cfg["bf16_emulation"]:
+        os.environ["AMD_TRITON_NPU_BF16_EMULATION"] = "1"
+
     benchmark.select_npu_backend()
     for N in [2**i for i in range(10, 16, 1)]:
-        bench_vecadd(N, "test")
+        bench_vecadd(N, "test", cfg)

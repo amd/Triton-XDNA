@@ -20,7 +20,7 @@ module attributes {transform.with_named_sequence} {
         (%arg1) : (!transform.any_op) -> ()
     transform.include @canonicalize_with_cse failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
-    transform.include @pad_and_promote_unary_bf16 failures(propagate)
+    transform.include @pad_and_promote_unary_@DTYPE@ failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
     transform.include @canonicalize_with_cse failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
@@ -29,7 +29,7 @@ module attributes {transform.with_named_sequence} {
     transform.include @post_bufferize_cleanup failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
 
-    transform.include @vectorize_generics_at_16 failures(propagate)
+    transform.include @vectorize_generics_at_@VECTOR_SIZE@ failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
     %vh = transform.include @air_herd_mapping_with_extern_and_vectorize
         failures(propagate) (%arg1) : (!transform.any_op) -> !transform.any_op

@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 ////////////////////////////////////////////////////////////////////////////////
-// Transform Script for AXPY (AIE2): out = alpha * x + y
-// Binary op (2 inputs: x, y). Cast mulf and addf to bf16 when float.
+// Transform Script for Unary Elementwise Ops (AIE2): square
 // Dtype-generic: uses @DTYPE@ and @VECTOR_SIZE@ placeholders.
 // Uses shared library sequences from transform_library.mlir (auto-injected).
 ////////////////////////////////////////////////////////////////////////////////
@@ -20,7 +19,7 @@ module attributes {transform.with_named_sequence} {
         (%arg1) : (!transform.any_op) -> ()
     transform.include @canonicalize_with_cse failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
-    transform.include @pad_and_promote_binary_@DTYPE@ failures(propagate)
+    transform.include @pad_and_promote_unary_@DTYPE@ failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
     transform.include @canonicalize_with_cse failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
