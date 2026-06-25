@@ -175,22 +175,19 @@ def triton_linear(x, weight, bias=None, backend="gpu", transform_script=None):
             c.stride(0), c.stride(1),
         )
     else:
-        # NPU path: pad to block-aligned dims.
+        # NPU path: pad to block-aligned dims, single launch (full K on-device).
         # BLOCK stays at 256 (the transform script's multi-core herd tiling assumes
-        # a >=128 program block); the K dimension is chunked instead. The single-
-        # block kernel loads A (BLOCK_M x BLOCK_K) and B (BLOCK_K x BLOCK_N) whole,
-        # so BLOCK_M * BLOCK_K must stay within Triton's max tensor numel (1<<20).
-        # With BLOCK_M=256 that caps BLOCK_K at 4096. For larger K (e.g. gpt2-xl
-        # mlp_proj K=6400 -> 8192) we split K into chunks of CHUNK_K and sum the
-        # partial products in float32.
+        # a >=128 program block). The single-block kernel loads A (BLOCK_M x K) and
+        # B (K x BLOCK_N) whole; the transform script's k_reduction_loop tiles the
+        # K reduction across L3/L2/L1 on-device, so K is not chunked on the host.
+        # K is padded to a power of two (tl.arange requires pow2) and zero-padded
+        # for correctness.
         BLOCK_M = 256
         BLOCK_N = 256
-        MAX_NUMEL = 1 << 20
-        CHUNK_K = min(1 << (K - 1).bit_length(), MAX_NUMEL // BLOCK_M)
 
         M_padded = math.ceil(M_orig / BLOCK_M) * BLOCK_M
         N_padded = math.ceil(N / BLOCK_N) * BLOCK_N
-        K_padded = math.ceil(K / CHUNK_K) * CHUNK_K  # multiple of CHUNK_K
+        K_padded = 1 << (K - 1).bit_length()
 
         x_bf16 = x_2d.to(torch.bfloat16)
         # Pad x: (M_orig, K) -> (M_padded, K_padded), zero-pad K dim for correctness
@@ -213,22 +210,16 @@ def triton_linear(x, weight, bias=None, backend="gpu", transform_script=None):
             os.environ["AIR_TRANSFORM_TILING_SCRIPT"] = transform_script
 
         grid = (M_padded // BLOCK_M, N_padded // BLOCK_N)
-        n_chunks = K_padded // CHUNK_K
-        c = torch.zeros((M_padded, N_padded), dtype=torch.float32)
-        for kc in range(n_chunks):
-            a_chunk = x_bf16[:, kc * CHUNK_K:(kc + 1) * CHUNK_K].contiguous()
-            b_chunk = w_t[kc * CHUNK_K:(kc + 1) * CHUNK_K, :].contiguous()
-            c_chunk = torch.empty((M_padded, N_padded), dtype=torch.float32)
-            _matmul_npu_cached(
-                matmul_kernel_npu, grid,
-                a_chunk, b_chunk, c_chunk,
-                M_padded, N_padded, CHUNK_K,
-                a_chunk.stride(0), a_chunk.stride(1),
-                b_chunk.stride(0), b_chunk.stride(1),
-                c_chunk.stride(0), c_chunk.stride(1),
-                BLOCK_SIZE_M=BLOCK_M, BLOCK_SIZE_N=BLOCK_N, BLOCK_SIZE_K=CHUNK_K,
-            )
-            c += c_chunk
+        c = torch.empty((M_padded, N_padded), dtype=torch.float32)
+        _matmul_npu_cached(
+            matmul_kernel_npu, grid,
+            x_bf16, w_t, c,
+            M_padded, N_padded, K_padded,
+            x_bf16.stride(0), x_bf16.stride(1),
+            w_t.stride(0), w_t.stride(1),
+            c.stride(0), c.stride(1),
+            BLOCK_SIZE_M=BLOCK_M, BLOCK_SIZE_N=BLOCK_N, BLOCK_SIZE_K=K_padded,
+        )
 
         # Restore env
         if old_script is not None:

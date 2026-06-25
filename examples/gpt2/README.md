@@ -105,13 +105,26 @@ Measured on AMD Ryzen AI MAX+ PRO 395 -- Radeon 8060S iGPU (gfx1151, RDNA 3.5)
 | `gpu` | ~6 ms | ~170 |
 | `hetero-fast` | ~5 ms | ~205 |
 | `hetero` | ~8.5 s | ~0.1 |
+| `hetero` + `AMD_TRITON_NPU_FUSED_MLP=1` | ~86 ms | ~12 |
 
 "Steady TPOT" excludes the first decode step (which includes JIT compilation).
 
-`hetero` decode is currently very slow: each NPU kernel launch re-instantiates
-the XRT hardware context, and that per-launch context setup dominates decode
-latency. This is a known issue -- use `hetero-fast`, which routes decode to the
-iGPU and avoids the per-step NPU dispatch cost entirely.
+`hetero` decode is slow by default: each NPU kernel launch re-instantiates the
+XRT hardware context, and that per-launch context setup dominates decode latency.
+
+Setting `AMD_TRITON_NPU_FUSED_MLP=1` fuses the MLP block
+(`mlp_fc -> gelu -> mlp_proj`) plus the following residual add into a single
+`load_pdi` multi-launch ELF that runs through **one** persistent `hw_context`,
+reused across all layers (the mlir-air llama pattern: one ELF compiled once,
+per-layer weights swapped in). This collapses four per-op NPU dispatches per
+layer into one (the residual `add` rides the chain via DDR hand-off, with no
+host round-trip) and removes the bulk of the context-rebuild cost, taking
+`hetero` decode from ~8.5 s to ~86 ms (~100x). It is opt-in and applies to
+`hetero`/`npu` modes (where the MLP runs on NPU). Decode is still dispatch-bound
+-- at sequence length 1 the tensors are
+tiny, so per-layer launch overhead dominates regardless. For the lowest decode
+latency use `hetero-fast`, which routes decode to the iGPU and avoids per-step
+NPU dispatch entirely.
 
 ### Prefill Latency (TTFT)
 
@@ -126,6 +139,17 @@ iGPU and avoids the per-step NPU dispatch cost entirely.
 more for a one-shot prefill but keeps the NPU utilized. Even with a warm Triton
 cache, the first forward pass pays NPU compilation and XRT setup; these tables
 reflect that warm-but-first-pass cost.
+
+### Larger variants on NPU
+
+All four sizes run end-to-end on the NPU. The single-block NPU matmul reduces
+over the full K dimension on-device (the transform script tiles K across
+L3/L2/L1), so the wider `gpt2-large`/`gpt2-xl` MLP matmuls (K padded to 8192)
+compile and run as one launch each -- no host-side K-chunking and no PyTorch
+fallback. For reference, `gpt2-large` (774M, 36 layers): `hetero-fast` decode
+~15 ms TPOT; `hetero` + `AMD_TRITON_NPU_FUSED_MLP=1` ~540 ms TPOT (the fused MLP
+shares one `hw_context` across all 36 layers, so deep models no longer exhaust
+NPU hardware contexts).
 
 ### Accuracy
 

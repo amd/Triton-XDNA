@@ -38,6 +38,27 @@ if not logger.handlers:
     logger.addHandler(_handler)
 logger.propagate = False
 
+
+def _lift_tensor_numel_limit():
+    """Raise Triton's max-tensor-numel guard for the AIR-tiled NPU backend.
+
+    Triton caps a block tensor at 2**20 elements because on a GPU a block
+    becomes a register tile. On this backend a whole-tile load + tl.dot lowers
+    to a single linalg.matmul that the transform script tiles across L3/L2/L1
+    on-device, so the cap doesn't apply -- it only forced the NPU matmul wrapper
+    to chunk K and reduce partials on the host. validate_block_shape reads this
+    value from the _utils module global at call time, so bumping it here covers
+    every call site (including core.py's imported binding).
+    """
+    import triton._utils as _tu
+
+    cap = 1 << 22  # 256 (BLOCK_M) x 8192 (largest padded K) = 2**21, with headroom
+    if _tu.TRITON_MAX_TENSOR_NUMEL < cap:
+        _tu.TRITON_MAX_TENSOR_NUMEL = cap
+
+
+_lift_tensor_numel_limit()
+
 autotune_time = False
 
 

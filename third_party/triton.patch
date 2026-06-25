@@ -1,14 +1,26 @@
-From 756a069476911f81175159d3bad4b1876597ef62 Mon Sep 17 00:00:00 2001
-From: Emily Furst <emifurst@amd.com>
-Date: Thu, 4 Sep 2025 21:21:01 -0700
-Subject: [PATCH] update autotuner to recognize backend changes and retune
-
----
- python/triton/runtime/autotuner.py | 4 +++-
- 1 file changed, 3 insertions(+), 1 deletion(-)
-
+diff --git a/include/triton/Dialect/Triton/IR/Traits.h b/include/triton/Dialect/Triton/IR/Traits.h
+index 392436308b..482cd04b81 100644
+--- a/include/triton/Dialect/Triton/IR/Traits.h
++++ b/include/triton/Dialect/Triton/IR/Traits.h
+@@ -21,7 +21,15 @@ namespace impl {
+ // of size up to 256K elements. It will spill for datatypes wider than 1B,
+ // but we probably should limit number of elements (rather than bytes) to
+ // keep specs simple
+-int constexpr maxTensorNumElements = 1048576;
++//
++// XDNA/AIE backend: a block tensor does not become a GPU register tile here.
++// triton-shared lowers whole-tile loads + tl.dot to a single linalg.matmul
++// that the MLIR-AIR transform pipeline tiles across L3/L2/L1 on-device, so the
++// register-pressure rationale above does not apply. Raised from 2**20 to 2**22
++// so single-block NPU matmuls can express full K (e.g. 256 x 8192) without
++// chunking the reduction on the host. Keep in sync with the Python-side guard
++// (TRITON_MAX_TENSOR_NUMEL) lifted in amd_triton_npu/backend/driver.py.
++int constexpr maxTensorNumElements = 4194304;
+ 
+ LogicalResult verifyTensorSize(Operation *op);
+ LogicalResult verifyTensorLayouts(Operation *op);
 diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
-index 0c4d71049..538912ddf 100644
+index 0c4d710496..538912ddf0 100644
 --- a/python/triton/runtime/autotuner.py
 +++ b/python/triton/runtime/autotuner.py
 @@ -119,7 +119,7 @@ class Autotuner(KernelInterface):
@@ -29,6 +41,3 @@ index 0c4d71049..538912ddf 100644
              if key not in self.cache:
                  used_cached_result = False
                  pruned_configs = self.prune_configs(kwargs)
--- 
-2.48.1
-

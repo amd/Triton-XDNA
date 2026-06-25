@@ -339,6 +339,26 @@ class MultiLaunchRunner:
             ).reshape(a.shape)
         return results
 
+    def unload(self):
+        """Release XRT handles in dependency order while the runtime is alive.
+
+        Mirrors mlir-air's ``XRTBackend.unload()``: drop dependents before the
+        device (BOs/kernel -> context -> elf -> device) so pyxrt's C++
+        destructors run cleanly, instead of leaving them to arbitrary-order GC
+        at interpreter shutdown (which can fault in XRT teardown). Idempotent.
+        """
+        self._bos = {}
+        self.kernel = None
+        self.context = None
+        self.elf = None
+        self.device = None
+
+    def __del__(self):
+        try:
+            self.unload()
+        except Exception:
+            pass
+
 
 class NPUChain:
     """Model-facing wrapper: declare a chain of NPU ops, dispatch as one ELF.
@@ -450,3 +470,16 @@ class NPUChain:
             intermediate_indices=intermediate_indices,
             output_indices=output_indices,
         )
+
+    def close(self):
+        """Release the chain's persistent XRT context/BOs (see
+        ``MultiLaunchRunner.unload``). Safe to call repeatedly."""
+        if self._runner is not None:
+            self._runner.unload()
+            self._runner = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

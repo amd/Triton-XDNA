@@ -112,19 +112,25 @@ def _next_pow2(n):
 
 
 class _FusedMLP:
-    """Fuse mlp_fc(+bias) -> gelu -> mlp_proj into ONE load_pdi multi-launch ELF.
+    """Fuse mlp_fc(+bias) -> gelu -> mlp_proj -> residual add into ONE load_pdi
+    multi-launch ELF.
 
-    Replaces three separate NPU dispatches (each paying the ~147ms hw_context
+    Replaces four separate NPU dispatches (each paying the ~147ms hw_context
     rebuild) with a single fused ELF dispatched through one persistent
     hw_context + one xrt.run. See docs/load_pdi_multilaunch_design.md.
 
     Per layer (lazily on first use) builds an NPUChain with pre-prepped weights:
-      op0 mlp_fc:   C0 = [x|1] @ [W_fc ; b_fc]   (bias folded via augmented-K)
-      op1 gelu:     G  = gelu(C0)                (f32 -> bf16)
-      op2 mlp_proj: C2 = G @ W_proj              (bf16 -> f32)
+      op0 mlp_fc:   C0  = [x|1] @ [W_fc ; b_fc]  (bias folded via augmented-K)
+      op1 gelu:     G   = gelu(C0)               (f32 -> bf16)
+      op2 mlp_proj: C2  = G @ W_proj             (bf16 -> f32)
+      op3 add:      out = C2 + residual          (f32; the block's post-MLP
+                                                  residual add, DDR hand-off)
     mlp_proj's bias is added on host post-readback (its A is gelu's output, so
-    the augmented-K fold can't apply; this is a boundary op, the 3 compute ops
-    still live in one ELF).
+    the augmented-K fold can't apply; it folds into the residual add: the device
+    computes C2 + residual and the host adds b_proj, giving x + mlp_out). The
+    ln2 that feeds this chain stays a separate NPU dispatch -- folding it on
+    device needs a custom normalize kernel + transform script for marginal gain
+    (see the deferred Stage B note).
 
     Shapes (HF stores c_fc/c_proj as (in,out), used as x@W directly):
       W_fc=(D, H), b_fc=(H,)  ; W_proj=(H, D), b_proj=(D,).  D=n_embd, H=mlp_dim.
@@ -132,15 +138,23 @@ class _FusedMLP:
     M is padded to 256 (BLOCK_M). Only valid rows/cols are read back.
     """
 
-    def __init__(self, n_embd, mlp_dim, matmul_script, gelu_f32in_script):
+    def __init__(self, n_embd, mlp_dim, matmul_script, gelu_f32in_script,
+                 add_f32_script):
         self.D = n_embd
         self.H = mlp_dim
         self.matmul_script = matmul_script
         self.gelu_script = gelu_f32in_script
+        self.add_script = add_f32_script
         self.BM = self.BN = 256
         self.K0_pad = _next_pow2(self.D + 1)       # +1 bias row
         self.HID_pad = _next_pow2(self.H)
-        self._chains = {}    # layer_idx -> (NPUChain, B0, B2, b_proj)
+        # One shared chain (one stitched ELF + one hw_context) serves every
+        # layer; per-layer weights are swapped in via bo_key at run time. A
+        # chain-per-layer would allocate one hw_context per layer and exhaust the
+        # NPU (DRM_IOCTL_AMDXDNA_CREATE_HWCTX) on deep models. Mirrors the
+        # upstream mlir-air llama pattern (ELF compiled once, per-layer BOs).
+        self._chain = None              # shared NPUChain
+        self._weights = {}              # layer_idx -> (B0, B2, b_proj_np)
         self._mm = None
         self._gelu = None
         self._build_kernels()
@@ -177,8 +191,18 @@ class _FusedMLP:
             y = (xf * tl.sigmoid(2.0 * z)).to(tl.bfloat16)
             tl.store(Y + offsets[:], y)
 
+        @triton.jit
+        def _add_kernel(A, B, C, n_elements: tl.constexpr,
+                        BLOCK_SIZE: tl.constexpr):
+            pid = tl.program_id(0)
+            offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            a = tl.load(A + offsets[:])
+            b = tl.load(B + offsets[:])
+            tl.store(C + offsets[:], a + b)
+
         self._mm = _mm_kernel
         self._gelu = _gelu_f32in
+        self._add = _add_kernel
 
     def _prep_weights(self, w_fc, b_fc, w_proj, b_proj):
         """Build padded, bias-folded static weight arrays (numpy bf16)."""
@@ -196,15 +220,19 @@ class _FusedMLP:
         B2[:H, :D] = w_proj.astype(bfloat16)
         return B0, B2
 
-    def _chain_for(self, layer_idx, w_fc, b_fc, w_proj, b_proj):
-        if layer_idx in self._chains:
-            return self._chains[layer_idx]
+    def _get_chain(self):
+        """Build the shared MLP chain once (every layer has the same MLP shape).
+
+        A single stitched ELF + one hw_context serves all layers; per-layer
+        weights are supplied at run time via bo_key. Warmup tensors are
+        shape-representative placeholders (layer-independent).
+        """
+        if self._chain is not None:
+            return self._chain
         from triton.backends.amd_triton_npu.multilaunch import NPUChain
         D, H, K0_pad, HID_pad, BM, BN = (
             self.D, self.H, self.K0_pad, self.HID_pad, self.BM, self.BN)
         M_pad = self.BM  # single M-block; valid rows sliced on readback
-        B0, B2 = self._prep_weights(w_fc, b_fc, w_proj, b_proj)
-        b_proj_np = b_proj.to(torch.float32).cpu().numpy()
 
         tAf = torch.zeros((M_pad, K0_pad), dtype=torch.bfloat16)
         tB0 = torch.zeros((K0_pad, HID_pad), dtype=torch.bfloat16)
@@ -214,8 +242,11 @@ class _FusedMLP:
         tGm = torch.zeros((M_pad, HID_pad), dtype=torch.bfloat16)
         tB2 = torch.zeros((HID_pad, D), dtype=torch.bfloat16)
         tC2 = torch.zeros((M_pad, D), dtype=torch.float32)
+        tC2f = torch.zeros(M_pad * D, dtype=torch.float32)
+        tR = torch.zeros(M_pad * D, dtype=torch.float32)
+        tOut = torch.zeros(M_pad * D, dtype=torch.float32)
 
-        chain = NPUChain(f"gpt2_mlp_L{layer_idx}")
+        chain = NPUChain("gpt2_mlp")
         chain.add(self._mm, grid=(M_pad // BM, HID_pad // BN),
                   arg_map={0: 0, 1: 1, 2: 2},
                   args=(tAf, tB0, tC0, M_pad, HID_pad, K0_pad,
@@ -235,22 +266,56 @@ class _FusedMLP:
                   constexprs={"BLOCK_SIZE_M": BM, "BLOCK_SIZE_N": BN,
                               "BLOCK_SIZE_K": HID_pad},
                   transform_script=self.matmul_script)
-        self._chains[layer_idx] = (chain, B0, B2, b_proj_np)
-        return self._chains[layer_idx]
+        # op3 add: out = C2 + residual (fold the post-MLP residual add into the
+        # chain so it shares the one hw_context; mlp_proj bias is still applied
+        # host-side on readback). C2 (combined idx 5) becomes an intermediate.
+        chain.add(self._add, grid=((M_pad * D) // 1024,),
+                  arg_map={0: 5, 1: 6, 2: 7},
+                  args=(tC2f, tR, tOut, M_pad * D),
+                  constexprs={"BLOCK_SIZE": 1024},
+                  transform_script=self.add_script)
+        self._chain = chain
+        return chain
 
-    def run(self, layer_idx, x_norm, w_fc, b_fc, w_proj, b_proj):
-        """Run the fused MLP for one layer. x_norm: (B,S,D) tensor (CPU).
+    def close(self):
+        """Release the shared chain's XRT context/BOs in order (see
+        NPUChain.close / MultiLaunchRunner.unload)."""
+        if self._chain is not None:
+            self._chain.close()
+            self._chain = None
 
-        Returns mlp_out (B,S,D) torch f32 tensor (before the residual add),
-        matching what `_linear(mlp_proj)` returns in the unfused path.
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _weights_for(self, layer_idx, w_fc, b_fc, w_proj, b_proj):
+        """Per-layer prepped weights (cached). Shape is identical across layers;
+        only the values differ, so they ride the shared chain as per-layer BOs."""
+        if layer_idx not in self._weights:
+            B0, B2 = self._prep_weights(w_fc, b_fc, w_proj, b_proj)
+            b_proj_np = b_proj.to(torch.float32).cpu().numpy()
+            self._weights[layer_idx] = (B0, B2, b_proj_np)
+        return self._weights[layer_idx]
+
+    def run(self, layer_idx, x_norm, residual, w_fc, b_fc, w_proj, b_proj):
+        """Run the fused MLP + residual add for one layer.
+
+        x_norm: ln2(x) (B,S,D) tensor (CPU); residual: x (B,S,D) the block
+        hidden state added back after the MLP. Returns x + mlp(x_norm)
+        (B,S,D) torch f32 tensor -- i.e. the post-residual-add result, matching
+        `x = add(x, mlp_out)` in the unfused path.
         """
         from ml_dtypes import bfloat16
         D, H, K0_pad, HID_pad = self.D, self.H, self.K0_pad, self.HID_pad
-        chain, B0, B2, b_proj_np = self._chain_for(
+        chain = self._get_chain()
+        B0, B2, b_proj_np = self._weights_for(
             layer_idx, w_fc, b_fc, w_proj, b_proj)
 
         orig_shape = x_norm.shape
         x2d = x_norm.reshape(-1, D).to(torch.float32).cpu().numpy()  # (M_real, D)
+        res2d = residual.reshape(-1, D).to(torch.float32).cpu().numpy()
         M_real = x2d.shape[0]
         M_pad = self.BM
         if M_real > M_pad:
@@ -267,15 +332,19 @@ class _FusedMLP:
         C0 = np.zeros((M_pad, HID_pad), dtype=np.float32)
         G = np.zeros(M_pad * HID_pad, dtype=bfloat16)
         C2 = np.zeros((M_pad, D), dtype=np.float32)
+        R = np.zeros((M_pad, D), dtype=np.float32)
+        R[:M_real, :D] = res2d
+        OUT = np.zeros((M_pad, D), dtype=np.float32)
 
-        out = chain.run([A_aug, B0, C0, G, B2, C2],
+        # On-device: OUT = C2 + R (residual). Host: + b_proj broadcast over M,
+        # giving x + (mlp_proj_out + b_proj) = x + mlp_out.
+        out = chain.run([A_aug, B0, C0, G, B2, C2, R, OUT],
                         bo_key=f"gpt2_mlp_L{layer_idx}",
                         static_indices={1, 4},
-                        intermediate_indices={2, 3},
-                        output_indices={5})
-        c2 = out[5].astype(np.float32)[:M_real, :D] + b_proj_np  # host bias
-        mlp_out = torch.from_numpy(c2.copy())
-        return mlp_out.reshape(orig_shape)
+                        intermediate_indices={2, 3, 5},
+                        output_indices={7})
+        res = out[7].astype(np.float32)[:M_real, :D] + b_proj_np  # host bias
+        return torch.from_numpy(res.copy()).reshape(orig_shape)
 
 
 class GPT2Model:
@@ -333,6 +402,7 @@ class GPT2Model:
         self.matmul_script = os.path.join(self.script_dir, "transform_matmul_aie2p.mlir")
         self.elem_script = os.path.join(self.script_dir, "transform_elementwise_aie2p.mlir")
         self.add_script = os.path.join(self.script_dir, "transform_add_aie2p.mlir")
+        self.add_f32_script = os.path.join(self.script_dir, "transform_add_f32_aie2p.mlir")
         self.softmax_script = os.path.join(self.script_dir, "transform_softmax_aie2p.mlir")
         self.layernorm_script = os.path.join(self.script_dir, "transform_layernorm_aie2p.mlir")
         self.gelu_f32in_script = os.path.join(self.script_dir, "transform_gelu_f32in_aie2p.mlir")
@@ -349,6 +419,7 @@ class GPT2Model:
             self._fused_mlp = _FusedMLP(
                 self.n_embd, self.mlp_dim,
                 self.matmul_script, self.gelu_f32in_script,
+                self.add_f32_script,
             )
 
     def _load_weights(self, sd):
@@ -743,9 +814,11 @@ class GPT2Model:
                     and x_norm.reshape(-1, self.n_embd).shape[0] <= 256
                 )
                 if _fused_ok:
+                    # The fused chain folds the post-MLP residual add (op3), so
+                    # run() returns x + mlp(x_norm) directly.
                     with self.timer.track("mlp_fused"):
-                        mlp_out = self._fused_mlp.run(
-                            i, x_norm,
+                        x = self._fused_mlp.run(
+                            i, x_norm, x,
                             npu_w["mlp_fc_weight"], npu_w["mlp_fc_bias"],
                             npu_w["mlp_proj_weight"], npu_w["mlp_proj_bias"],
                         )
@@ -756,9 +829,8 @@ class GPT2Model:
                         h = self._gelu(h, backend=gelu_be)
                     with self.timer.track("mlp_proj"):
                         mlp_out = self._linear(h, npu_w["mlp_proj_weight"], npu_w["mlp_proj_bias"], backend=mlp_proj_be)
-
-                with self.timer.track("add2"):
-                    x = self._add(x, mlp_out, backend=add_be)
+                    with self.timer.track("add2"):
+                        x = self._add(x, mlp_out, backend=add_be)
 
             else:
                 # --- SINGLE-BACKEND PATH (gpu or npu) ---
@@ -785,9 +857,11 @@ class GPT2Model:
                     and x_norm.reshape(-1, self.n_embd).shape[0] <= 256
                 )
                 if _fused_ok:
+                    # run() folds the post-MLP residual add (op3), returning
+                    # x + mlp(x_norm) directly.
                     with self.timer.track("mlp_fused"):
-                        mlp_out = self._fused_mlp.run(
-                            i, x_norm,
+                        x = self._fused_mlp.run(
+                            i, x_norm, x,
                             layer["mlp_fc_weight"], layer["mlp_fc_bias"],
                             layer["mlp_proj_weight"], layer["mlp_proj_bias"],
                         )
@@ -798,8 +872,8 @@ class GPT2Model:
                         h = self._gelu(h)
                     with self.timer.track("mlp_proj"):
                         mlp_out = self._linear(h, layer["mlp_proj_weight"], layer["mlp_proj_bias"])
-                with self.timer.track("add2"):
-                    x = self._add(x, mlp_out)
+                    with self.timer.track("add2"):
+                        x = self._add(x, mlp_out)
 
         # Final LayerNorm
         if hetero and not decode_gpu:

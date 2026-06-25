@@ -427,3 +427,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Backstop for the XRT/ROCm process-global teardown fault: results are fully
+    # computed and printed by now, so skip interpreter finalization (C++ static
+    # destructors) entirely. Flush first since os._exit does not. NPU resources
+    # are released in order via _FusedMLP/NPUChain.__del__ during normal GC; this
+    # only guards the residual global-teardown crash GC ordering cannot reach.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
