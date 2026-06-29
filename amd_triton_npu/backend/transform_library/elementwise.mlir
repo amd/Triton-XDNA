@@ -21,7 +21,10 @@ transform.named_sequence @fuse_elementwise_and_canonicalize(
   transform.yield
 }
 
-// Flatten to 1D, allocate result in L2, tile forall [256] for multi-core.
+// Flatten to 1D, allocate result in L2, split across a fixed number of cores.
+// num_threads (not tile_sizes) fixes the herd width regardless of block size:
+// tile_sizes [256] made width = BLOCK/256, which folds to no herd when
+// BLOCK <= 256 and overflows the 4-column array when BLOCK >= 2048.
 transform.named_sequence @flatten_tile_forall(
     %module: !transform.any_op {transform.readonly}) {
   %op = transform.structured.match ops{["linalg.generic"]} in %module
@@ -35,7 +38,7 @@ transform.named_sequence @flatten_tile_forall(
   %op_1 = transform.structured.match ops{["linalg.generic"]} in %module
       : (!transform.any_op) -> !transform.any_op
   %tiled_op_1, %forall_op_1 =
-      transform.structured.tile_using_forall %op_1 tile_sizes [256]
+      transform.structured.tile_using_forall %op_1 num_threads [4]
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
   transform.yield
 }
