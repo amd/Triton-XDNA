@@ -22,9 +22,12 @@ transform.named_sequence @fuse_elementwise_and_canonicalize(
 }
 
 // Flatten to 1D, allocate result in L2, split across a fixed number of cores.
-// num_threads (not tile_sizes) fixes the herd width regardless of block size:
-// tile_sizes [256] made width = BLOCK/256, which folds to no herd when
-// BLOCK <= 256 and overflows the 4-column array when BLOCK >= 2048.
+// num_threads (not tile_sizes) keeps the herd width independent of block size.
+// With tile_sizes the width was ceildiv(block, tile): a single trip when the
+// block fits one tile (the forall is then folded away, leaving no herd) and
+// wider than the target's column count for large blocks (placement fails). A
+// fixed thread count avoids both. NOTE: the count below is sized for the npu1
+// 4-column array; targets with more columns (AIE2P) may want a larger value.
 transform.named_sequence @flatten_tile_forall(
     %module: !transform.any_op {transform.readonly}) {
   %op = transform.structured.match ops{["linalg.generic"]} in %module
