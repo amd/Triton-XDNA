@@ -24,7 +24,7 @@ module attributes {transform.with_named_sequence} {
     transform.include @fuse_elementwise_and_canonicalize failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
 
-    // Phase 3: Flatten + tile forall [256]
+    // Phase 3: Flatten + tile across the herd (num_threads [8] for AIE2P)
     transform.include @flatten_tile_forall_aie2p failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
 
