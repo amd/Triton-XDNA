@@ -28,12 +28,9 @@ transform.named_sequence @fuse_elementwise_and_canonicalize(
 // wider than the target's column count for large blocks (placement fails). A
 // fixed thread count avoids both.
 //
-// The count is intentionally hardcoded to 4 for the npu1 4-column array. This
-// sequence is also included by AIE2P (npu2) elementwise scripts, where 4 caps
-// the herd at 4 of the 8 available columns -- correct, but it under-utilizes
-// the array for large blocks. Making the count target-aware (a per-target
-// sequence, or a driver-injected parameter) is left as a follow-up; 4 is kept
-// for now because it is the value validated on npu1 hardware.
+// The count is hardcoded to 4 for the npu1 4-column array. AIE2P (npu2)
+// elementwise scripts include @flatten_tile_forall_aie2p below instead, which
+// tiles into 8 threads to fill the 8-column Strix array.
 transform.named_sequence @flatten_tile_forall(
     %module: !transform.any_op {transform.readonly}) {
   %op = transform.structured.match ops{["linalg.generic"]} in %module
@@ -47,8 +44,37 @@ transform.named_sequence @flatten_tile_forall(
   %op_1 = transform.structured.match ops{["linalg.generic"]} in %module
       : (!transform.any_op) -> !transform.any_op
   %tiled_op_1, %forall_op_1 =
-      // 4 = npu1 column count (hardcoded; see note above for AIE2P/npu2).
+      // 4 = npu1 column count (hardcoded; AIE2P uses the _aie2p variant below).
       transform.structured.tile_using_forall %op_1 num_threads [4]
+      : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+  transform.yield
+}
+
+// AIE2P (npu2) variant of @flatten_tile_forall: 8 threads for the 8-column
+// Strix array instead of npu1's 4. Identical otherwise.
+//
+// DEPENDS ON mlir-air PR #1696 (Xilinx/mlir-air): "Preserve launch base offset
+// when splitting L2 memref". The 8-way split this triggers exposed a bug in
+// air-split-l2-memref where the per-iteration air.launch base offset was
+// dropped, so a multi-program (grid > 1) elementwise kernel silently moved
+// only the first program's data on npu2. Without an mlir-air build that
+// contains that fix, grid > 1 produces wrong results here; grid == 1 (a single
+// large block split across the herd) is correct regardless.
+transform.named_sequence @flatten_tile_forall_aie2p(
+    %module: !transform.any_op {transform.readonly}) {
+  %op = transform.structured.match ops{["linalg.generic"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %op_flattened = transform.structured.flatten_elementwise %op
+      : (!transform.any_op) -> !transform.any_op
+  %op_res_shared, %new_op = transform.structured.bufferize_to_allocation
+      %op_flattened
+      {memory_space = 1, bufferize_destination_only, emit_dealloc}
+      : !transform.any_op
+  %op_1 = transform.structured.match ops{["linalg.generic"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %tiled_op_1, %forall_op_1 =
+      // 8 = npu2/AIE2P column count (Strix). See dependency note above.
+      transform.structured.tile_using_forall %op_1 num_threads [8]
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
   transform.yield
 }

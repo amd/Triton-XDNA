@@ -16,7 +16,7 @@ module attributes {transform.with_named_sequence} {
         (%arg1) : (!transform.any_op) -> ()
     transform.include @fuse_elementwise_and_canonicalize failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
-    transform.include @flatten_tile_forall failures(propagate)
+    transform.include @flatten_tile_forall_aie2p failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
     transform.include @canonicalize_with_cse failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
