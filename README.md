@@ -110,6 +110,8 @@ A triton python package with a new amd_triton_npu backend is also pip installed 
 
 ### Run examples
 
+Browse the full set of available operators, their supported datatypes, and AIE2/AIE2P coverage in the live [examples dashboard](https://amd.github.io/Triton-XDNA/).
+
 Please make sure to run `source {path_to_xrt}/setup.sh` before running examples.
 The test also depends on PyTorch as CPU reference.
 
