@@ -20,7 +20,7 @@ import triton.language as tl
     configs=[
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=4),
     ],
-    key=['seq_len'],
+    key=["seq_len"],
 )
 @triton.jit
 def fused_attention_kernel(
@@ -62,8 +62,8 @@ def fused_attention_kernel(
 
     # Online softmax state
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)  # running max
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)                # running exp sum
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)      # running output
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)  # running exp sum
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)  # running output
 
     # Iterate over K/V blocks
     for start_n in range(0, total_len, BLOCK_N):
@@ -136,7 +136,7 @@ def triton_fused_attention(q, k, v, scale, causal=True, pos_offset=0):
     out = torch.empty((B_NH, S, HEAD_DIM), dtype=torch.bfloat16, device=device)
 
     def grid(META):
-        return (triton.cdiv(S, META['BLOCK_M']), B_NH)
+        return (triton.cdiv(S, META["BLOCK_M"]), B_NH)
 
     fused_attention_kernel[grid](
         q, k, v, out,

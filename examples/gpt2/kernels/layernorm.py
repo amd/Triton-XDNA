@@ -19,7 +19,10 @@ import triton.language as tl
 # ---------------------------------------------------------------------------
 @triton.jit
 def layernorm_kernel_gpu(
-    X, Y, Gamma, Beta,
+    X,
+    Y,
+    Gamma,
+    Beta,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     stride_x: tl.constexpr,
@@ -62,9 +65,12 @@ def layernorm_kernel_gpu(
 # to avoid routing pressure from extra DMA channels on the AIE shim tile.
 @triton.jit
 def layernorm_kernel_npu(
-    X, Y,
-    input_stride_row: tl.constexpr, input_stride_col: tl.constexpr,
-    output_stride_row: tl.constexpr, output_stride_col: tl.constexpr,
+    X,
+    Y,
+    input_stride_row: tl.constexpr,
+    input_stride_col: tl.constexpr,
+    output_stride_row: tl.constexpr,
+    output_stride_col: tl.constexpr,
     n_cols: tl.constexpr,
     n_cols_real: tl.constexpr,
     eps: tl.constexpr,
@@ -99,6 +105,7 @@ def layernorm_kernel_npu(
 # Wrapper: triton_layernorm
 # ---------------------------------------------------------------------------
 from .backend_utils import CachedNPUKernel
+
 _layernorm_npu_cached = CachedNPUKernel()
 
 
@@ -140,9 +147,14 @@ def triton_layernorm(x, gamma, beta, eps=1e-5, backend="gpu", transform_script=N
 
         BLOCK_SIZE = triton.next_power_of_2(n_cols)
         layernorm_kernel_gpu[(n_rows,)](
-            x_dev, output, gamma_dev, beta_dev,
-            n_cols, eps,
-            x_dev.stride(0), output.stride(0),
+            x_dev,
+            output,
+            gamma_dev,
+            beta_dev,
+            n_cols,
+            eps,
+            x_dev.stride(0),
+            output.stride(0),
             BLOCK_SIZE=BLOCK_SIZE,
         )
     else:
@@ -172,11 +184,17 @@ def triton_layernorm(x, gamma, beta, eps=1e-5, backend="gpu", transform_script=N
 
         grid = (n_rows_padded // BLOCK_SIZE, 1)
         _layernorm_npu_cached(
-            layernorm_kernel_npu, grid,
-            x_npu, output,
-            x_npu.stride(0), x_npu.stride(1),
-            output.stride(0), output.stride(1),
-            n_cols_padded, n_cols, eps,
+            layernorm_kernel_npu,
+            grid,
+            x_npu,
+            output,
+            x_npu.stride(0),
+            x_npu.stride(1),
+            output.stride(0),
+            output.stride(1),
+            n_cols_padded,
+            n_cols,
+            eps,
             BLOCK_SIZE=BLOCK_SIZE,
         )
 

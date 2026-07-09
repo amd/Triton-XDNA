@@ -19,7 +19,8 @@ import triton.language as tl
 # ---------------------------------------------------------------------------
 @triton.jit
 def softmax_kernel_gpu(
-    input_ptr, output_ptr,
+    input_ptr,
+    output_ptr,
     n_cols,
     stride_row,
     BLOCK_SIZE: tl.constexpr,
@@ -48,9 +49,12 @@ def softmax_kernel_gpu(
 # ---------------------------------------------------------------------------
 @triton.jit
 def softmax_kernel_npu(
-    input_ptr, output_ptr,
-    input_stride_row: tl.constexpr, input_stride_col: tl.constexpr,
-    output_stride_row: tl.constexpr, output_stride_col: tl.constexpr,
+    input_ptr,
+    output_ptr,
+    input_stride_row: tl.constexpr,
+    input_stride_col: tl.constexpr,
+    output_stride_row: tl.constexpr,
+    output_stride_col: tl.constexpr,
     n_cols: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -80,6 +84,7 @@ def softmax_kernel_npu(
 # Wrapper: triton_softmax
 # ---------------------------------------------------------------------------
 from .backend_utils import CachedNPUKernel
+
 _softmax_npu_cached = CachedNPUKernel()
 
 
@@ -115,7 +120,8 @@ def triton_softmax(x, causal_mask=None, backend="gpu", transform_script=None):
         # BLOCK_SIZE must be power of 2 >= n_cols
         BLOCK_SIZE = triton.next_power_of_2(n_cols)
         softmax_kernel_gpu[(n_rows,)](
-            x_2d, output,
+            x_2d,
+            output,
             n_cols,
             x_2d.stride(0),
             BLOCK_SIZE=BLOCK_SIZE,
@@ -166,10 +172,14 @@ def triton_softmax(x, causal_mask=None, backend="gpu", transform_script=None):
             chunk = x_2d[row_start:row_start + BLOCK_SIZE].to(torch.bfloat16).contiguous()
             out_chunk = torch.empty_like(chunk)
             _softmax_npu_cached(
-                softmax_kernel_npu, (1, 1),
-                chunk, out_chunk,
-                chunk.stride(0), chunk.stride(1),
-                out_chunk.stride(0), out_chunk.stride(1),
+                softmax_kernel_npu,
+                (1, 1),
+                chunk,
+                out_chunk,
+                chunk.stride(0),
+                chunk.stride(1),
+                out_chunk.stride(0),
+                out_chunk.stride(1),
                 n_cols_padded,
                 BLOCK_SIZE=BLOCK_SIZE,
             )

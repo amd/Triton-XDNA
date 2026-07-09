@@ -23,7 +23,8 @@ import triton.language as tl
 # ---------------------------------------------------------------------------
 @triton.jit
 def gelu_kernel_gpu(
-    X, Y,
+    X,
+    Y,
     n_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -48,7 +49,8 @@ def gelu_kernel_gpu(
 # ---------------------------------------------------------------------------
 @triton.jit
 def gelu_kernel_npu(
-    X, Y,
+    X,
+    Y,
     n_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -70,6 +72,7 @@ def gelu_kernel_npu(
 # Wrapper: triton_gelu
 # ---------------------------------------------------------------------------
 from .backend_utils import CachedNPUKernel
+
 _gelu_npu_cached = CachedNPUKernel()
 
 
@@ -114,7 +117,9 @@ def triton_gelu(x, backend="gpu", transform_script=None):
             os.environ["AIR_TRANSFORM_TILING_SCRIPT"] = transform_script
 
         grid = (n_padded // BLOCK_SIZE,)
-        _gelu_npu_cached(gelu_kernel_npu, grid, x_npu, output, n_padded, BLOCK_SIZE=BLOCK_SIZE)
+        _gelu_npu_cached(
+            gelu_kernel_npu, grid, x_npu, output, n_padded, BLOCK_SIZE=BLOCK_SIZE
+        )
 
         if old_script is not None:
             os.environ["AIR_TRANSFORM_TILING_SCRIPT"] = old_script

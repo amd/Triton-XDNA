@@ -88,7 +88,6 @@ def run_triton_model(state_dict, input_ids, backend, profile=False, config=None)
         benchmark.select_npu_backend()
     elif backend in ("gpu", "hetero", "hetero-fast"):
         import benchmark
-          
         benchmark.select_gpu_backend()
 
     model = GPT2Model(state_dict, backend=backend, config=config)

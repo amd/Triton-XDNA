@@ -75,6 +75,7 @@ class OpTimer:
     def total_ms(self):
         return sum(ms for _, ms in self.records)
 
+
 # GPT-2 variant configs. All variants share the same architecture, vocab,
 # context length, and head_dim (64) — only depth/width differ — so the same
 # kernels and transform scripts serve every size.
@@ -96,14 +97,14 @@ GPT2_CONFIG = GPT2_CONFIGS["gpt2"]
 
 # Default hetero routing policy: which device runs each operator
 HETERO_ROUTING = {
-    "layernorm":  "npu",
+    "layernorm": "npu",
     "qkv_linear": "gpu",
-    "attn_proj":  "gpu",
-    "softmax":    "gpu",
-    "mlp_fc":     "npu",
-    "gelu":       "npu",
-    "mlp_proj":   "npu",
-    "add":        "npu",
+    "attn_proj": "gpu",
+    "softmax": "gpu",
+    "mlp_fc": "npu",
+    "gelu": "npu",
+    "mlp_proj": "npu",
+    "add": "npu",
 }
 
 
@@ -138,8 +139,9 @@ class _FusedMLP:
     M is padded to 256 (BLOCK_M). Only valid rows/cols are read back.
     """
 
-    def __init__(self, n_embd, mlp_dim, matmul_script, gelu_f32in_script,
-                 add_f32_script):
+    def __init__(
+        self, n_embd, mlp_dim, matmul_script, gelu_f32in_script, add_f32_script
+    ):
         self.D = n_embd
         self.H = mlp_dim
         self.matmul_script = matmul_script
@@ -147,15 +149,15 @@ class _FusedMLP:
         self.add_script = add_f32_script
         self.BM = 128
         self.BN = 256
-        self.K0_pad = _next_pow2(self.D + 1)       # +1 bias row
+        self.K0_pad = _next_pow2(self.D + 1)  # +1 bias row
         self.HID_pad = _next_pow2(self.H)
         # One shared chain (one stitched ELF + one hw_context) serves every
         # layer; per-layer weights are swapped in via bo_key at run time. A
         # chain-per-layer would allocate one hw_context per layer and exhaust the
         # NPU (DRM_IOCTL_AMDXDNA_CREATE_HWCTX) on deep models. Mirrors the
         # upstream mlir-air llama pattern (ELF compiled once, per-layer BOs).
-        self._chain = None              # shared NPUChain
-        self._weights = {}              # layer_idx -> (B0, B2, b_proj_np)
+        self._chain = None  # shared NPUChain
+        self._weights = {}  # layer_idx -> (B0, B2, b_proj_np)
         self._mm = None
         self._gelu = None
         self._build_kernels()
@@ -165,6 +167,7 @@ class _FusedMLP:
         # matmul is row-independent and output is sliced to [:M_real]). K-padding
         # columns (D+1:) stay zero (written once here, never touched again).
         from ml_dtypes import bfloat16 as _bf16
+
         self._A_aug = np.zeros((self.BM, self.K0_pad), dtype=_bf16)
         self._C0 = np.zeros((self.BM, self.HID_pad), dtype=np.float32)
         self._G = np.zeros(self.BM * self.HID_pad, dtype=_bf16)
@@ -205,8 +208,7 @@ class _FusedMLP:
             tl.store(Y + offsets[:], y)
 
         @triton.jit
-        def _add_kernel(A, B, C, n_elements: tl.constexpr,
-                        BLOCK_SIZE: tl.constexpr):
+        def _add_kernel(A, B, C, n_elements: tl.constexpr, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
             offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
             a = tl.load(A + offsets[:])
@@ -220,9 +222,10 @@ class _FusedMLP:
     def _prep_weights(self, w_fc, b_fc, w_proj, b_proj):
         """Build padded, bias-folded static weight arrays (numpy bf16)."""
         from ml_dtypes import bfloat16
+
         D, H, K0_pad, HID_pad = self.D, self.H, self.K0_pad, self.HID_pad
-        w_fc = w_fc.to(torch.float32).cpu().numpy()      # (D, H)
-        b_fc = b_fc.to(torch.float32).cpu().numpy()      # (H,)
+        w_fc = w_fc.to(torch.float32).cpu().numpy()  # (D, H)
+        b_fc = b_fc.to(torch.float32).cpu().numpy()  # (H,)
         w_proj = w_proj.to(torch.float32).cpu().numpy()  # (H, D)
         # B0 = [W_fc ; b_fc] padded to (K0_pad, HID_pad)
         B0 = np.zeros((K0_pad, HID_pad), dtype=bfloat16)
@@ -243,8 +246,15 @@ class _FusedMLP:
         if self._chain is not None:
             return self._chain
         from triton.backends.amd_triton_npu.multilaunch import NPUChain
+
         D, H, K0_pad, HID_pad, BM, BN = (
-            self.D, self.H, self.K0_pad, self.HID_pad, self.BM, self.BN)
+            self.D,
+            self.H,
+            self.K0_pad,
+            self.HID_pad,
+            self.BM,
+            self.BN,
+        )
         M_pad = self.BM  # single M-block; valid rows sliced on readback
 
         tAf = torch.zeros((M_pad, K0_pad), dtype=torch.bfloat16)
@@ -282,11 +292,14 @@ class _FusedMLP:
         # op3 add: out = C2 + residual (fold the post-MLP residual add into the
         # chain so it shares the one hw_context; mlp_proj bias is still applied
         # host-side on readback). C2 (combined idx 5) becomes an intermediate.
-        chain.add(self._add, grid=((M_pad * D) // 1024,),
-                  arg_map={0: 5, 1: 6, 2: 7},
-                  args=(tC2f, tR, tOut, M_pad * D),
-                  constexprs={"BLOCK_SIZE": 1024},
-                  transform_script=self.add_script)
+        chain.add(
+            self._add,
+            grid=((M_pad * D) // 1024,),
+            arg_map={0: 5, 1: 6, 2: 7},
+            args=(tC2f, tR, tOut, M_pad * D),
+            constexprs={"BLOCK_SIZE": 1024},
+            transform_script=self.add_script,
+        )
         self._chain = chain
         return chain
 
@@ -321,6 +334,7 @@ class _FusedMLP:
         `x = add(x, mlp_out)` in the unfused path.
         """
         from ml_dtypes import bfloat16
+
         D, H, K0_pad, HID_pad = self.D, self.H, self.K0_pad, self.HID_pad
         chain = self._get_chain()
         B0, B2, b_proj_np = self._weights_for(

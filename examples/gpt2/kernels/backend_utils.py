@@ -11,6 +11,7 @@ from contextlib import contextmanager
 def npu_driver_scope():
     """Temporarily activate NPU driver for a kernel launch, then restore."""
     from triton.backends.amd_triton_npu.driver import NPUDriver
+
     triton.runtime.driver.set_active(NPUDriver())
     try:
         yield
@@ -63,4 +64,5 @@ class CachedNPUKernel:
             with npu_driver_scope():
                 kernel[grid](*args, **constexpr_kwargs)
             from triton.backends.amd_triton_npu.driver import _last_dispatched_module
+
             self._cache[cache_key] = _last_dispatched_module

@@ -22,9 +22,17 @@ import triton.language as tl
     # The per-process autotune benchmark sweep (compile+time every config each
     # run) dominated startup for these small shapes. See sandbox/sweep_dump.py.
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=4),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 4,
+            },
+            num_warps=4,
+        ),
     ],
-    key=['M', 'N', 'K'],
+    key=["M", "N", "K"],
 )
 @triton.jit
 def matmul_kernel_gpu(
@@ -122,6 +130,7 @@ def _pad_to_multiple(x, multiple):
 
 
 from .backend_utils import CachedNPUKernel
+
 _matmul_npu_cached = CachedNPUKernel()
 
 
@@ -243,9 +252,17 @@ def triton_linear(x, weight, bias=None, backend="gpu", transform_script=None):
     # Single fixed config: bmm is not on the hot path (attention uses the fused
     # kernel), but pin it to avoid any autotune sweep if ever called.
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=4),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 4,
+            },
+            num_warps=4,
+        ),
     ],
-    key=['M', 'N', 'K'],
+    key=["M", "N", "K"],
 )
 @triton.jit
 def bmm_kernel_gpu(
@@ -329,7 +346,7 @@ def triton_bmm(a, b):
 
     def grid(META):
         return (
-            triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
             batch,
         )
 

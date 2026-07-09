@@ -43,8 +43,7 @@ def _extract_private_funcs(mlir_text):
 
 
 def _rename_all(text, prefix):
-    """Rename SSA values, affine maps, and symbols with a unique prefix.
-    """
+    """Rename SSA values, affine maps, and symbols with a unique prefix."""
     # Affine attribute symbols: `#map...` and `#set...` (longest first).
     affine_names = set(re.findall(r"#map\d*", text)) | set(re.findall(r"#set\d*", text))
     for name in sorted(affine_names, key=len, reverse=True):
