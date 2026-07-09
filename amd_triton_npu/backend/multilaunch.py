@@ -10,9 +10,6 @@ launches reconfigure the AIE array via ``load_pdi`` (firmware-sequenced), so the
 ~147 ms-per-launch hw_context rebuild is paid once for the whole chain instead of
 once per op. Intermediates flow op->op through DDR with no host round-trip.
 
-See ``docs/load_pdi_multilaunch_design.md`` for the design and
-``sandbox/load_pdi_poc/`` for the standalone PoC this is based on.
-
 This is an ADDITIVE path: nothing here touches the per-kernel ``compile_module``
 flow used by the example suite.
 """

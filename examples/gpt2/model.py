@@ -117,7 +117,7 @@ class _FusedMLP:
 
     Replaces four separate NPU dispatches (each paying the ~147ms hw_context
     rebuild) with a single fused ELF dispatched through one persistent
-    hw_context + one xrt.run. See docs/load_pdi_multilaunch_design.md.
+    hw_context + one xrt.run.
 
     Per layer (lazily on first use) builds an NPUChain with pre-prepped weights:
       op0 mlp_fc:   C0  = [x|1] @ [W_fc ; b_fc]  (bias folded via augmented-K)
@@ -420,7 +420,7 @@ class GPT2Model:
         # Fuse mlp_fc->gelu->mlp_proj into one load_pdi ELF on NPU. On by default
         # whenever the MLP runs on NPU (hetero/hetero-fast or npu mode); the
         # unfused per-op path is ~10x slower, so it's only kept as an escape
-        # hatch via AMD_TRITON_NPU_FUSED_MLP=0. See docs/load_pdi_multilaunch_design.md.
+        # hatch via AMD_TRITON_NPU_FUSED_MLP=0.
         self._fused_mlp = None
         if (
             (self._is_hetero or backend == "npu")

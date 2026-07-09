@@ -6,7 +6,7 @@
 Ported from Xilinx/mlir-air@9377b0e
 programming_examples/llama32_1b/kernel_builder/stitching.py. Used by
 multilaunch.py to combine per-op AIR modules into one multi-launch module that
-compiles to a single load_pdi ELF (see docs/load_pdi_multilaunch_design.md).
+compiles to a single load_pdi ELF.
 Pure regex/string ops, no MLIR API.
 """
 
@@ -42,47 +42,43 @@ def _extract_private_funcs(mlir_text):
     return [l for l in mlir_text.split("\n") if "func.func private" in l]
 
 
-def _extract_channel_decls(mlir_text):
-    """Extract module-level `air.channel @name ...` declaration lines."""
-    return [l for l in mlir_text.split("\n") if re.match(r"\s*air\.channel @", l)]
-
-
-_DEFAULT_EXTERN_FUNCS = {
-    "@silu_and_mul_bf16",
-    "@zero_vectorized_bf16",
-    "@matmul_bf16",
-}
-
-
 def _rename_all(text, prefix):
     """Rename SSA values, affine maps, and symbols with a unique prefix.
-
-    External kernel symbols (those in `_DEFAULT_EXTERN_FUNCS`) are preserved
-    so they can be linked across stitched modules.
     """
-    return _rename_all_with_externs(text, prefix, _DEFAULT_EXTERN_FUNCS)
+    # Affine attribute symbols: `#map...` and `#set...` (longest first).
+    affine_names = set(re.findall(r"#map\d*", text)) | set(re.findall(r"#set\d*", text))
+    for name in sorted(affine_names, key=len, reverse=True):
+        text = re.sub(re.escape(name) + r"(?!\w)", f"#{prefix}_{name[1:]}", text)
+
+    # SSA word values
+    for name in sorted(set(re.findall(r"%[a-zA-Z_]\w*", text)), key=len, reverse=True):
+        text = re.sub(re.escape(name) + r"(?!\w)", f"%{prefix}_{name[1:]}", text)
+
+    # SSA numbered values — re.sub with `(?!\d)` boundary so `%10` cannot
+    # substring-match `%100`. Longest-first ordering is no longer required for
+    # correctness but kept for determinism.
+    for name in sorted(
+        set(re.findall(r"%\d+", text)), key=lambda x: int(x[1:]), reverse=True
+    ):
+        text = re.sub(re.escape(name) + r"(?!\d)", f"%{prefix}_n{name[1:]}", text)
+
+    # Symbol names but NOT extern functions
+    for name in sorted(set(re.findall(r"@[\w]+", text)), key=len, reverse=True):
+        text = text.replace(name, f"@{prefix}_{name[1:]}")
+    return text
 
 
-def _fix_launch_func_args(text, prefix, arg_map, arg_aliases=None):
+def _fix_launch_func_args(text, prefix, arg_map):
     """Fix func-arg references in launch's args() clause after _rename_all.
 
     arg_map: {orig_idx: combined_idx} — map per-launch %{prefix}_argN to outer
         %argM of the combined func.
-    arg_aliases: {orig_idx: "%some_ssa_name"} — map per-launch %{prefix}_argN
-        to an arbitrary SSA value defined in the combined func body (e.g. a
-        subview/cast result emitted at the top of the func). Use to alias
-        multiple launches onto a shared sub-region of a packed buffer without
-        burning an extra func arg.
     """
     for orig_idx, combined_idx in arg_map.items():
         old_ref = f"%{prefix}_arg{orig_idx}"
         new_ref = f"%arg{combined_idx}"
         text = text.replace(f"={old_ref},", f"={new_ref},")
         text = text.replace(f"={old_ref})", f"={new_ref})")
-    for orig_idx, ssa_name in (arg_aliases or {}).items():
-        old_ref = f"%{prefix}_arg{orig_idx}"
-        text = text.replace(f"={old_ref},", f"={ssa_name},")
-        text = text.replace(f"={old_ref})", f"={ssa_name})")
     return text
 
 
@@ -201,30 +197,3 @@ def _wrap_ir_in_launch(mlir_text):
     new_lines.extend(lines[body_end:])
 
     return "\n".join(new_lines)
-
-
-def _rename_all_with_externs(text, prefix, extern_funcs):
-    """Like _rename_all but with a configurable extern_funcs set."""
-    # Affine attribute symbols: `#map...` and `#set...` (longest first).
-    affine_names = set(re.findall(r"#map\d*", text)) | set(re.findall(r"#set\d*", text))
-    for name in sorted(affine_names, key=len, reverse=True):
-        text = re.sub(re.escape(name) + r"(?!\w)", f"#{prefix}_{name[1:]}", text)
-
-    # SSA word values
-    for name in sorted(set(re.findall(r"%[a-zA-Z_]\w*", text)), key=len, reverse=True):
-        text = re.sub(re.escape(name) + r"(?!\w)", f"%{prefix}_{name[1:]}", text)
-
-    # SSA numbered values — re.sub with `(?!\d)` boundary so `%10` cannot
-    # substring-match `%100`. Longest-first ordering is no longer required for
-    # correctness but kept for determinism.
-    for name in sorted(
-        set(re.findall(r"%\d+", text)), key=lambda x: int(x[1:]), reverse=True
-    ):
-        text = re.sub(re.escape(name) + r"(?!\d)", f"%{prefix}_n{name[1:]}", text)
-
-    # Symbol names but NOT extern functions
-    for name in sorted(set(re.findall(r"@[\w]+", text)), key=len, reverse=True):
-        if name not in extern_funcs:
-            text = text.replace(name, f"@{prefix}_{name[1:]}")
-
-    return text
