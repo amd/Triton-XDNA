@@ -165,6 +165,43 @@ transform.named_sequence @pad_and_promote_binary_bf16(
   transform.yield
 }
 
+// Binary variant with f32 inputs and bf16 output (2 inputs + 1 output).
+// For fused chains where a binary elementwise consumes two non-padded f32
+// buffers produced on-device (e.g. two f32-accumulate matmuls) and produces a
+// bf16 buffer for a following op -- e.g. the SwiGLU merge silu(gate)*up at the
+// middle of the load_pdi MLP chain (gate_f32, up_f32 -> H_bf16 feeding the down
+// matmul). Input pad values are f32; the result pad value is bf16. Mirrors the
+// unary @pad_and_promote_unary_f32in_bf16out.
+transform.named_sequence @pad_and_promote_binary_f32in_bf16out(
+    %module: !transform.any_op {transform.readonly}) {
+  %op = transform.structured.match ops{["linalg.generic"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %padded_op, %pad_op, %__ = transform.structured.pad %op {
+      padding_values=[0.0 : f32, 0.0 : f32, 0.0 : bf16],
+      padding_dimensions=[0, 1, 2],
+      nofold_flags=[1, 1, 1],
+      copy_back_op="linalg.copy"
+  } : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+  %pad_dps = transform.structured.rewrite_in_destination_passing_style %pad_op
+      : (!transform.any_op) -> !transform.any_op
+  %padded_lhs = transform.get_producer_of_operand %padded_op[0]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_lhs_buffer, %padded_lhs_new =
+      transform.structured.bufferize_to_allocation %padded_lhs
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_rhs = transform.get_producer_of_operand %padded_op[1]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_rhs_buffer, %padded_rhs_new =
+      transform.structured.bufferize_to_allocation %padded_rhs
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  %padded_result = transform.get_producer_of_operand %padded_op[2]
+      : (!transform.any_op) -> (!transform.any_op)
+  %padded_result_buffer, %padded_result_new =
+      transform.structured.bufferize_to_allocation %padded_result
+      {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+  transform.yield
+}
+
 // Binary variant with all-f32 operands (2 inputs + 1 output = 3 operands).
 // For fused chains where a producing op (e.g. an f32-accumulate matmul) hands a
 // non-padded f32 buffer to a binary elementwise that stays in f32 -- e.g. the
