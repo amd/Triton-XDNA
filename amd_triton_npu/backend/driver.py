@@ -38,6 +38,28 @@ if not logger.handlers:
     logger.addHandler(_handler)
 logger.propagate = False
 
+
+def _lift_tensor_numel_limit():
+    """Raise Triton's max-tensor-numel guard for the AIR-tiled NPU backend.
+
+    Triton caps a block tensor at 2**20 elements because on a GPU a block
+    becomes a register tile. On this backend a whole-tile load + tl.dot lowers
+    to a single linalg.matmul that the transform script tiles across L3/L2/L1
+    on-device, so the cap doesn't apply -- it only forced the NPU matmul wrapper
+    to chunk K and reduce partials on the host. validate_block_shape reads this
+    value from the _utils module global at call time, so bumping it here covers
+    every call site (including core.py's imported binding).
+    """
+    import triton._utils as _tu
+
+    cap = 1 << 22  # 256 (BLOCK_M) x 8192 (largest padded K) = 2**21, with headroom
+    cur = getattr(_tu, "TRITON_MAX_TENSOR_NUMEL", None)
+    if cur is not None and cur < cap:
+        _tu.TRITON_MAX_TENSOR_NUMEL = cap
+
+
+_lift_tensor_numel_limit()
+
 autotune_time = False
 
 
@@ -1432,6 +1454,148 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
+def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
+    """Run aircc on an AIR-dialect MLIR file to produce an NPU binary.
+
+    Resolves the aircc binary + peano flag, builds the command for the requested
+    ``output_format`` ("elf" or "xclbin"), runs it, and returns the produced
+    artifact paths. For "elf" also extracts the dispatch kernel name from
+    ``full_elf_config.json``.
+
+    Args:
+        air_mlir_path: path to the AIR-dialect .mlir to compile.
+        output_format: "elf" or "xclbin".
+        npu_version: target device string ("npu1"/"npu2") for ``--device``.
+        air_proj_path: directory aircc writes artifacts into.
+
+    Returns:
+        elf:    {"elf_path": str, "elf_kernel_name": str}
+        xclbin: {"xclbin_path": str, "insts_path": str}
+
+    Raises:
+        subprocess.CalledProcessError: if aircc exits non-zero.
+    """
+    aircc_binary_name = "aircc.exe" if IS_WINDOWS else "aircc"
+    aircc_bin = _find_mlir_air_binary(aircc_binary_name)
+
+    # On Windows, construct peano path from llvm-aie package and
+    # add mlir_aie/bin to PATH so aircc can find aiecc.exe
+    peano_flag = "--peano="
+    if IS_WINDOWS:
+        peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
+        if peano_dir:
+            # LLVM_BINARY_DIR points to bin/, peano wants parent
+            peano_flag = f"--peano={str(Path(peano_dir).parent)}"
+        else:
+            # Auto-detect from pip-installed llvm-aie package
+            try:
+                dist = importlib.metadata.distribution("llvm-aie")
+                llvm_aie_root = Path(dist._path.parent) / "llvm-aie"
+                if (llvm_aie_root / "bin" / "opt.exe").exists():
+                    peano_flag = f"--peano={llvm_aie_root}"
+            except Exception:
+                pass
+        # Also check PEANO_INSTALL_DIR env var
+        if peano_flag == "--peano=":
+            peano_env = os.environ.get("PEANO_INSTALL_DIR", "")
+            if peano_env and os.path.isdir(peano_env):
+                peano_flag = f"--peano={peano_env}"
+        # Ensure aiecc is findable
+        try:
+            import mlir_aie
+
+            mlir_aie_bin = str(Path(mlir_aie.__path__[0]) / "bin")
+        except ImportError:
+            mlir_aie_bin = str(
+                Path(aircc.__file__).resolve().parent.parent.parent / "mlir_aie" / "bin"
+            )
+
+        if os.path.isdir(mlir_aie_bin) and mlir_aie_bin not in os.environ.get(
+            "PATH", ""
+        ):
+            os.environ["PATH"] = mlir_aie_bin + os.pathsep + os.environ.get("PATH", "")
+
+    if output_format == "elf":
+        elf_path = os.path.join(air_proj_path, "aie.elf")
+        aircc_cmd = [
+            aircc_bin,
+            "--device",
+            npu_version,
+            "--no-xchesscc",
+            "--no-xbridge",
+            "--output-format",
+            "elf",
+            "--elf-name",
+            elf_path,
+            peano_flag,
+            air_mlir_path,
+        ]
+    else:
+        xclbin_path = os.path.join(air_proj_path, "aie.xclbin")
+        insts_path = os.path.join(air_proj_path, "insts.bin")
+        aircc_cmd = [
+            aircc_bin,
+            "--device",
+            npu_version,
+            "--no-xchesscc",
+            "--no-xbridge",
+            "--output-format",
+            "xclbin",
+            "-i",
+            insts_path,
+            "-o",
+            xclbin_path,
+            peano_flag,
+            air_mlir_path,
+        ]
+    # Enable bf16 emulation: hardware truncates f32 -> bf16 before
+    # multiply, with f32 accumulation.
+    if npu_config.bf16_emulation:
+        aircc_cmd.insert(-1, "--bf16-emulation")
+    # Explicitly set runtime loop tiling sizes to [4,4] (aircc
+    # default changed from [4,4] to [] in mlir-air #1470).
+    aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
+    aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
+    # Increase core stack size to 2048 bytes to accommodate
+    # deeper call chains in register-intensive kernels.
+    aircc_cmd.insert(-1, "--stack-size")
+    aircc_cmd.insert(-1, "2048")
+    if npu_config.debug:
+        subprocess.check_call(aircc_cmd)
+    else:
+        result = subprocess.run(
+            aircc_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if result.returncode != 0:
+            if result.stdout:
+                stderr_buf = getattr(sys.stderr, "buffer", None)
+                if stderr_buf is not None:
+                    stderr_buf.write(result.stdout)
+                else:
+                    sys.stderr.write(result.stdout.decode("utf-8", errors="replace"))
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                aircc_cmd,
+                output=result.stdout,
+            )
+
+    if output_format == "elf":
+        # Extract kernel name from ELF config.json. aircc writes
+        # full_elf_config.json into its hardcoded default working dir
+        # (<cwd>/air_project), NOT necessarily air_proj_path -- so check
+        # air_proj_path first, then fall back to the cwd default.
+        config_json_path = os.path.join(air_proj_path, "full_elf_config.json")
+        if not os.path.isfile(config_json_path):
+            fallback = os.path.join("air_project", "full_elf_config.json")
+            if os.path.isfile(fallback):
+                config_json_path = fallback
+        elf_kernel_name = _extract_elf_kernel_name(config_json_path)
+        return {"elf_path": elf_path, "elf_kernel_name": elf_kernel_name}
+    return {"xclbin_path": xclbin_path, "insts_path": insts_path}
+
+
 # Global cache: maps input hash -> (loaded .pyd module, launch function)
 # Persists across all NPULauncher instances for the process lifetime.
 # Bypasses the expensive MLIR pipeline on repeated dispatches of the same kernel.
@@ -1440,6 +1604,45 @@ _global_module_cache = {}
 # Last dispatched module — set after each dispatch so callers can capture it
 # for direct fast-path calls (bypassing Triton JIT entirely).
 _last_dispatched_module = None
+
+
+def _get_cached_aircc_artifacts(cache, output_format):
+    """Return cached aircc artifacts (elf/xclbin) or None if the set is incomplete.
+
+    Keys mirror ``_put_aircc_artifacts``:
+        elf:    {"elf_path", "elf_kernel_name_path"}
+        xclbin: {"xclbin_path", "insts_path"}
+    """
+    if output_format == "elf":
+        elf_path = cache.get_file("aie.elf")
+        kname_path = cache.get_file("elf_kernel_name.txt")
+        if elf_path is None or kname_path is None:
+            return None
+        return {"elf_path": elf_path, "elf_kernel_name_path": kname_path}
+    xclbin_path = cache.get_file("aie.xclbin")
+    insts_path = cache.get_file("insts.bin")
+    if xclbin_path is None or insts_path is None:
+        return None
+    return {"xclbin_path": xclbin_path, "insts_path": insts_path}
+
+
+def _put_aircc_artifacts(cache, artifacts, output_format):
+    """Persist aircc artifacts; return cached paths in the same shape as the getter.
+
+    ``artifacts`` is the dict returned by ``_aircc_compile``.
+    """
+    if output_format == "elf":
+        with open(artifacts["elf_path"], "rb") as f:
+            elf_path = cache.put(f.read(), "aie.elf", binary=True)
+        kname_path = cache.put(
+            artifacts["elf_kernel_name"].encode(), "elf_kernel_name.txt"
+        )
+        return {"elf_path": elf_path, "elf_kernel_name_path": kname_path}
+    with open(artifacts["xclbin_path"], "rb") as f:
+        xclbin_path = cache.put(f.read(), "aie.xclbin", binary=True)
+    with open(artifacts["insts_path"], "rb") as f:
+        insts_path = cache.put(f.read(), "insts.bin")
+    return {"xclbin_path": xclbin_path, "insts_path": insts_path}
 
 
 def compile_module(
@@ -1535,12 +1738,14 @@ def compile_module(
         name = "__npu_dispatch"
         filename = f"{name}.pyd" if IS_WINDOWS else f"{name}.so"
         cache_path = cache.get_file(filename)
-        if output_format == "elf":
-            cache_elf_path = cache.get_file("aie.elf")
-            cache_elf_kernel_path = cache.get_file("elf_kernel_name.txt")
-        else:
-            cache_xclbin_path = cache.get_file("aie.xclbin")
-            cache_insts_path = cache.get_file("insts.bin")
+        cached_artifacts = _get_cached_aircc_artifacts(cache, output_format)
+        if cached_artifacts is not None:
+            if output_format == "elf":
+                cache_elf_path = cached_artifacts["elf_path"]
+                cache_elf_kernel_path = cached_artifacts["elf_kernel_name_path"]
+            else:
+                cache_xclbin_path = cached_artifacts["xclbin_path"]
+                cache_insts_path = cached_artifacts["insts_path"]
 
         if cache_path is None:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -1629,138 +1834,20 @@ def compile_module(
 
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
-                aircc_binary_name = "aircc.exe" if IS_WINDOWS else "aircc"
-                aircc_bin = _find_mlir_air_binary(aircc_binary_name)
-
-                # On Windows, construct peano path from llvm-aie package and
-                # add mlir_aie/bin to PATH so aircc can find aiecc.exe
-                peano_flag = "--peano="
-                if IS_WINDOWS:
-                    peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
-                    if peano_dir:
-                        # LLVM_BINARY_DIR points to bin/, peano wants parent
-                        peano_flag = f"--peano={str(Path(peano_dir).parent)}"
-                    else:
-                        # Auto-detect from pip-installed llvm-aie package
-                        try:
-                            dist = importlib.metadata.distribution("llvm-aie")
-                            llvm_aie_root = Path(dist._path.parent) / "llvm-aie"
-                            if (llvm_aie_root / "bin" / "opt.exe").exists():
-                                peano_flag = f"--peano={llvm_aie_root}"
-                        except Exception:
-                            pass
-                    # Also check PEANO_INSTALL_DIR env var
-                    if peano_flag == "--peano=":
-                        peano_env = os.environ.get("PEANO_INSTALL_DIR", "")
-                        if peano_env and os.path.isdir(peano_env):
-                            peano_flag = f"--peano={peano_env}"
-                    # Ensure aiecc is findable
-                    try:
-                        import mlir_aie
-
-                        mlir_aie_bin = str(Path(mlir_aie.__path__[0]) / "bin")
-                    except ImportError:
-                        mlir_aie_bin = str(
-                            Path(aircc.__file__).resolve().parent.parent.parent
-                            / "mlir_aie"
-                            / "bin"
-                        )
-                    if os.path.isdir(
-                        mlir_aie_bin
-                    ) and mlir_aie_bin not in os.environ.get("PATH", ""):
-                        os.environ["PATH"] = (
-                            mlir_aie_bin + os.pathsep + os.environ.get("PATH", "")
-                        )
-
-                if output_format == "elf":
-                    elf_path = os.path.join(air_proj_path, "aie.elf")
-                    aircc_cmd = [
-                        aircc_bin,
-                        "--device",
-                        npu_version,
-                        "--no-xchesscc",
-                        "--no-xbridge",
-                        "--output-format",
-                        "elf",
-                        "--elf-name",
-                        elf_path,
-                        peano_flag,
-                        air_mlir_path,
-                    ]
-                else:
-                    xclbin_path = os.path.join(air_proj_path, "aie.xclbin")
-                    insts_path = os.path.join(air_proj_path, "insts.bin")
-                    aircc_cmd = [
-                        aircc_bin,
-                        "--device",
-                        npu_version,
-                        "--no-xchesscc",
-                        "--no-xbridge",
-                        "--output-format",
-                        "xclbin",
-                        "-i",
-                        insts_path,
-                        "-o",
-                        xclbin_path,
-                        peano_flag,
-                        air_mlir_path,
-                    ]
-                # Enable bf16 emulation: hardware truncates f32 -> bf16 before
-                # multiply, with f32 accumulation.
-                if npu_config.bf16_emulation:
-                    aircc_cmd.insert(-1, "--bf16-emulation")
-                # Explicitly set runtime loop tiling sizes to [4,4] (aircc
-                # default changed from [4,4] to [] in mlir-air #1470).
-                aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
-                aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
-                # Increase core stack size to 2048 bytes to accommodate
-                # deeper call chains in register-intensive kernels.
-                aircc_cmd.insert(-1, "--stack-size")
-                aircc_cmd.insert(-1, "2048")
-                if npu_config.debug:
-                    subprocess.check_call(aircc_cmd)
-                else:
-                    result = subprocess.run(
-                        aircc_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                    )
-                    if result.returncode != 0:
-                        if result.stdout:
-                            stderr_buf = getattr(sys.stderr, "buffer", None)
-                            if stderr_buf is not None:
-                                stderr_buf.write(result.stdout)
-                            else:
-                                sys.stderr.write(
-                                    result.stdout.decode("utf-8", errors="replace")
-                                )
-                        raise subprocess.CalledProcessError(
-                            result.returncode,
-                            aircc_cmd,
-                            output=result.stdout,
-                        )
+                artifacts = _aircc_compile(
+                    air_mlir_path, output_format, npu_version, air_proj_path
+                )
 
                 # Cache format-specific artifacts first, then the .so last.
                 # This avoids partial cache entries if aircc or kernel name
                 # extraction fails -- the .so is the gate for cache hits.
+                cached_artifacts = _put_aircc_artifacts(cache, artifacts, output_format)
                 if output_format == "elf":
-                    with open(elf_path, "rb") as f:
-                        cache_elf_path = cache.put(f.read(), "aie.elf", binary=True)
-                    # Extract kernel name from ELF config.json
-                    config_json_path = os.path.join(
-                        air_proj_path, "full_elf_config.json"
-                    )
-                    elf_kernel_name = _extract_elf_kernel_name(config_json_path)
-                    cache_elf_kernel_path = cache.put(
-                        elf_kernel_name.encode(), "elf_kernel_name.txt"
-                    )
+                    cache_elf_path = cached_artifacts["elf_path"]
+                    cache_elf_kernel_path = cached_artifacts["elf_kernel_name_path"]
                 else:
-                    with open(xclbin_path, "rb") as f:
-                        cache_xclbin_path = cache.put(
-                            f.read(), "aie.xclbin", binary=True
-                        )
-                    with open(insts_path, "rb") as f:
-                        cache_insts_path = cache.put(f.read(), "insts.bin")
+                    cache_xclbin_path = cached_artifacts["xclbin_path"]
+                    cache_insts_path = cached_artifacts["insts_path"]
                 with open(so_path, "rb") as f:
                     cache_path = cache.put(f.read(), filename, binary=True)
 
