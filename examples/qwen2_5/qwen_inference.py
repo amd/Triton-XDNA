@@ -67,14 +67,9 @@ def run_reference(hf_model, input_ids):
 def run_triton_model(state_dict, input_ids, backend, profile=False, config=None):
     from model import Qwen2Model
 
-    if backend == "npu":
-        import benchmark
+    import benchmark
 
-        benchmark.select_npu_backend()
-    elif backend in ("gpu", "hetero", "hetero-fast"):
-        import benchmark
-
-        benchmark.select_gpu_backend()
+    benchmark.select_gpu_backend()
 
     model = Qwen2Model(state_dict, backend=backend, config=config)
     model.timer.enabled = profile
@@ -145,14 +140,9 @@ def print_generation(logits, tokenizer, prompt):
 def run_generation(hf_model, tokenizer, input_ids, args):
     from model import Qwen2Model
 
-    if args.backend == "npu":
-        import benchmark
+    import benchmark
 
-        benchmark.select_npu_backend()
-    elif args.backend in ("gpu", "hetero", "hetero-fast"):
-        import benchmark
-
-        benchmark.select_gpu_backend()
+    benchmark.select_gpu_backend()
 
     state_dict = hf_model.state_dict()
     model = Qwen2Model(
@@ -226,14 +216,9 @@ def run_interactive(hf_model, tokenizer, args):
     max_tokens = args.max_tokens if args.max_tokens > 0 else 40
     backend = args.backend
 
-    if backend == "npu":
-        import benchmark
+    import benchmark
 
-        benchmark.select_npu_backend()
-    elif backend in ("gpu", "hetero", "hetero-fast"):
-        import benchmark
-
-        benchmark.select_gpu_backend()
+    benchmark.select_gpu_backend()
 
     state_dict = hf_model.state_dict()
     model = Qwen2Model(

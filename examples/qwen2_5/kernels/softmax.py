@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """
-Softmax kernel for GPT-2 attention.
+Softmax kernel for Qwen2.5 attention.
 GPU: Online softmax with masking support for causal attention.
 NPU: Block-based softmax adapted from test_softmax example.
 """

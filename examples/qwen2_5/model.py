@@ -828,9 +828,10 @@ class Qwen2Model:
         """
         B, S, D = x.shape
 
-        attn_be = self.op_backend["qkv_linear"] if self.op_backend else None
-        softmax_be = self.op_backend["softmax"] if self.op_backend else None
-        proj_be = self.op_backend["attn_proj"] if self.op_backend else None
+        # Attention runs on GPU in every backend (the fused kernel is GPU-only and
+        # there is no NPU attention path), so the qkv/o_proj matmuls must too
+        attn_be = self.op_backend["qkv_linear"] if self.op_backend else "gpu"
+        proj_be = self.op_backend["attn_proj"] if self.op_backend else "gpu"
 
         # Fused QKV projection: q/k/v share input x, so concat their weights and
         # biases into one (n_head+2*n_kv_head)*hd linear -> one GPU launch instead
@@ -1033,6 +1034,9 @@ class Qwen2Model:
                         x_norm, layer, kv_cache=layer_cache, pos_offset=pos_offset
                     )
                 new_kv_caches.append(new_cache)
+
+                with self.timer.track("to_cpu"):
+                    attn_out = self._to_cpu(attn_out)
                 # Fused fast path (npu mode): ONE load_pdi ELF for the whole
                 # per-layer NPU tail -- add1 -> rmsnorm(post_ln) -> gate/up ->
                 # silu*mul -> down -> add2 -- when the row count fits a single

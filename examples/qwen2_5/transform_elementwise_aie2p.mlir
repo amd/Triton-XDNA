@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 ////////////////////////////////////////////////////////////////////////////////
-// Transform Script for GELU (AIE2P)
-// gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-// or via sigmoid approximation: x * sigmoid(1.702 * x)
+// Transform Script for SiLU (AIE2P)
+// silu(x) = x * sigmoid(x)  -- the unary pass of the SwiGLU MLP (see
+// kernels/swiglu.py; the elementwise multiply by up_proj uses the add script).
 // Strategy: fuse_elementwise_linalg -> unary pad+promote -> vectorize at 16
 // -> cast exp, subf, addf, mulf to bf16; divf stays f32.
 // Uses shared library sequences from transform_library.mlir (auto-injected).
