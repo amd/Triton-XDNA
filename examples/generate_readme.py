@@ -156,6 +156,17 @@ EXAMPLES = [
             "composed from Triton kernels, running across iGPU and NPU."
         ),
     },
+    {
+        "kind": "model",
+        "name": "Qwen2.5",
+        "path": "qwen2_5",
+        "datatypes": "bf16",
+        "description": (
+            "End-to-end Qwen2.5-Instruct inference (0.5B/1.5B) composed from "
+            "Triton kernels, with KV-cached autoregressive generation running "
+            "across iGPU and NPU."
+        ),
+    },
 ]
 
 # Directories to ignore when verifying registry completeness
