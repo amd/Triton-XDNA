@@ -1,3 +1,19 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5792dcb..aa80cf5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,6 +28,11 @@ if (TRITON_SHARED_BUILD_CPU_BACKEND)
+ 
+     add_triton_plugin(TritonShared ${CMAKE_CURRENT_SOURCE_DIR}/triton_shared.cc LINK_LIBS TritonSharedAnalysis TritonTilingExtIR ${conversion_libs} ${extension_libs} MLIRSparseTensorTransforms MLIRControlFlowTransforms MLIRTensorInferTypeOpInterfaceImpl)
+     target_link_libraries(TritonShared PRIVATE Python3::Module pybind11::headers)
++    # triton_shared.cc includes TPtrDialect.h -> TPtrDialect.h.inc, which is
++    # emitted by the TPtrTableGen target. Without this explicit dependency a
++    # parallel/cold build can compile triton_shared.cc before tablegen runs,
++    # failing with "TPtrDialect.h.inc file not found".
++    add_dependencies(TritonShared TPtrTableGen)
+ endif()
+ 
+ # Add symlinks to selected pytest files in triton. The tests are imported into triton-shared’s test folder to
 diff --git a/backend/driver.py b/backend/driver.py
 index a4ac9ef..69f50b3 100644
 --- a/backend/driver.py
