@@ -119,23 +119,25 @@ class _NPUConfig:
 
     @property
     def output_format(self):
-        """Force the output format to ``"elf"`` or ``"xclbin"``.
+        """Force the output format to ``"elf"``, ``"xclbin"``, or ``"pdi"``.
 
         Set to ``None`` for auto-detection (ELF on npu2, xclbin on npu1).
-        ELF format is only supported on npu2 (AIE2P) devices.
+        ELF format is only supported on npu2 (AIE2P) devices. PDI format
+        produces a raw ``aie.pdi`` plus an ``insts.bin`` sidecar for an
+        alternative (non-XRT) runtime; it works on all NPU generations.
 
         Env var fallback: ``AMD_TRITON_NPU_OUTPUT_FORMAT``.
         """
         if self._output_format is not MISSING:
             return self._output_format
         v = os.getenv("AMD_TRITON_NPU_OUTPUT_FORMAT", "").lower()
-        return v if v in ("elf", "xclbin") else None
+        return v if v in ("elf", "xclbin", "pdi") else None
 
     @output_format.setter
     def output_format(self, value):
-        if value is not None and value not in ("elf", "xclbin"):
+        if value is not None and value not in ("elf", "xclbin", "pdi"):
             raise ValueError(
-                f"output_format must be 'elf', 'xclbin', or None; got {value!r}"
+                f"output_format must be 'elf', 'xclbin', 'pdi', or None; got {value!r}"
             )
         self._output_format = value
 
