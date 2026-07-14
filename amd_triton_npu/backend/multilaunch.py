@@ -199,8 +199,8 @@ module {{
         ``compile_module`` cache in driver.py.
 
         Returns:
-            elf:    (elf_path, kernel_name)
-            xclbin: (xclbin_path, insts_path)
+            elf:           (elf_path, kernel_name)
+            xclbin / pdi:  (bin_path, insts_path)
         """
         output_format = output_format or _get_output_format()
         npu_version = detect_npu_version()
@@ -213,7 +213,7 @@ module {{
             if output_format == "elf":
                 with open(cached["elf_kernel_name_path"]) as f:
                     return cached["elf_path"], f.read()
-            return cached["xclbin_path"], cached["insts_path"]
+            return cached["bin_path"], cached["insts_path"]
 
         air_proj = self.air_project_path
         os.makedirs(air_proj, exist_ok=True)
@@ -226,7 +226,7 @@ module {{
         cached = _put_aircc_artifacts(cache, artifacts, output_format)
         if output_format == "elf":
             return cached["elf_path"], artifacts["elf_kernel_name"]
-        return cached["xclbin_path"], cached["insts_path"]
+        return cached["bin_path"], cached["insts_path"]
 
 
 class MultiLaunchRunner:

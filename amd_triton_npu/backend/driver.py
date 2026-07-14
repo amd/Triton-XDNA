@@ -1643,7 +1643,7 @@ _last_dispatched_module = None
 
 
 def _get_cached_aircc_artifacts(cache, output_format):
-    """Return cached aircc artifacts (elf/xclbin) or None if the set is incomplete.
+    """Return cached aircc artifacts (elf/xclbin/pdi) or None if the set is incomplete.
 
     Keys mirror ``_put_aircc_artifacts``:
         elf:           {"elf_path", "elf_kernel_name_path"}
