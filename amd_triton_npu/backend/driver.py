@@ -497,7 +497,7 @@ def _get_output_format():
             raise RuntimeError(
                 "ELF output format is not supported on npu1 (AIE2) devices. "
                 "Unset or change AMD_TRITON_NPU_OUTPUT_FORMAT, or set "
-                "npu_config.output_format to 'xclbin' or None."
+                "npu_config.output_format to 'xclbin', 'pdi', or None."
             )
         return configured_format
     # Auto-detect: ELF for npu2, xclbin for npu1.
@@ -865,6 +865,20 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 // Call to XRT goes here:
 static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
+    // PDI artifacts target an alternative (non-XRT) runtime and cannot be
+    // loaded through the XRT xclbin API below. Fail early with a clear
+    // message pointing the user to their target runtime.
+    {{
+        std::string _aie_path(aie_path);
+        if (_aie_path.size() >= 4 &&
+            _aie_path.compare(_aie_path.size() - 4, 4, ".pdi") == 0)
+            throw std::runtime_error(
+                std::string("PDI artifact '") + aie_path +
+                "' targets an alternative (non-XRT) runtime and cannot be "
+                "launched via XRT. Pass the .pdi and its .insts.bin sidecar to "
+                "your target runtime directly.");
+    }}
+
     // Load instruction binary (inlined, replaces test_utils dependency)
     std::vector<uint32_t> instr_v;
     {{
@@ -1458,19 +1472,19 @@ def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
     """Run aircc on an AIR-dialect MLIR file to produce an NPU binary.
 
     Resolves the aircc binary + peano flag, builds the command for the requested
-    ``output_format`` ("elf" or "xclbin"), runs it, and returns the produced
-    artifact paths. For "elf" also extracts the dispatch kernel name from
-    ``full_elf_config.json``.
+    ``output_format`` ("elf", "xclbin", or "pdi"), runs it, and returns the
+    produced artifact paths. For "elf" also extracts the dispatch kernel name
+    from ``full_elf_config.json``.
 
     Args:
         air_mlir_path: path to the AIR-dialect .mlir to compile.
-        output_format: "elf" or "xclbin".
+        output_format: "elf", "xclbin", or "pdi".
         npu_version: target device string ("npu1"/"npu2") for ``--device``.
         air_proj_path: directory aircc writes artifacts into.
 
     Returns:
-        elf:    {"elf_path": str, "elf_kernel_name": str}
-        xclbin: {"xclbin_path": str, "insts_path": str}
+        elf:           {"elf_path": str, "elf_kernel_name": str}
+        xclbin / pdi:  {"bin_path": str, "insts_path": str}
 
     Raises:
         subprocess.CalledProcessError: if aircc exits non-zero.
@@ -1527,6 +1541,27 @@ def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
             "elf",
             "--elf-name",
             elf_path,
+            peano_flag,
+            air_mlir_path,
+        ]
+    elif output_format == "pdi":
+        # PDI output for alternative (non-XRT) runtimes: aircc emits a raw
+        # aie.pdi (CDO->PDI via bootgen) plus the insts.bin sidecar. Uses
+        # --pdi-name instead of -o. Requires mlir-air PR #1729.
+        pdi_path = os.path.join(air_proj_path, "aie.pdi")
+        insts_path = os.path.join(air_proj_path, "insts.bin")
+        aircc_cmd = [
+            aircc_bin,
+            "--device",
+            npu_version,
+            "--no-xchesscc",
+            "--no-xbridge",
+            "--output-format",
+            "pdi",
+            "-i",
+            insts_path,
+            "--pdi-name",
+            pdi_path,
             peano_flag,
             air_mlir_path,
         ]
@@ -1593,7 +1628,8 @@ def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
                 config_json_path = fallback
         elf_kernel_name = _extract_elf_kernel_name(config_json_path)
         return {"elf_path": elf_path, "elf_kernel_name": elf_kernel_name}
-    return {"xclbin_path": xclbin_path, "insts_path": insts_path}
+    bin_path = pdi_path if output_format == "pdi" else xclbin_path
+    return {"bin_path": bin_path, "insts_path": insts_path}
 
 
 # Global cache: maps input hash -> (loaded .pyd module, launch function)
@@ -1610,8 +1646,8 @@ def _get_cached_aircc_artifacts(cache, output_format):
     """Return cached aircc artifacts (elf/xclbin) or None if the set is incomplete.
 
     Keys mirror ``_put_aircc_artifacts``:
-        elf:    {"elf_path", "elf_kernel_name_path"}
-        xclbin: {"xclbin_path", "insts_path"}
+        elf:           {"elf_path", "elf_kernel_name_path"}
+        xclbin / pdi:  {"bin_path", "insts_path"}
     """
     if output_format == "elf":
         elf_path = cache.get_file("aie.elf")
@@ -1619,11 +1655,12 @@ def _get_cached_aircc_artifacts(cache, output_format):
         if elf_path is None or kname_path is None:
             return None
         return {"elf_path": elf_path, "elf_kernel_name_path": kname_path}
-    xclbin_path = cache.get_file("aie.xclbin")
+    bin_name = "aie.pdi" if output_format == "pdi" else "aie.xclbin"
+    bin_path = cache.get_file(bin_name)
     insts_path = cache.get_file("insts.bin")
-    if xclbin_path is None or insts_path is None:
+    if bin_path is None or insts_path is None:
         return None
-    return {"xclbin_path": xclbin_path, "insts_path": insts_path}
+    return {"bin_path": bin_path, "insts_path": insts_path}
 
 
 def _put_aircc_artifacts(cache, artifacts, output_format):
@@ -1638,11 +1675,12 @@ def _put_aircc_artifacts(cache, artifacts, output_format):
             artifacts["elf_kernel_name"].encode(), "elf_kernel_name.txt"
         )
         return {"elf_path": elf_path, "elf_kernel_name_path": kname_path}
-    with open(artifacts["xclbin_path"], "rb") as f:
-        xclbin_path = cache.put(f.read(), "aie.xclbin", binary=True)
+    bin_name = "aie.pdi" if output_format == "pdi" else "aie.xclbin"
+    with open(artifacts["bin_path"], "rb") as f:
+        bin_path = cache.put(f.read(), bin_name, binary=True)
     with open(artifacts["insts_path"], "rb") as f:
         insts_path = cache.put(f.read(), "insts.bin")
-    return {"xclbin_path": xclbin_path, "insts_path": insts_path}
+    return {"bin_path": bin_path, "insts_path": insts_path}
 
 
 def compile_module(
@@ -1744,7 +1782,7 @@ def compile_module(
                 cache_elf_path = cached_artifacts["elf_path"]
                 cache_elf_kernel_path = cached_artifacts["elf_kernel_name_path"]
             else:
-                cache_xclbin_path = cached_artifacts["xclbin_path"]
+                cache_bin_path = cached_artifacts["bin_path"]
                 cache_insts_path = cached_artifacts["insts_path"]
 
         if cache_path is None:
@@ -1846,7 +1884,7 @@ def compile_module(
                     cache_elf_path = cached_artifacts["elf_path"]
                     cache_elf_kernel_path = cached_artifacts["elf_kernel_name_path"]
                 else:
-                    cache_xclbin_path = cached_artifacts["xclbin_path"]
+                    cache_bin_path = cached_artifacts["bin_path"]
                     cache_insts_path = cached_artifacts["insts_path"]
                 with open(so_path, "rb") as f:
                     cache_path = cache.put(f.read(), filename, binary=True)
@@ -1857,7 +1895,7 @@ def compile_module(
                     if output_format == "elf":
                         logger.debug("  elf: %s", cache_elf_path)
                     else:
-                        logger.debug("  xclbin: %s", cache_xclbin_path)
+                        logger.debug("  %s: %s", output_format, cache_bin_path)
                         logger.debug("  insts: %s", cache_insts_path)
                     return None
         else:
@@ -1875,7 +1913,7 @@ def compile_module(
                 if output_format == "elf":
                     logger.debug("  elf: %s", cache_elf_path)
                 else:
-                    logger.debug("  xclbin: %s", cache_xclbin_path)
+                    logger.debug("  %s: %s", output_format, cache_bin_path)
                     logger.debug("  insts: %s", cache_insts_path)
                 return None
 
@@ -1896,14 +1934,14 @@ def compile_module(
                 elf_path_str = elf_path_str[4:]
             mod.set_paths(elf_path_str, elf_kernel_name)
         else:
-            xclbin_path_str = cache_xclbin_path
+            bin_path_str = cache_bin_path
             insts_path_str = cache_insts_path
             if IS_WINDOWS:
-                if xclbin_path_str.startswith("\\\\?\\"):
-                    xclbin_path_str = xclbin_path_str[4:]
+                if bin_path_str.startswith("\\\\?\\"):
+                    bin_path_str = bin_path_str[4:]
                 if insts_path_str.startswith("\\\\?\\"):
                     insts_path_str = insts_path_str[4:]
-            mod.set_paths(xclbin_path_str, insts_path_str)
+            mod.set_paths(bin_path_str, insts_path_str)
 
         # Cache the loaded module for fast subsequent dispatches
         _global_module_cache[input_key] = mod
