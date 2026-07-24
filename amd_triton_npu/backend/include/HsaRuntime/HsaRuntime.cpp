@@ -86,9 +86,9 @@ struct PoolSearch {
   bool found{false};
 };
 
-// hsa_amd_agent_iterate_memory_pools callback: select the first GLOBAL pool whose
-// flags include PoolSearch::flags and whose allocatability matches, then stop
-// the iteration with HSA_STATUS_INFO_BREAK (`data` is the PoolSearch).
+// hsa_amd_agent_iterate_memory_pools callback: select the first GLOBAL pool
+// whose flags include PoolSearch::flags and whose allocatability matches, then
+// stop the iteration with HSA_STATUS_INFO_BREAK (`data` is the PoolSearch).
 hsa_status_t find_pool(hsa_amd_memory_pool_t pool, void *data) {
   auto *d = static_cast<PoolSearch *>(data);
   hsa_amd_segment_t seg{};
