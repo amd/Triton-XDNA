@@ -114,14 +114,14 @@ inline long getElementSizeInBytes(PyObject *obj) {
 
   PyObject *dtype = PyObject_GetAttrString(obj, "dtype");
   if (!dtype) {
-    PyErr_Print();
+    // PyObject_GetAttrString already set an exception.
     return -1;
   }
 
   PyObject *itemsize = PyObject_GetAttrString(dtype, "itemsize");
   Py_DECREF(dtype);
   if (!itemsize) {
-    PyErr_Print();
+    // PyObject_GetAttrString already set an exception.
     return -1;
   }
 
@@ -129,7 +129,7 @@ inline long getElementSizeInBytes(PyObject *obj) {
   Py_DECREF(itemsize);
 
   if (size == -1 && PyErr_Occurred()) {
-    PyErr_Print();
+    // PyLong_AsLong already set an exception.
     return -1;
   }
 
