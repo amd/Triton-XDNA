@@ -5,8 +5,9 @@
 //
 // Compiled once into libtriton_npu_hsa.so and linked by every generated
 // launcher, so the HsaRuntime singleton is process-global: one hsa_init, queue,
-// completion signal, kernarg pool, and vmem buffer pool shared across all kernel
-// signatures. Dispatches are serialized on a single queue via a dispatch mutex.
+// completion signal, kernarg pool, and vmem buffer pool shared across all
+// kernel signatures. Dispatches are serialized on a single queue via a dispatch
+// mutex.
 //
 // Memory strategy:
 // * PDI + instructions: plain HSA pool allocation from the dev pool
