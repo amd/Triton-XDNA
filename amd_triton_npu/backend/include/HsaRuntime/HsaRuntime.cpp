@@ -427,7 +427,8 @@ class HsaRuntime {
     if (!f)
       throw std::runtime_error("failed to open '" + path + "'");
     std::streamsize sz = f.tellg();
-    if (sz <= 0) throw std::runtime_error("empty or unreadable '" + path + "'");
+    if (sz <= 0)
+      throw std::runtime_error("empty or unreadable '" + path + "'");
     f.seekg(0);
     void *buf = nullptr;
     HSA_CHECK(hsa_amd_memory_pool_allocate(
