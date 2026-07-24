@@ -95,7 +95,8 @@ hsa_status_t find_pool(hsa_amd_memory_pool_t pool, void *data) {
   if (hsa_amd_memory_pool_get_info(pool, HSA_AMD_MEMORY_POOL_INFO_SEGMENT,
                                    &seg) != HSA_STATUS_SUCCESS)
     return HSA_STATUS_SUCCESS;
-  if (seg != HSA_AMD_SEGMENT_GLOBAL) return HSA_STATUS_SUCCESS;
+  if (seg != HSA_AMD_SEGMENT_GLOBAL)
+    return HSA_STATUS_SUCCESS;
 
   hsa_amd_memory_pool_global_flag_t f{};
   if (hsa_amd_memory_pool_get_info(pool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,
