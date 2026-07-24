@@ -65,7 +65,7 @@ inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
 inline long getNumElements(PyObject *obj) {
   PyObject *shape = PyObject_GetAttrString(obj, "shape");
   if (!shape) {
-    PyErr_Print();
+    // PyObject_GetAttrString already set an exception.
     return -1;
   }
 
@@ -78,7 +78,7 @@ inline long getNumElements(PyObject *obj) {
   Py_ssize_t ndim = PySequence_Size(shape);
   if (ndim < 0) {
     Py_DECREF(shape);
-    PyErr_Print();
+    // PySequence_Size already set an exception.
     return -1;
   }
 
