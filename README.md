@@ -40,7 +40,7 @@ git submodule update --init
 
 Please follow the instructions in [mlir-aie project](https://github.com/Xilinx/mlir-aie/blob/main/README.md) on how to install the XDNA driver.
 
-### Setup build environment 
+### Setup build environment
 
 #### Option 1: Install Pre-built Wheel (Recommended)
 
@@ -115,12 +115,44 @@ Browse the full set of available operators, their supported datatypes, and AIE2/
 Please make sure to run `source {path_to_xrt}/setup.sh` before running examples.
 The test also depends on PyTorch as CPU reference.
 
-```
+```bash
 cd examples/matmul_bf16_m64_n64_k64
 AIR_TRANSFORM_TILING_SCRIPT=transform_aie2.mlir python matmul_bf16_m64_n64_k64.py
 ```
 
 **Note:** The `transform_aie2.mlir` transform dialect IR is specifically designed for the AIE2 architecture. For AIE2P architecture, use `transform_aie2p.mlir` instead.
+
+### Launch runtime: XRT (default) or HSA
+
+By default kernels are dispatched through XRT (xclbin on npu1, ELF on npu2). An alternative HSA via ROCR runtime dispatches Triton-generated kernels through the AIE agent path (`hsa_amd_aie_kernel_dispatch_packet_t`). Select it with the `AMD_TRITON_NPU_RUNTIME` environment variable:
+
+| Value | Behavior |
+| --- | --- |
+| `xrt` (default) | Dispatch via XRT; artifact is `xclbin` (npu1) or `elf` (npu2). |
+| `hsa` | Dispatch via HSA; the backend produces `pdi` + `insts.bin` and launches them on the AIE agent. |
+
+Under HSA the output format is forced to `pdi` (an explicit
+`AMD_TRITON_NPU_OUTPUT_FORMAT=elf|xclbin` is rejected). The HSA runtime is
+Linux-only and requires a ROCR install providing the HSA runtime headers and
+`libhsa-runtime64.so`; set `AMD_NPU_ROCR_PATH` or `ROCM_PATH` if it is not in the
+default location (`/opt/rocm`).
+
+```bash
+cd examples/hsa_matmul
+cd examples/matmul_bf16_m64_n64_k64
+AMD_TRITON_NPU_RUNTIME=hsa AIR_TRANSFORM_TILING_SCRIPT=transform_aie2.mlir python matmul_bf16_m64_n64_k64.py
+```
+
+Or activate it programmatically:
+
+```python
+import triton
+from triton.backends.amd_triton_npu.config import npu_config
+from triton.backends.amd_triton_npu.hsa_driver import HSADriver
+
+npu_config.runtime = "hsa"
+triton.runtime.driver.set_active(HSADriver())
+```
 
 ## Windows Support
 
