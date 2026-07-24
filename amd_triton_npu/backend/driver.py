@@ -1,6 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
+import functools
 import hashlib
 import json
 import logging
@@ -24,13 +25,13 @@ from air.compiler.util import run_transform
 from air.ir import *
 import air.passmanager
 
-from .config import npu_config
-from ._codegen import (
-    _extract_actual_sizes,
-    _extract_signature_and_constants,
-    _extracted_type,
-    _format_of,
-    _ty_to_cpp,
+from .config import npu_config, _VALID_RUNTIMES
+from .codegen import (
+    extract_actual_sizes,
+    extract_signature_and_constants,
+    extracted_type,
+    format_of,
+    ty_to_cpp,
 )
 
 IS_WINDOWS = sys.platform == "win32"
@@ -492,22 +493,28 @@ def detect_npu_version():
     )
 
 
-def _get_output_format():
+def _get_output_format(runtime=None):
     """Determine the output format for the NPU backend.
+
+    ``runtime`` is the caller's launch runtime ("xrt" or "hsa"); it defaults to
+    ``npu_config.runtime`` for callers (e.g. multilaunch) that don't thread a
+    driver-bound runtime through. Passing it explicitly is the single source of
+    truth for the launcher path, so the format never disagrees with the runtime.
 
     Checks ``npu_config.output_format`` first (which itself falls back to
     the ``AMD_TRITON_NPU_OUTPUT_FORMAT`` env var).
     If not set, defaults to "elf" on npu2 and "xclbin" on npu1.
     ELF format is only supported on npu2 (AIE2P) devices.
 
-    Under the HSA runtime (``npu_config.runtime == "hsa"``) the artifact must be
-    PDI + insts, since the ROCR AIE dispatch path consumes a raw ``aie.pdi``
-    and its ``insts.bin`` sidecar. In that case "pdi" is forced and an explicit
-    ELF/xclbin request is rejected.
+    Under the HSA runtime the artifact must be PDI + insts, since the ROCR AIE
+    dispatch path consumes a raw ``aie.pdi`` and its ``insts.bin`` sidecar. In
+    that case "pdi" is forced and an explicit ELF/xclbin request is rejected.
     """
+    if runtime is None:
+        runtime = npu_config.runtime
     npu_version = detect_npu_version()
     configured_format = npu_config.output_format
-    if npu_config.runtime == "hsa":
+    if runtime == "hsa":
         if configured_format is not None and configured_format != "pdi":
             raise RuntimeError(
                 f"ROCR requires the 'pdi' output format, but "
@@ -822,9 +829,9 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ, actual_sizes=None):
 
 
 def _generate_launcher(constants, signature, kernel_name):
-    arg_decls = ", ".join(f"{_ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
+    arg_decls = ", ".join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
     args_format = "".join(
-        [_format_of(_extracted_type(ty)) for ty in signature.values()]
+        [format_of(extracted_type(ty)) for ty in signature.values()]
     )
     format = "iiiOOOO" + args_format
     args_list = (
@@ -834,14 +841,14 @@ def _generate_launcher(constants, signature, kernel_name):
     )
 
     kernel_arg_decls = ", ".join(
-        _ty_to_cpp(ty) if ty[0] != "*" else f"int64_t, void*"
+        ty_to_cpp(ty) if ty[0] != "*" else f"int64_t, void*"
         for i, ty in signature.items()
         if ty != "constexpr"
     )
     kernel_arg_decls += ", " if kernel_arg_decls else ""
 
     kernel_parameters = ", ".join(
-        f"static_cast<{_ty_to_cpp(ty)}>(arg{i})" if ty[0] != "*" else f"0, &ptr_arg{i}"
+        f"static_cast<{ty_to_cpp(ty)}>(arg{i})" if ty[0] != "*" else f"0, &ptr_arg{i}"
         for i, ty in signature.items()
         if ty != "constexpr"
     )
@@ -1007,7 +1014,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   PyObject *launch_exit_hook = NULL;
   PyObject *kernel_metadata = NULL;
   PyObject *launch_metadata = NULL;
-  {' '.join([f"{_extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
+  {' '.join([f"{extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
   if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ,
                                            &kernel_metadata, &launch_metadata,
                                            &launch_enter_hook, &launch_exit_hook {args_list})) {{
@@ -1071,9 +1078,9 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 
 def _generate_elf_launcher(constants, signature, kernel_name):
     """Generate C++ launcher code using XRT ELF APIs (for NPU2/AIE2P only)."""
-    arg_decls = ", ".join(f"{_ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
+    arg_decls = ", ".join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
     args_format = "".join(
-        [_format_of(_extracted_type(ty)) for ty in signature.values()]
+        [format_of(extracted_type(ty)) for ty in signature.values()]
     )
     format = "iiiOOOO" + args_format
     args_list = (
@@ -1214,7 +1221,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   PyObject *launch_exit_hook = NULL;
   PyObject *kernel_metadata = NULL;
   PyObject *launch_metadata = NULL;
-  {' '.join([f"{_extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
+  {' '.join([f"{extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
   if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ,
                                            &kernel_metadata, &launch_metadata,
                                            &launch_enter_hook, &launch_exit_hook {args_list})) {{
@@ -1818,38 +1825,48 @@ class NPULauncher(object):
     npu_cache_dir: "str | None" = None
     launch = None  # callable(gridX, gridY, gridZ, stream, function, *args)
 
-    def __init__(self, src, metadata):
-        if npu_config.runtime == "hsa":
-            raise RuntimeError(
-                "AMD_TRITON_NPU_RUNTIME=hsa selects the ROCR runtime, which "
-                "requires the HSA driver. Activate it with:\n"
-                "    from triton.backends.amd_triton_npu.hsa_driver import HSADriver\n"
-                "    triton.runtime.driver.set_active(HSADriver())\n"
-                "(or unset AMD_TRITON_NPU_RUNTIME / npu_config.runtime to use XRT)."
-            )
+    def __init__(self, src, metadata, runtime="xrt"):
+        """Build the host launcher for ``src`` targeting ``runtime``.
 
-        constants, signature = _extract_signature_and_constants(src)
-        # Detect output format: ELF for npu2, xclbin for npu1
-        self.output_format = _get_output_format()
-        if self.output_format == "elf":
-            launcher_src = _generate_elf_launcher(
+        ``runtime`` is "xrt" (xclbin/ELF via XRT) or "hsa" (PDI + insts via
+        HSA/ROCR); it is bound by ``NPUDriver`` when it constructs the launcher.
+        """
+        constants, signature = extract_signature_and_constants(src)
+        if runtime == "hsa":
+            # HSA consumes PDI + insts and links ROCR. Import lazily so the
+            # (large) HSA codegen module is only loaded when the HSA path is used.
+            from .hsa_launcher import _generate_hsa_launcher
+
+            self.output_format = "pdi"
+            launcher_src = _generate_hsa_launcher(
                 constants, signature, self.kernel_placeholder_name
             )
+            link_profile = "hsa"
         else:
-            launcher_src = _generate_launcher(
-                constants, signature, self.kernel_placeholder_name
-            )
+            # Detect output format: ELF for npu2, xclbin for npu1. Pass the
+            # bound runtime so the format decision matches this launcher's
+            # runtime rather than the (possibly different) global config.
+            self.output_format = _get_output_format(runtime=runtime)
+            if self.output_format == "elf":
+                launcher_src = _generate_elf_launcher(
+                    constants, signature, self.kernel_placeholder_name
+                )
+            else:
+                launcher_src = _generate_launcher(
+                    constants, signature, self.kernel_placeholder_name
+                )
+            link_profile = "xrt"
 
-        self._finalize(src, launcher_src, link_profile="xrt")
+        self._finalize(src, launcher_src, link_profile=link_profile)
 
     def _finalize(self, src, launcher_src: str, link_profile: str = "xrt") -> None:
         """Extract padding sizes, wire the cache-dir callback, and JIT-compile.
 
-        Uses ``self.output_format`` (set by the caller). Shared by the XRT
-        (:class:`NPULauncher`) and HSA (``HSADriver``'s ``HSALauncher``)
-        launchers so the compile/caching tail is defined once.
+        Uses ``self.output_format`` (set by ``__init__``). Shared by the XRT and
+        HSA paths so the compile/caching tail is defined once; ``link_profile``
+        selects which runtime the launcher links against.
         """
-        actual_sizes = _extract_actual_sizes(src)
+        actual_sizes = extract_actual_sizes(src)
 
         self.npu_cache_dir = None
 
@@ -1958,14 +1975,38 @@ class NPUUtils(object):
 
 class NPUDriver(DriverBase):
 
-    def __init__(self):
+    def __init__(self, runtime=None):
+        """Create the NPU driver for a launch runtime.
+
+        ``runtime`` selects how kernels are dispatched:
+
+        * ``"xrt"`` -- XRT (xclbin on npu1, ELF on npu2).
+        * ``"hsa"`` -- HSA/ROCR AIE dispatch (PDI + insts).
+
+        Defaults to ``npu_config.runtime`` (the ``AMD_TRITON_NPU_RUNTIME`` env
+        var, itself defaulting to ``"xrt"``), so ``NPUDriver()`` honors the
+        environment while ``NPUDriver("hsa")`` / ``NPUDriver("xrt")`` force it.
+        """
         super().__init__()
+        if runtime is None:
+            # Already validated + normalized by the config property.
+            runtime = npu_config.runtime
+        elif isinstance(runtime, str):
+            runtime = runtime.lower()  # match npu_config.runtime normalization
+        if runtime not in _VALID_RUNTIMES:
+            raise ValueError(
+                f"runtime must be one of {sorted(_VALID_RUNTIMES)}; got {runtime!r}"
+            )
+        # Exposed for introspection (e.g. triton.runtime.driver.active.runtime).
+        self.runtime = runtime
         self.utils = NPUUtils()
-        self.launcher_cls = NPULauncher
+        # Triton instantiates the launcher as ``launcher_cls(src, metadata)`` and
+        # never passes the driver, so bind the chosen runtime here.
+        self.launcher_cls = functools.partial(NPULauncher, runtime=runtime)
         self.binary_ext = "ttsharedir"
 
     # NPU driver won't be automatically chosen unless explicitly set through
-    # triton.runtime.driver.set_active(NPUDriver())
+    # triton.runtime.driver.set_active(NPUDriver()) / NPUDriver("hsa").
     @staticmethod
     def is_active():
         return False
@@ -2062,4 +2103,4 @@ class NPUDriver(DriverBase):
         return args
 
     def map_python_to_cpp_type(self, ty: str) -> str:
-        return _ty_to_cpp(ty)
+        return ty_to_cpp(ty)

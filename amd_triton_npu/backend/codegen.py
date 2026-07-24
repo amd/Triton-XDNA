@@ -4,13 +4,13 @@
 """Shared code-generation helpers for the NPU launchers.
 
 These primitives are used by both the XRT launchers (``driver.py``) and the
-HSA launcher (``hsa_driver.py``). They live in their own module so the two
+HSA launcher (``hsa_launcher.py``). They live in their own module so the two
 drivers depend on a common surface instead of reaching into each other's
 internals.
 """
 
 
-def _ty_to_cpp(ty: str) -> str:
+def ty_to_cpp(ty: str) -> str:
     """Map a Triton signature type to the C++ type used in the launcher."""
     if ty[0] == "*":
         return "void*"
@@ -35,15 +35,15 @@ def _ty_to_cpp(ty: str) -> str:
     }[ty]
 
 
-def _extracted_type(ty: str) -> str:
+def extracted_type(ty: str) -> str:
     """C++ type used to receive an argument from ``PyArg_ParseTuple``."""
     if ty[0] == "*" or ty == "constexpr":
         return "PyObject*"
-    return _ty_to_cpp(ty)
+    return ty_to_cpp(ty)
 
 
-def _format_of(ty: str) -> str:
-    """``PyArg_ParseTuple`` format character for a C++ type from ``_extracted_type``."""
+def format_of(ty: str) -> str:
+    """``PyArg_ParseTuple`` format character for a C++ type from ``extracted_type``."""
     return {
         "PyObject*": "O",
         "constexpr": "O",
@@ -61,7 +61,7 @@ def _format_of(ty: str) -> str:
     }[ty]
 
 
-def _extract_signature_and_constants(src) -> tuple[dict, dict]:
+def extract_signature_and_constants(src) -> tuple[dict, dict]:
     """Return ``(constants, signature)`` keyed by positional arg index."""
     constants = src.constants if hasattr(src, "constants") else dict()
     cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
@@ -70,7 +70,7 @@ def _extract_signature_and_constants(src) -> tuple[dict, dict]:
     return constants, signature
 
 
-def _extract_actual_sizes(src) -> "str | None":
+def extract_actual_sizes(src) -> "str | None":
     """Extract actual (non-padded) problem sizes from constexpr args.
 
     When the kernel has constexpr args named "M" and "N", their values are the

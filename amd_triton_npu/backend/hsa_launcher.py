@@ -1,17 +1,14 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""HSA launch runtime for the Triton-XDNA NPU backend.
+"""HSA/ROCR launcher code generation for the Triton-XDNA NPU backend.
 
-This driver dispatches Triton-generated NPU kernels through ROCR using the
-AIE agent path (``hsa_amd_aie_kernel_dispatch_packet_t``) instead of XRT. It
-reuses the shared MLIR -> AIR -> PDI compile pipeline (``compile_module`` with
-``output_format="pdi"``) and swaps in an HSA-based C++ launcher.
-
-Selection:
-
-* ``AMD_TRITON_NPU_RUNTIME=hsa`` (or ``npu_config.runtime = "hsa"``), then
-  ``triton.runtime.driver.set_active(HSADriver())``.
+This module generates the C++ CPython launcher that dispatches Triton-generated
+NPU kernels through ROCR using the AIE agent path
+(``hsa_amd_aie_kernel_dispatch_packet_t``) instead of XRT. It is used by
+``NPULauncher`` in ``driver.py`` when the driver's runtime is "hsa"; select it
+with ``NPUDriver("hsa")`` (or ``AMD_TRITON_NPU_RUNTIME=hsa`` +
+``triton.runtime.driver.set_active(NPUDriver())``).
 
 Memory strategy (see docs/hsa-zero-copy-notes.md for the deferred zero-copy
 path):
@@ -29,13 +26,7 @@ path):
 """
 
 from .config import npu_config
-from ._codegen import (
-    _extract_signature_and_constants,
-    _extracted_type,
-    _format_of,
-    _ty_to_cpp,
-)
-from .driver import NPUDriver, NPULauncher
+from .codegen import extracted_type, format_of, ty_to_cpp
 
 # Queue depth cap. Also bounds the kernarg slot pool (one slot per ring slot).
 HSA_QUEUE_SIZE = 32
@@ -55,9 +46,9 @@ def _generate_hsa_launcher(constants, signature, _kernel_name) -> str:
     generators but is unused: the HSA path selects work by PDI/insts address,
     not by a kernel symbol name.
     """
-    arg_decls = ", ".join(f"{_ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
+    arg_decls = ", ".join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
     args_format = "".join(
-        [_format_of(_extracted_type(ty)) for ty in signature.values()]
+        [format_of(extracted_type(ty)) for ty in signature.values()]
     )
     fmt = "iiiOOOO" + args_format
     args_list = (
@@ -587,7 +578,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   PyObject* launch_exit_hook = NULL;
   PyObject* kernel_metadata = NULL;
   PyObject* launch_metadata = NULL;
-  {' '.join([f"{_extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
+  {' '.join([f"{extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
   if (!PyArg_ParseTuple(args, \"{fmt}\", &gridX, &gridY, &gridZ,
                         &kernel_metadata, &launch_metadata,
                         &launch_enter_hook, &launch_exit_hook {args_list})) {{
@@ -645,51 +636,3 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
   return m;
 }}
 """
-
-
-class HSALauncher(NPULauncher):
-    """Launcher that JIT-compiles an HSA/ROCR host dispatcher for a kernel.
-
-    Subclasses :class:`NPULauncher` so ``get_npu_cache_dir`` and the ``__call__``
-    protocol keep working, but forces the ``pdi`` output format and the ``hsa``
-    link profile.
-    """
-
-    def __init__(self, src, metadata):
-        # Intentionally does NOT call super().__init__(): NPULauncher.__init__
-        # detects the XRT output format and rejects runtime == "hsa". This
-        # subclass fixes the format to "pdi" and the link profile to "hsa", then
-        # reuses the parent's compile/caching tail via _finalize().
-        constants, signature = _extract_signature_and_constants(src)
-        self.output_format = "pdi"
-        launcher_src = _generate_hsa_launcher(
-            constants, signature, self.kernel_placeholder_name
-        )
-        self._finalize(src, launcher_src, link_profile="hsa")
-
-
-class HSADriver(NPUDriver):
-    """Triton driver that dispatches NPU kernels through HSA/ROCR.
-
-    Activate explicitly::
-
-        import triton
-        from triton.backends.amd_triton_npu.hsa_driver import HSADriver
-        triton.runtime.driver.set_active(HSADriver())
-
-    or select the runtime via ``AMD_TRITON_NPU_RUNTIME=hsa`` /
-    ``npu_config.runtime = "hsa"`` (which also drives ``is_active``).
-    """
-
-    def __init__(self):
-        # Reuse NPUDriver's setup but dispatch through the HSA launcher.
-        super().__init__()
-        self.launcher_cls = HSALauncher
-
-    @staticmethod
-    def is_active():
-        # Note: Triton's backend loader only discovers the driver in driver.py,
-        # so it never auto-selects HSADriver via is_active(); activation is always
-        # explicit (triton.runtime.driver.set_active(HSADriver())). This reports
-        # whether HSA is the configured runtime for callers that ask directly.
-        return npu_config.runtime == "hsa"
