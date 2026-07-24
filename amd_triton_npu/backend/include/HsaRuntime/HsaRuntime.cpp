@@ -387,8 +387,8 @@ class HsaRuntime {
     // Kernarg slot pool: one slot per ring slot, sized for the worst case
     // (MAX_KERNARGS addresses + MAX_KERNARGS sizes), aligned to 64 bytes.
     std::uint32_t kernarg_slot_count = static_cast<std::uint32_t>(queue_->size);
-    std::size_t raw = static_cast<std::size_t>(TRITON_NPU_HSA_MAX_KERNARGS) * 2 *
-                      sizeof(std::uint64_t);
+    std::size_t raw = static_cast<std::size_t>(TRITON_NPU_HSA_MAX_KERNARGS) *
+                      2 * sizeof(std::uint64_t);
     kernarg_slot_size_ = (raw + 63u) & ~static_cast<std::size_t>(63u);
     HSA_CHECK(hsa_amd_memory_pool_allocate(
         kernarg_pool, kernarg_slot_size_ * kernarg_slot_count, 0,
