@@ -424,7 +424,8 @@ class HsaRuntime {
   // `handle` stays zero, `va` is the pool pointer).
   DeviceBuffer load_binary(const std::string &path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) throw std::runtime_error("failed to open '" + path + "'");
+    if (!f)
+      throw std::runtime_error("failed to open '" + path + "'");
     std::streamsize sz = f.tellg();
     if (sz <= 0) throw std::runtime_error("empty or unreadable '" + path + "'");
     f.seekg(0);
