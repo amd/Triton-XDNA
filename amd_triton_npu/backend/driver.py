@@ -310,6 +310,7 @@ def _build_hsa_runtime_lib(include_dir: str, rocr_dir: str) -> str:
             "-shared",
             "-fPIC",
             "-O2",
+            "-pthread",
             src_path,
             f"-I{include_dir}",
             f"-I{os.path.join(rocr_dir, 'include')}",
