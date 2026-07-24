@@ -71,8 +71,10 @@ hsa_status_t collect_agents(hsa_agent_t agent, void *data) {
   auto *s = static_cast<AgentSearch *>(data);
   hsa_device_type_t t{};
   hsa_status_t st = hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &t);
-  if (st != HSA_STATUS_SUCCESS) return st;
-  if (t == s->want) s->out->push_back(agent);
+  if (st != HSA_STATUS_SUCCESS)
+    return st;
+  if (t == s->want)
+    s->out->push_back(agent);
   return HSA_STATUS_SUCCESS;
 }
 
