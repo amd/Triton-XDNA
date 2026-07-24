@@ -135,6 +135,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
     PyObject* ret = PyObject_CallObject(launch_enter_hook, hook_args);
     Py_DECREF(hook_args);
     if (!ret) return NULL;
+    Py_DECREF(ret);
   }}
 
   {ptr_info_lines}
