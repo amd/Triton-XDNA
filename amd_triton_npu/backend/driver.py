@@ -250,6 +250,81 @@ def _get_rocr_path() -> str:
     )
 
 
+def _run_compile(cmd, env=None):
+    """Run a compiler/build subprocess, echoing its output to stderr on failure.
+
+    Honors ``npu_config.debug`` (streams output live). On a non-zero exit,
+    writes the captured combined stdout/stderr to our stderr and raises
+    ``subprocess.CalledProcessError``. Shared by the aircc, launcher, and
+    HSA-runtime-lib builds.
+    """
+    if npu_config.debug:
+        subprocess.check_call(cmd, env=env)
+        return
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env
+    )
+    if result.returncode != 0:
+        if result.stdout:
+            stderr_buf = getattr(sys.stderr, "buffer", None)
+            if stderr_buf is not None:
+                stderr_buf.write(result.stdout)
+            else:
+                sys.stderr.write(result.stdout.decode("utf-8", errors="replace"))
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
+
+
+def _build_hsa_runtime_lib(include_dir: str, rocr_dir: str) -> str:
+    """Build (once, cached) the shared HSA runtime library; return its directory.
+
+    Compiles ``include/HsaRuntime/HsaRuntime.cpp`` into ``libtriton_npu_hsa.so``
+    linked against ROCR. The build is cached (keyed by source + ROCR path), so it
+    happens only once per toolchain. Every generated HSA launcher links this one
+    ``.so``; because the dynamic linker loads a shared dependency once per
+    process, the ``HsaRuntime`` singleton inside it is process-global (one queue),
+    which is what lets multiple kernel signatures run on an AIE agent limited to
+    ``QUEUES_MAX == 1``.
+
+    Built at runtime (not as a wheel/install-time artifact) on purpose: ROCR is
+    resolved from the environment (see ``_get_rocr_path``), and the wheel may be
+    built on a host without ROCR. Do not move this into setup.py/CMake without
+    solving ROCR-less builds.
+
+    Returns the directory containing the ``.so`` (for the launcher's -L / -rpath).
+    """
+    lib_name = "libtriton_npu_hsa.so"
+    src_path = os.path.join(include_dir, "HsaRuntime", "HsaRuntime.cpp")
+    with open(src_path, "rb") as f:
+        src_bytes = f.read()
+    key = hashlib.md5(src_bytes + f"_rocr_{rocr_dir}_hsartlib".encode()).hexdigest()
+    cache = get_cache_manager(key)
+    lib_path = cache.get_file(lib_name)
+    if lib_path is not None:
+        return os.path.dirname(lib_path)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = os.path.join(tmpdir, lib_name)
+        cmd = [
+            "g++",
+            "-std=c++23",
+            "-shared",
+            "-fPIC",
+            "-O2",
+            src_path,
+            f"-I{include_dir}",
+            f"-I{os.path.join(rocr_dir, 'include')}",
+            f"-L{os.path.join(rocr_dir, 'lib')}",
+            f"-Wl,-rpath,{os.path.join(rocr_dir, 'lib')}",
+            "-lhsa-runtime64",
+            "-o",
+            out_path,
+        ]
+        _run_compile(cmd)
+        with open(out_path, "rb") as f:
+            lib_path = cache.put(f.read(), lib_name, binary=True)
+    return os.path.dirname(lib_path)
+
+
 def _find_msvc_cl() -> str:
     """Locate cl.exe for JIT compilation on Windows.
 
@@ -1032,7 +1107,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  {"; ".join([f"long tensor_volume{i} = getNumElements(_arg{i}) * getElementSizeInBytes(_arg{i}); if (tensor_volume{i} == -1) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  {"; ".join([f"long nelem{i} = getNumElements(_arg{i}); long ebytes{i} = getElementSizeInBytes(_arg{i}); if (nelem{i} == -1 || ebytes{i} == -1) return NULL; long tensor_volume{i} = nelem{i} * ebytes{i};" if ty[0] == "*" else "" for i, ty in signature.items()])};
   _launch(gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
 
   if (PyErr_Occurred()) {{
@@ -1239,7 +1314,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  {"; ".join([f"long tensor_volume{i} = getNumElements(_arg{i}) * getElementSizeInBytes(_arg{i}); if (tensor_volume{i} == -1) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  {"; ".join([f"long nelem{i} = getNumElements(_arg{i}); long ebytes{i} = getElementSizeInBytes(_arg{i}); if (nelem{i} == -1 || ebytes{i} == -1) return NULL; long tensor_volume{i} = nelem{i} * ebytes{i};" if ty[0] == "*" else "" for i, ty in signature.items()])};
   _launch(gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
 
   if (PyErr_Occurred()) {{
@@ -1410,26 +1485,7 @@ def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
     # deeper call chains in register-intensive kernels.
     aircc_cmd.insert(-1, "--stack-size")
     aircc_cmd.insert(-1, "2048")
-    if npu_config.debug:
-        subprocess.check_call(aircc_cmd)
-    else:
-        result = subprocess.run(
-            aircc_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        if result.returncode != 0:
-            if result.stdout:
-                stderr_buf = getattr(sys.stderr, "buffer", None)
-                if stderr_buf is not None:
-                    stderr_buf.write(result.stdout)
-                else:
-                    sys.stderr.write(result.stdout.decode("utf-8", errors="replace"))
-            raise subprocess.CalledProcessError(
-                result.returncode,
-                aircc_cmd,
-                output=result.stdout,
-            )
+    _run_compile(aircc_cmd)
 
     if output_format == "elf":
         # Extract kernel name from ELF config.json. aircc writes
@@ -1547,7 +1603,13 @@ def compile_module(
     # Runtime-specific SDK locations. Only resolve the one we actually link
     # against so an XRT-only or ROCR-only host still works.
     xrt_dir = _get_xrt_path() if link_profile == "xrt" else None
-    rocr_dir = _get_rocr_path() if link_profile == "hsa" else None
+    # HSA launchers link the shared runtime library (built once against ROCR),
+    # not ROCR directly, so all signatures share one process-global HsaRuntime.
+    hsa_rt_dir = (
+        _build_hsa_runtime_lib(include_dir, _get_rocr_path())
+        if link_profile == "hsa"
+        else None
+    )
     aie_test_utils_dir = _get_aie_test_utils_path()
 
     def launch(
@@ -1673,15 +1735,15 @@ def compile_module(
                         "-Wall",
                     ]
                     if link_profile == "hsa":
-                        # Link against ROCR (libhsa-runtime64) for the AIE
-                        # dispatch path. rpath keeps the .so loadable without
-                        # LD_LIBRARY_PATH.
+                        # Link the shared HSA runtime (libtriton_npu_hsa.so),
+                        # which in turn links libhsa-runtime64. The launcher needs
+                        # no ROCR headers -- only the C ABI in include/HsaRuntime
+                        # (covered by -I{include_dir} above). rpath keeps both
+                        # .so's loadable without LD_LIBRARY_PATH.
                         compile_flags += [
-                            f"-I{os.path.join(rocr_dir, 'include')}",
-                            f"-L{os.path.join(rocr_dir, 'lib')}",
-                            f"-Wl,-rpath,{os.path.join(rocr_dir, 'lib')}",
-                            "-lhsa-runtime64",
-                            "-lrt",
+                            f"-L{hsa_rt_dir}",
+                            f"-Wl,-rpath,{hsa_rt_dir}",
+                            "-ltriton_npu_hsa",
                             "-lstdc++",
                         ]
                     else:
@@ -1698,31 +1760,7 @@ def compile_module(
                         # instruction binary, but that has been inlined.
                         pass
                     compile_flags += ["-o", so_path]
-                _quiet = os.getenv("TRITON_NPU_QUIET", "0") != "0"
-                _devnull = subprocess.DEVNULL if _quiet else None
-                if npu_config.debug:
-                    subprocess.check_call(compile_flags, env=msvc_env)
-                else:
-                    result = subprocess.run(
-                        compile_flags,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        env=msvc_env,
-                    )
-                    if result.returncode != 0:
-                        if result.stdout:
-                            stderr_buf = getattr(sys.stderr, "buffer", None)
-                            if stderr_buf is not None:
-                                stderr_buf.write(result.stdout)
-                            else:
-                                sys.stderr.write(
-                                    result.stdout.decode("utf-8", errors="replace")
-                                )
-                        raise subprocess.CalledProcessError(
-                            result.returncode,
-                            compile_flags,
-                            output=result.stdout,
-                        )
+                _run_compile(compile_flags, env=msvc_env)
 
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
