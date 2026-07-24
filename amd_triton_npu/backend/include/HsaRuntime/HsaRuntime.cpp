@@ -46,15 +46,15 @@ constexpr std::uint32_t QUEUE_SIZE = 32;
 constexpr std::uint16_t AIE_PACKET_COUNT = 24;
 
 // Throw std::runtime_error with the HSA status string on a non-success status.
-#define HSA_CHECK(expr)                                                      \
-  do {                                                                       \
-    hsa_status_t _s = (expr);                                                \
-    if (_s != HSA_STATUS_SUCCESS) {                                          \
-      const char *_m = nullptr;                                              \
-      hsa_status_string(_s, &_m);                                            \
-      throw std::runtime_error(std::string(#expr) + " failed: " +            \
-                               (_m ? _m : "unknown HSA error"));             \
-    }                                                                        \
+#define HSA_CHECK(expr)                                                        \
+  do {                                                                         \
+    hsa_status_t _s = (expr);                                                  \
+    if (_s != HSA_STATUS_SUCCESS) {                                            \
+      const char *_m = nullptr;                                                \
+      hsa_status_string(_s, &_m);                                              \
+      throw std::runtime_error(std::string(#expr) +                            \
+                               " failed: " + (_m ? _m : "unknown HSA error")); \
+    }                                                                          \
   } while (0)
 
 // ---- Agent discovery -------------------------------------------------------
