@@ -132,9 +132,11 @@ By default kernels are dispatched through XRT (xclbin on npu1, ELF on npu2). An 
 | `hsa` | Dispatch via HSA; the backend produces `pdi` + `insts.bin` and launches them on the AIE agent. |
 
 Under HSA the output format is `pdi`. The HSA runtime is Linux-only and requires
-a ROCR install providing the HSA runtime headers and `libhsa-runtime64.so`; set
-`AMD_NPU_ROCR_PATH` or `ROCM_PATH` if it is not in the default location
-(`/opt/rocm`).
+an **AIE-capable ROCR** — one that provides the AIE dispatch extension header
+(`include/hsa/hsa_ext_amd_aie.h`) and `libhsa-runtime64.so`. A stock `/opt/rocm`
+often lacks AIE support, so you typically build ROCR from source (below) and
+point the backend at it with `AMD_NPU_ROCR_PATH` (which falls back to `ROCM_PATH`,
+then `/opt/rocm`).
 
 ```bash
 cd examples/hsa_matmul
@@ -149,6 +151,48 @@ from triton.backends.amd_triton_npu.driver import NPUDriver
 
 triton.runtime.driver.set_active(NPUDriver("hsa"))
 ```
+
+#### Building an AIE-capable ROCR
+
+Build rocr-runtime from source and install it to a private prefix. The helper
+`scripts/build-rocr.sh` automates this (defaults install to `<workspace>/opt/rocm`,
+where `<workspace>` is the directory containing this checkout):
+
+```bash
+# Requires the rocm-systems repo (rocr-runtime, with AIE support) checked out.
+# Override ROCR_SRC / PREFIX / CLANG_DIR / JOBS via the environment if needed.
+./scripts/build-rocr.sh
+```
+
+Equivalently, by hand:
+
+```bash
+ROCR_SRC=/path/to/rocm-systems/projects/rocr-runtime
+PREFIX=$HOME/opt/rocm                 # install prefix -> AMD_NPU_ROCR_PATH
+cmake -S "$ROCR_SRC" -B "$ROCR_SRC/build" \
+  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DClang_DIR=/usr/lib/cmake/clang-22 \   # match your installed clang/LLVM
+  -DIMAGE_SUPPORT=OFF \
+  -DBUILD_SHARED_LIBS=ON
+cmake --build "$ROCR_SRC/build" -j"$(nproc)"
+cmake --install "$ROCR_SRC/build"
+```
+
+This installs `include/hsa/hsa_ext_amd_aie.h` and `lib/libhsa-runtime64.so` under
+`$PREFIX`. Point the backend at it and put its `lib/` ahead of any system ROCR at
+runtime:
+
+```bash
+export AMD_NPU_ROCR_PATH="$PREFIX"                       # build/link the HSA runtime against it
+export LD_LIBRARY_PATH="$PREFIX/lib:${LD_LIBRARY_PATH}"  # load its libhsa-runtime64 first
+```
+
+`AMD_NPU_ROCR_PATH` selects which ROCR the backend compiles and links the shared
+HSA runtime (`libtriton_npu_hsa.so`) against. `LD_LIBRARY_PATH` then guarantees
+the freshly built `libhsa-runtime64.so` is loaded ahead of a system-installed one
+(e.g. a stock `/opt/rocm` without AIE support), avoiding a mismatch at dispatch
+time.
 
 ## Windows Support
 
