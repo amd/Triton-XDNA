@@ -172,7 +172,8 @@ PREFIX=$HOME/opt/rocm                 # install prefix -> AMD_NPU_ROCR_PATH
 cmake -S "$ROCR_SRC" -B "$ROCR_SRC/build" \
   -DCMAKE_INSTALL_PREFIX="$PREFIX" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DClang_DIR=/usr/lib/cmake/clang-22 \   # match your installed clang/LLVM
+  # Match your installed clang/LLVM
+  -DClang_DIR=/usr/lib/cmake/clang-22 \
   -DIMAGE_SUPPORT=OFF \
   -DBUILD_SHARED_LIBS=ON
 cmake --build "$ROCR_SRC/build" -j"$(nproc)"
