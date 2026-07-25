@@ -216,9 +216,7 @@ def _get_rocr_path() -> str:
         if not path:
             return ""
         has_hdr = os.path.isfile(os.path.join(path, "include", "hsa", "hsa.h"))
-        has_lib = os.path.isfile(
-            os.path.join(path, "lib", "libhsa-runtime64.so")
-        )
+        has_lib = os.path.isfile(os.path.join(path, "lib", "libhsa-runtime64.so"))
         if has_hdr and has_lib:
             return path
         if os.path.isdir(path):
@@ -271,7 +269,9 @@ def _run_compile(cmd, env=None):
                 stderr_buf.write(result.stdout)
             else:
                 sys.stderr.write(result.stdout.decode("utf-8", errors="replace"))
-        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd, output=result.stdout
+        )
 
 
 def _build_hsa_runtime_lib(include_dir: str, rocr_dir: str) -> str:
@@ -906,9 +906,7 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ, actual_sizes=None):
 
 def _generate_launcher(constants, signature, kernel_name):
     arg_decls = ", ".join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
-    args_format = "".join(
-        [format_of(extracted_type(ty)) for ty in signature.values()]
-    )
+    args_format = "".join([format_of(extracted_type(ty)) for ty in signature.values()])
     format = "iiiOOOO" + args_format
     args_list = (
         ", " + ", ".join(f"&_arg{i}" for i, ty in signature.items())
@@ -1155,9 +1153,7 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 def _generate_elf_launcher(constants, signature, kernel_name):
     """Generate C++ launcher code using XRT ELF APIs (for NPU2/AIE2P only)."""
     arg_decls = ", ".join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
-    args_format = "".join(
-        [format_of(extracted_type(ty)) for ty in signature.values()]
-    )
+    args_format = "".join([format_of(extracted_type(ty)) for ty in signature.values()])
     format = "iiiOOOO" + args_format
     args_list = (
         ", " + ", ".join(f"&_arg{i}" for i, ty in signature.items())
@@ -1572,9 +1568,7 @@ def compile_module(
       ``output_format == "pdi"``.
     """
     if link_profile not in ("xrt", "hsa"):
-        raise ValueError(
-            f"link_profile must be 'xrt' or 'hsa'; got {link_profile!r}"
-        )
+        raise ValueError(f"link_profile must be 'xrt' or 'hsa'; got {link_profile!r}")
     if IS_WINDOWS and link_profile == "hsa":
         # Assert this up front, before resolving the ROCR SDK below, so the
         # user gets this clear message instead of a "ROCR not found" error.

@@ -35,18 +35,20 @@ typedef struct triton_npu_hsa_program *triton_npu_hsa_program_t;
 // (with a message written to errbuf). Call once per launcher module.
 triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *pdi_path,
                                                 const char *insts_path,
-                                                char *errbuf, size_t errbuf_len);
+                                                char *errbuf,
+                                                size_t errbuf_len);
 
 // Dispatch a prepared program: acquire vmem I/O buffers, copy inputs in, fill
 // kernargs, enqueue the AIE packet, wait for completion, copy outputs back, and
 // return the buffers to the pool. host_ptrs[i]/sizes[i] describe tensor i (i in
 // [0, num_tensors)). Returns 0 on success, or a negative value on error (with a
-// message written to errbuf). num_tensors must be <= TRITON_NPU_HSA_MAX_KERNARGS.
+// message written to errbuf). num_tensors must be <=
+// TRITON_NPU_HSA_MAX_KERNARGS.
 int triton_npu_hsa_dispatch(triton_npu_hsa_program_t program,
                             uint32_t num_tensors, void *const *host_ptrs,
                             const uint64_t *sizes, char *errbuf,
                             size_t errbuf_len);
 
 #ifdef __cplusplus
-}  // extern "C"
+} // extern "C"
 #endif

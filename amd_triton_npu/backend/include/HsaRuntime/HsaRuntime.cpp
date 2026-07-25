@@ -104,7 +104,8 @@ hsa_status_t find_pool(hsa_amd_memory_pool_t pool, void *data) {
   if (hsa_amd_memory_pool_get_info(pool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,
                                    &f) != HSA_STATUS_SUCCESS)
     return HSA_STATUS_SUCCESS;
-  if ((f & d->flags) == 0) return HSA_STATUS_SUCCESS;
+  if ((f & d->flags) == 0)
+    return HSA_STATUS_SUCCESS;
 
   std::size_t granule = 0;
   if (hsa_amd_memory_pool_get_info(
@@ -112,7 +113,8 @@ hsa_status_t find_pool(hsa_amd_memory_pool_t pool, void *data) {
       HSA_STATUS_SUCCESS)
     return HSA_STATUS_SUCCESS;
   bool allocatable = (granule != 0);
-  if (allocatable != d->allocatable) return HSA_STATUS_SUCCESS;
+  if (allocatable != d->allocatable)
+    return HSA_STATUS_SUCCESS;
 
   d->pool = pool;
   d->found = true;
@@ -136,7 +138,7 @@ struct DeviceBuffer {
   std::size_t size{};
 };
 
-}  // namespace
+} // namespace
 
 // A prepared program is just its two device buffers; the opaque handle in the
 // C ABI points at one of these, owned by the runtime's program cache.
@@ -150,10 +152,10 @@ namespace {
 // ---- Process-global HSA runtime -------------------------------------------
 // Owns every persistent HSA resource: the AIE agent, the dev/data/kernarg
 // memory pools, the single command queue and completion signal, the fixed-slot
-// kernarg pool, the pooled vmem I/O buffers, and the cache of prepared programs.
-// One instance per process (see runtime()).
+// kernarg pool, the pooled vmem I/O buffers, and the cache of prepared
+// programs. One instance per process (see runtime()).
 class HsaRuntime {
- public:
+public:
   // Construct by running the full one-time HSA initialization.
   HsaRuntime() { init(); }
 
@@ -165,30 +167,38 @@ class HsaRuntime {
   ~HsaRuntime() {
     for (auto &kv : vmem_pool_) {
       for (auto &b : kv.second) {
-        if (!b.va) continue;
+        if (!b.va)
+          continue;
         hsa_amd_vmem_unmap(b.va, b.size);
         hsa_amd_vmem_address_free(b.va, b.size);
         hsa_amd_vmem_handle_release(b.handle);
       }
     }
     for (auto &kv : programs_) {
-      if (kv.second->pdi.va) hsa_amd_memory_pool_free(kv.second->pdi.va);
-      if (kv.second->insts.va) hsa_amd_memory_pool_free(kv.second->insts.va);
+      if (kv.second->pdi.va)
+        hsa_amd_memory_pool_free(kv.second->pdi.va);
+      if (kv.second->insts.va)
+        hsa_amd_memory_pool_free(kv.second->insts.va);
     }
-    if (kernarg_buffer_) hsa_amd_memory_pool_free(kernarg_buffer_);
-    if (signal_.handle) hsa_signal_destroy(signal_);
-    if (queue_) hsa_queue_destroy(queue_);
+    if (kernarg_buffer_)
+      hsa_amd_memory_pool_free(kernarg_buffer_);
+    if (signal_.handle)
+      hsa_signal_destroy(signal_);
+    if (queue_)
+      hsa_queue_destroy(queue_);
     hsa_shut_down();
   }
 
-  // Load + cache the PDI/insts for a kernel and return its program handle. Keyed
-  // by (pdi_path, insts_path) so repeated prepares (or a PDI shared by two
-  // signatures) reuse the same device allocation. Thread-safe.
-  triton_npu_hsa_program *prepare(const char *pdi_path, const char *insts_path) {
+  // Load + cache the PDI/insts for a kernel and return its program handle.
+  // Keyed by (pdi_path, insts_path) so repeated prepares (or a PDI shared by
+  // two signatures) reuse the same device allocation. Thread-safe.
+  triton_npu_hsa_program *prepare(const char *pdi_path,
+                                  const char *insts_path) {
     std::string key = std::string(pdi_path) + '\0' + insts_path;
     std::lock_guard<std::mutex> lock(programs_mtx_);
     auto it = programs_.find(key);
-    if (it != programs_.end()) return it->second.get();
+    if (it != programs_.end())
+      return it->second.get();
     auto prog = std::make_unique<triton_npu_hsa_program>();
     prog->pdi = load_binary(pdi_path);
     prog->insts = load_binary(insts_path);
@@ -237,7 +247,8 @@ class HsaRuntime {
 
       // Each ring slot owns a fixed kernarg slot of the same index; no
       // allocation on the hot path. Layout: [addr0..addrN-1, size0..sizeN-1].
-      auto *kernargs = static_cast<std::uint64_t *>(kernarg_slot((std::uint32_t)pkt_idx));
+      auto *kernargs =
+          static_cast<std::uint64_t *>(kernarg_slot((std::uint32_t)pkt_idx));
       for (std::uint32_t i = 0; i < num_tensors; ++i) {
         kernargs[i] = reinterpret_cast<std::uint64_t>(bufs[i].va);
         kernargs[num_tensors + i] = sizes[i];
@@ -265,8 +276,8 @@ class HsaRuntime {
       // Arm the signal to 1 (device decrements to 0 on success, or sets a
       // negative error code), publish the packet, then ring the doorbell.
       hsa_signal_store_screlease(signal_, 1);
-      static_cast<hsa_amd_aie_kernel_dispatch_packet_t *>(q->base_address)[pkt_idx] =
-          pkt;
+      static_cast<hsa_amd_aie_kernel_dispatch_packet_t *>(
+          q->base_address)[pkt_idx] = pkt;
       hsa_signal_store_screlease(q->doorbell_signal, wr_idx);
 
       // Wait for completion. Wait for value < 1 (rather than == 0) so a device
@@ -283,26 +294,29 @@ class HsaRuntime {
                                  std::to_string((long long)sig_val));
 
       // Copy every tensor buffer back to its host pointer. We cannot know which
-      // argument(s) the kernel writes, so copying all back is correct regardless
-      // of output position (unmodified inputs just copy identical bytes).
+      // argument(s) the kernel writes, so copying all back is correct
+      // regardless of output position (unmodified inputs just copy identical
+      // bytes).
       for (std::uint32_t i = 0; i < num_tensors; ++i)
         std::memcpy(host_ptrs[i], bufs[i].va, (std::size_t)sizes[i]);
 
-      for (std::uint32_t i = 0; i < num_tensors; ++i) release(bufs[i]);
+      for (std::uint32_t i = 0; i < num_tensors; ++i)
+        release(bufs[i]);
     } catch (...) {
       // Return any buffers acquired before the failure so they are not leaked.
-      for (std::uint32_t i = 0; i < acquired; ++i) release(bufs[i]);
+      for (std::uint32_t i = 0; i < acquired; ++i)
+        release(bufs[i]);
       throw;
     }
   }
 
- private:
+private:
   hsa_agent_t aie_agent_{};
   hsa_amd_memory_pool_t dev_pool_{};
   hsa_amd_memory_pool_t data_pool_{};
   hsa_queue_t *queue_ = nullptr;
   hsa_signal_t signal_{};
-  std::vector<hsa_amd_memory_access_desc_t> access_descs_;  // RW, built once
+  std::vector<hsa_amd_memory_access_desc_t> access_descs_; // RW, built once
   std::size_t data_granule_ = 0;
 
   // Fixed-slot kernarg pool: one backing allocation, one slot per ring slot.
@@ -343,8 +357,10 @@ class HsaRuntime {
     // Every vmem I/O buffer must be RW-accessible to the CPU (host memcpy) and
     // the AIE agent (execution). Build that descriptor list once, here.
     std::vector<hsa_agent_t> access_agents;
-    for (auto c : cpus) access_agents.push_back(c);
-    for (auto a : aies) access_agents.push_back(a);
+    for (auto c : cpus)
+      access_agents.push_back(c);
+    for (auto a : aies)
+      access_agents.push_back(a);
     access_descs_.reserve(access_agents.size());
     for (auto a : access_agents)
       access_descs_.push_back({HSA_ACCESS_PERMISSION_RW, a});
@@ -366,7 +382,8 @@ class HsaRuntime {
     HSA_CHECK(hsa_amd_memory_pool_get_info(
         data_pool_, HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_GRANULE,
         &data_granule_));
-    if (data_granule_ == 0) data_granule_ = 4096;  // sane fallback for round_up
+    if (data_granule_ == 0)
+      data_granule_ = 4096; // sane fallback for round_up
 
     // Queue, capped at QUEUE_SIZE but clamped into the agent's supported range
     // (the AIE agent requires an exact size, e.g. 64, so clamp up to min_q).
@@ -376,10 +393,12 @@ class HsaRuntime {
     HSA_CHECK(
         hsa_agent_get_info(aie_agent_, HSA_AGENT_INFO_QUEUE_MAX_SIZE, &max_q));
     std::uint32_t qsize = QUEUE_SIZE;
-    if (qsize < min_q) qsize = min_q;
-    if (max_q > 0 && qsize > max_q) qsize = max_q;
-    HSA_CHECK(hsa_queue_create(aie_agent_, qsize, HSA_QUEUE_TYPE_SINGLE, nullptr,
-                               nullptr, 0, 0, &queue_));
+    if (qsize < min_q)
+      qsize = min_q;
+    if (max_q > 0 && qsize > max_q)
+      qsize = max_q;
+    HSA_CHECK(hsa_queue_create(aie_agent_, qsize, HSA_QUEUE_TYPE_SINGLE,
+                               nullptr, nullptr, 0, 0, &queue_));
 
     // Persistent completion signal, armed per dispatch.
     HSA_CHECK(hsa_signal_create(0, 0, nullptr, &signal_));
@@ -449,8 +468,8 @@ class HsaRuntime {
     size = round_up(size);
     DeviceBuffer b{};
     b.size = size;
-    HSA_CHECK(hsa_amd_vmem_handle_create(data_pool_, size, MEMORY_TYPE_PINNED, 0,
-                                         &b.handle));
+    HSA_CHECK(hsa_amd_vmem_handle_create(data_pool_, size, MEMORY_TYPE_PINNED,
+                                         0, &b.handle));
     HSA_CHECK(hsa_amd_vmem_address_reserve_align(
         &b.va, size, 0, 0, HSA_AMD_VMEM_ADDRESS_NO_REGISTER));
     HSA_CHECK(hsa_amd_vmem_map(b.va, size, 0, b.handle, 0));
@@ -470,12 +489,13 @@ class HsaRuntime {
       it->second.pop_back();
       return b;
     }
-    return vmem_alloc(size);  // rounds to the same `rounded` size
+    return vmem_alloc(size); // rounds to the same `rounded` size
   }
 
   // Return a buffer to the free-list for reuse (does not unmap).
   void release(DeviceBuffer &b) {
-    if (!b.va) return;
+    if (!b.va)
+      return;
     vmem_pool_[b.size].push_back(b);
     b.va = nullptr;
   }
@@ -489,21 +509,23 @@ HsaRuntime &runtime() {
 
 // Copy `msg` into a caller-provided errbuf, NUL-terminated.
 void write_err(char *errbuf, size_t errbuf_len, const std::string &msg) {
-  if (!errbuf || errbuf_len == 0) return;
+  if (!errbuf || errbuf_len == 0)
+    return;
   std::size_t n = msg.size() < errbuf_len - 1 ? msg.size() : errbuf_len - 1;
   std::memcpy(errbuf, msg.data(), n);
   errbuf[n] = '\0';
 }
 
-}  // namespace
+} // namespace
 
-extern "C" triton_npu_hsa_program_t triton_npu_hsa_prepare(
-    const char *pdi_path, const char *insts_path, char *errbuf,
-    size_t errbuf_len) {
+extern "C" triton_npu_hsa_program_t
+triton_npu_hsa_prepare(const char *pdi_path, const char *insts_path,
+                       char *errbuf, size_t errbuf_len) {
   try {
     return runtime().prepare(pdi_path, insts_path);
   } catch (const std::exception &e) {
-    write_err(errbuf, errbuf_len, std::string("HSA prepare failed: ") + e.what());
+    write_err(errbuf, errbuf_len,
+              std::string("HSA prepare failed: ") + e.what());
     return nullptr;
   }
 }
@@ -517,7 +539,8 @@ extern "C" int triton_npu_hsa_dispatch(triton_npu_hsa_program_t program,
     runtime().dispatch(program, num_tensors, host_ptrs, sizes);
     return 0;
   } catch (const std::exception &e) {
-    write_err(errbuf, errbuf_len, std::string("HSA dispatch failed: ") + e.what());
+    write_err(errbuf, errbuf_len,
+              std::string("HSA dispatch failed: ") + e.what());
     return -1;
   }
 }

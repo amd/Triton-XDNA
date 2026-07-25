@@ -912,7 +912,7 @@ def _copy_backend_to_triton(backend_src, backend_name):
     dst = triton_dir / "backends" / backend_name
     dst.mkdir(parents=True, exist_ok=True)
 
-    # Copy all Python modules in the backend (skip __init__.py; handled below).
+    # Copy all Python modules in the backend (excluding __init__.py, handled below).
     for src_file in sorted(backend_src.glob("*.py")):
         if src_file.name == "__init__.py":
             continue

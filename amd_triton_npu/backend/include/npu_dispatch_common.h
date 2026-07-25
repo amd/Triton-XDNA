@@ -11,8 +11,9 @@
 #include <Python.h>
 #include <stdbool.h>
 
-// Result of resolving a kernel pointer argument: the raw device/host address and
-// whether resolution succeeded (a Python error is set when `valid` is false).
+// Result of resolving a kernel pointer argument: the raw device/host address
+// and whether resolution succeeded (a Python error is set when `valid` is
+// false).
 struct DevicePtrInfo {
   void *dev_ptr;
   bool valid;
@@ -26,7 +27,12 @@ inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
   ptr_info.dev_ptr = 0;
   ptr_info.valid = true;
   if (PyLong_Check(obj)) {
-    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(obj));
+    unsigned long long addr = PyLong_AsUnsignedLongLong(obj);
+    if (addr == (unsigned long long)-1 && PyErr_Occurred()) {
+      ptr_info.valid = false;
+      return ptr_info;
+    }
+    ptr_info.dev_ptr = reinterpret_cast<void *>(addr);
     return ptr_info;
   }
   if (obj == Py_None) {
@@ -46,26 +52,33 @@ inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
     }
     if (!PyLong_Check(ret)) {
       Py_DECREF(ret);
-      PyErr_SetString(PyExc_TypeError,
-                      "data_ptr method of Pointer object must return 64-bit int");
+      PyErr_SetString(
+          PyExc_TypeError,
+          "data_ptr method of Pointer object must return 64-bit int");
       ptr_info.valid = false;
       return ptr_info;
     }
-    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));
+    unsigned long long addr = PyLong_AsUnsignedLongLong(ret);
     Py_DECREF(ret);
+    if (addr == (unsigned long long)-1 && PyErr_Occurred()) {
+      ptr_info.valid = false;
+      return ptr_info;
+    }
+    ptr_info.dev_ptr = reinterpret_cast<void *>(addr);
     return ptr_info;
   }
-  PyErr_SetString(PyExc_TypeError,
-                  "Pointer argument must be either uint64 or have data_ptr method");
+  PyErr_SetString(
+      PyExc_TypeError,
+      "Pointer argument must be either uint64 or have data_ptr method");
+  ptr_info.valid = false;
   return ptr_info;
 }
 
 // Total element count of a tensor-like object (product of obj.shape). Returns
-// -1 and sets/print a Python error on failure.
+// -1 and leaves a Python error set on failure.
 inline long getNumElements(PyObject *obj) {
   PyObject *shape = PyObject_GetAttrString(obj, "shape");
   if (!shape) {
-    // PyObject_GetAttrString already set an exception.
     return -1;
   }
 
@@ -78,7 +91,6 @@ inline long getNumElements(PyObject *obj) {
   Py_ssize_t ndim = PySequence_Size(shape);
   if (ndim < 0) {
     Py_DECREF(shape);
-    // PySequence_Size already set an exception.
     return -1;
   }
 
@@ -87,7 +99,6 @@ inline long getNumElements(PyObject *obj) {
     PyObject *dim_obj = PySequence_GetItem(shape, i);
     if (!dim_obj) {
       Py_DECREF(shape);
-      PyErr_Print();
       return -1;
     }
 
@@ -96,7 +107,6 @@ inline long getNumElements(PyObject *obj) {
 
     if (dim == -1 && PyErr_Occurred()) {
       Py_DECREF(shape);
-      PyErr_Print();
       return -1;
     }
 
@@ -107,21 +117,20 @@ inline long getNumElements(PyObject *obj) {
   return num_elements;
 }
 
-// Size in bytes of a single element of a tensor-like object (obj.dtype.itemsize).
-// Returns -1 and sets/print a Python error on failure.
+// Size in bytes of a single element of a tensor-like object
+// (obj.dtype.itemsize). Returns -1 and leaves a Python error set on failure.
 inline long getElementSizeInBytes(PyObject *obj) {
-  if (!obj) return -1;
+  if (!obj)
+    return -1;
 
   PyObject *dtype = PyObject_GetAttrString(obj, "dtype");
   if (!dtype) {
-    // PyObject_GetAttrString already set an exception.
     return -1;
   }
 
   PyObject *itemsize = PyObject_GetAttrString(dtype, "itemsize");
   Py_DECREF(dtype);
   if (!itemsize) {
-    // PyObject_GetAttrString already set an exception.
     return -1;
   }
 
@@ -129,7 +138,6 @@ inline long getElementSizeInBytes(PyObject *obj) {
   Py_DECREF(itemsize);
 
   if (size == -1 && PyErr_Occurred()) {
-    // PyLong_AsLong already set an exception.
     return -1;
   }
 

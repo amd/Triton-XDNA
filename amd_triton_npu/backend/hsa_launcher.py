@@ -165,6 +165,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
     PyObject* ret = PyObject_CallObject(launch_exit_hook, hook_args);
     Py_DECREF(hook_args);
     if (!ret) return NULL;
+    Py_DECREF(ret);
   }}
 
   Py_INCREF(Py_None);
