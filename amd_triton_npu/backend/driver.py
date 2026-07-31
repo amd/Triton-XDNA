@@ -8,7 +8,7 @@ import tempfile
 import sys
 import functools
 
-import os, subprocess, tempfile, platform
+import os, subprocess, platform
 import importlib.util
 import importlib.metadata
 import shutil
