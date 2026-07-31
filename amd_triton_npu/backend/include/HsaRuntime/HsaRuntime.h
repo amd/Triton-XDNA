@@ -8,9 +8,7 @@
 // links against. Because the dynamic linker loads that shared dependency once
 // per process, the HsaRuntime singleton behind these functions is truly
 // process-global: one hsa_init, one queue, one completion signal, one kernarg
-// pool, one vmem buffer pool, shared across all kernel signatures. That is what
-// lets multiple signatures run in one process on an AIE agent that only permits
-// one queue (QUEUES_MAX == 1).
+// pool, one vmem buffer pool, shared across all kernel signatures.
 //
 // This header exposes only opaque handles and plain C types -- no hsa/*.h -- so
 // the launcher never needs the ROCR headers; only HsaRuntime.cpp does.
@@ -25,7 +23,10 @@ extern "C" {
 
 // Maximum number of tensor kernel arguments a single dispatch may carry.
 // triton_npu_hsa_dispatch() returns an error if num_tensors exceeds this.
-#define TRITON_NPU_HSA_MAX_KERNARGS 8
+// Sized well above the largest observed design (9 arguments); the only cost of
+// headroom is the kernarg slot pool, which is MAX_KERNARGS * 16 bytes per queue
+// ring slot (a few KiB in total).
+#define TRITON_NPU_HSA_MAX_KERNARGS 16
 
 // Opaque handle to a prepared (pdi, insts) program, owned by the runtime.
 typedef struct triton_npu_hsa_program *triton_npu_hsa_program_t;
@@ -44,6 +45,18 @@ triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *pdi_path,
 // [0, num_tensors)). Returns 0 on success, or a negative value on error (with a
 // message written to errbuf). num_tensors must be <=
 // TRITON_NPU_HSA_MAX_KERNARGS.
+//
+// Setting AMD_TRITON_NPU_HSA_TIMEOUT to a number of seconds (fractional
+// accepted) arms a watchdog on the runtime's internal waits. Two caveats:
+//
+// * It is off by default because recovering from a timeout means permanently
+//   abandoning the completion signal and the I/O buffers of the timed-out
+//   dispatch -- the device may still write to them -- so a timeout set too low
+//   for a legitimately slow kernel leaks memory on every launch.
+// * It does NOT currently make a hung dispatch recoverable. Ringing the AIE
+//   doorbell submits synchronously, so the whole dispatch happens inside a
+//   ROCR call that takes no timeout; the waits the watchdog does bound are
+//   microseconds long today. See the note on TIMEOUT_ENV in HsaRuntime.cpp.
 int triton_npu_hsa_dispatch(triton_npu_hsa_program_t program,
                             uint32_t num_tensors, void *const *host_ptrs,
                             const uint64_t *sizes, char *errbuf,
