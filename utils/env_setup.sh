@@ -18,7 +18,7 @@ MLIR_AIR_TIMESTAMP=$(awk -v kw="Timestamp:" '$0 ~ kw {for (i=1; i<NF; i++) if ($
 echo "mlir-air timestamp: $MLIR_AIR_TIMESTAMP"
 python3 -m pip install "mlir_air[aie]==$MLIR_AIR_VERSION.$MLIR_AIR_TIMESTAMP+$SHORT_MLIR_AIR_COMMIT_HASH.no.rtti" \
     -f https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti \
-    -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
+    -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.4.0 \
     -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 
 # The [aie] extra requires llvm-aie without a version pin. To track the
@@ -28,7 +28,19 @@ python3 -m pip install "mlir_air[aie]==$MLIR_AIR_VERSION.$MLIR_AIR_TIMESTAMP+$SH
 python3 -m pip install --upgrade llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 
 if [[ "$MLIR_AIE_INSTALL_DIR" == "" ]]; then
-    export MLIR_AIE_INSTALL_DIR="$(python3 -m pip show mlir_aie | grep ^Location: | awk '{print $2}')/mlir_aie"
+    # The [aie] extra installs the no-RTTI wheel (dist name: mlir_aie_no_rtti),
+    # falling back to the RTTI wheel (dist name: mlir_aie). Both unpack the
+    # python package under <site-packages>/mlir_aie.
+    MLIR_AIE_LOCATION="$(python3 -m pip show mlir_aie_no_rtti 2>/dev/null | grep ^Location: | awk '{print $2}')"
+    if [[ "$MLIR_AIE_LOCATION" == "" ]]; then
+        MLIR_AIE_LOCATION="$(python3 -m pip show mlir_aie 2>/dev/null | grep ^Location: | awk '{print $2}')"
+    fi
+    if [[ "$MLIR_AIE_LOCATION" == "" ]]; then
+        echo "ERROR: could not locate an installed mlir_aie(_no_rtti) package." >&2
+        echo "       Install it (e.g. via mlir_air[aie]) or set MLIR_AIE_INSTALL_DIR manually." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    export MLIR_AIE_INSTALL_DIR="${MLIR_AIE_LOCATION}/mlir_aie"
 fi
 
 export PATH="${MLIR_AIE_INSTALL_DIR}/bin:${PATH}"
