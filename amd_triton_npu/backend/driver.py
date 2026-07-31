@@ -14,6 +14,7 @@ import importlib.metadata
 import shutil
 
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
@@ -199,52 +200,180 @@ def _get_xrt_path() -> str:
     )
 
 
-def _get_rocr_path() -> str:
-    """Get the path to the ROCR/ROCm install prefix (HSA runtime headers + lib).
+# Headers the shared HSA runtime (HsaRuntime.cpp) includes, relative to a ROCm
+# prefix. hsa_ext_amd_aie.h carries the AIE dispatch extension and is absent
+# from stock ROCm releases, so requiring it here turns "your ROCm has no AIE
+# support" into an error at discovery rather than a header-not-found deep in
+# the compile.
+_ROCR_HEADERS = ("hsa/hsa.h", "hsa/hsa_ext_amd.h", "hsa/hsa_ext_amd_aie.h")
 
-    The prefix must contain ``include/hsa/hsa.h`` and a
-    ``lib/libhsa-runtime64.so`` so the generated HSA launcher can be compiled
-    and linked against ROCR.
+# Library directories to probe under a ROCm prefix, in order. lib64 and the
+# Debian/Ubuntu multiarch directory matter for system prefixes such as /usr.
+_ROCR_LIB_DIRS = ("lib", "lib64", os.path.join("lib", "x86_64-linux-gnu"))
+
+# Library file names, in preference order. The unversioned name is a symlink
+# from the development package and is what ``-lhsa-runtime64`` needs; ROCm
+# wheels built by TheRock ship no symlinks, so only the SONAME exists there and
+# we link it by absolute path instead.
+_ROCR_LIB_NAMES = ("libhsa-runtime64.so", "libhsa-runtime64.so.1")
+
+# Python packages that may contain a pip-installed ROCm (TheRock). The core
+# runtime package is the one carrying libhsa-runtime64; ``rocm_sdk`` is asked
+# for the platform-specific name first, since it varies by target.
+_PIP_ROCM_PACKAGE = "_rocm_sdk_core"
+
+
+class _RocrInstall(NamedTuple):
+    """A validated ROCm/ROCR installation usable for AIE dispatch."""
+
+    prefix: str  # install root, for diagnostics
+    include_dir: str  # contains hsa/hsa.h
+    lib_dir: str  # contains the library, for -L and -rpath
+    lib_path: str  # the library file itself
+    source: str  # how we found it, for error messages
+
+
+def _pip_rocm_prefix() -> str:
+    """Root of a pip-installed ROCm (TheRock), or ``""`` if there is none.
+
+    Resolves the package directory from its import spec rather than shelling
+    out to the ``rocm-sdk`` CLI: ``rocm-sdk path --root`` reports the
+    multi-gigabyte devel tree, not the runtime package that actually holds
+    libhsa-runtime64.
+    """
+    names = []
+    try:
+        import rocm_sdk
+
+        # The core package name is platform-specific and the accessor for it is
+        # not a stable public API, so try the known spellings and fall through
+        # to the default name if none of them are present.
+        for attr in (
+            "determine_platform_package_name",
+            "_determine_platform_package_name",
+            "platform_package_name",
+        ):
+            fn = getattr(rocm_sdk, attr, None)
+            if callable(fn):
+                try:
+                    name = fn()
+                except Exception:
+                    continue
+                if name:
+                    names.append(name)
+                    break
+    except ImportError:
+        pass
+    names.append(_PIP_ROCM_PACKAGE)
+
+    for name in names:
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            continue
+        if spec is None:
+            continue
+        # A namespace package has no origin; use its search path instead.
+        origin = spec.origin
+        if origin and origin != "namespace":
+            return os.path.dirname(origin)
+        for location in spec.submodule_search_locations or ():
+            return location
+    return ""
+
+
+def _probe_rocr(prefix: str, source: str) -> tuple[Optional[_RocrInstall], str]:
+    """Check whether ``prefix`` is a ROCm install we can build against.
+
+    Returns ``(install, "")`` on success, or ``(None, reason)`` explaining what
+    disqualified it (an empty reason means the prefix simply does not exist, so
+    it is not worth reporting).
+    """
+    if not prefix or not os.path.isdir(prefix):
+        return None, ""
+
+    include_dir = os.path.join(prefix, "include")
+    missing = [
+        h for h in _ROCR_HEADERS if not os.path.isfile(os.path.join(include_dir, h))
+    ]
+
+    lib_path = ""
+    for rel in _ROCR_LIB_DIRS:
+        lib_dir = os.path.join(prefix, rel)
+        for name in _ROCR_LIB_NAMES:
+            candidate = os.path.join(lib_dir, name)
+            if os.path.isfile(candidate):
+                lib_path = candidate
+                break
+        if lib_path:
+            break
+
+    if missing or not lib_path:
+        reasons = []
+        if missing:
+            reasons.append(
+                "missing header(s) " + ", ".join("include/" + m for m in missing)
+            )
+        if not lib_path:
+            reasons.append(
+                f"no {_ROCR_LIB_NAMES[0]} under " + ", ".join(_ROCR_LIB_DIRS)
+            )
+        return None, f"{prefix} (via {source}): " + "; ".join(reasons)
+
+    return (
+        _RocrInstall(
+            prefix=prefix,
+            include_dir=include_dir,
+            lib_dir=os.path.dirname(lib_path),
+            lib_path=lib_path,
+            source=source,
+        ),
+        "",
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _get_rocr_install() -> _RocrInstall:
+    """Locate a ROCm/ROCR install providing the AIE-capable HSA runtime.
 
     Search order:
-    1. ``AMD_NPU_ROCR_PATH`` environment variable
-    2. ``ROCM_PATH`` environment variable
-    3. ``/opt/rocm`` (standard ROCm install location)
+
+    1. ``AMD_NPU_ROCR_PATH``
+    2. ``ROCM_PATH``
+    3. a pip-installed ROCm (TheRock), see :func:`_pip_rocm_prefix`
+    4. the system location ``/opt/rocm``
+
+    Every candidate must supply the headers HsaRuntime.cpp includes -- notably
+    ``hsa/hsa_ext_amd_aie.h`` -- and libhsa-runtime64. Candidates that fail are
+    collected and reported together, so a prefix that was set explicitly but is
+    unusable says *why* instead of being silently skipped.
     """
-
-    def _validate(path: str, source: str) -> str:
-        if not path:
-            return ""
-        has_hdr = os.path.isfile(os.path.join(path, "include", "hsa", "hsa.h"))
-        has_lib = os.path.isfile(os.path.join(path, "lib", "libhsa-runtime64.so"))
-        if has_hdr and has_lib:
-            return path
-        if os.path.isdir(path):
-            missing = []
-            if not has_hdr:
-                missing.append("include/hsa/hsa.h")
-            if not has_lib:
-                missing.append("lib/libhsa-runtime64.so")
-            raise RuntimeError(
-                f"ROCR directory found via {source} at {path}, but it is missing: "
-                f"{', '.join(missing)}. Point AMD_NPU_ROCR_PATH/ROCM_PATH at a ROCR "
-                "install that provides the HSA runtime headers and library."
-            )
-        return ""
-
-    for source, path in (
-        ("AMD_NPU_ROCR_PATH environment variable", os.getenv("AMD_NPU_ROCR_PATH", "")),
-        ("ROCM_PATH environment variable", os.getenv("ROCM_PATH", "")),
+    candidates = [
+        ("AMD_NPU_ROCR_PATH", os.getenv("AMD_NPU_ROCR_PATH", "")),
+        ("ROCM_PATH", os.getenv("ROCM_PATH", "")),
+        ("pip-installed ROCm", _pip_rocm_prefix()),
         ("default location", "/opt/rocm"),
-    ):
-        result = _validate(path, source)
-        if result:
-            return result
+    ]
 
+    rejected = []
+    for source, prefix in candidates:
+        install, reason = _probe_rocr(prefix, source)
+        if install is not None:
+            return install
+        if reason:
+            rejected.append(reason)
+
+    detail = ""
+    if rejected:
+        detail = "\nRejected candidates:\n" + "\n".join("  - " + r for r in rejected)
     raise RuntimeError(
-        "ROCR install not found. The HSA runtime is required for the HSA "
-        "launch runtime (AMD_TRITON_NPU_RUNTIME=hsa). Set AMD_NPU_ROCR_PATH or ROCM_PATH "
-        "to a prefix containing include/hsa/hsa.h and lib/libhsa-runtime64.so."
+        "No ROCR install with AIE support found. The HSA launch runtime "
+        "(AMD_TRITON_NPU_RUNTIME=hsa) needs a ROCm prefix providing "
+        + ", ".join("include/" + h for h in _ROCR_HEADERS)
+        + " and lib/libhsa-runtime64.so. Stock ROCm releases do not ship "
+        "hsa/hsa_ext_amd_aie.h; build an AIE-capable ROCR with "
+        "scripts/build-rocr.sh and point AMD_NPU_ROCR_PATH at its install "
+        "prefix." + detail
     )
 
 
@@ -274,7 +403,7 @@ def _run_compile(cmd, env=None):
         )
 
 
-def _build_hsa_runtime_lib(include_dir: str, rocr_dir: str) -> str:
+def _build_hsa_runtime_lib(include_dir: str, rocr: _RocrInstall) -> str:
     """Build (once, cached) the shared HSA runtime library; return its directory.
 
     Compiles ``include/HsaRuntime/HsaRuntime.cpp`` into ``libtriton_npu_hsa.so``
@@ -286,8 +415,8 @@ def _build_hsa_runtime_lib(include_dir: str, rocr_dir: str) -> str:
     ``QUEUES_MAX == 1``.
 
     Built at runtime (not as a wheel/install-time artifact) on purpose: ROCR is
-    resolved from the environment (see ``_get_rocr_path``), and the wheel may be
-    built on a host without ROCR. Do not move this into setup.py/CMake without
+    resolved from the environment (see ``_get_rocr_install``), and the wheel may
+    be built on a host without ROCR. Do not move this into setup.py/CMake without
     solving ROCR-less builds.
 
     Returns the directory containing the ``.so`` (for the launcher's -L / -rpath).
@@ -296,7 +425,8 @@ def _build_hsa_runtime_lib(include_dir: str, rocr_dir: str) -> str:
     src_path = os.path.join(include_dir, "HsaRuntime", "HsaRuntime.cpp")
     with open(src_path, "rb") as f:
         src_bytes = f.read()
-    key = hashlib.md5(src_bytes + f"_rocr_{rocr_dir}_hsartlib".encode()).hexdigest()
+    key_src = src_bytes + f"_rocr_{rocr.lib_path}_hsartlib".encode()
+    key = hashlib.md5(key_src).hexdigest()
     cache = get_cache_manager(key)
     lib_path = cache.get_file(lib_name)
     if lib_path is not None:
@@ -313,10 +443,17 @@ def _build_hsa_runtime_lib(include_dir: str, rocr_dir: str) -> str:
             "-pthread",
             src_path,
             f"-I{include_dir}",
-            f"-I{os.path.join(rocr_dir, 'include')}",
-            f"-L{os.path.join(rocr_dir, 'lib')}",
-            f"-Wl,-rpath,{os.path.join(rocr_dir, 'lib')}",
-            "-lhsa-runtime64",
+            f"-I{rocr.include_dir}",
+            f"-L{rocr.lib_dir}",
+            f"-Wl,-rpath,{rocr.lib_dir}",
+            # Link the resolved file rather than -lhsa-runtime64: a ROCm wheel
+            # ships only libhsa-runtime64.so.1, and without the unversioned
+            # symlink the linker's -l lookup fails.
+            (
+                "-lhsa-runtime64"
+                if os.path.basename(rocr.lib_path) == _ROCR_LIB_NAMES[0]
+                else rocr.lib_path
+            ),
             "-o",
             out_path,
         ]
@@ -1573,8 +1710,7 @@ def compile_module(
         # Assert this up front, before resolving the ROCR SDK below, so the
         # user gets this clear message instead of a "ROCR not found" error.
         raise RuntimeError(
-            "HSA (AMD_TRITON_NPU_RUNTIME=hsa) is only supported on Linux; "
-            "ROCR is not available on Windows."
+            "HSA (AMD_TRITON_NPU_RUNTIME=hsa) with AIE is only supported on Linux."
         )
     py_version = sys.version_info
     if platform.system() == "Windows":
@@ -1601,7 +1737,7 @@ def compile_module(
     # HSA launchers link the shared runtime library (built once against ROCR),
     # not ROCR directly, so all signatures share one process-global HsaRuntime.
     hsa_rt_dir = (
-        _build_hsa_runtime_lib(include_dir, _get_rocr_path())
+        _build_hsa_runtime_lib(include_dir, _get_rocr_install())
         if link_profile == "hsa"
         else None
     )

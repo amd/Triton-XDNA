@@ -134,9 +134,10 @@ By default kernels are dispatched through XRT (xclbin on npu1, ELF on npu2). An 
 Under HSA the output format is `pdi`. The HSA runtime is Linux-only and requires
 an **AIE-capable ROCR** — one that provides the AIE dispatch extension header
 (`include/hsa/hsa_ext_amd_aie.h`) and `libhsa-runtime64.so`. A stock `/opt/rocm`
-often lacks AIE support, so you typically build ROCR from source (below) and
-point the backend at it with `AMD_NPU_ROCR_PATH` (which falls back to `ROCM_PATH`,
-then `/opt/rocm`).
+usually lacks AIE support, so you typically build ROCR from source (below) and
+point the backend at it with `AMD_NPU_ROCR_PATH`.
+
+The backend searches, in order: `AMD_NPU_ROCR_PATH`, `ROCM_PATH`, a pip-installed ROCm (TheRock's `rocm-sdk` wheels), then `/opt/rocm`. A candidate is accepted only if it provides *all* the headers the runtime includes — including `hsa/hsa_ext_amd_aie.h` — plus `libhsa-runtime64`, so an installation without AIE support is reported at startup rather than failing later in the compile. If nothing qualifies, the error lists every candidate and what each was missing.
 
 ```bash
 cd examples/hsa_matmul

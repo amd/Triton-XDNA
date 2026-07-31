@@ -4,9 +4,7 @@
 #
 # Build an AIE-capable ROCR (rocr-runtime) from source and install it to a
 # private prefix, for use with the HSA launch runtime
-# (AMD_TRITON_NPU_RUNTIME=hsa / NPUDriver("hsa")). A stock /opt/rocm often lacks
-# the AIE dispatch extension header (hsa/hsa_ext_amd_aie.h), so building ROCR
-# from source is usually required.
+# (AMD_TRITON_NPU_RUNTIME=hsa / NPUDriver("hsa")).
 #
 # After it finishes, point the backend at the install prefix and put its lib
 # ahead of any system-installed ROCR at runtime:
