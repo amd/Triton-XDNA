@@ -6,8 +6,9 @@ import json
 import logging
 import tempfile
 import sys
+import functools
 
-import os, subprocess, tempfile, platform
+import os, subprocess, platform
 import importlib.util
 import importlib.metadata
 import shutil
@@ -406,7 +407,11 @@ def _dump_ir_if_needed(files):
         shutil.copy(f, os.path.join(air_proj_path, os.path.basename(f)))
 
 
+@functools.lru_cache(maxsize=1)
 def get_npu_device_info():
+    # Cached: physical NPU devices do not change within a process, and this
+    # is called on the per-dispatch hot path (via detect_npu_version). Without
+    # caching, each kernel launch would spawn an `xrt-smi examine` subprocess.
     try:
         import re
 
