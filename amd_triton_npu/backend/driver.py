@@ -1988,20 +1988,28 @@ def compile_module(
 
         # Auto-generate a matmul tiling schedule when the IR is a plain matmul
         # and no user script is supplied. f32 matmul additionally turns on
-        # bf16 emulation (no native f32 MAC on AIE).
+        # bf16 emulation (no native f32 MAC on AIE). The emulation decision is
+        # keyed off the detected input dtype, not off whether a schedule could
+        # be derived, so an f32 matmul still enables it even when derivation
+        # fails and we fall back to the default tiling.
+        user_script = npu_config.transform_tiling_script
         matmul_params = None
-        if not npu_config.transform_tiling_script:
+        matmul_dtype = None
+        if not user_script:
             _mm_info = _detect_matmul(asm_src.decode("utf-8", errors="ignore"))
+            if _mm_info is not None:
+                matmul_dtype = _mm_info["in_elem"]
             matmul_params = _matmul_transform_params(_mm_info, detect_npu_version())
-        effective_bf16 = npu_config.bf16_emulation or bool(
-            matmul_params and matmul_params["bf16_emulation"]
-        )
+        effective_bf16 = npu_config.bf16_emulation or matmul_dtype == "f32"
 
-        # Fast path: check if we've already loaded the .pyd for this kernel
+        # Fast path: check if we've already loaded the .pyd for this kernel.
+        # The tiling script path is part of the key so the same kernel compiled
+        # with different schedules (or scriptless vs a user script) does not
+        # collide on the in-process module cache.
         input_key = hashlib.md5(
             asm_src + f"_{gridX}_{gridY}_{gridZ}_{kernel_name}"
             f"_{autotune_time}_{output_format}_{link_profile}"
-            f"_{effective_bf16}".encode()
+            f"_{effective_bf16}_{user_script or ''}".encode()
         ).hexdigest()
 
         if input_key in _global_module_cache:
