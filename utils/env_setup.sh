@@ -33,7 +33,12 @@ if [[ "$MLIR_AIE_INSTALL_DIR" == "" ]]; then
     # python package under <site-packages>/mlir_aie.
     MLIR_AIE_LOCATION="$(python3 -m pip show mlir_aie_no_rtti 2>/dev/null | grep ^Location: | awk '{print $2}')"
     if [[ "$MLIR_AIE_LOCATION" == "" ]]; then
-        MLIR_AIE_LOCATION="$(python3 -m pip show mlir_aie | grep ^Location: | awk '{print $2}')"
+        MLIR_AIE_LOCATION="$(python3 -m pip show mlir_aie 2>/dev/null | grep ^Location: | awk '{print $2}')"
+    fi
+    if [[ "$MLIR_AIE_LOCATION" == "" ]]; then
+        echo "ERROR: could not locate an installed mlir_aie(_no_rtti) package." >&2
+        echo "       Install it (e.g. via mlir_air[aie]) or set MLIR_AIE_INSTALL_DIR manually." >&2
+        return 1 2>/dev/null || exit 1
     fi
     export MLIR_AIE_INSTALL_DIR="${MLIR_AIE_LOCATION}/mlir_aie"
 fi

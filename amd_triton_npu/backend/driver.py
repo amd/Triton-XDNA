@@ -1496,24 +1496,33 @@ def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
     # (e.g. a system /usr/bin/opt) which lacks the aie2p/aie2 target and fails
     # with "unrecognized architecture 'aie2p'".
     opt_name = "opt.exe" if IS_WINDOWS else "opt"
+
+    def _is_peano_root(root) -> bool:
+        # A valid peano root has the AIE-aware opt under bin/.
+        return bool(root) and (Path(root) / "bin" / opt_name).exists()
+
     peano_flag = "--peano="
+    # 1) LLVM_BINARY_DIR points to bin/, peano wants the parent. Only trust it
+    #    if that parent actually contains bin/opt, otherwise fall through so a
+    #    misconfigured LLVM_BINARY_DIR doesn't feed aircc a bogus --peano.
     peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
     if peano_dir:
-        # LLVM_BINARY_DIR points to bin/, peano wants parent
-        peano_flag = f"--peano={str(Path(peano_dir).parent)}"
-    else:
-        # Auto-detect from pip-installed llvm-aie package
+        candidate = Path(peano_dir).parent
+        if _is_peano_root(candidate):
+            peano_flag = f"--peano={candidate}"
+    # 2) Auto-detect from the pip-installed llvm-aie package.
+    if peano_flag == "--peano=":
         try:
             dist = importlib.metadata.distribution("llvm-aie")
-            llvm_aie_root = Path(dist._path.parent) / "llvm-aie"
-            if (llvm_aie_root / "bin" / opt_name).exists():
-                peano_flag = f"--peano={llvm_aie_root}"
+            candidate = Path(dist.locate_file("")) / "llvm-aie"
+            if _is_peano_root(candidate):
+                peano_flag = f"--peano={candidate}"
         except Exception:
             pass
-    # Also check PEANO_INSTALL_DIR env var
+    # 3) Fall back to the PEANO_INSTALL_DIR env var.
     if peano_flag == "--peano=":
         peano_env = os.environ.get("PEANO_INSTALL_DIR", "")
-        if peano_env and os.path.isdir(peano_env):
+        if _is_peano_root(peano_env):
             peano_flag = f"--peano={peano_env}"
 
     # On Windows, add mlir_aie/bin to PATH so aircc can find aiecc.exe
