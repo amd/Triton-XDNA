@@ -18,7 +18,7 @@ from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
 
-import aie.compiler.aiecc.main as aiecc
+import aie
 import air.compiler.aircc.main as aircc
 from air.compiler.util import run_transform
 from air.ir import *
@@ -385,11 +385,10 @@ def _get_aie_test_utils_path() -> str:
     custom = os.getenv("AIE_TEST_UTILS_DIR")
     if custom:
         return custom
+    # aie.__file__ is <mlir_aie>/python/aie/__init__.py; three parents up is
+    # the mlir_aie install root that contains runtime_lib/.
     path = (
-        Path(aiecc.__file__).parent.parent.parent.parent.parent
-        / "runtime_lib"
-        / "x86_64"
-        / "test_lib"
+        Path(aie.__file__).parent.parent.parent / "runtime_lib" / "x86_64" / "test_lib"
     )
     return path
 
@@ -1492,28 +1491,33 @@ def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
     aircc_binary_name = "aircc.exe" if IS_WINDOWS else "aircc"
     aircc_bin = _find_mlir_air_binary(aircc_binary_name)
 
-    # On Windows, construct peano path from llvm-aie package and
-    # add mlir_aie/bin to PATH so aircc can find aiecc.exe
+    # Resolve the peano (llvm-aie) install root and pass it explicitly to
+    # aircc. Without --peano, aiecc falls back to whichever opt/llc is on PATH
+    # (e.g. a system /usr/bin/opt) which lacks the aie2p/aie2 target and fails
+    # with "unrecognized architecture 'aie2p'".
+    opt_name = "opt.exe" if IS_WINDOWS else "opt"
     peano_flag = "--peano="
+    peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
+    if peano_dir:
+        # LLVM_BINARY_DIR points to bin/, peano wants parent
+        peano_flag = f"--peano={str(Path(peano_dir).parent)}"
+    else:
+        # Auto-detect from pip-installed llvm-aie package
+        try:
+            dist = importlib.metadata.distribution("llvm-aie")
+            llvm_aie_root = Path(dist._path.parent) / "llvm-aie"
+            if (llvm_aie_root / "bin" / opt_name).exists():
+                peano_flag = f"--peano={llvm_aie_root}"
+        except Exception:
+            pass
+    # Also check PEANO_INSTALL_DIR env var
+    if peano_flag == "--peano=":
+        peano_env = os.environ.get("PEANO_INSTALL_DIR", "")
+        if peano_env and os.path.isdir(peano_env):
+            peano_flag = f"--peano={peano_env}"
+
+    # On Windows, add mlir_aie/bin to PATH so aircc can find aiecc.exe
     if IS_WINDOWS:
-        peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
-        if peano_dir:
-            # LLVM_BINARY_DIR points to bin/, peano wants parent
-            peano_flag = f"--peano={str(Path(peano_dir).parent)}"
-        else:
-            # Auto-detect from pip-installed llvm-aie package
-            try:
-                dist = importlib.metadata.distribution("llvm-aie")
-                llvm_aie_root = Path(dist._path.parent) / "llvm-aie"
-                if (llvm_aie_root / "bin" / "opt.exe").exists():
-                    peano_flag = f"--peano={llvm_aie_root}"
-            except Exception:
-                pass
-        # Also check PEANO_INSTALL_DIR env var
-        if peano_flag == "--peano=":
-            peano_env = os.environ.get("PEANO_INSTALL_DIR", "")
-            if peano_env and os.path.isdir(peano_env):
-                peano_flag = f"--peano={peano_env}"
         # Ensure aiecc is findable
         try:
             import mlir_aie
