@@ -31,6 +31,14 @@ extern "C" {
 // Opaque handle to a prepared (pdi, insts) program, owned by the runtime.
 typedef struct triton_npu_hsa_program *triton_npu_hsa_program_t;
 
+// Initialize the runtime (idempotent) and write the AIE agent's device name
+// into buf, NUL-terminated -- "aie2" on npu1 (Phoenix), "aie2p" on npu2
+// (Strix). Returns 0 on success, or a negative value on error (with a message
+// written to errbuf). Lets a caller identify the NPU generation straight from
+// the HSA agent, without shelling out to xrt-smi.
+int triton_npu_hsa_agent_name(char *buf, size_t buf_len, char *errbuf,
+                              size_t errbuf_len);
+
 // Initialize the runtime (idempotent) and load + cache the PDI and instruction
 // binaries for one kernel. Returns an opaque program handle, or NULL on error
 // (with a message written to errbuf). Call once per launcher module.

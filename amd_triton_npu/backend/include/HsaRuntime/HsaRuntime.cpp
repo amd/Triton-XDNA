@@ -196,6 +196,18 @@ public:
     hsa_shut_down();
   }
 
+  // The AIE agent's device name -- "aie2" (npu1/Phoenix) or "aie2p"
+  // (npu2/Strix). Read from HSA_AGENT_INFO_NAME rather than the agent's ISA:
+  // ROCR reports no ISA for the AIE agent (the query fails and leaves a null
+  // handle), while the name carries the generation.
+  std::string agent_name() {
+    // HSA_AGENT_INFO_NAME writes a fixed 64-byte NUL-terminated string.
+    char buf[64] = {};
+    HSA_CHECK(hsa_agent_get_info(aie_agent_, HSA_AGENT_INFO_NAME, buf));
+    buf[sizeof(buf) - 1] = '\0';
+    return std::string(buf);
+  }
+
   // Load + cache the PDI/insts for a kernel and return its program handle.
   // Keyed by (pdi_path, insts_path) so repeated prepares (or a PDI shared by
   // two signatures) reuse the same device allocation. Thread-safe.
@@ -716,6 +728,25 @@ void write_err(char *errbuf, size_t errbuf_len, const std::string &msg) {
 }
 
 } // namespace
+
+extern "C" int triton_npu_hsa_agent_name(char *buf, size_t buf_len,
+                                         char *errbuf, size_t errbuf_len) {
+  try {
+    if (!buf || buf_len == 0)
+      throw std::runtime_error("null or zero-length output buffer");
+    const std::string name = runtime().agent_name();
+    if (name.size() + 1 > buf_len)
+      throw std::runtime_error("agent name '" + name +
+                               "' does not fit in the " +
+                               std::to_string(buf_len) + "-byte buffer");
+    std::memcpy(buf, name.c_str(), name.size() + 1);
+    return 0;
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len,
+              std::string("HSA agent query failed: ") + e.what());
+    return -1;
+  }
+}
 
 extern "C" triton_npu_hsa_program_t
 triton_npu_hsa_prepare(const char *pdi_path, const char *insts_path,

@@ -671,14 +671,80 @@ NPU_MODELS = {
     "npu2": ["npu4", "Strix", "npu5", "Strix Halo", "npu6", "Krackan"],
 }
 
+# Device names reported by the HSA AIE agent (HSA_AGENT_INFO_NAME), which names
+# the AIE generation directly rather than the marketing name xrt-smi prints.
+NPU_AGENT_NAMES = {"aie2": "npu1", "aie2p": "npu2"}
 
-def detect_npu_version():
+
+@functools.lru_cache(maxsize=1)
+def _hsa_agent_name() -> str:
+    """Device name reported by the HSA AIE agent, e.g. ``"aie2p"``.
+
+    Loads the shared HSA runtime (building it if needed) and calls its
+    ``triton_npu_hsa_agent_name``. Deliberately reuses that library rather than
+    dlopen-ing ROCR separately from Python: the launcher loads the very same
+    ``.so``, so the process keeps a single ``hsa_init`` and a single HsaRuntime
+    singleton, which the AIE agent requires (``QUEUES_MAX == 1``).
+    """
+    import ctypes
+
+    include_dir = os.path.join(Path(__file__).resolve().parent, "include")
+    lib_dir = _build_hsa_runtime_lib(include_dir, _get_rocr_install())
+    lib = ctypes.CDLL(os.path.join(lib_dir, "libtriton_npu_hsa.so"))
+
+    fn = lib.triton_npu_hsa_agent_name
+    fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+    fn.restype = ctypes.c_int
+
+    buf = ctypes.create_string_buffer(64)
+    err = ctypes.create_string_buffer(512)
+    if fn(buf, len(buf), err, len(err)) != 0:
+        raise RuntimeError(err.value.decode("utf-8", errors="replace"))
+    return buf.value.decode("utf-8", errors="replace")
+
+
+class UnsupportedNPUDeviceError(RuntimeError):
+    """The AIE agent named a device generation this backend does not know.
+
+    Kept distinct from the errors raised when the agent cannot be *queried*
+    (no ROCR, no agent, runtime library unbuildable). A failed query says
+    nothing about the hardware, so falling back to xrt-smi is reasonable; an
+    answer we do not recognize is a definite negative, and continuing would
+    mean compiling for a guessed generation.
+    """
+
+
+def _detect_npu_version_hsa() -> str:
+    """Identify the NPU generation from the HSA AIE agent."""
+    name = _hsa_agent_name().strip().lower()
+    version = NPU_AGENT_NAMES.get(name)
+    if version is None:
+        raise UnsupportedNPUDeviceError(
+            f"The HSA AIE agent reports device name {name!r}, which this "
+            f"backend does not recognize (known: {sorted(NPU_AGENT_NAMES)}). "
+            "Refusing to guess the NPU generation: compiling for the wrong one "
+            "wedges the device until the driver timeout fires. Set "
+            "AMD_TRITON_NPU_TARGET (or npu_config.target) to 'npu1'/'npu2' to "
+            "override, or add the name to NPU_AGENT_NAMES if it is supported."
+        )
+    return version
+
+
+def detect_npu_version(runtime=None):
     """Map known device names to internal NPU version strings.
 
     If ``npu_config.target`` is set (programmatically or via the
     ``AMD_TRITON_NPU_TARGET`` env var), use that value directly
     (must be 'npu1' or 'npu2'). This enables cross-compilation
     without local NPU hardware.
+
+    ``runtime`` is the caller's launch runtime ("xrt" or "hsa"), defaulting to
+    ``npu_config.runtime``. Under HSA the generation is read from the AIE agent
+    first, so an HSA-only host does not need XRT installed merely to identify
+    the device. If that *query* fails the search continues with xrt-smi, but an
+    agent that answers with an unrecognized device name raises
+    ``UnsupportedNPUDeviceError`` immediately rather than letting a second
+    source supply a generation for hardware we do not know.
     """
     target = npu_config.target
     if target is not None:
@@ -689,6 +755,26 @@ def detect_npu_version():
                 f"Supported values: {list(NPU_MODELS.keys())}"
             )
         return target
+
+    if runtime is None:
+        runtime = npu_config.runtime
+    hsa_error = None
+    if runtime == "hsa":
+        try:
+            return _detect_npu_version_hsa()
+        except UnsupportedNPUDeviceError:
+            # The agent answered and we did not recognize it. Propagate rather
+            # than consulting xrt-smi: a second opinion here would only produce
+            # a generation for hardware this backend has never been validated
+            # against, which is exactly the guess we are refusing to make.
+            raise
+        except Exception as e:
+            # The agent could not be queried at all (no ROCR, no AIE agent, the
+            # runtime library would not build). That says nothing about the
+            # hardware, so let xrt-smi try.
+            hsa_error = e
+            logger.debug("HSA device detection failed, trying xrt-smi: %s", e)
+
     devices = get_npu_device_info()
     for device in devices:
         name = device["name"]
@@ -696,9 +782,10 @@ def detect_npu_version():
             if any(kw.lower() in name.lower() for kw in keywords):
                 return version
     if not devices:
-        raise RuntimeError(
-            "No NPU devices found. Ensure XRT is installed and xrt-smi is available."
-        )
+        msg = "No NPU devices found. Ensure XRT is installed and xrt-smi is available."
+        if hsa_error is not None:
+            msg += f" Detection via the HSA AIE agent also failed: {hsa_error}"
+        raise RuntimeError(msg)
     device_names = [d["name"] for d in devices]
     raise RuntimeError(
         f"Unsupported NPU device(s): {device_names}. "
@@ -725,7 +812,7 @@ def _get_output_format(runtime=None):
     """
     if runtime is None:
         runtime = npu_config.runtime
-    npu_version = detect_npu_version()
+    npu_version = detect_npu_version(runtime)
     configured_format = npu_config.output_format
     if runtime == "hsa":
         if configured_format is not None and configured_format != "pdi":
@@ -1791,7 +1878,7 @@ def compile_module(
         with open(Path(os.path.join(air_proj_path, "asm_air_output.mlir")), "w") as f:
             f.write(str(air_output))
 
-        npu_version = detect_npu_version()
+        npu_version = detect_npu_version(link_profile)
         key_data = (
             str(air_output)
             + f"_timing_{autotune_time}"
