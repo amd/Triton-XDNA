@@ -635,16 +635,45 @@ private:
 
   // Allocate a fresh vmem buffer of at least `size` bytes (rounded up to the
   // pool granule), mapped and granted RW access to the CPU and AIE agents.
+  // Each step is undone if a later one fails. This is not just leak hygiene:
+  // a half-built buffer strands a *mapping*, and a stranded mapping makes the
+  // next allocation that reserves the same virtual address fail -- so leaking
+  // here breaks unrelated allocations later, not merely this one.
   DeviceBuffer vmem_alloc(std::size_t size) {
     size = round_up(size);
     DeviceBuffer b{};
     b.size = size;
     HSA_CHECK(hsa_amd_vmem_handle_create(data_pool_, size, MEMORY_TYPE_PINNED,
                                          0, &b.handle));
-    HSA_CHECK(hsa_amd_vmem_address_reserve_align(
-        &b.va, size, 0, 0, HSA_AMD_VMEM_ADDRESS_NO_REGISTER));
-    HSA_CHECK(hsa_amd_vmem_map(b.va, size, 0, b.handle, 0));
-    HSA_CHECK(set_vmem_access(b.va, size, true));
+    try {
+      HSA_CHECK(hsa_amd_vmem_address_reserve_align(
+          &b.va, size, 0, 0, HSA_AMD_VMEM_ADDRESS_NO_REGISTER));
+    } catch (...) {
+      log_status("hsa_amd_vmem_handle_release",
+                 hsa_amd_vmem_handle_release(b.handle));
+      throw;
+    }
+    try {
+      HSA_CHECK(hsa_amd_vmem_map(b.va, size, 0, b.handle, 0));
+    } catch (...) {
+      log_status("hsa_amd_vmem_address_free",
+                 hsa_amd_vmem_address_free(b.va, size));
+      log_status("hsa_amd_vmem_handle_release",
+                 hsa_amd_vmem_handle_release(b.handle));
+      throw;
+    }
+    try {
+      HSA_CHECK(set_vmem_access(b.va, size, true));
+    } catch (...) {
+      // Access was never granted, so unmapping directly is safe here (the
+      // revoke in vmem_free exists to drop grants that *were* applied).
+      log_status("hsa_amd_vmem_unmap", hsa_amd_vmem_unmap(b.va, size));
+      log_status("hsa_amd_vmem_address_free",
+                 hsa_amd_vmem_address_free(b.va, size));
+      log_status("hsa_amd_vmem_handle_release",
+                 hsa_amd_vmem_handle_release(b.handle));
+      throw;
+    }
     return b;
   }
 
