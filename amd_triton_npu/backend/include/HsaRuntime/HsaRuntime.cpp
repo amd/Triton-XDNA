@@ -63,16 +63,25 @@ struct HsaTimeoutError : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// Build (but do not throw) a runtime_error describing a failed HSA call.
+// Returning it rather than throwing lets a caller that must release resources
+// first run its cleanup and then throw once, instead of unwinding through a
+// catch block only to rethrow.
+std::runtime_error hsa_error(const char *what, hsa_status_t status) {
+  const char *m = nullptr;
+  hsa_status_string(status, &m);
+  return std::runtime_error(std::string(what) +
+                            " failed: " + (m ? m : "unknown HSA error"));
+}
+
 // Throw std::runtime_error with the HSA status string on a non-success status.
+// For calls with nothing to clean up on failure; where cleanup is needed,
+// check the status directly and throw hsa_error() after unwinding.
 #define HSA_CHECK(expr)                                                        \
   do {                                                                         \
     hsa_status_t _s = (expr);                                                  \
-    if (_s != HSA_STATUS_SUCCESS) {                                            \
-      const char *_m = nullptr;                                                \
-      hsa_status_string(_s, &_m);                                              \
-      throw std::runtime_error(std::string(#expr) +                            \
-                               " failed: " + (_m ? _m : "unknown HSA error")); \
-    }                                                                          \
+    if (_s != HSA_STATUS_SUCCESS)                                              \
+      throw hsa_error(#expr, _s);                                              \
   } while (0)
 
 // ---- Agent discovery -------------------------------------------------------
@@ -590,10 +599,8 @@ private:
     log_status("hsa_amd_vmem_set_access(NONE)",
                set_vmem_access(b.va, b.size, false));
     log_status("hsa_amd_vmem_unmap", hsa_amd_vmem_unmap(b.va, b.size));
-    log_status("hsa_amd_vmem_address_free",
-               hsa_amd_vmem_address_free(b.va, b.size));
-    log_status("hsa_amd_vmem_handle_release",
-               hsa_amd_vmem_handle_release(b.handle));
+    release_address(b);
+    release_handle(b);
     b.va = nullptr;
   }
 
@@ -655,38 +662,49 @@ private:
     size = round_up(size);
     DeviceBuffer b{};
     b.size = size;
-    HSA_CHECK(hsa_amd_vmem_handle_create(data_pool_, size, MEMORY_TYPE_PINNED,
-                                         0, &b.handle));
-    try {
-      HSA_CHECK(hsa_amd_vmem_address_reserve_align(
-          &b.va, size, 0, 0, HSA_AMD_VMEM_ADDRESS_NO_REGISTER));
-    } catch (...) {
-      log_status("hsa_amd_vmem_handle_release",
-                 hsa_amd_vmem_handle_release(b.handle));
-      throw;
+    hsa_status_t st = hsa_amd_vmem_handle_create(
+        data_pool_, size, MEMORY_TYPE_PINNED, 0, &b.handle);
+    if (st != HSA_STATUS_SUCCESS)
+      throw hsa_error("hsa_amd_vmem_handle_create", st);
+
+    st = hsa_amd_vmem_address_reserve_align(&b.va, size, 0, 0,
+                                            HSA_AMD_VMEM_ADDRESS_NO_REGISTER);
+    if (st != HSA_STATUS_SUCCESS) {
+      release_handle(b);
+      throw hsa_error("hsa_amd_vmem_address_reserve_align", st);
     }
-    try {
-      HSA_CHECK(hsa_amd_vmem_map(b.va, size, 0, b.handle, 0));
-    } catch (...) {
-      log_status("hsa_amd_vmem_address_free",
-                 hsa_amd_vmem_address_free(b.va, size));
-      log_status("hsa_amd_vmem_handle_release",
-                 hsa_amd_vmem_handle_release(b.handle));
-      throw;
+
+    st = hsa_amd_vmem_map(b.va, size, 0, b.handle, 0);
+    if (st != HSA_STATUS_SUCCESS) {
+      release_address(b);
+      release_handle(b);
+      throw hsa_error("hsa_amd_vmem_map", st);
     }
-    try {
-      HSA_CHECK(set_vmem_access(b.va, size, true));
-    } catch (...) {
+
+    st = set_vmem_access(b.va, size, true);
+    if (st != HSA_STATUS_SUCCESS) {
       // Access was never granted, so unmapping directly is safe here (the
       // revoke in vmem_free exists to drop grants that *were* applied).
-      log_status("hsa_amd_vmem_unmap", hsa_amd_vmem_unmap(b.va, size));
-      log_status("hsa_amd_vmem_address_free",
-                 hsa_amd_vmem_address_free(b.va, size));
-      log_status("hsa_amd_vmem_handle_release",
-                 hsa_amd_vmem_handle_release(b.handle));
-      throw;
+      log_status("hsa_amd_vmem_unmap", hsa_amd_vmem_unmap(b.va, b.size));
+      release_address(b);
+      release_handle(b);
+      throw hsa_error("hsa_amd_vmem_set_access", st);
     }
     return b;
+  }
+
+  // Reclaim steps of a vmem buffer, in reverse order of acquisition. Used both
+  // by vmem_free and to unwind a partially built buffer in vmem_alloc; they
+  // report rather than throw, so an allocation failure surfaces its own status
+  // instead of one from the cleanup.
+  void release_address(const DeviceBuffer &b) {
+    log_status("hsa_amd_vmem_address_free",
+               hsa_amd_vmem_address_free(b.va, b.size));
+  }
+
+  void release_handle(const DeviceBuffer &b) {
+    log_status("hsa_amd_vmem_handle_release",
+               hsa_amd_vmem_handle_release(b.handle));
   }
 
   // Get a buffer of at least `size` bytes: reuse a pooled one of the matching
