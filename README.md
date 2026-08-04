@@ -40,7 +40,7 @@ git submodule update --init
 
 Please follow the instructions in [mlir-aie project](https://github.com/Xilinx/mlir-aie/blob/main/README.md) on how to install the XDNA driver.
 
-### Setup build environment 
+### Setup build environment
 
 #### Option 1: Install Pre-built Wheel (Recommended)
 
@@ -115,12 +115,86 @@ Browse the full set of available operators, their supported datatypes, and AIE2/
 Please make sure to run `source {path_to_xrt}/setup.sh` before running examples.
 The test also depends on PyTorch as CPU reference.
 
-```
+```bash
 cd examples/matmul_bf16_m64_n64_k64
 AIR_TRANSFORM_TILING_SCRIPT=transform_aie2.mlir python matmul_bf16_m64_n64_k64.py
 ```
 
 **Note:** The `transform_aie2.mlir` transform dialect IR is specifically designed for the AIE2 architecture. For AIE2P architecture, use `transform_aie2p.mlir` instead.
+
+### Launch runtime: XRT (default) or HSA
+
+By default kernels are dispatched through XRT (xclbin on npu1, ELF on npu2). An alternative HSA via ROCR runtime dispatches Triton-generated kernels through the AIE agent path (`hsa_amd_aie_kernel_dispatch_packet_t`). Select the runtime by passing it to the driver — `NPUDriver("hsa")` or `NPUDriver("xrt")` — or via the `AMD_TRITON_NPU_RUNTIME` environment variable (honored by a bare `NPUDriver()`):
+
+| Value | Behavior |
+| --- | --- |
+| `xrt` (default) | Dispatch via XRT; artifact is `xclbin` (npu1) or `elf` (npu2). |
+| `hsa` | Dispatch via HSA; the backend produces `pdi` + `insts.bin` and launches them on the AIE agent. |
+
+Under HSA the output format is `pdi`. The HSA runtime is Linux-only and requires
+an **AIE-capable ROCR** — one that provides the AIE dispatch extension header
+(`include/hsa/hsa_ext_amd_aie.h`) and `libhsa-runtime64.so`. A stock `/opt/rocm`
+usually lacks AIE support, so you typically build ROCR from source (below) and
+point the backend at it with `AMD_NPU_ROCR_PATH`.
+
+The backend searches, in order: `AMD_NPU_ROCR_PATH`, `ROCM_PATH`, a pip-installed ROCm (TheRock's `rocm-sdk` wheels), then `/opt/rocm`. A candidate is accepted only if it provides *all* the headers the runtime includes — including `hsa/hsa_ext_amd_aie.h` — plus `libhsa-runtime64`, so an installation without AIE support is reported at startup rather than failing later in the compile. If nothing qualifies, the error lists every candidate and what each was missing.
+
+```bash
+cd examples/hsa_matmul
+python hsa_matmul.py
+```
+
+Or activate it programmatically:
+
+```python
+import triton
+from triton.backends.amd_triton_npu.driver import NPUDriver
+
+triton.runtime.driver.set_active(NPUDriver("hsa"))
+```
+
+#### Building an AIE-capable ROCR
+
+Build rocr-runtime from source and install it to a private prefix. The helper
+`scripts/build-rocr.sh` automates this (defaults install to `<workspace>/opt/rocm`,
+where `<workspace>` is the directory containing this checkout):
+
+```bash
+# Requires the rocm-systems repo (rocr-runtime, with AIE support) checked out.
+# Override ROCR_SRC / PREFIX / CLANG_DIR / JOBS via the environment if needed.
+./scripts/build-rocr.sh
+```
+
+Equivalently, by hand:
+
+```bash
+ROCR_SRC=/path/to/rocm-systems/projects/rocr-runtime
+PREFIX=$HOME/opt/rocm                 # install prefix -> AMD_NPU_ROCR_PATH
+cmake -S "$ROCR_SRC" -B "$ROCR_SRC/build" \
+  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+  -DCMAKE_BUILD_TYPE=Release \
+  # Match your installed clang/LLVM
+  -DClang_DIR=/usr/lib/cmake/clang-22 \
+  -DIMAGE_SUPPORT=OFF \
+  -DBUILD_SHARED_LIBS=ON
+cmake --build "$ROCR_SRC/build" -j"$(nproc)"
+cmake --install "$ROCR_SRC/build"
+```
+
+This installs `include/hsa/hsa_ext_amd_aie.h` and `lib/libhsa-runtime64.so` under
+`$PREFIX`. Point the backend at it and put its `lib/` ahead of any system ROCR at
+runtime:
+
+```bash
+export AMD_NPU_ROCR_PATH="$PREFIX"                       # build/link the HSA runtime against it
+export LD_LIBRARY_PATH="$PREFIX/lib:${LD_LIBRARY_PATH}"  # load its libhsa-runtime64 first
+```
+
+`AMD_NPU_ROCR_PATH` selects which ROCR the backend compiles and links the shared
+HSA runtime (`libtriton_npu_hsa.so`) against. `LD_LIBRARY_PATH` then guarantees
+the freshly built `libhsa-runtime64.so` is loaded ahead of a system-installed one
+(e.g. a stock `/opt/rocm` without AIE support), avoiding a mismatch at dispatch
+time.
 
 ## Windows Support
 

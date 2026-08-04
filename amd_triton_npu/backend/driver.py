@@ -1,6 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
+import functools
 import hashlib
 import json
 import logging
@@ -14,6 +15,7 @@ import importlib.metadata
 import shutil
 
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
@@ -25,7 +27,14 @@ from air.compiler.util import run_transform
 from air.ir import *
 import air.passmanager
 
-from .config import npu_config
+from .config import npu_config, _VALID_RUNTIMES
+from .codegen import (
+    extract_actual_sizes,
+    extract_signature_and_constants,
+    extracted_type,
+    format_of,
+    ty_to_cpp,
+)
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -65,54 +74,6 @@ autotune_time = False
 
 
 # -------------------- Launcher ----------------------------
-def _ty_to_cpp(ty):
-    if ty[0] == "*":
-        return "void*"
-    if ty == "constexpr":
-        return "PyObject*"
-    return {
-        "i1": "int32_t",
-        "i8": "int8_t",
-        "i16": "int16_t",
-        "i32": "int32_t",
-        "i64": "int64_t",
-        "u1": "uint32_t",
-        "u8": "uint8_t",
-        "u16": "uint16_t",
-        "u32": "uint32_t",
-        "u64": "uint64_t",
-        "fp16": "float",
-        "bf16": "bfloat16",
-        "fp32": "float",
-        "f32": "float",
-        "fp64": "double",
-    }[ty]
-
-
-def _extracted_type(ty):
-    if ty[0] == "*":
-        return "PyObject*"
-    if ty == "constexpr":
-        return "PyObject*"
-    return _ty_to_cpp(ty)
-
-
-def _format_of(ty):
-    return {
-        "PyObject*": "O",
-        "constexpr": "O",
-        "float": "f",
-        "double": "d",
-        "long": "l",
-        "int8_t": "b",
-        "int16_t": "h",
-        "int32_t": "i",
-        "int64_t": "l",
-        "uint8_t": "B",
-        "uint16_t": "H",
-        "uint32_t": "I",
-        "uint64_t": "K",
-    }[ty]
 
 
 def _find_mlir_air_binary(binary_name: str) -> str:
@@ -207,7 +168,7 @@ def _get_xrt_path() -> str:
                 missing.append("include/xrt (headers)")
             if not has_lib:
                 missing.append("lib (import libraries)")
-            raise Exception(
+            raise RuntimeError(
                 f"XRT directory found via {source} at {path}, but it appears to "
                 f"be a runtime-only installation — missing: {', '.join(missing)}. "
                 "Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases "
@@ -232,12 +193,275 @@ def _get_xrt_path() -> str:
         if result:
             return result
 
-    raise Exception(
+    raise RuntimeError(
         "XRT development files not found. "
         "Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases "
         "and extract the xrt/ directory to C:\\Program Files\\AMD\\xrt "
         "(or set the XILINX_XRT environment variable to its location)."
     )
+
+
+# Headers the shared HSA runtime (HsaRuntime.cpp) includes, relative to a ROCm
+# prefix. hsa_ext_amd_aie.h carries the AIE dispatch extension and is absent
+# from stock ROCm releases, so requiring it here turns "your ROCm has no AIE
+# support" into an error at discovery rather than a header-not-found deep in
+# the compile.
+_ROCR_HEADERS = ("hsa/hsa.h", "hsa/hsa_ext_amd.h", "hsa/hsa_ext_amd_aie.h")
+
+# Library directories to probe under a ROCm prefix, in order. lib64 and the
+# Debian/Ubuntu multiarch directory matter for system prefixes such as /usr.
+_ROCR_LIB_DIRS = ("lib", "lib64", os.path.join("lib", "x86_64-linux-gnu"))
+
+# Library file names, in preference order. The unversioned name is a symlink
+# from the development package and is what ``-lhsa-runtime64`` needs; ROCm
+# wheels built by TheRock ship no symlinks, so only the SONAME exists there and
+# we link it by absolute path instead.
+_ROCR_LIB_NAMES = ("libhsa-runtime64.so", "libhsa-runtime64.so.1")
+
+# Python packages that may contain a pip-installed ROCm (TheRock). The core
+# runtime package is the one carrying libhsa-runtime64; ``rocm_sdk`` is asked
+# for the platform-specific name first, since it varies by target.
+_PIP_ROCM_PACKAGE = "_rocm_sdk_core"
+
+
+class _RocrInstall(NamedTuple):
+    """A validated ROCm/ROCR installation usable for AIE dispatch."""
+
+    prefix: str  # install root, for diagnostics
+    include_dir: str  # contains hsa/hsa.h
+    lib_dir: str  # contains the library, for -L and -rpath
+    lib_path: str  # the library file itself
+    source: str  # how we found it, for error messages
+
+
+def _pip_rocm_prefix() -> str:
+    """Root of a pip-installed ROCm (TheRock), or ``""`` if there is none.
+
+    Resolves the package directory from its import spec rather than shelling
+    out to the ``rocm-sdk`` CLI: ``rocm-sdk path --root`` reports the
+    multi-gigabyte devel tree, not the runtime package that actually holds
+    libhsa-runtime64.
+    """
+    names = []
+    try:
+        import rocm_sdk
+
+        # The core package name is platform-specific and the accessor for it is
+        # not a stable public API, so try the known spellings and fall through
+        # to the default name if none of them are present.
+        for attr in (
+            "determine_platform_package_name",
+            "_determine_platform_package_name",
+            "platform_package_name",
+        ):
+            fn = getattr(rocm_sdk, attr, None)
+            if callable(fn):
+                try:
+                    name = fn()
+                except Exception:
+                    continue
+                if name:
+                    names.append(name)
+                    break
+    except ImportError:
+        pass
+    names.append(_PIP_ROCM_PACKAGE)
+
+    for name in names:
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            continue
+        if spec is None:
+            continue
+        # A namespace package has no origin; use its search path instead.
+        origin = spec.origin
+        if origin and origin != "namespace":
+            return os.path.dirname(origin)
+        for location in spec.submodule_search_locations or ():
+            return location
+    return ""
+
+
+def _probe_rocr(prefix: str, source: str) -> tuple[Optional[_RocrInstall], str]:
+    """Check whether ``prefix`` is a ROCm install we can build against.
+
+    Returns ``(install, "")`` on success, or ``(None, reason)`` explaining what
+    disqualified it (an empty reason means the prefix simply does not exist, so
+    it is not worth reporting).
+    """
+    if not prefix or not os.path.isdir(prefix):
+        return None, ""
+
+    include_dir = os.path.join(prefix, "include")
+    missing = [
+        h for h in _ROCR_HEADERS if not os.path.isfile(os.path.join(include_dir, h))
+    ]
+
+    lib_path = ""
+    for rel in _ROCR_LIB_DIRS:
+        lib_dir = os.path.join(prefix, rel)
+        for name in _ROCR_LIB_NAMES:
+            candidate = os.path.join(lib_dir, name)
+            if os.path.isfile(candidate):
+                lib_path = candidate
+                break
+        if lib_path:
+            break
+
+    if missing or not lib_path:
+        reasons = []
+        if missing:
+            reasons.append(
+                "missing header(s) " + ", ".join("include/" + m for m in missing)
+            )
+        if not lib_path:
+            reasons.append(
+                f"no {_ROCR_LIB_NAMES[0]} under " + ", ".join(_ROCR_LIB_DIRS)
+            )
+        return None, f"{prefix} (via {source}): " + "; ".join(reasons)
+
+    return (
+        _RocrInstall(
+            prefix=prefix,
+            include_dir=include_dir,
+            lib_dir=os.path.dirname(lib_path),
+            lib_path=lib_path,
+            source=source,
+        ),
+        "",
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _get_rocr_install() -> _RocrInstall:
+    """Locate a ROCm/ROCR install providing the AIE-capable HSA runtime.
+
+    Search order:
+
+    1. ``AMD_NPU_ROCR_PATH``
+    2. ``ROCM_PATH``
+    3. a pip-installed ROCm (TheRock), see :func:`_pip_rocm_prefix`
+    4. the system location ``/opt/rocm``
+
+    Every candidate must supply the headers HsaRuntime.cpp includes -- notably
+    ``hsa/hsa_ext_amd_aie.h`` -- and libhsa-runtime64. Candidates that fail are
+    collected and reported together, so a prefix that was set explicitly but is
+    unusable says *why* instead of being silently skipped.
+    """
+    candidates = [
+        ("AMD_NPU_ROCR_PATH", os.getenv("AMD_NPU_ROCR_PATH", "")),
+        ("ROCM_PATH", os.getenv("ROCM_PATH", "")),
+        ("pip-installed ROCm", _pip_rocm_prefix()),
+        ("default location", "/opt/rocm"),
+    ]
+
+    rejected = []
+    for source, prefix in candidates:
+        install, reason = _probe_rocr(prefix, source)
+        if install is not None:
+            return install
+        if reason:
+            rejected.append(reason)
+
+    detail = ""
+    if rejected:
+        detail = "\nRejected candidates:\n" + "\n".join("  - " + r for r in rejected)
+    raise RuntimeError(
+        "No ROCR install with AIE support found. The HSA launch runtime "
+        "(AMD_TRITON_NPU_RUNTIME=hsa) needs a ROCm prefix providing "
+        + ", ".join("include/" + h for h in _ROCR_HEADERS)
+        + " and lib/libhsa-runtime64.so. Stock ROCm releases do not ship "
+        "hsa/hsa_ext_amd_aie.h; build an AIE-capable ROCR with "
+        "scripts/build-rocr.sh and point AMD_NPU_ROCR_PATH at its install "
+        "prefix." + detail
+    )
+
+
+def _run_compile(cmd, env=None):
+    """Run a compiler/build subprocess, echoing its output to stderr on failure.
+
+    Honors ``npu_config.debug`` (streams output live). On a non-zero exit,
+    writes the captured combined stdout/stderr to our stderr and raises
+    ``subprocess.CalledProcessError``. Shared by the aircc, launcher, and
+    HSA-runtime-lib builds.
+    """
+    if npu_config.debug:
+        subprocess.check_call(cmd, env=env)
+        return
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env
+    )
+    if result.returncode != 0:
+        if result.stdout:
+            stderr_buf = getattr(sys.stderr, "buffer", None)
+            if stderr_buf is not None:
+                stderr_buf.write(result.stdout)
+            else:
+                sys.stderr.write(result.stdout.decode("utf-8", errors="replace"))
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd, output=result.stdout
+        )
+
+
+def _build_hsa_runtime_lib(include_dir: str, rocr: _RocrInstall) -> str:
+    """Build (once, cached) the shared HSA runtime library; return its directory.
+
+    Compiles ``include/HsaRuntime/HsaRuntime.cpp`` into ``libtriton_npu_hsa.so``
+    linked against ROCR. The build is cached (keyed by source + ROCR path), so it
+    happens only once per toolchain. Every generated HSA launcher links this one
+    ``.so``; because the dynamic linker loads a shared dependency once per
+    process, the ``HsaRuntime`` singleton inside it is process-global (one queue),
+    which is what lets multiple kernel signatures run on an AIE agent limited to
+    ``QUEUES_MAX == 1``.
+
+    Built at runtime (not as a wheel/install-time artifact) on purpose: ROCR is
+    resolved from the environment (see ``_get_rocr_install``), and the wheel may
+    be built on a host without ROCR. Do not move this into setup.py/CMake without
+    solving ROCR-less builds.
+
+    Returns the directory containing the ``.so`` (for the launcher's -L / -rpath).
+    """
+    lib_name = "libtriton_npu_hsa.so"
+    src_path = os.path.join(include_dir, "HsaRuntime", "HsaRuntime.cpp")
+    with open(src_path, "rb") as f:
+        src_bytes = f.read()
+    key_src = src_bytes + f"_rocr_{rocr.lib_path}_hsartlib".encode()
+    key = hashlib.md5(key_src).hexdigest()
+    cache = get_cache_manager(key)
+    lib_path = cache.get_file(lib_name)
+    if lib_path is not None:
+        return os.path.dirname(lib_path)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = os.path.join(tmpdir, lib_name)
+        cmd = [
+            "g++",
+            "-std=c++23",
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-pthread",
+            src_path,
+            f"-I{include_dir}",
+            f"-I{rocr.include_dir}",
+            f"-L{rocr.lib_dir}",
+            f"-Wl,-rpath,{rocr.lib_dir}",
+            # Link the resolved file rather than -lhsa-runtime64: a ROCm wheel
+            # ships only libhsa-runtime64.so.1, and without the unversioned
+            # symlink the linker's -l lookup fails.
+            (
+                "-lhsa-runtime64"
+                if os.path.basename(rocr.lib_path) == _ROCR_LIB_NAMES[0]
+                else rocr.lib_path
+            ),
+            "-o",
+            out_path,
+        ]
+        _run_compile(cmd)
+        with open(out_path, "rb") as f:
+            lib_path = cache.put(f.read(), lib_name, binary=True)
+    return os.path.dirname(lib_path)
 
 
 def _find_msvc_cl() -> str:
@@ -299,7 +523,7 @@ def _find_msvc_cl() -> str:
                     if os.path.isfile(candidate):
                         return candidate
 
-    raise Exception(
+    raise RuntimeError(
         "MSVC compiler (cl.exe) not found. Triton-XDNA needs MSVC for JIT "
         "compilation of NPU dispatch code on Windows.\n"
         "Options:\n"
@@ -335,7 +559,7 @@ def _get_msvc_env(cl_path: str) -> dict:
     msvc_lib = os.path.join(msvc_ver_dir, "lib", "x64")
 
     if not os.path.isdir(msvc_include):
-        raise Exception(
+        raise RuntimeError(
             f"Found cl.exe at {cl_path} but could not locate MSVC include "
             f"directory at {msvc_include}. Run from a VS Developer Command Prompt "
             "or ensure INCLUDE/LIB environment variables are set."
@@ -451,14 +675,80 @@ NPU_MODELS = {
     "npu2": ["npu4", "Strix", "npu5", "Strix Halo", "npu6", "Krackan"],
 }
 
+# Device names reported by the HSA AIE agent (HSA_AGENT_INFO_NAME), which names
+# the AIE generation directly rather than the marketing name xrt-smi prints.
+NPU_AGENT_NAMES = {"aie2": "npu1", "aie2p": "npu2"}
 
-def detect_npu_version():
+
+@functools.lru_cache(maxsize=1)
+def _hsa_agent_name() -> str:
+    """Device name reported by the HSA AIE agent, e.g. ``"aie2p"``.
+
+    Loads the shared HSA runtime (building it if needed) and calls its
+    ``triton_npu_hsa_agent_name``. Deliberately reuses that library rather than
+    dlopen-ing ROCR separately from Python: the launcher loads the very same
+    ``.so``, so the process keeps a single ``hsa_init`` and a single HsaRuntime
+    singleton, which the AIE agent requires (``QUEUES_MAX == 1``).
+    """
+    import ctypes
+
+    include_dir = os.path.join(Path(__file__).resolve().parent, "include")
+    lib_dir = _build_hsa_runtime_lib(include_dir, _get_rocr_install())
+    lib = ctypes.CDLL(os.path.join(lib_dir, "libtriton_npu_hsa.so"))
+
+    fn = lib.triton_npu_hsa_agent_name
+    fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+    fn.restype = ctypes.c_int
+
+    buf = ctypes.create_string_buffer(64)
+    err = ctypes.create_string_buffer(512)
+    if fn(buf, len(buf), err, len(err)) != 0:
+        raise RuntimeError(err.value.decode("utf-8", errors="replace"))
+    return buf.value.decode("utf-8", errors="replace")
+
+
+class UnsupportedNPUDeviceError(RuntimeError):
+    """The AIE agent named a device generation this backend does not know.
+
+    Kept distinct from the errors raised when the agent cannot be *queried*
+    (no ROCR, no agent, runtime library unbuildable). A failed query says
+    nothing about the hardware, so falling back to xrt-smi is reasonable; an
+    answer we do not recognize is a definite negative, and continuing would
+    mean compiling for a guessed generation.
+    """
+
+
+def _detect_npu_version_hsa() -> str:
+    """Identify the NPU generation from the HSA AIE agent."""
+    name = _hsa_agent_name().strip().lower()
+    version = NPU_AGENT_NAMES.get(name)
+    if version is None:
+        raise UnsupportedNPUDeviceError(
+            f"The HSA AIE agent reports device name {name!r}, which this "
+            f"backend does not recognize (known: {sorted(NPU_AGENT_NAMES)}). "
+            "Refusing to guess the NPU generation: compiling for the wrong one "
+            "wedges the device until the driver timeout fires. Set "
+            "AMD_TRITON_NPU_TARGET (or npu_config.target) to 'npu1'/'npu2' to "
+            "override, or add the name to NPU_AGENT_NAMES if it is supported."
+        )
+    return version
+
+
+def detect_npu_version(runtime=None):
     """Map known device names to internal NPU version strings.
 
     If ``npu_config.target`` is set (programmatically or via the
     ``AMD_TRITON_NPU_TARGET`` env var), use that value directly
     (must be 'npu1' or 'npu2'). This enables cross-compilation
     without local NPU hardware.
+
+    ``runtime`` is the caller's launch runtime ("xrt" or "hsa"), defaulting to
+    ``npu_config.runtime``. Under HSA the generation is read from the AIE agent
+    first, so an HSA-only host does not need XRT installed merely to identify
+    the device. If that *query* fails the search continues with xrt-smi, but an
+    agent that answers with an unrecognized device name raises
+    ``UnsupportedNPUDeviceError`` immediately rather than letting a second
+    source supply a generation for hardware we do not know.
     """
     target = npu_config.target
     if target is not None:
@@ -469,6 +759,26 @@ def detect_npu_version():
                 f"Supported values: {list(NPU_MODELS.keys())}"
             )
         return target
+
+    if runtime is None:
+        runtime = npu_config.runtime
+    hsa_error = None
+    if runtime == "hsa":
+        try:
+            return _detect_npu_version_hsa()
+        except UnsupportedNPUDeviceError:
+            # The agent answered and we did not recognize it. Propagate rather
+            # than consulting xrt-smi: a second opinion here would only produce
+            # a generation for hardware this backend has never been validated
+            # against, which is exactly the guess we are refusing to make.
+            raise
+        except Exception as e:
+            # The agent could not be queried at all (no ROCR, no AIE agent, the
+            # runtime library would not build). That says nothing about the
+            # hardware, so let xrt-smi try.
+            hsa_error = e
+            logger.debug("HSA device detection failed, trying xrt-smi: %s", e)
+
     devices = get_npu_device_info()
     for device in devices:
         name = device["name"]
@@ -476,9 +786,10 @@ def detect_npu_version():
             if any(kw.lower() in name.lower() for kw in keywords):
                 return version
     if not devices:
-        raise RuntimeError(
-            "No NPU devices found. Ensure XRT is installed and xrt-smi is available."
-        )
+        msg = "No NPU devices found. Ensure XRT is installed and xrt-smi is available."
+        if hsa_error is not None:
+            msg += f" Detection via the HSA AIE agent also failed: {hsa_error}"
+        raise RuntimeError(msg)
     device_names = [d["name"] for d in devices]
     raise RuntimeError(
         f"Unsupported NPU device(s): {device_names}. "
@@ -486,16 +797,36 @@ def detect_npu_version():
     )
 
 
-def _get_output_format():
+def _get_output_format(runtime=None):
     """Determine the output format for the NPU backend.
+
+    ``runtime`` is the caller's launch runtime ("xrt" or "hsa"); it defaults to
+    ``npu_config.runtime`` for callers (e.g. multilaunch) that don't thread a
+    driver-bound runtime through. Passing it explicitly is the single source of
+    truth for the launcher path, so the format never disagrees with the runtime.
 
     Checks ``npu_config.output_format`` first (which itself falls back to
     the ``AMD_TRITON_NPU_OUTPUT_FORMAT`` env var).
     If not set, defaults to "elf" on npu2 and "xclbin" on npu1.
     ELF format is only supported on npu2 (AIE2P) devices.
+
+    Under the HSA runtime the artifact must be PDI + insts, since the ROCR AIE
+    dispatch path consumes a raw ``aie.pdi`` and its ``insts.bin`` sidecar. In
+    that case "pdi" is forced and an explicit ELF/xclbin request is rejected.
     """
-    npu_version = detect_npu_version()
+    if runtime is None:
+        runtime = npu_config.runtime
+    npu_version = detect_npu_version(runtime)
     configured_format = npu_config.output_format
+    if runtime == "hsa":
+        if configured_format is not None and configured_format != "pdi":
+            raise RuntimeError(
+                f"ROCR requires the 'pdi' output format, but "
+                f"output_format={configured_format!r} was requested. Unset "
+                "AMD_TRITON_NPU_OUTPUT_FORMAT (or npu_config.output_format), or "
+                "set it to 'pdi'."
+            )
+        return "pdi"
     if configured_format is not None:
         if configured_format == "elf" and npu_version == "npu1":
             raise RuntimeError(
@@ -802,10 +1133,8 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ, actual_sizes=None):
 
 
 def _generate_launcher(constants, signature, kernel_name):
-    arg_decls = ", ".join(f"{_ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
-    args_format = "".join(
-        [_format_of(_extracted_type(ty)) for ty in signature.values()]
-    )
+    arg_decls = ", ".join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
+    args_format = "".join([format_of(extracted_type(ty)) for ty in signature.values()])
     format = "iiiOOOO" + args_format
     args_list = (
         ", " + ", ".join(f"&_arg{i}" for i, ty in signature.items())
@@ -814,14 +1143,14 @@ def _generate_launcher(constants, signature, kernel_name):
     )
 
     kernel_arg_decls = ", ".join(
-        _ty_to_cpp(ty) if ty[0] != "*" else f"int64_t, void*"
+        ty_to_cpp(ty) if ty[0] != "*" else f"int64_t, void*"
         for i, ty in signature.items()
         if ty != "constexpr"
     )
     kernel_arg_decls += ", " if kernel_arg_decls else ""
 
     kernel_parameters = ", ".join(
-        f"static_cast<{_ty_to_cpp(ty)}>(arg{i})" if ty[0] != "*" else f"0, &ptr_arg{i}"
+        f"static_cast<{ty_to_cpp(ty)}>(arg{i})" if ty[0] != "*" else f"0, &ptr_arg{i}"
         for i, ty in signature.items()
         if ty != "constexpr"
     )
@@ -945,7 +1274,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
     // get instruction sequence
     auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(int),
                             XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
-    
+
     {' '.join(f'auto bo_{i} = xrt::bo(device, size{i}, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({i+3}));' for i, ty in signature.items() if i not in constants and ty[0] == "*")}
 
     if (verbosity >= 1)
@@ -961,7 +1290,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
     if (verbosity >= 1)
         std::cout << "Running Kernel." << std::endl;
     unsigned int opcode = 3;
-    {'auto start = std::chrono::high_resolution_clock::now();' if autotune_time else ''} 
+    {'auto start = std::chrono::high_resolution_clock::now();' if autotune_time else ''}
     auto run = kernel(opcode, bo_instr, instr_v.size(), {','.join(f'bo_{i}' for i, ty in signature.items() if i not in constants and ty[0] == "*")});
     run.wait();
     {'auto stop = std::chrono::high_resolution_clock::now(); float npu_time = std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();' if autotune_time else ''}
@@ -979,115 +1308,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
   }}
 }}
 
-typedef struct _DevicePtrInfo {{
-  void *dev_ptr;
-  bool valid;
-}} DevicePtrInfo;
-
-static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
-  DevicePtrInfo ptr_info;
-  ptr_info.dev_ptr = 0;
-  ptr_info.valid = true;
-  if (PyLong_Check(obj)) {{
-    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(obj));
-    return ptr_info;
-  }}
-  if (obj == Py_None) {{
-    // valid nullptr
-    return ptr_info;
-  }}
-  PyObject *ptr = PyObject_GetAttrString(obj, "data_ptr");
-  if(ptr){{
-    PyObject *empty_tuple = PyTuple_New(0);
-    PyObject *ret = PyObject_Call(ptr, empty_tuple, NULL);
-    Py_DECREF(empty_tuple);
-    Py_DECREF(ptr);
-    if (!PyLong_Check(ret)) {{
-      PyErr_SetString(PyExc_TypeError, "data_ptr method of Pointer object must return 64-bit int");
-      ptr_info.valid = false;
-      return ptr_info;
-    }}
-    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));
-    if(!ptr_info.dev_ptr)
-      return ptr_info;
-    Py_DECREF(ret);  // Thanks ChatGPT!
-    return ptr_info;
-  }}
-  PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
-  return ptr_info;
-}}
-
-long getNumElements(PyObject *obj) {{
-    PyObject *shape = PyObject_GetAttrString(obj, "shape");
-    if (!shape) {{
-        PyErr_Print();
-        return -1;
-    }}
-
-    if (!PySequence_Check(shape)) {{
-        Py_DECREF(shape);
-        PyErr_SetString(PyExc_TypeError, "Attribute 'shape' is not a sequence.");
-        return -1;
-    }}
-
-    Py_ssize_t ndim = PySequence_Size(shape);
-    if (ndim < 0) {{
-        Py_DECREF(shape);
-        PyErr_Print();
-        return -1;
-    }}
-
-    long num_elements = 1;
-    for (Py_ssize_t i = 0; i < ndim; ++i) {{
-        PyObject *dim_obj = PySequence_GetItem(shape, i);
-        if (!dim_obj) {{
-            Py_DECREF(shape);
-            PyErr_Print();
-            return -1;
-        }}
-
-        long dim = PyLong_AsLong(dim_obj);
-        Py_DECREF(dim_obj);
-
-        if (dim == -1 && PyErr_Occurred()) {{
-            Py_DECREF(shape);
-            PyErr_Print();
-            return -1;
-        }}
-
-        num_elements *= dim;
-    }}
-
-    Py_DECREF(shape);
-    return num_elements;
-}}
-
-long getElementSizeInBytes(PyObject *obj) {{
-    if (!obj) return -1;
-
-    PyObject *dtype = PyObject_GetAttrString(obj, "dtype");
-    if (!dtype) {{
-        PyErr_Print();
-        return -1;
-    }}
-
-    PyObject *itemsize = PyObject_GetAttrString(dtype, "itemsize");
-    Py_DECREF(dtype);
-    if (!itemsize) {{
-        PyErr_Print();
-        return -1;
-    }}
-
-    long size = PyLong_AsLong(itemsize);
-    Py_DECREF(itemsize);
-
-    if (size == -1 && PyErr_Occurred()) {{
-        PyErr_Print();
-        return -1;
-    }}
-
-    return size;
-}}
+#include "npu_dispatch_common.h"
 
 static PyObject* launch(PyObject* self, PyObject* args) {{
   int gridX, gridY, gridZ;
@@ -1095,7 +1316,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   PyObject *launch_exit_hook = NULL;
   PyObject *kernel_metadata = NULL;
   PyObject *launch_metadata = NULL;
-  {' '.join([f"{_extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
+  {' '.join([f"{extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
   if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ,
                                            &kernel_metadata, &launch_metadata,
                                            &launch_enter_hook, &launch_exit_hook {args_list})) {{
@@ -1113,7 +1334,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  {"; ".join([f"long tensor_volume{i} = getNumElements(_arg{i}) * getElementSizeInBytes(_arg{i}); if (tensor_volume{i} == -1) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  {"; ".join([f"long nelem{i} = getNumElements(_arg{i}); long ebytes{i} = getElementSizeInBytes(_arg{i}); if (nelem{i} == -1 || ebytes{i} == -1) return NULL; long tensor_volume{i} = nelem{i} * ebytes{i};" if ty[0] == "*" else "" for i, ty in signature.items()])};
   _launch(gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
 
   if (PyErr_Occurred()) {{
@@ -1159,10 +1380,8 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 
 def _generate_elf_launcher(constants, signature, kernel_name):
     """Generate C++ launcher code using XRT ELF APIs (for NPU2/AIE2P only)."""
-    arg_decls = ", ".join(f"{_ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
-    args_format = "".join(
-        [_format_of(_extracted_type(ty)) for ty in signature.values()]
-    )
+    arg_decls = ", ".join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
+    args_format = "".join([format_of(extracted_type(ty)) for ty in signature.values()])
     format = "iiiOOOO" + args_format
     args_list = (
         ", " + ", ".join(f"&_arg{i}" for i, ty in signature.items())
@@ -1294,115 +1513,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
   }}
 }}
 
-typedef struct _DevicePtrInfo {{
-  void *dev_ptr;
-  bool valid;
-}} DevicePtrInfo;
-
-static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
-  DevicePtrInfo ptr_info;
-  ptr_info.dev_ptr = 0;
-  ptr_info.valid = true;
-  if (PyLong_Check(obj)) {{
-    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(obj));
-    return ptr_info;
-  }}
-  if (obj == Py_None) {{
-    // valid nullptr
-    return ptr_info;
-  }}
-  PyObject *ptr = PyObject_GetAttrString(obj, "data_ptr");
-  if(ptr){{
-    PyObject *empty_tuple = PyTuple_New(0);
-    PyObject *ret = PyObject_Call(ptr, empty_tuple, NULL);
-    Py_DECREF(empty_tuple);
-    Py_DECREF(ptr);
-    if (!PyLong_Check(ret)) {{
-      PyErr_SetString(PyExc_TypeError, "data_ptr method of Pointer object must return 64-bit int");
-      ptr_info.valid = false;
-      return ptr_info;
-    }}
-    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));
-    if(!ptr_info.dev_ptr)
-      return ptr_info;
-    Py_DECREF(ret);  // Thanks ChatGPT!
-    return ptr_info;
-  }}
-  PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
-  return ptr_info;
-}}
-
-long getNumElements(PyObject *obj) {{
-    PyObject *shape = PyObject_GetAttrString(obj, "shape");
-    if (!shape) {{
-        PyErr_Print();
-        return -1;
-    }}
-
-    if (!PySequence_Check(shape)) {{
-        Py_DECREF(shape);
-        PyErr_SetString(PyExc_TypeError, "Attribute 'shape' is not a sequence.");
-        return -1;
-    }}
-
-    Py_ssize_t ndim = PySequence_Size(shape);
-    if (ndim < 0) {{
-        Py_DECREF(shape);
-        PyErr_Print();
-        return -1;
-    }}
-
-    long num_elements = 1;
-    for (Py_ssize_t i = 0; i < ndim; ++i) {{
-        PyObject *dim_obj = PySequence_GetItem(shape, i);
-        if (!dim_obj) {{
-            Py_DECREF(shape);
-            PyErr_Print();
-            return -1;
-        }}
-
-        long dim = PyLong_AsLong(dim_obj);
-        Py_DECREF(dim_obj);
-
-        if (dim == -1 && PyErr_Occurred()) {{
-            Py_DECREF(shape);
-            PyErr_Print();
-            return -1;
-        }}
-
-        num_elements *= dim;
-    }}
-
-    Py_DECREF(shape);
-    return num_elements;
-}}
-
-long getElementSizeInBytes(PyObject *obj) {{
-    if (!obj) return -1;
-
-    PyObject *dtype = PyObject_GetAttrString(obj, "dtype");
-    if (!dtype) {{
-        PyErr_Print();
-        return -1;
-    }}
-
-    PyObject *itemsize = PyObject_GetAttrString(dtype, "itemsize");
-    Py_DECREF(dtype);
-    if (!itemsize) {{
-        PyErr_Print();
-        return -1;
-    }}
-
-    long size = PyLong_AsLong(itemsize);
-    Py_DECREF(itemsize);
-
-    if (size == -1 && PyErr_Occurred()) {{
-        PyErr_Print();
-        return -1;
-    }}
-
-    return size;
-}}
+#include "npu_dispatch_common.h"
 
 static PyObject* launch(PyObject* self, PyObject* args) {{
   int gridX, gridY, gridZ;
@@ -1410,7 +1521,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   PyObject *launch_exit_hook = NULL;
   PyObject *kernel_metadata = NULL;
   PyObject *launch_metadata = NULL;
-  {' '.join([f"{_extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
+  {' '.join([f"{extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
   if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ,
                                            &kernel_metadata, &launch_metadata,
                                            &launch_enter_hook, &launch_exit_hook {args_list})) {{
@@ -1428,7 +1539,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  {"; ".join([f"long tensor_volume{i} = getNumElements(_arg{i}) * getElementSizeInBytes(_arg{i}); if (tensor_volume{i} == -1) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  {"; ".join([f"long nelem{i} = getNumElements(_arg{i}); long ebytes{i} = getElementSizeInBytes(_arg{i}); if (nelem{i} == -1 || ebytes{i} == -1) return NULL; long tensor_volume{i} = nelem{i} * ebytes{i};" if ty[0] == "*" else "" for i, ty in signature.items()])};
   _launch(gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
 
   if (PyErr_Occurred()) {{
@@ -1613,26 +1724,7 @@ def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
     # deeper call chains in register-intensive kernels.
     aircc_cmd.insert(-1, "--stack-size")
     aircc_cmd.insert(-1, "2048")
-    if npu_config.debug:
-        subprocess.check_call(aircc_cmd)
-    else:
-        result = subprocess.run(
-            aircc_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        if result.returncode != 0:
-            if result.stdout:
-                stderr_buf = getattr(sys.stderr, "buffer", None)
-                if stderr_buf is not None:
-                    stderr_buf.write(result.stdout)
-                else:
-                    sys.stderr.write(result.stdout.decode("utf-8", errors="replace"))
-            raise subprocess.CalledProcessError(
-                result.returncode,
-                aircc_cmd,
-                output=result.stdout,
-            )
+    _run_compile(aircc_cmd)
 
     if output_format == "elf":
         # Extract kernel name from ELF config.json. aircc writes
@@ -1707,7 +1799,24 @@ def compile_module(
     output_format="xclbin",
     actual_sizes=None,
     on_cache_resolved=None,
+    link_profile="xrt",
 ):
+    """Lower a kernel and JIT-compile its host launcher shared object.
+
+    ``link_profile`` selects the runtime the generated launcher links against:
+
+    * ``"xrt"``  -- XRT (xclbin/ELF); links xrt_coreutil + uuid.
+    * ``"hsa"``  -- HSA AIE dispatch via ROCR; links libhsa-runtime64. Requires
+      ``output_format == "pdi"``.
+    """
+    if link_profile not in ("xrt", "hsa"):
+        raise ValueError(f"link_profile must be 'xrt' or 'hsa'; got {link_profile!r}")
+    if IS_WINDOWS and link_profile == "hsa":
+        # Assert this up front, before resolving the ROCR SDK below, so the
+        # user gets this clear message instead of a "ROCR not found" error.
+        raise RuntimeError(
+            "HSA (AMD_TRITON_NPU_RUNTIME=hsa) with AIE is only supported on Linux."
+        )
     py_version = sys.version_info
     if platform.system() == "Windows":
         py_include_dir = os.path.join(sys.base_prefix, "include")
@@ -1727,7 +1836,16 @@ def compile_module(
         )
     npu_backend_path = Path(__file__).resolve().parent
     include_dir = os.path.join(npu_backend_path, "include")
-    xrt_dir = _get_xrt_path()
+    # Runtime-specific SDK locations. Only resolve the one we actually link
+    # against so an XRT-only or ROCR-only host still works.
+    xrt_dir = _get_xrt_path() if link_profile == "xrt" else None
+    # HSA launchers link the shared runtime library (built once against ROCR),
+    # not ROCR directly, so all signatures share one process-global HsaRuntime.
+    hsa_rt_dir = (
+        _build_hsa_runtime_lib(include_dir, _get_rocr_install())
+        if link_profile == "hsa"
+        else None
+    )
     aie_test_utils_dir = _get_aie_test_utils_path()
 
     def launch(
@@ -1749,7 +1867,7 @@ def compile_module(
         # Fast path: check if we've already loaded the .pyd for this kernel
         input_key = hashlib.md5(
             asm_src + f"_{gridX}_{gridY}_{gridZ}_{kernel_name}"
-            f"_{autotune_time}_{output_format}"
+            f"_{autotune_time}_{output_format}_{link_profile}"
             f"_{os.getenv('AMD_TRITON_NPU_BF16_EMULATION', '0')}".encode()
         ).hexdigest()
 
@@ -1778,11 +1896,12 @@ def compile_module(
         with open(Path(os.path.join(air_proj_path, "asm_air_output.mlir")), "w") as f:
             f.write(str(air_output))
 
-        npu_version = detect_npu_version()
+        npu_version = detect_npu_version(link_profile)
         key_data = (
             str(air_output)
             + f"_timing_{autotune_time}"
             + f"_format_{output_format}"
+            + f"_link_{link_profile}"
             + f"_npu_{npu_version}"
             + f"_bf16emu_{npu_config.bf16_emulation}"
         )
@@ -1850,43 +1969,34 @@ def compile_module(
                         f"-l{py_lib}",
                         "-fPIC",
                         "-Wall",
-                        f"-I{os.path.join(xrt_dir, 'include')}",
-                        f"-L{os.path.join(xrt_dir, 'lib')}",
-                        "-luuid",
-                        "-lxrt_coreutil",
-                        "-lrt",
-                        "-lstdc++",
                     ]
+                    if link_profile == "hsa":
+                        # Link the shared HSA runtime (libtriton_npu_hsa.so),
+                        # which in turn links libhsa-runtime64. The launcher needs
+                        # no ROCR headers -- only the C ABI in include/HsaRuntime
+                        # (covered by -I{include_dir} above). rpath keeps both
+                        # .so's loadable without LD_LIBRARY_PATH.
+                        compile_flags += [
+                            f"-L{hsa_rt_dir}",
+                            f"-Wl,-rpath,{hsa_rt_dir}",
+                            "-ltriton_npu_hsa",
+                            "-lstdc++",
+                        ]
+                    else:
+                        compile_flags += [
+                            f"-I{os.path.join(xrt_dir, 'include')}",
+                            f"-L{os.path.join(xrt_dir, 'lib')}",
+                            "-luuid",
+                            "-lxrt_coreutil",
+                            "-lrt",
+                            "-lstdc++",
+                        ]
                     if output_format != "elf":
                         # xclbin mode previously needed test_utils for loading
                         # instruction binary, but that has been inlined.
                         pass
                     compile_flags += ["-o", so_path]
-                _quiet = os.getenv("TRITON_NPU_QUIET", "0") != "0"
-                _devnull = subprocess.DEVNULL if _quiet else None
-                if npu_config.debug:
-                    subprocess.check_call(compile_flags, env=msvc_env)
-                else:
-                    result = subprocess.run(
-                        compile_flags,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        env=msvc_env,
-                    )
-                    if result.returncode != 0:
-                        if result.stdout:
-                            stderr_buf = getattr(sys.stderr, "buffer", None)
-                            if stderr_buf is not None:
-                                stderr_buf.write(result.stdout)
-                            else:
-                                sys.stderr.write(
-                                    result.stdout.decode("utf-8", errors="replace")
-                                )
-                        raise subprocess.CalledProcessError(
-                            result.returncode,
-                            compile_flags,
-                            output=result.stdout,
-                        )
+                _run_compile(compile_flags, env=msvc_env)
 
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
@@ -1980,62 +2090,58 @@ def compile_module(
 
 
 class NPULauncher(object):
-    def __init__(self, src, metadata):
-        kernel_placeholder_name = "KERNEL_NAME_PLACEHOLDER"
+    # Placeholder replaced with the real kernel name at compile time.
+    kernel_placeholder_name = "KERNEL_NAME_PLACEHOLDER"
 
-        constants = src.constants if hasattr(src, "constants") else dict()
-        cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
-        constants = {cst_key(key): value for key, value in constants.items()}
-        signature = {cst_key(key): value for key, value in src.signature.items()}
-        # Detect output format: ELF for npu2, xclbin for npu1
-        self.output_format = _get_output_format()
-        if self.output_format == "elf":
-            launcher_src = _generate_elf_launcher(
-                constants, signature, kernel_placeholder_name
+    # Instance attributes, declared here so every instance has a well-defined
+    # shape even if compilation raises before they are assigned in _finalize.
+    output_format: "str | None" = None
+    npu_cache_dir: "str | None" = None
+    launch = None  # callable(gridX, gridY, gridZ, stream, function, *args)
+
+    def __init__(self, src, metadata, runtime="xrt"):
+        """Build the host launcher for ``src`` targeting ``runtime``.
+
+        ``runtime`` is "xrt" (xclbin/ELF via XRT) or "hsa" (PDI + insts via
+        HSA/ROCR); it is bound by ``NPUDriver`` when it constructs the launcher.
+        """
+        constants, signature = extract_signature_and_constants(src)
+        if runtime == "hsa":
+            # HSA consumes PDI + insts and links ROCR. Import lazily so the
+            # (large) HSA codegen module is only loaded when the HSA path is used.
+            from .hsa_launcher import _generate_hsa_launcher
+
+            self.output_format = "pdi"
+            launcher_src = _generate_hsa_launcher(
+                constants, signature, self.kernel_placeholder_name
             )
+            link_profile = "hsa"
         else:
-            launcher_src = _generate_launcher(
-                constants, signature, kernel_placeholder_name
-            )
+            # Detect output format: ELF for npu2, xclbin for npu1. Pass the
+            # bound runtime so the format decision matches this launcher's
+            # runtime rather than the (possibly different) global config.
+            self.output_format = _get_output_format(runtime=runtime)
+            if self.output_format == "elf":
+                launcher_src = _generate_elf_launcher(
+                    constants, signature, self.kernel_placeholder_name
+                )
+            else:
+                launcher_src = _generate_launcher(
+                    constants, signature, self.kernel_placeholder_name
+                )
+            link_profile = "xrt"
 
-        # Extract actual problem sizes from constexpr args for padding support.
-        # When the kernel has constexpr args named "M" and "N", their values
-        # are the actual (non-padded) problem dimensions. These are passed to
-        # air-wrap-func-with-parallel as actual-sizes to enable DMA padding
-        # via air-split-launch-for-padding on boundary tiles.
-        # Only set actual-sizes when dimensions are NOT tile-aligned (i.e.,
-        # M % BLOCK_SIZE_M != 0 or N % BLOCK_SIZE_N != 0), to avoid triggering
-        # the padding split path when it's not needed.
-        actual_sizes = None
-        if hasattr(src, "fn") and hasattr(src.fn, "arg_names"):
-            arg_names = src.fn.arg_names
-            raw_constants = src.constants if hasattr(src, "constants") else {}
+        self._finalize(src, launcher_src, link_profile=link_profile)
 
-            def _get_constexpr(name):
-                """Look up a constexpr value by arg name, trying multiple key forms."""
-                if name not in arg_names:
-                    return None
-                idx = arg_names.index(name)
-                # src.constants uses tuple keys (idx,) per ASTSource.__init__,
-                # but check multiple forms for robustness across versions.
-                for key in [(idx,), idx, name]:
-                    if key in raw_constants:
-                        return raw_constants[key]
-                return None
+    def _finalize(self, src, launcher_src: str, link_profile: str = "xrt") -> None:
+        """Extract padding sizes, wire the cache-dir callback, and JIT-compile.
 
-            m_val = _get_constexpr("M")
-            n_val = _get_constexpr("N")
-            if m_val is not None and n_val is not None:
-                bsm = _get_constexpr("BLOCK_SIZE_M")
-                bsn = _get_constexpr("BLOCK_SIZE_N")
-                needs_padding = True
-                if bsm is not None and bsn is not None:
-                    needs_padding = (m_val % bsm != 0) or (n_val % bsn != 0)
-                if needs_padding:
-                    actual_sizes = f"{m_val},{n_val},1"
+        Uses ``self.output_format`` (set by ``__init__``). Shared by the XRT and
+        HSA paths so the compile/caching tail is defined once; ``link_profile``
+        selects which runtime the launcher links against.
+        """
+        actual_sizes = extract_actual_sizes(src)
 
-        # Later KERNEL_NAME_PLACEHOLDER will be used to assign the kernel name
-        # in the following launch function.
         self.npu_cache_dir = None
 
         def _on_cache_resolved(cache_dir):
@@ -2043,10 +2149,11 @@ class NPULauncher(object):
 
         self.launch = compile_module(
             launcher_src,
-            kernel_placeholder_name,
+            self.kernel_placeholder_name,
             self.output_format,
             actual_sizes=actual_sizes,
             on_cache_resolved=_on_cache_resolved,
+            link_profile=link_profile,
         )
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):
@@ -2142,14 +2249,38 @@ class NPUUtils(object):
 
 class NPUDriver(DriverBase):
 
-    def __init__(self):
+    def __init__(self, runtime=None):
+        """Create the NPU driver for a launch runtime.
+
+        ``runtime`` selects how kernels are dispatched:
+
+        * ``"xrt"`` -- XRT (xclbin on npu1, ELF on npu2).
+        * ``"hsa"`` -- HSA/ROCR AIE dispatch (PDI + insts).
+
+        Defaults to ``npu_config.runtime`` (the ``AMD_TRITON_NPU_RUNTIME`` env
+        var, itself defaulting to ``"xrt"``), so ``NPUDriver()`` honors the
+        environment while ``NPUDriver("hsa")`` / ``NPUDriver("xrt")`` force it.
+        """
         super().__init__()
+        if runtime is None:
+            # Already validated + normalized by the config property.
+            runtime = npu_config.runtime
+        elif isinstance(runtime, str):
+            runtime = runtime.lower()  # match npu_config.runtime normalization
+        if runtime not in _VALID_RUNTIMES:
+            raise ValueError(
+                f"runtime must be one of {sorted(_VALID_RUNTIMES)}; got {runtime!r}"
+            )
+        # Exposed for introspection (e.g. triton.runtime.driver.active.runtime).
+        self.runtime = runtime
         self.utils = NPUUtils()
-        self.launcher_cls = NPULauncher
+        # Triton instantiates the launcher as ``launcher_cls(src, metadata)`` and
+        # never passes the driver, so bind the chosen runtime here.
+        self.launcher_cls = functools.partial(NPULauncher, runtime=runtime)
         self.binary_ext = "ttsharedir"
 
     # NPU driver won't be automatically chosen unless explicitly set through
-    # triton.runtime.driver.set_active(NPUDriver())
+    # triton.runtime.driver.set_active(NPUDriver()) / NPUDriver("hsa").
     @staticmethod
     def is_active():
         return False
@@ -2246,4 +2377,4 @@ class NPUDriver(DriverBase):
         return args
 
     def map_python_to_cpp_type(self, ty: str) -> str:
-        return _ty_to_cpp(ty)
+        return ty_to_cpp(ty)

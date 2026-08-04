@@ -42,6 +42,7 @@ from dataclasses import MISSING
 from pathlib import Path
 
 _VALID_TARGETS = frozenset(("npu1", "npu2"))
+_VALID_RUNTIMES = frozenset(("xrt", "hsa"))
 
 
 class _NPUConfig:
@@ -60,6 +61,7 @@ class _NPUConfig:
         self._air_project_path = MISSING
         self._debug = MISSING
         self._target = MISSING
+        self._runtime = MISSING
 
     # ---- compile_only ----
 
@@ -225,6 +227,46 @@ class _NPUConfig:
                 )
         self._target = value
 
+    # ---- runtime ----
+
+    @property
+    def runtime(self):
+        """Select the launch runtime: ``"xrt"`` (default) or ``"hsa"``.
+
+        ``"xrt"`` dispatches through XRT (xclbin/ELF). ``"hsa"`` dispatches
+        Triton-generated kernels through HSA using the AIE agent path;
+        under HSA the backend produces PDI + insts artifacts.
+
+        Env var fallback: ``AMD_TRITON_NPU_RUNTIME``. If the environment
+        variable is set to a non-empty unsupported value, a ``ValueError``
+        is raised.
+        """
+        if self._runtime is not MISSING:
+            return self._runtime
+        v = os.getenv("AMD_TRITON_NPU_RUNTIME", "")
+        if not v:
+            return "xrt"
+        v = v.lower()
+        if v not in _VALID_RUNTIMES:
+            raise ValueError(
+                f"AMD_TRITON_NPU_RUNTIME must be one of {sorted(_VALID_RUNTIMES)} "
+                f"or empty/unset; got {v!r}"
+            )
+        return v
+
+    @runtime.setter
+    def runtime(self, value):
+        if value is None:
+            self._runtime = MISSING
+            return
+        value = value.lower()
+        if value not in _VALID_RUNTIMES:
+            raise ValueError(
+                f"runtime must be one of {sorted(_VALID_RUNTIMES)} or None; "
+                f"got {value!r}"
+            )
+        self._runtime = value
+
     # ---- utilities ----
 
     def reset(self):
@@ -236,6 +278,7 @@ class _NPUConfig:
         self._air_project_path = MISSING
         self._debug = MISSING
         self._target = MISSING
+        self._runtime = MISSING
 
 
 # Module-level singleton
@@ -265,6 +308,7 @@ def set_config(**kwargs):
         "output_format",
         "air_project_path",
         "target",
+        "runtime",
     }
     for key, value in kwargs.items():
         if key not in valid_keys:
