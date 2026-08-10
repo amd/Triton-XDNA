@@ -1020,13 +1020,116 @@ def _inject_transform_library(user_script):
     return result
 
 
-def _get_transform_ir_string():
+def _detect_matmul(asm_src_text):
+    """Detect a single plain matmul in the TritonShared IR.
+
+    Returns a dict {m, k, n, in_elem, out_elem} when the module contains
+    exactly one ``linalg.matmul`` and no linalg compute ops other than
+    ``fill`` (fused epilogues are out of scope). Returns None otherwise, in
+    which case the caller keeps the built-in default tiling.
+    """
+    import re
+
+    # Bail if any linalg op other than matmul / fill is present (fusion).
+    linalg_ops = set(re.findall(r"linalg\.(\w+)", asm_src_text))
+    if not linalg_ops.issubset({"matmul", "fill"}):
+        return None
+
+    matmuls = re.findall(
+        r"linalg\.matmul\b.*?"
+        r"ins\([^:]*:\s*tensor<(\d+)x(\d+)x(\w+)>,\s*tensor<(\d+)x(\d+)x(\w+)>\)\s*"
+        r"outs\([^:]*:\s*tensor<(\d+)x(\d+)x(\w+)>\)",
+        asm_src_text,
+        flags=re.DOTALL,
+    )
+    if len(matmuls) != 1:
+        return None
+
+    m, k, in_elem, k2, n, in_elem2, m2, n2, out_elem = matmuls[0]
+    m, k, n, k2, m2, n2 = int(m), int(k), int(n), int(k2), int(m2), int(n2)
+    # Defensive shape consistency: A[MxK] * B[KxN] = C[MxN].
+    if k != k2 or m != m2 or n != n2 or in_elem != in_elem2:
+        return None
+    return {"m": m, "k": k, "n": n, "in_elem": in_elem, "out_elem": out_elem}
+
+
+def _matmul_transform_params(info, npu_version):
+    """Derive generate_matmul_transform kwargs from a detected matmul.
+
+    Returns a kwargs dict (l1_m, l1_n, l2_k, pack_sizes, accum_type,
+    contract_input_type, bf16_emulation) or None if the shape/dtype cannot
+    be mapped to a valid schedule.
+    """
+    if info is None:
+        return None
+
+    # Pack sizes and herd caps are architecture-specific.
+    if npu_version == "npu2":
+        pack_m, pack_n, pack_k = 8, 8, 8
+        cap_m, cap_n = 4, 4
+    else:  # npu1 (Phoenix, 4x2 array)
+        pack_m, pack_n, pack_k = 4, 4, 8
+        cap_m, cap_n = 4, 2
+
+    # dtype -> accumulator / contract-input / bf16-emulation rules.
+    in_elem, out_elem = info["in_elem"], info["out_elem"]
+    if in_elem == "f32":
+        accum_type, contract_input_type, bf16_emulation = "f32", "bf16", True
+    elif in_elem == "bf16":
+        accum_type, contract_input_type, bf16_emulation = "f32", None, False
+    elif in_elem == "i8":
+        accum_type, contract_input_type, bf16_emulation = "i32", "i16", False
+    else:
+        return None
+
+    m, k, n = info["m"], info["k"], info["n"]
+    # Pack requires exact divisibility of each dim by its pack size.
+    if m % pack_m or n % pack_n or k % pack_k:
+        return None
+
+    def _largest_divisor_leq(x, cap):
+        for d in range(min(x, cap), 0, -1):
+            if x % d == 0:
+                return d
+        return 1
+
+    # Distribute the packed M/N outer dims across the core array (herd).
+    herd_m = _largest_divisor_leq(m // pack_m, cap_m)
+    herd_n = _largest_divisor_leq(n // pack_n, cap_n)
+    l1_m = m // herd_m
+    l1_n = n // herd_n
+
+    # L2 K tile: largest multiple of pack_k dividing K, capped at 2*pack_k.
+    # A small K tile keeps L2 buffering conservative; larger tiles were
+    # observed to miscompute padded boundary tiles under the
+    # air-split-launch-for-padding path.
+    l2k_cap = 2 * pack_k
+    l2_k = pack_k
+    for v in range(min(k, l2k_cap) - (min(k, l2k_cap) % pack_k), 0, -pack_k):
+        if k % v == 0:
+            l2_k = v
+            break
+
+    return {
+        "l1_m": l1_m,
+        "l1_n": l1_n,
+        "l2_k": l2_k,
+        "pack_sizes": (pack_m, pack_n, pack_k),
+        "accum_type": accum_type,
+        "contract_input_type": contract_input_type,
+        "bf16_emulation": bf16_emulation,
+    }
+
+
+def _get_transform_ir_string(matmul_info=None):
     """
     Get the transform IR string for tiling operations.
 
-    If ``npu_config.transform_tiling_script`` is set (or the
-    ``AIR_TRANSFORM_TILING_SCRIPT`` env var), read the transform IR from
-    that file. Otherwise, use the default hardcoded transform IR string.
+    Priority: (1) a user-supplied script via
+    ``npu_config.transform_tiling_script`` / ``AIR_TRANSFORM_TILING_SCRIPT``;
+    (2) an auto-generated matmul schedule when ``matmul_info`` (kwargs for
+    ``generate_matmul_transform``) is provided; (3) the built-in default
+    tiling IR string.
 
     If the script uses `transform.include`, the shared transform library
     (transform_library.mlir) is automatically injected.
@@ -1048,6 +1151,21 @@ def _get_transform_ir_string():
             logger.debug("Using custom tiling script from: %s", custom_script_path)
             user_script = f.read()
         return _inject_transform_library(user_script)
+
+    # Auto-generated matmul schedule (parameters derived from the IR).
+    if matmul_info is not None:
+        from .matmul_transform import generate_matmul_transform
+
+        logger.debug("Auto-generating matmul transform with params: %s", matmul_info)
+        script = generate_matmul_transform(**matmul_info)
+        try:
+            air_proj_path = npu_config.air_project_path
+            os.makedirs(air_proj_path, exist_ok=True)
+            with open(os.path.join(air_proj_path, "auto_transform.mlir"), "w") as f:
+                f.write(script)
+        except OSError:
+            pass
+        return script
 
     # Default hardcoded transform IR string
     matmul_tiling_size_l1_m = 32
@@ -1083,7 +1201,7 @@ def _get_transform_ir_string():
         """
 
 
-def _ttshared_to_air(mod, gridX, gridY, gridZ, actual_sizes=None):
+def _ttshared_to_air(mod, gridX, gridY, gridZ, actual_sizes=None, matmul_info=None):
     # Get Triton-Shared-MLIR as string
     with tempfile.TemporaryDirectory() as tmpdir:
         dst_path = os.path.join(tmpdir, "airinput.mlir")
@@ -1104,7 +1222,7 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ, actual_sizes=None):
         pm = air.passmanager.PassManager.parse(pipeline, context=air_context)
         pm.run(air_module.operation)
         # MLIR-AIR compilation step 2: tiling the launch body
-        transform_ir_string = _get_transform_ir_string()
+        transform_ir_string = _get_transform_ir_string(matmul_info=matmul_info)
         transform_ir = Module.parse(transform_ir_string, context=air_context)
         run_transform(transform_ir, air_module)
         # MLIR-AIR compilation step 3: converting to AIR
@@ -1583,7 +1701,9 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 """
 
 
-def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
+def _aircc_compile(
+    air_mlir_path, output_format, npu_version, air_proj_path, bf16_emulation=None
+):
     """Run aircc on an AIR-dialect MLIR file to produce an NPU binary.
 
     Resolves the aircc binary + peano flag, builds the command for the requested
@@ -1604,6 +1724,8 @@ def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
     Raises:
         subprocess.CalledProcessError: if aircc exits non-zero.
     """
+    if bf16_emulation is None:
+        bf16_emulation = npu_config.bf16_emulation
     aircc_binary_name = "aircc.exe" if IS_WINDOWS else "aircc"
     aircc_bin = _find_mlir_air_binary(aircc_binary_name)
 
@@ -1714,7 +1836,7 @@ def _aircc_compile(air_mlir_path, output_format, npu_version, air_proj_path):
         ]
     # Enable bf16 emulation: hardware truncates f32 -> bf16 before
     # multiply, with f32 accumulation.
-    if npu_config.bf16_emulation:
+    if bf16_emulation:
         aircc_cmd.insert(-1, "--bf16-emulation")
     # Explicitly set runtime loop tiling sizes to [4,4] (aircc
     # default changed from [4,4] to [] in mlir-air #1470).
@@ -1864,11 +1986,30 @@ def compile_module(
         asm_src = cu_function
         kernel_name = kernel_metadata[6]  # see pack_metadata in compiler.py
 
-        # Fast path: check if we've already loaded the .pyd for this kernel
+        # Auto-generate a matmul tiling schedule when the IR is a plain matmul
+        # and no user script is supplied. f32 matmul additionally turns on
+        # bf16 emulation (no native f32 MAC on AIE). The emulation decision is
+        # keyed off the detected input dtype, not off whether a schedule could
+        # be derived, so an f32 matmul still enables it even when derivation
+        # fails and we fall back to the default tiling.
+        user_script = npu_config.transform_tiling_script
+        matmul_params = None
+        matmul_dtype = None
+        if not user_script:
+            _mm_info = _detect_matmul(asm_src.decode("utf-8", errors="ignore"))
+            if _mm_info is not None:
+                matmul_dtype = _mm_info["in_elem"]
+            matmul_params = _matmul_transform_params(_mm_info, detect_npu_version())
+        effective_bf16 = npu_config.bf16_emulation or matmul_dtype == "f32"
+
+        # Fast path: check if we've already loaded the .pyd for this kernel.
+        # The tiling script path is part of the key so the same kernel compiled
+        # with different schedules (or scriptless vs a user script) does not
+        # collide on the in-process module cache.
         input_key = hashlib.md5(
             asm_src + f"_{gridX}_{gridY}_{gridZ}_{kernel_name}"
             f"_{autotune_time}_{output_format}_{link_profile}"
-            f"_{os.getenv('AMD_TRITON_NPU_BF16_EMULATION', '0')}".encode()
+            f"_{effective_bf16}_{user_script or ''}".encode()
         ).hexdigest()
 
         if input_key in _global_module_cache:
@@ -1891,7 +2032,12 @@ def compile_module(
         os.makedirs(air_proj_path, exist_ok=True)
         Path(os.path.join(air_proj_path, "asm_src.mlir")).write_bytes(asm_src)
         air_output = _ttshared_to_air(
-            asm_src, gridX, gridY, gridZ, actual_sizes=actual_sizes
+            asm_src,
+            gridX,
+            gridY,
+            gridZ,
+            actual_sizes=actual_sizes,
+            matmul_info=matmul_params,
         )
         with open(Path(os.path.join(air_proj_path, "asm_air_output.mlir")), "w") as f:
             f.write(str(air_output))
@@ -1903,7 +2049,7 @@ def compile_module(
             + f"_format_{output_format}"
             + f"_link_{link_profile}"
             + f"_npu_{npu_version}"
-            + f"_bf16emu_{npu_config.bf16_emulation}"
+            + f"_bf16emu_{effective_bf16}"
         )
         key = hashlib.md5(key_data.encode("utf-8")).hexdigest()
 
@@ -2001,7 +2147,11 @@ def compile_module(
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
                 artifacts = _aircc_compile(
-                    air_mlir_path, output_format, npu_version, air_proj_path
+                    air_mlir_path,
+                    output_format,
+                    npu_version,
+                    air_proj_path,
+                    bf16_emulation=effective_bf16,
                 )
 
                 # Cache format-specific artifacts first, then the .so last.
