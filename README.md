@@ -199,11 +199,18 @@ time.
 ## Windows Support
 
 Native Windows builds are supported using MSVC — no WSL or Linux required. The full
-compilation pipeline (Triton → MLIR → xclbin → XRT dispatch) runs natively on Windows.
+compilation pipeline (Triton → MLIR → xclbin/ELF → XRT dispatch) runs natively on Windows.
+
+**Kernel execution on Windows is currently validated on npu2 (AIE2P) devices only.**
+On npu1 (AIE2) the compile pipeline completes, but dispatch goes through the older
+xclbin/DPU path, which is not yet supported on the Windows NPU driver stack; kernels
+abort with `ERT_CMD_STATE_ABORT` and produce zeroed output. Use Linux for npu1 for
+now. See [#88](https://github.com/amd/Triton-XDNA/issues/88).
 
 ### Windows Requirements
 
 - **Windows 10/11** (x64)
+- **AMD NPU: npu2 (AIE2P)** — npu1 (AIE2) is compile-only on Windows for now
 - **Visual Studio 2022** with "Desktop development with C++" workload
 - **Python 3.10–3.14** (3.13 recommended). Prebuilt Windows wheels are published
   for all of these versions; 3.13 is recommended because it matches the prebuilt
@@ -306,6 +313,11 @@ $env:AIR_TRANSFORM_TILING_SCRIPT = "transform_aie2p.mlir"
 python vec-add.py
 ```
 
+`transform_aie2p.mlir` targets npu2 (AIE2P). The npu1 (AIE2) equivalents —
+`transform_aie2.mlir` and `AMD_TRITON_NPU_TARGET=npu1` — compile successfully on
+Windows but do not yet execute; see the limitation noted under
+[Windows Support](#windows-support).
+
 ### Windows Environment Variables
 
 | Variable | Purpose |
@@ -315,6 +327,11 @@ python vec-add.py
 
 ### Windows Known Limitations
 
+- Kernel execution is currently validated on npu2 (AIE2P) only. npu1 (AIE2)
+  compiles but does not yet execute on Windows — dispatch uses the xclbin/DPU
+  path, which the Windows NPU driver stack does not yet support, so kernels abort
+  (`ERT_CMD_STATE_ABORT`) and outputs come back zeroed. Use Linux for npu1 for
+  now. See [#88](https://github.com/amd/Triton-XDNA/issues/88)
 - Python 3.10–3.14 supported; 3.13 recommended so the prebuilt `pyxrt.pyd` in the
   XRT Windows SDK can be used as-is. On other versions, build `pyxrt` from source
   to match your interpreter
