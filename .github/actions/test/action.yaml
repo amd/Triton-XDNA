@@ -55,9 +55,22 @@ runs:
         if [ -f utils/env_setup.sh ]; then
           echo "env_setup.sh found"
           
-          # Set MLIR_AIE_INSTALL_DIR first to skip reinstallation
+          # Set MLIR_AIE_INSTALL_DIR first to skip reinstallation. The build
+          # step already exports it via GITHUB_ENV; only resolve it here if it
+          # is unset. The [aie] extra installs the no-RTTI wheel (dist name:
+          # mlir_aie_no_rtti), so try that name before the RTTI one.
           echo "Setting MLIR_AIE_INSTALL_DIR..."
-          export MLIR_AIE_INSTALL_DIR="$(python3 -m pip show mlir_aie 2>/dev/null | grep ^Location: | awk '{print $2}')/mlir_aie"
+          if [ -z "$MLIR_AIE_INSTALL_DIR" ]; then
+            MLIR_AIE_LOCATION="$(python3 -m pip show mlir_aie_no_rtti 2>/dev/null | grep ^Location: | awk '{print $2}')"
+            if [ -z "$MLIR_AIE_LOCATION" ]; then
+              MLIR_AIE_LOCATION="$(python3 -m pip show mlir_aie 2>/dev/null | grep ^Location: | awk '{print $2}')"
+            fi
+            if [ -z "$MLIR_AIE_LOCATION" ]; then
+              echo "ERROR: could not locate an installed mlir_aie(_no_rtti) package."
+              exit 1
+            fi
+            export MLIR_AIE_INSTALL_DIR="${MLIR_AIE_LOCATION}/mlir_aie"
+          fi
           echo "MLIR_AIE_INSTALL_DIR: $MLIR_AIE_INSTALL_DIR"
           
           echo "Sourcing env_setup.sh..."
@@ -122,7 +135,12 @@ runs:
         echo "PYTHONPATH: $PYTHONPATH"
         echo "PATH: $PATH"
         echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
-        
+        # Report what XRT sees, so a missing/unavailable NPU is obvious in the
+        # log instead of surfacing as a per-test "No NPU devices found".
+        echo "--- xrt-smi examine ---"
+        xrt-smi examine || echo "WARNING: xrt-smi examine failed"
+        ls -l /dev/accel/ || echo "WARNING: /dev/accel not present in container"
+
         echo ""
         echo "=========================================="
         echo "STEP 8: Run Tests"
