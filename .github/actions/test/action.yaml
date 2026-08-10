@@ -137,9 +137,20 @@ runs:
         echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
         # Report what XRT sees, so a missing/unavailable NPU is obvious in the
         # log instead of surfacing as a per-test "No NPU devices found".
-        echo "--- xrt-smi examine ---"
-        xrt-smi examine || echo "WARNING: xrt-smi examine failed"
+        echo "--- xrt version ---"
+        xrt-smi --version || echo "WARNING: xrt-smi --version failed"
+        echo "--- xrt-smi examine (exit status reported below) ---"
+        xrt-smi examine && echo "xrt-smi examine exit: 0" \
+          || echo "xrt-smi examine exit: $? (non-zero)"
         ls -l /dev/accel/ || echo "WARNING: /dev/accel not present in container"
+        # Probe the XRT API the same way the driver now does, so the device
+        # name is in the log even when the suite never gets that far.
+        echo "--- pyxrt device probe ---"
+        python -c "
+        import pyxrt
+        d = pyxrt.device(0)
+        print('pyxrt device name:', repr(d.get_info(pyxrt.xrt_info_device.name)))
+        " || echo "WARNING: pyxrt device probe failed"
 
         echo ""
         echo "=========================================="
