@@ -1063,14 +1063,6 @@ def _matmul_transform_params(info, npu_version):
     if info is None:
         return None
 
-    # Pack sizes and herd caps are architecture-specific.
-    if npu_version == "npu2":
-        pack_m, pack_n, pack_k = 8, 8, 8
-        cap_m, cap_n = 4, 4
-    else:  # npu1 (Phoenix, 4x2 array)
-        pack_m, pack_n, pack_k = 4, 4, 8
-        cap_m, cap_n = 4, 2
-
     # dtype -> accumulator / contract-input / bf16-emulation rules.
     in_elem, out_elem = info["in_elem"], info["out_elem"]
     if in_elem == "f32":
@@ -1078,9 +1070,28 @@ def _matmul_transform_params(info, npu_version):
     elif in_elem == "bf16":
         accum_type, contract_input_type, bf16_emulation = "f32", None, False
     elif in_elem == "i8":
-        accum_type, contract_input_type, bf16_emulation = "i32", "i16", False
+        # No contract-input cast: the AIEVec lowering recovers signedness from
+        # the arith.extsi it peels off the operands, so casting to i16 first
+        # only obscures it.
+        accum_type, contract_input_type, bf16_emulation = "i32", None, False
     else:
         return None
+
+    # Pack sizes are the hardware MAC shape, so they depend on the element type
+    # as well as the target; herd caps depend only on the array. Note
+    # pack_sizes is ordered (M, N, K) while a MAC shape is written (M, K, N) --
+    # the two coincide only when the shape is cubic, which is why npu2 does not
+    # need to distinguish them.
+    if npu_version == "npu2":
+        # AIE2P has an 8x8x8 MAC for both bf16 and i8.
+        pack_m, pack_n, pack_k = 8, 8, 8
+        cap_m, cap_n = 4, 4
+    else:  # npu1 (Phoenix / AIE2, 4x2 array)
+        # IsValidAIE2MatMulShapeAndType lists exactly one shape per input type
+        # on AIE2: bf16 is 4x8 x 8x4 -> 4x4, i8 is 4x8 x 8x8 -> 4x8.
+        pack_m, pack_k = 4, 8
+        pack_n = 8 if in_elem == "i8" else 4
+        cap_m, cap_n = 4, 2
 
     m, k, n = info["m"], info["k"], info["n"]
     # Pack requires exact divisibility of each dim by its pack size.
