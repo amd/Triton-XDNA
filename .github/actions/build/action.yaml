@@ -39,23 +39,15 @@ runs:
       pip install --no-cache-dir lit cmake joblib pybind11 nanobind
       pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-   - name: Install MLIR-AIE with specified hash
+   - name: Install MLIR-AIR (with mlir-aie + llvm-aie via [aie] extra)
      env:
        HOME: /workspace
      shell: bash
      run: |
       source ${{ inputs.env_name }}/bin/activate
-      MLIR_AIE_COMMIT_HASH_FILE=utils/mlir-aie-hash.txt
-      # Install mlir-aie
-      MLIR_AIE_COMMIT_HASH=$(awk -v kw="Commit:" '$0 ~ kw {for (i=1; i<NF; i++) if ($i == kw) print $(i+1)}' "$MLIR_AIE_COMMIT_HASH_FILE")
-      SHORT_MLIR_AIE_COMMIT_HASH="${MLIR_AIE_COMMIT_HASH:0:7}"
-      echo "Using mlir-aie hash: $SHORT_MLIR_AIE_COMMIT_HASH"
-      MLIR_AIE_VERSION=$(awk -v kw="Version:" '$0 ~ kw {for (i=1; i<NF; i++) if ($i == kw) print $(i+1)}' "$MLIR_AIE_COMMIT_HASH_FILE")
-      echo "Version: $MLIR_AIE_VERSION"
-      TIMESTAMP=$(awk -v kw="Timestamp:" '$0 ~ kw {for (i=1; i<NF; i++) if ($i == kw) print $(i+1)}' "$MLIR_AIE_COMMIT_HASH_FILE")
-      echo "Timestamp: $TIMESTAMP"
-      python3 -m pip install mlir_aie==$MLIR_AIE_VERSION.$TIMESTAMP+$SHORT_MLIR_AIE_COMMIT_HASH.no.rtti -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti/
-      # Install mlir-air
+      # The mlir-air wheel pins the matching mlir-aie commit and requires
+      # llvm-aie via the [aie] extra, so a single pip install pulls the whole
+      # stack with a guaranteed-compatible mlir-aie.
       MLIR_AIR_HASH_FILE=utils/mlir-air-hash.txt
       MLIR_AIR_COMMIT_HASH=$(awk -v kw="Commit:" '$0 ~ kw {for (i=1; i<NF; i++) if ($i == kw) print $(i+1)}' "$MLIR_AIR_HASH_FILE")
       SHORT_MLIR_AIR_COMMIT_HASH="${MLIR_AIR_COMMIT_HASH:0:7}"
@@ -64,17 +56,22 @@ runs:
       echo "mlir-air version: $MLIR_AIR_VERSION"
       MLIR_AIR_TIMESTAMP=$(awk -v kw="Timestamp:" '$0 ~ kw {for (i=1; i<NF; i++) if ($i == kw) print $(i+1)}' "$MLIR_AIR_HASH_FILE")
       echo "mlir-air timestamp: $MLIR_AIR_TIMESTAMP"
-      python3 -m pip install mlir_air==$MLIR_AIR_VERSION.$MLIR_AIR_TIMESTAMP+$SHORT_MLIR_AIR_COMMIT_HASH.no.rtti -f https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
-      # Install llvm-aie (latest nightly)
+      python3 -m pip install "mlir_air[aie]==$MLIR_AIR_VERSION.$MLIR_AIR_TIMESTAMP+$SHORT_MLIR_AIR_COMMIT_HASH.no.rtti" \
+          -f https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti \
+          -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
+          -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+      # The [aie] extra requires llvm-aie without a version pin. Force an
+      # upgrade so we always test against the latest nightly wheel.
       python3 -m pip install --no-cache-dir --upgrade --force-reinstall llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
       python3 -m pip show llvm-aie
+      python3 -m pip show mlir_aie_no_rtti
       # Set environmental variable "MLIR_AIE_INSTALL_DIR"
-      MLIR_AIE_INSTALL_DIR_STR="$(python3 -m pip show mlir_aie | grep ^Location: | awk '{print $2}')/mlir_aie"
+      MLIR_AIE_INSTALL_DIR_STR="$(python3 -m pip show mlir_aie_no_rtti | grep ^Location: | awk '{print $2}')/mlir_aie"
       echo "MLIR_AIE_INSTALL_DIR=$MLIR_AIE_INSTALL_DIR_STR" >> $GITHUB_ENV
       # Update paths in environmental variables
-      echo "${MLIR_AIE_INSTALL_DIR}/bin" >> $GITHUB_PATH
-      echo "PYTHONPATH=${MLIR_AIE_INSTALL_DIR}/python:$PYTHONPATH" >> $GITHUB_ENV
-      echo "LD_LIBRARY_PATH=${MLIR_AIE_INSTALL_DIR}/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+      echo "${MLIR_AIE_INSTALL_DIR_STR}/bin" >> $GITHUB_PATH
+      echo "PYTHONPATH=${MLIR_AIE_INSTALL_DIR_STR}/python:$PYTHONPATH" >> $GITHUB_ENV
+      echo "LD_LIBRARY_PATH=${MLIR_AIE_INSTALL_DIR_STR}/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
    - name: Build
      env:
        HOME: /workspace
