@@ -10,12 +10,36 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-
 # Example directories skipped by default unless explicitly selected via --select
 DEFAULT_SKIPPED_EXAMPLES = {
     "layernorm",
     "load_2d_block",
     "multi_drivers",
+}
+
+# Examples that cannot run without a transform script on a given device, keyed
+# by device. An example with no transform_<device>.mlir is otherwise run
+# scriptless, since the driver derives a schedule for matmul IR; these are the
+# cases where that does not work, listed with the reason so the gap is visible
+# rather than hidden behind a missing file.
+SCRIPTLESS_UNSUPPORTED = {
+    "aie2": {
+        # Not matmul, so there is nothing to auto-generate and the built-in
+        # default transform is used instead; it fails to legalize
+        # airrt.dma_memcpy_nd / airrt.segment_load on npu1.
+        "gelu": "non-matmul; built-in default transform fails to legalize on npu1",
+        "rms_norm": "non-matmul; built-in default transform fails to legalize on npu1",
+        # Auto-generation produces a legal schedule, but the resulting L2->L1
+        # copy needs a buffer descriptor of 32768 32-bit words against a
+        # 16383-word maximum for the tile type.
+        "matmul_i8_m128_n64_k64": "aie.dma_bd length exceeds the npu1 tile maximum",
+        # LLM examples targeting npu2. They drive their own per-kernel
+        # transform scripts, all of which are *_aie2p.mlir, so the single
+        # transform_<device>.mlir convention does not apply to them either.
+        "gpt2": "npu2-only example",
+        "qwen2_5": "npu2-only example",
+    },
+    "aie2p": {},
 }
 
 
@@ -207,7 +231,13 @@ def main():
             print()
             continue
 
-        # Check if transform file exists for the target device
+        # Use the device's transform script when the example ships one. When it
+        # does not, run without AIR_TRANSFORM_TILING_SCRIPT rather than
+        # skipping: the driver derives a schedule for matmul IR, and falls back
+        # to the built-in default otherwise. Skipping on a missing file alone
+        # would hide exactly the cases the scriptless path exists to cover --
+        # only the examples listed in SCRIPTLESS_UNSUPPORTED are skipped, and
+        # each carries the reason.
         transform_path = ex_dir / transform_filename
         if transform_path.exists():
             transform_file = transform_filename
@@ -215,13 +245,17 @@ def main():
                 f"   {transform_filename} detected; will set AIR_TRANSFORM_TILING_SCRIPT"
             )
         else:
-            # No transform file for this device - skip the example
+            reason = SCRIPTLESS_UNSUPPORTED.get(args.device, {}).get(ex_dir.name)
+            if reason:
+                print(f"   ⏭️  SKIP: no {transform_filename} and {reason}")
+                skipped += 1
+                print()
+                continue
+            transform_file = None
             print(
-                f"   ⏭️  SKIP: {transform_filename} not found for device {args.device}"
+                f"   no {transform_filename}; running scriptless "
+                f"(driver derives the schedule)"
             )
-            skipped += 1
-            print()
-            continue
 
         for py_file in py_files:
             total_files += 1
