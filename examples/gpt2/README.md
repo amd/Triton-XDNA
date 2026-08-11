@@ -27,8 +27,11 @@ ROCm build of PyTorch must be installed.
 ```bash
 # Prerequisites
 pip install transformers
-# ROCm PyTorch (adjust the ROCm version to match your install)
-pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+# ROCm PyTorch (adjust the ROCm version to match your install). rocm7.2 has
+# native gfx1151 (Strix Halo) kernels; older wheels (e.g. rocm6.2) lack them
+# and fail with "HIP error: invalid device function" unless you set
+# HSA_OVERRIDE_GFX_VERSION.
+pip install torch --index-url https://download.pytorch.org/whl/test/rocm7.2
 
 # Environment setup (required for NPU/hetero modes)
 source /opt/xilinx/xrt/setup.sh

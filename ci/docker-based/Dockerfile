@@ -4,6 +4,11 @@
 # triton-xdna dev container with GitHub Actions runner
 # To run with NPU device passthrough, use:
 # docker run -v /dev/accel/accel0:/dev/accel/accel0 --device-cgroup-rule 'c 261:* rmw' --ulimit memlock=-1:-1 <image>
+# The heterogeneous examples (examples/gpt2, examples/qwen2_5) also run part of
+# the model on the iGPU via ROCm, so those runs additionally need the iGPU
+# devices (/dev/kfd, /dev/dri) passed through. The ROCm userspace ships in the
+# torch wheel, so no host ROCm mount is required. See test_docker_ci.sh /
+# loop_docker_ci.sh for the full device set.
 
 # To build this docker, run from the repo root:
 # docker build -f ci/docker-based/Dockerfile -t triton-xdna-dev-github-runner
@@ -21,6 +26,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # with "error while loading shared libraries" and every XRT query that
     # shells out to it silently reports no NPU.
     libboost-filesystem1.83.0 libboost-program-options1.83.0 \
+    # Runtime deps of the host-mounted ROCm stack, needed by the heterogeneous
+    # examples that run part of the model on the iGPU. Without libelf1, rocminfo
+    # and torch's HIP init fail with "libelf.so.1: cannot open shared object
+    # file"; libnuma/libdrm are pulled in by the ROCm HIP runtime.
+    libelf1 libnuma1 libdrm2 libdrm-amdgpu1 \
     # Required by MHA kernel
     llvm-18 \
     # Clang toolchain for Triton build
