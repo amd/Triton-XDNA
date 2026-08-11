@@ -23,11 +23,12 @@ DEFAULT_SKIPPED_EXAMPLES = {
     #     call <16 x bfloat> @llvm.aie2p.v16accfloat.to.v16bf16(
     #         <16 x float> splat (float 1.702000e+00))
     #
-    # Fixed upstream in mlir-aie 4f156e80833 ("[aiecc] Downgrade LLVM 24
-    # narrow-float decimal literals for Peano", 2026-08-10), which rewrites such
-    # literals to hex. No released wheel carries it yet: the newest mlir-air
-    # wheel (85f638d) pins mlir-aie 687ff97 from 2026-08-07. Drop this entry
-    # once utils/mlir-air-hash.txt moves to a build containing that commit.
+    # The fix is Xilinx/mlir-aie#3528 ("[aiecc] Downgrade LLVM 24 narrow-float
+    # decimal literals for Peano"), which rewrites such literals to hex. That
+    # PR is still open as of 2026-08-11, so no wheel can carry it yet -- and
+    # the newest mlir-air wheel (85f638d) pins mlir-aie 687ff97 from
+    # 2026-08-07 regardless. Drop this entry once #3528 lands and
+    # utils/mlir-air-hash.txt moves to a build containing it.
     "gelu",
 }
 
