@@ -76,6 +76,45 @@ autotune_time = False
 # -------------------- Launcher ----------------------------
 
 
+@functools.lru_cache(maxsize=8)
+def _is_peano_root(root: str) -> bool:
+    """True only for an LLVM install that can actually target AIE.
+
+    Checking for ``bin/opt`` is not enough: *every* LLVM install has one, so
+    an ``LLVM_BINARY_DIR`` pointing at Triton's own LLVM (which is what
+    ``compiler.py`` uses it for) passed the old check and got handed to aiecc
+    as ``--peano``. That LLVM has no AIE backend, so it fails partway through
+    the pipeline on Peano IR it cannot parse, e.g.
+
+        error: floating point constant invalid for type
+          %2 = call <16 x bfloat> @llvm.aie2p.v16accfloat.to.v16bf16(...)
+
+    Ask llc which targets it registers instead; only Peano lists aie2.
+    """
+    if not root:
+        return False
+    root_path = Path(root)
+    opt_name = "opt.exe" if IS_WINDOWS else "opt"
+    llc_name = "llc.exe" if IS_WINDOWS else "llc"
+    if not (root_path / "bin" / opt_name).exists():
+        return False
+    llc = root_path / "bin" / llc_name
+    if not llc.exists():
+        return False
+    try:
+        result = subprocess.run(
+            [str(llc), "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+        )
+    except Exception as e:
+        logger.debug("Could not query %s for its targets: %s", llc, e)
+        return False
+    return "aie2" in result.stdout
+
+
 def _find_mlir_air_binary(binary_name: str) -> str:
     """Locate a binary inside the mlir-air install prefix.
 
@@ -1804,27 +1843,21 @@ def _aircc_compile(
     # aircc. Without --peano, aiecc falls back to whichever opt/llc is on PATH
     # (e.g. a system /usr/bin/opt) which lacks the aie2p/aie2 target and fails
     # with "unrecognized architecture 'aie2p'".
-    opt_name = "opt.exe" if IS_WINDOWS else "opt"
-
-    def _is_peano_root(root) -> bool:
-        # A valid peano root has the AIE-aware opt under bin/.
-        return bool(root) and (Path(root) / "bin" / opt_name).exists()
-
     peano_flag = "--peano="
     # 1) LLVM_BINARY_DIR points to bin/, peano wants the parent. Only trust it
-    #    if that parent actually contains bin/opt, otherwise fall through so a
+    #    if that parent is an AIE-capable LLVM, otherwise fall through so a
     #    misconfigured LLVM_BINARY_DIR doesn't feed aircc a bogus --peano.
     peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
     if peano_dir:
         candidate = Path(peano_dir).parent
-        if _is_peano_root(candidate):
+        if _is_peano_root(str(candidate)):
             peano_flag = f"--peano={candidate}"
     # 2) Auto-detect from the pip-installed llvm-aie package.
     if peano_flag == "--peano=":
         try:
             dist = importlib.metadata.distribution("llvm-aie")
             candidate = Path(dist.locate_file("")) / "llvm-aie"
-            if _is_peano_root(candidate):
+            if _is_peano_root(str(candidate)):
                 peano_flag = f"--peano={candidate}"
         except Exception:
             pass
