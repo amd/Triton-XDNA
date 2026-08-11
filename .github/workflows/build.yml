@@ -66,9 +66,9 @@ jobs:
       MLIR_AIE_INSTALL_DIR_STR="$(python3 -m pip show mlir_aie_no_rtti | grep ^Location: | awk '{print $2}')/mlir_aie"
       echo "MLIR_AIE_INSTALL_DIR=$MLIR_AIE_INSTALL_DIR_STR" >> $GITHUB_ENV
       # Update paths in environmental variables
-      echo "${MLIR_AIE_INSTALL_DIR}/bin" >> $GITHUB_PATH
-      echo "PYTHONPATH=${MLIR_AIE_INSTALL_DIR}/python:$PYTHONPATH" >> $GITHUB_ENV
-      echo "LD_LIBRARY_PATH=${MLIR_AIE_INSTALL_DIR}/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+      echo "${MLIR_AIE_INSTALL_DIR_STR}/bin" >> $GITHUB_PATH
+      echo "PYTHONPATH=${MLIR_AIE_INSTALL_DIR_STR}/python${PYTHONPATH:+:$PYTHONPATH}" >> $GITHUB_ENV
+      echo "LD_LIBRARY_PATH=${MLIR_AIE_INSTALL_DIR_STR}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
    - name: Build
      run: |
       mkdir build

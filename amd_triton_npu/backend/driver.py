@@ -76,6 +76,45 @@ autotune_time = False
 # -------------------- Launcher ----------------------------
 
 
+@functools.lru_cache(maxsize=8)
+def _is_peano_root(root: str) -> bool:
+    """True only for an LLVM install that can actually target AIE.
+
+    Checking for ``bin/opt`` is not enough: *every* LLVM install has one, so
+    an ``LLVM_BINARY_DIR`` pointing at Triton's own LLVM (which is what
+    ``compiler.py`` uses it for) passed the old check and got handed to aiecc
+    as ``--peano``. That LLVM has no AIE backend, so it fails partway through
+    the pipeline on Peano IR it cannot parse, e.g.
+
+        error: floating point constant invalid for type
+          %2 = call <16 x bfloat> @llvm.aie2p.v16accfloat.to.v16bf16(...)
+
+    Ask llc which targets it registers instead; only Peano lists aie2.
+    """
+    if not root:
+        return False
+    root_path = Path(root)
+    opt_name = "opt.exe" if IS_WINDOWS else "opt"
+    llc_name = "llc.exe" if IS_WINDOWS else "llc"
+    if not (root_path / "bin" / opt_name).exists():
+        return False
+    llc = root_path / "bin" / llc_name
+    if not llc.exists():
+        return False
+    try:
+        result = subprocess.run(
+            [str(llc), "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+        )
+    except Exception as e:
+        logger.debug("Could not query %s for its targets: %s", llc, e)
+        return False
+    return "aie2" in result.stdout
+
+
 def _find_mlir_air_binary(binary_name: str) -> str:
     """Locate a binary inside the mlir-air install prefix.
 
@@ -643,10 +682,19 @@ def get_npu_device_info():
             ["xrt-smi", "examine"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            check=True,
+            check=False,
             text=True,
         )
-        output = result.stdout
+        # Parse whatever was printed regardless of the exit status, and include
+        # stderr: xrt-smi can list the device and still exit non-zero (e.g. a
+        # driver/userspace version mismatch, or an unrelated sub-report that
+        # failed). mlir-aie's iron_setup and lit helpers likewise ignore the
+        # return code when no specific device was demanded.
+        output = result.stdout + "\n" + result.stderr
+        if result.returncode != 0:
+            logger.debug(
+                "xrt-smi examine exited %d: %s", result.returncode, result.stderr
+            )
 
         # Match either one or two pipes with optional whitespace around them
         device_pattern = re.compile(
@@ -659,11 +707,18 @@ def get_npu_device_info():
         for bdf, name in matches:
             devices.append({"bdf": bdf, "name": name.strip()})
 
+        if not devices:
+            # The `Device(s) Present` table is a presentation layer: its shape
+            # changes between XRT releases. Fall back to scanning the whole
+            # output for a known model name, as mlir-air's XRTBackend does.
+            for keywords in NPU_MODELS.values():
+                for kw in keywords:
+                    if kw.lower() in output.lower():
+                        devices.append({"bdf": "unknown", "name": kw})
+                        return devices
+
         return devices
 
-    except subprocess.CalledProcessError as e:
-        logger.error("Failed to run xrt-smi: %s", e.stderr)
-        return []
     except Exception as e:
         logger.exception("Unexpected error during NPU device detection")
         return []
@@ -678,6 +733,45 @@ NPU_MODELS = {
 # Device names reported by the HSA AIE agent (HSA_AGENT_INFO_NAME), which names
 # the AIE generation directly rather than the marketing name xrt-smi prints.
 NPU_AGENT_NAMES = {"aie2": "npu1", "aie2p": "npu2"}
+
+
+@functools.lru_cache(maxsize=1)
+def _pyxrt_device_name() -> str:
+    """Return the device name XRT reports for device 0.
+
+    This asks the XRT API directly instead of scraping ``xrt-smi examine``
+    text, which is what mlir-aie's runtime does (``XRTHostRuntime`` reads
+    ``pyxrt.xrt_info_device.name`` and only shells out to xrt-smi as debug
+    output when opening the device fails). The CLI table is a human-facing
+    presentation layer: its columns change between XRT releases, and it can
+    come up empty on a host whose sysfs entries it cannot render even though
+    the device node itself opens fine.
+    """
+    import pyxrt
+
+    device = pyxrt.device(0)
+    name = device.get_info(pyxrt.xrt_info_device.name)
+    # Release the device before returning: this query runs during launcher
+    # construction, and holding an open handle would contend with the actual
+    # kernel dispatch that follows.
+    del device
+    return name
+
+
+def _detect_npu_version_pyxrt() -> str:
+    """Identify the NPU generation from the name XRT reports for device 0."""
+    name = _pyxrt_device_name()
+    for version, keywords in NPU_MODELS.items():
+        if any(kw.lower() in name.lower() for kw in keywords):
+            return version
+    raise UnsupportedNPUDeviceError(
+        f"XRT reports device name {name!r}, which this backend does not "
+        f"recognize (known: {dict(NPU_MODELS)}). Refusing to guess the NPU "
+        "generation: compiling for the wrong one wedges the device until the "
+        "driver timeout fires. Set AMD_TRITON_NPU_TARGET (or "
+        "npu_config.target) to 'npu1'/'npu2' to override, or add the name to "
+        "NPU_MODELS if it is supported."
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -779,6 +873,20 @@ def detect_npu_version(runtime=None):
             hsa_error = e
             logger.debug("HSA device detection failed, trying xrt-smi: %s", e)
 
+    # Ask XRT for the device name before falling back to parsing xrt-smi's
+    # table. Same rule as the HSA path above: a device that answers with a
+    # name we do not recognize propagates immediately, while a failure to
+    # query at all (no pyxrt on the path, device busy) says nothing about the
+    # hardware and lets the next source try.
+    pyxrt_error = None
+    try:
+        return _detect_npu_version_pyxrt()
+    except UnsupportedNPUDeviceError:
+        raise
+    except Exception as e:
+        pyxrt_error = e
+        logger.debug("pyxrt device detection failed, trying xrt-smi: %s", e)
+
     devices = get_npu_device_info()
     for device in devices:
         name = device["name"]
@@ -787,6 +895,8 @@ def detect_npu_version(runtime=None):
                 return version
     if not devices:
         msg = "No NPU devices found. Ensure XRT is installed and xrt-smi is available."
+        if pyxrt_error is not None:
+            msg += f" Querying the XRT device directly also failed: {pyxrt_error}"
         if hsa_error is not None:
             msg += f" Detection via the HSA AIE agent also failed: {hsa_error}"
         raise RuntimeError(msg)
@@ -1733,27 +1843,21 @@ def _aircc_compile(
     # aircc. Without --peano, aiecc falls back to whichever opt/llc is on PATH
     # (e.g. a system /usr/bin/opt) which lacks the aie2p/aie2 target and fails
     # with "unrecognized architecture 'aie2p'".
-    opt_name = "opt.exe" if IS_WINDOWS else "opt"
-
-    def _is_peano_root(root) -> bool:
-        # A valid peano root has the AIE-aware opt under bin/.
-        return bool(root) and (Path(root) / "bin" / opt_name).exists()
-
     peano_flag = "--peano="
     # 1) LLVM_BINARY_DIR points to bin/, peano wants the parent. Only trust it
-    #    if that parent actually contains bin/opt, otherwise fall through so a
+    #    if that parent is an AIE-capable LLVM, otherwise fall through so a
     #    misconfigured LLVM_BINARY_DIR doesn't feed aircc a bogus --peano.
     peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
     if peano_dir:
         candidate = Path(peano_dir).parent
-        if _is_peano_root(candidate):
+        if _is_peano_root(str(candidate)):
             peano_flag = f"--peano={candidate}"
     # 2) Auto-detect from the pip-installed llvm-aie package.
     if peano_flag == "--peano=":
         try:
             dist = importlib.metadata.distribution("llvm-aie")
             candidate = Path(dist.locate_file("")) / "llvm-aie"
-            if _is_peano_root(candidate):
+            if _is_peano_root(str(candidate)):
                 peano_flag = f"--peano={candidate}"
         except Exception:
             pass

@@ -8,9 +8,11 @@ inputs:
     required: false
     default: "ci_env"
   device:
-    description: "Target device architecture: aie2 (npu1) or aie2p (npu2)"
+    description: >
+      Target device architecture: aie2 (npu1) or aie2p (npu2).
+      Leave empty to detect it from the NPU the runner actually has.
     required: false
-    default: "aie2"
+    default: ""
 
 
 runs:
@@ -55,9 +57,22 @@ runs:
         if [ -f utils/env_setup.sh ]; then
           echo "env_setup.sh found"
           
-          # Set MLIR_AIE_INSTALL_DIR first to skip reinstallation
+          # Set MLIR_AIE_INSTALL_DIR first to skip reinstallation. The build
+          # step already exports it via GITHUB_ENV; only resolve it here if it
+          # is unset. The [aie] extra installs the no-RTTI wheel (dist name:
+          # mlir_aie_no_rtti), so try that name before the RTTI one.
           echo "Setting MLIR_AIE_INSTALL_DIR..."
-          export MLIR_AIE_INSTALL_DIR="$(python3 -m pip show mlir_aie 2>/dev/null | grep ^Location: | awk '{print $2}')/mlir_aie"
+          if [ -z "$MLIR_AIE_INSTALL_DIR" ]; then
+            MLIR_AIE_LOCATION="$(python3 -m pip show mlir_aie_no_rtti 2>/dev/null | grep ^Location: | awk '{print $2}')"
+            if [ -z "$MLIR_AIE_LOCATION" ]; then
+              MLIR_AIE_LOCATION="$(python3 -m pip show mlir_aie 2>/dev/null | grep ^Location: | awk '{print $2}')"
+            fi
+            if [ -z "$MLIR_AIE_LOCATION" ]; then
+              echo "ERROR: could not locate an installed mlir_aie(_no_rtti) package."
+              exit 1
+            fi
+            export MLIR_AIE_INSTALL_DIR="${MLIR_AIE_LOCATION}/mlir_aie"
+          fi
           echo "MLIR_AIE_INSTALL_DIR: $MLIR_AIE_INSTALL_DIR"
           
           echo "Sourcing env_setup.sh..."
@@ -122,10 +137,48 @@ runs:
         echo "PYTHONPATH: $PYTHONPATH"
         echo "PATH: $PATH"
         echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
-        
+        # Report what XRT sees, so a missing/unavailable NPU is obvious in the
+        # log instead of surfacing as a per-test "No NPU devices found".
+        echo "--- xrt version ---"
+        xrt-smi --version || echo "WARNING: xrt-smi --version failed"
+        echo "--- xrt-smi examine (exit status reported below) ---"
+        xrt-smi examine && echo "xrt-smi examine exit: 0" \
+          || echo "xrt-smi examine exit: $? (non-zero)"
+        ls -l /dev/accel/ || echo "WARNING: /dev/accel not present in container"
+        # Probe the XRT API the same way the driver now does, so the device
+        # name is in the log even when the suite never gets that far.
+        echo "--- pyxrt device probe ---"
+        python -c "
+        import pyxrt
+        d = pyxrt.device(0)
+        print('pyxrt device name:', repr(d.get_info(pyxrt.xrt_info_device.name)))
+        " || echo "WARNING: pyxrt device probe failed"
+
         echo ""
         echo "=========================================="
         echo "STEP 8: Run Tests"
         echo "=========================================="
-        echo "Target device: ${{ inputs.device }}"
-        python scripts/run_tests.py --device ${{ inputs.device }} --verbose --timeout 1200
+        # Pick the tiling scripts that match the NPU this runner actually has.
+        # Hard-coding aie2 ran the 8-core AIE2 schedules against AIE2P silicon
+        # (e.g. Krackan), which fails in aiecc rather than at detection.
+        DEVICE="${{ inputs.device }}"
+        if [ -z "$DEVICE" ]; then
+          DEVICE=$(python -c "
+        import pyxrt
+        # Mirrors NPU_MODELS in the driver / mlir-aie's hostruntime.
+        ARCH = {
+            'aie2': ['npu1', 'Phoenix'],
+            'aie2p': ['npu4', 'Strix', 'npu5', 'Strix Halo', 'npu6', 'Krackan'],
+        }
+        name = pyxrt.device(0).get_info(pyxrt.xrt_info_device.name)
+        print(next(a for a, kws in ARCH.items()
+                   if any(k.lower() in name.lower() for k in kws)))
+        ") || {
+            echo "ERROR: could not detect the NPU architecture. Pass the"
+            echo "       'device' input explicitly (aie2 or aie2p)."
+            exit 1
+          }
+          echo "Auto-detected device architecture: $DEVICE"
+        fi
+        echo "Target device: $DEVICE"
+        python scripts/run_tests.py --device "$DEVICE" --verbose --timeout 1200
