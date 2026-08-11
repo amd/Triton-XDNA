@@ -10,12 +10,25 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-
 # Example directories skipped by default unless explicitly selected via --select
 DEFAULT_SKIPPED_EXAMPLES = {
     "layernorm",
     "load_2d_block",
     "multi_drivers",
+    # gelu's 1.702 sigmoid coefficient is not exactly representable in f32, and
+    # the LLVM that writes peano-linked_*.ll prints it as a short decimal, which
+    # Peano's parser rejects:
+    #
+    #   error: floating point constant invalid for type
+    #     call <16 x bfloat> @llvm.aie2p.v16accfloat.to.v16bf16(
+    #         <16 x float> splat (float 1.702000e+00))
+    #
+    # Fixed upstream in mlir-aie 4f156e80833 ("[aiecc] Downgrade LLVM 24
+    # narrow-float decimal literals for Peano", 2026-08-10), which rewrites such
+    # literals to hex. No released wheel carries it yet: the newest mlir-air
+    # wheel (85f638d) pins mlir-aie 687ff97 from 2026-08-07. Drop this entry
+    # once utils/mlir-air-hash.txt moves to a build containing that commit.
+    "gelu",
 }
 
 
