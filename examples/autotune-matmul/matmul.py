@@ -95,16 +95,18 @@ def bench_matmul(M, N, K, provider):
         with open("tt.shared.mlir", "w") as f:
             f.write(str(compiled_kernel.asm["ttsharedir"]))
         if provider == "test":
-            # Tolerance follows mlir-air's bf16_in_fp32_out tier A: rtol
-            # anchors to PyTorch's bf16 standard (1.6e-2), because the GEMM
-            # computes in bf16 regardless of f32 storage. Measured on npu2
-            # over 8 seeds this kernel's rms error is 5.9e-4 -- the same
-            # FP32-accumulate tier mlir-air records (~5.8e-4) -- but its tail
-            # reaches 2.97e-3, so mlir-air's atol=1.5e-3 does not hold here.
-            # 5e-3 keeps ~1.7x margin over the worst observed error.
+            # Tolerance follows mlir-air's bf16_in_fp32_out tier A: rtol is
+            # PyTorch's bf16 standard (1.6e-2), because the GEMM computes in
+            # bf16 whatever the storage type. atol is looser than mlir-air's
+            # 1.5e-3 -- on npu2 this kernel's rms error sits in the same
+            # FP32-accumulate tier they document (~6e-4), but its worst
+            # element is several times that, so 5e-3 leaves headroom.
             torch.testing.assert_close(c, c_ref, atol=5e-3, rtol=1.6e-2)
 
 
 if __name__ == "__main__":
+    # Fixed seed: the tolerance above is tight enough that unseeded inputs
+    # would make a failure awkward to reproduce.
+    torch.manual_seed(0)
     benchmark.select_npu_backend()
     bench_matmul(256, 256, 256, "test")
