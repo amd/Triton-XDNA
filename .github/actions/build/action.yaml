@@ -72,6 +72,79 @@ runs:
       echo "${MLIR_AIE_INSTALL_DIR_STR}/bin" >> $GITHUB_PATH
       echo "PYTHONPATH=${MLIR_AIE_INSTALL_DIR_STR}/python${PYTHONPATH:+:$PYTHONPATH}" >> $GITHUB_ENV
       echo "LD_LIBRARY_PATH=${MLIR_AIE_INSTALL_DIR_STR}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
+
+   - name: Make the host-mounted XRT tools runnable
+     env:
+       HOME: /workspace
+     shell: bash
+     run: |
+      # XRT is bind-mounted read-only from the CI host, but its runtime deps
+      # are not, and the runner image does not ship them: xrt-smi links
+      # against libboost_filesystem/libboost_program_options and otherwise
+      # dies with "error while loading shared libraries" (exit 127), which
+      # makes every XRT query report no NPU. mlir-air's CI installs boost
+      # with `sudo apt-get install libboost-all-dev`, but that only works on
+      # GitHub-hosted runners; this container is a non-root user with no
+      # sudo, so fall back to unpacking the packages into $HOME.
+      XRT_ROOT="${XILINX_XRT:-/opt/xilinx/xrt}"
+      XRT_SMI="$XRT_ROOT/bin/unwrapped/xrt-smi"
+      if [ ! -x "$XRT_SMI" ]; then
+        echo "No $XRT_SMI found; skipping"
+        exit 0
+      fi
+      if "$XRT_ROOT/bin/xrt-smi" --version >/dev/null 2>&1; then
+        echo "xrt-smi already runs; nothing to install"
+        exit 0
+      fi
+
+      MISSING=$(ldd "$XRT_SMI" 2>/dev/null | awk '/not found/ {print $1}')
+      if [ -z "$MISSING" ]; then
+        echo "WARNING: xrt-smi fails for a reason other than missing libraries:"
+        "$XRT_ROOT/bin/xrt-smi" --version || true
+        exit 0
+      fi
+      echo "Missing shared libraries: $MISSING"
+
+      # libboost_filesystem.so.1.83.0 -> libboost-filesystem1.83.0, so a boost
+      # version bump on the host does not need a change here.
+      PKGS=""
+      for lib in $MISSING; do
+        case "$lib" in
+          libboost_*)
+            base="${lib%%.so.*}"
+            ver="${lib##*.so.}"
+            PKGS="$PKGS $(echo "$base" | tr '_' '-')${ver}"
+            ;;
+          *) echo "WARNING: no package mapping known for $lib" ;;
+        esac
+      done
+      if [ -z "$PKGS" ]; then
+        echo "WARNING: nothing installable; leaving xrt-smi broken"
+        exit 0
+      fi
+      echo "Installing:$PKGS"
+
+      if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y $PKGS
+      else
+        PREFIX="$HOME/xrt-deps"
+        APT="$HOME/.aptwork"
+        mkdir -p "$APT/lists/partial" "$APT/cache/archives/partial" "$PREFIX"
+        APTOPTS="-o Dir::State::Lists=$APT/lists -o Dir::Cache=$APT/cache -o Debug::NoLocking=1"
+        apt-get $APTOPTS update -qq
+        cd "$PREFIX"
+        apt-get $APTOPTS download $PKGS
+        for d in *.deb; do dpkg -x "$d" "$PREFIX"; done
+        cd - >/dev/null
+        BOOST_LIB="$PREFIX/usr/lib/x86_64-linux-gnu"
+        NEW_LD_PATH="$BOOST_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        export LD_LIBRARY_PATH="$NEW_LD_PATH"
+        echo "LD_LIBRARY_PATH=$NEW_LD_PATH" >> $GITHUB_ENV
+      fi
+
+      "$XRT_ROOT/bin/xrt-smi" --version && echo "xrt-smi OK" \
+        || echo "WARNING: xrt-smi still not runnable"
+
    - name: Build
      env:
        HOME: /workspace
