@@ -4,6 +4,7 @@
 # this is a benchmark which multiplies square matrices with maximum block size
 # to check the performance of tl.dot operation
 
+import math
 import torch
 import triton
 import triton.language as tl
@@ -12,7 +13,11 @@ import sys, os
 sys.path.append(os.path.abspath(".."))
 import benchmark
 
-configs = [triton.Config(kwargs={'BLOCK_SIZE_M': 256}), triton.Config(kwargs={'BLOCK_SIZE_M': 128})]
+configs = [
+    triton.Config(kwargs={"BLOCK_SIZE_M": 256}),
+    triton.Config(kwargs={"BLOCK_SIZE_M": 128}),
+]
+
 
 @triton.autotune(configs=configs, key=["M"])
 @triton.jit
@@ -53,11 +58,17 @@ def bench_matmul(M, N, K, provider):
     device = "cpu"
     dtype_in = torch.bfloat16
     dtype_out = torch.float32
-    a = torch.randn((M, K), device=device, dtype=dtype_in)
-    b = torch.randn((K, N), device=device, dtype=dtype_in)
+    # Scale inputs by 1/sqrt(K) so |c| stays O(1) independent of K, and take
+    # the reference in f32 from the same bf16 inputs. Both follow mlir-air's
+    # bf16_in_fp32_out GEMM, and together they make a tight tolerance
+    # meaningful: an unscaled reference grows with K, and a bf16 reference
+    # rounds the very result it is compared against.
+    scale = 1.0 / math.sqrt(K)
+    a = (torch.randn((M, K), device=device) * scale).to(dtype_in)
+    b = (torch.randn((K, N), device=device) * scale).to(dtype_in)
     c = torch.empty((M, N), device=device, dtype=dtype_out)
     if provider == "torch" or provider == "test":
-        c_ref = torch.matmul(a, b).to(dtype_out)
+        c_ref = a.to(dtype_out) @ b.to(dtype_out)
     if provider == "triton" or provider == "test":
         # 2D launch kernel where each block gets its own program.
         grid = lambda META: (
@@ -84,9 +95,16 @@ def bench_matmul(M, N, K, provider):
         with open("tt.shared.mlir", "w") as f:
             f.write(str(compiled_kernel.asm["ttsharedir"]))
         if provider == "test":
-            torch.testing.assert_close(c, c_ref, atol=1e-2, rtol=1e-2)
+            # Tolerance follows mlir-air's bf16_in_fp32_out tier A: rtol
+            # anchors to PyTorch's bf16 standard (1.6e-2), because the GEMM
+            # computes in bf16 regardless of f32 storage. Measured on npu2
+            # over 8 seeds this kernel's rms error is 5.9e-4 -- the same
+            # FP32-accumulate tier mlir-air records (~5.8e-4) -- but its tail
+            # reaches 2.97e-3, so mlir-air's atol=1.5e-3 does not hold here.
+            # 5e-3 keeps ~1.7x margin over the worst observed error.
+            torch.testing.assert_close(c, c_ref, atol=5e-3, rtol=1.6e-2)
 
 
 if __name__ == "__main__":
     benchmark.select_npu_backend()
-    bench_matmul(256,256,256, "test")
+    bench_matmul(256, 256, 256, "test")
