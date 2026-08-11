@@ -27,10 +27,10 @@ Usage:
         l1_m=64, l1_n=64, l2_k=64, pack_sizes=(4, 4, 8),
     )
 
-    # Integer matmul (i8->i32 accumulation, i16 contract inputs)
+    # Integer matmul (i8 -> i32 accumulation, inputs left as-is)
     mlir = generate_matmul_transform(
         l1_m=64, l1_n=128, l2_k=256,
-        pack_sizes=(8, 8, 8), accum_type="i32", contract_input_type="i16",
+        pack_sizes=(8, 8, 8), accum_type="i32",
     )
 """
 
@@ -55,16 +55,21 @@ def generate_matmul_transform(
         l2_k: L3-to-L2 copy tile size along K dimension. Also determines
             the K-reduction tile in packed space (l2_k // pack_sizes[2]).
         pack_sizes: Pack sizes for (M, N, K) dimensions matching the
-            hardware microkernel MAC dimensions (mmul_mkn). Typical values:
-            (8, 8, 8) for AIE2P, (4, 4, 8) for AIE2.
+            hardware MAC shape. Note the orderings differ: a MAC shape is
+            written (M, K, N), so (4, 4, 8) here is a 4x8 x 8x4 -> 4x4 MAC.
+            AIE2P is (8, 8, 8) for every type. AIE2 has one shape per input
+            type: (4, 4, 8) for bf16 and (4, 8, 8) for i8.
         accum_type: Element type for the accumulator in vector.contract.
             The vector_type_cast in Phase 11 casts input[2] and output[0]
             to this type. Use "f32" for bf16 matmul, "i32" for i8/i16 matmul.
         contract_input_type: Element type for vector.contract inputs 0,1.
             If set, adds a vector_type_cast to cast the inputs to this type.
-            Use "i16" for i8 matmul (AIE2P native i8xi8->i16 MAC with i32
-            accumulation). Use "bf16" for f32 data with bf16 emulation.
-            If None, inputs are left as-is after vectorization.
+            Use "bf16" for f32 data with bf16 emulation. If None, inputs are
+            left as-is after vectorization.
+            Leave this None for integer matmul: the AIEVec lowering recovers
+            each operand's signedness from the arith.extsi/extui it peels off
+            the contraction, and casting the inputs first discards that. An
+            i8 matmul with a cast here lowers with the wrong MAC signedness.
         bf16_emulation: Shorthand for contract_input_type="bf16". If True
             and contract_input_type is None, sets contract_input_type="bf16".
 
@@ -90,7 +95,9 @@ def generate_matmul_transform(
     # target type. This matches the hardware MAC unit's native input type.
     # - bf16 matmul: inputs stay bf16 (no cast needed)
     # - bf16 emulation (f32 data): cast inputs f32->bf16
-    # - i8 matmul: cast inputs i32->i16 (AIE2P native i8xi8 MAC uses i16 contract)
+    # - integer matmul: no cast. The AIEVec lowering takes each operand's
+    #   signedness from the arith.extsi/extui it peels off the contraction,
+    #   so casting here would drop it and pick the wrong MAC signedness.
     input_cast = ""
     if contract_input_type is not None:
         input_cast = f"""
@@ -408,7 +415,9 @@ if __name__ == "__main__":
         type=str,
         default=None,
         choices=["bf16", "i16", "i32"],
-        help="Cast vector.contract inputs to this type (e.g., i16 for i8 matmul)",
+        help="Cast vector.contract inputs to this type (bf16 for f32 data "
+        "under bf16 emulation). Leave unset for integer matmul, so the AIEVec "
+        "lowering can read operand signedness off the extsi/extui it peels.",
     )
     parser.add_argument(
         "--bf16-emulation",
