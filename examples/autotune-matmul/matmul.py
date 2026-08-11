@@ -97,10 +97,12 @@ def bench_matmul(M, N, K, provider):
         if provider == "test":
             # Tolerance follows mlir-air's bf16_in_fp32_out tier A: rtol is
             # PyTorch's bf16 standard (1.6e-2), because the GEMM computes in
-            # bf16 whatever the storage type. atol is looser than mlir-air's
-            # 1.5e-3 -- on npu2 this kernel's rms error sits in the same
-            # FP32-accumulate tier they document (~6e-4), but its worst
-            # element is several times that, so 5e-3 leaves headroom.
+            # bf16 whatever the storage type. Their atol=1.5e-3 is not a
+            # constant to copy: it was measured at K=8192, and with inputs
+            # scaled by 1/sqrt(K) the error also falls as 1/sqrt(K) (verified
+            # here at K=256/512/1024). Rescaled to K=256 their bound is
+            # ~8.5e-3, so 5e-3 is the tighter of the two and still leaves
+            # ~1.7x over the worst element observed on npu2.
             torch.testing.assert_close(c, c_ref, atol=5e-3, rtol=1.6e-2)
 
 
