@@ -1316,6 +1316,8 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 // Call to XRT goes here:
 static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
+    try {{
+
     // PDI artifacts target an alternative (non-XRT) runtime and cannot be
     // loaded through the XRT xclbin API below. Fail early with a clear
     // message pointing the user to their target runtime.
@@ -1410,7 +1412,9 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
     unsigned int opcode = 3;
     {'auto start = std::chrono::high_resolution_clock::now();' if autotune_time else ''}
     auto run = kernel(opcode, bo_instr, instr_v.size(), {','.join(f'bo_{i}' for i, ty in signature.items() if i not in constants and ty[0] == "*")});
-    run.wait();
+    // Throws unless the command reaches ERT_CMD_STATE_COMPLETED; an aborted run
+    // must not fall through to the readback below and return zeros as a result.
+    run.wait2();
     {'auto stop = std::chrono::high_resolution_clock::now(); float npu_time = std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();' if autotune_time else ''}
 
     {'std::ofstream file("data.txt"); file << npu_time << std::endl; file.close();' if autotune_time else ''}
@@ -1423,6 +1427,11 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
 
     if (verbosity >= 1)
         std::cout << "Launch finished." << std::endl;
+
+    }} catch (const std::exception& e) {{
+        std::string msg = std::string("XRT runtime error: ") + e.what();
+        PyErr_SetString(PyExc_RuntimeError, msg.c_str());
+    }}
   }}
 }}
 
