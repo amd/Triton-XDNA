@@ -16,6 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # MLIR-AIE build requirements  
     build-essential ninja-build cmake python3 python3-dev python3.12-venv python3-pip unzip \
     libssl-dev uuid-dev \
+    # Runtime deps of the host-mounted XRT tools. xrt-smi links against
+    # libboost_filesystem/libboost_program_options; without them it exits 127
+    # with "error while loading shared libraries" and every XRT query that
+    # shells out to it silently reports no NPU.
+    libboost-filesystem1.83.0 libboost-program-options1.83.0 \
     # Required by MHA kernel
     llvm-18 \
     # Clang toolchain for Triton build
