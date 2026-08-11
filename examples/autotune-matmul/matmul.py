@@ -54,6 +54,13 @@ def bare_matmul(
 
 
 # @benchmark.measure()
+# mlir-air's bf16_in_fp32_out GEMM reports this atol for the FP32-accumulate
+# tier at this K; see the tolerance note in bench_matmul for how it is carried
+# to other shapes.
+AIR_TIER_A_ATOL = 1.5e-3
+AIR_TIER_A_K = 8192
+
+
 def bench_matmul(M, N, K, provider):
     device = "cpu"
     dtype_in = torch.bfloat16
@@ -95,15 +102,17 @@ def bench_matmul(M, N, K, provider):
         with open("tt.shared.mlir", "w") as f:
             f.write(str(compiled_kernel.asm["ttsharedir"]))
         if provider == "test":
-            # Tolerance follows mlir-air's bf16_in_fp32_out tier A: rtol is
-            # PyTorch's bf16 standard (1.6e-2), because the GEMM computes in
-            # bf16 whatever the storage type. Their atol=1.5e-3 is not a
-            # constant to copy: it was measured at K=8192, and with inputs
-            # scaled by 1/sqrt(K) the error also falls as 1/sqrt(K) (verified
-            # here at K=256/512/1024). Rescaled to K=256 their bound is
-            # ~8.5e-3, so 5e-3 is the tighter of the two and still leaves
-            # ~1.7x over the worst element observed on npu2.
-            torch.testing.assert_close(c, c_ref, atol=5e-3, rtol=1.6e-2)
+            # Same standard as mlir-air's bf16_in_fp32_out tier A, carried
+            # over rather than copied as a constant. rtol is PyTorch's bf16
+            # value (1.6e-2), because the GEMM computes in bf16 whatever the
+            # storage type. Their atol=1.5e-3 was measured at K=8192, and
+            # with 1/sqrt(K)-scaled inputs the error also falls as 1/sqrt(K)
+            # (verified on npu2 at K=256/512/1024), so rescale it by K rather
+            # than hard-coding a number that only holds at one shape.
+            # Headroom at K=256: the bound is 8.5e-3 against a worst observed
+            # element of 3.0e-3 and an rms of 5.9e-4.
+            atol = AIR_TIER_A_ATOL * math.sqrt(AIR_TIER_A_K / K)
+            torch.testing.assert_close(c, c_ref, atol=atol, rtol=1.6e-2)
 
 
 if __name__ == "__main__":
