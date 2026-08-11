@@ -26,7 +26,10 @@ pip install transformers
 # torch: a CPU build is enough for `npu` and `reference`; use a ROCm build for
 # the gpu/hetero modes (adjust the ROCm version to match your install).
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-# pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+# ROCm build: rocm7.2 has native gfx1151 (Strix Halo) kernels; older wheels
+# (e.g. rocm6.2) lack them and fail with "HIP error: invalid device function"
+# unless you set HSA_OVERRIDE_GFX_VERSION.
+# pip install torch --index-url https://download.pytorch.org/whl/test/rocm7.2
 
 # Environment setup (required for NPU/hetero modes)
 source /opt/xilinx/xrt/setup.sh
