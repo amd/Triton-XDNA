@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=70.1", "wheel", "pip", "build", "pybind11", "cmake>=3.20", "ninja"]
+# nanobind is needed because setup.py builds third_party/triton with
+# --no-build-isolation from inside this package's isolated build env, and
+# triton's own setup.py imports nanobind at module scope.
+requires = ["setuptools>=70.1", "wheel", "pip", "build", "pybind11", "nanobind", "cmake>=3.20", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
