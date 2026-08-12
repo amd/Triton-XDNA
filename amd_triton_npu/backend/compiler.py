@@ -135,6 +135,7 @@ class NPUOptions:
     allowed_dot_input_precisions: Tuple[str] = ("ieee",)
     sanitize_overflow: bool = True
     instrumentation_mode: str = ""
+    fpsan_homomorphic_casts: bool = False
 
     def __post_init__(self):
         pass
