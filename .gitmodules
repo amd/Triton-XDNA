@@ -7,4 +7,11 @@
 [submodule "third_party/triton-windows"]
 	path = third_party/triton-windows
 	url = https://github.com/triton-lang/triton-windows.git
-	branch = release/3.7.x-windows
+	# main-windows-staged, not a release/*-windows line: the Windows release
+	# branches are cut from upstream release/*.*.x, and release/3.8.x-windows
+	# branched ~19h before triton's pybind11->nanobind migration, so it can
+	# never build a nanobind-era triton_shared. main-windows-staged tracks
+	# upstream main and is CI-gated before main-windows is reset onto it.
+	# Note it is force-pushed on every rebase, so we pin by SHA and should
+	# move to release/3.9.x-windows once that exists.
+	branch = main-windows-staged

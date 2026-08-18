@@ -28,8 +28,6 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from email.parser import Parser
-import tarfile
-import urllib.request
 import shlex
 
 from setuptools import setup
@@ -66,7 +64,6 @@ AMD_TRITON_NPU_DIR = BASE_DIR / "amd_triton_npu"
 
 # same strategy as used in TheRock
 # https://github.com/ROCm/TheRock/pull/4006/changes#diff-6812ec4cd824b4a56416cd4ca74afdece86fe8d39c813300eddc0d17194b9e80R153-R155
-LLVM_BASE_URL = "https://oaitriton.blob.core.windows.net/public/llvm-builds"
 
 # Patch configuration: (submodule_name, patch_file)
 PATCHES = [
@@ -329,75 +326,6 @@ def get_install_requires():
     ]
 
 
-def get_triton_windows_llvm_hash(triton_dir: Path) -> str:
-    """Read the LLVM hash from triton-windows cmake/llvm-hash.txt."""
-    hash_file = triton_dir / "cmake" / "llvm-hash.txt"
-    if not hash_file.exists():
-        raise RuntimeError(f"LLVM hash file not found: {hash_file}")
-    return hash_file.read_text().strip()
-
-
-def download_llvm_for_triton_windows(triton_dir: Path) -> Path:
-    """Download and extract pre-built LLVM binaries for triton-windows.
-
-    triton-windows requires a specific LLVM version that matches the hash
-    in cmake/llvm-hash.txt. Pre-built binaries are hosted at oaitriton.blob.core.windows.net.
-    """
-    full_hash = get_triton_windows_llvm_hash(triton_dir)
-    short_hash = full_hash[:8]
-
-    llvm_dir = triton_dir.parent / f"llvm-{short_hash}-windows-x64"
-    llvm_hash_marker = llvm_dir / ".llvm-hash"
-
-    if llvm_hash_marker.exists():
-        installed_hash = llvm_hash_marker.read_text().strip()
-        if installed_hash == full_hash:
-            print(f"LLVM already downloaded: {llvm_dir}")
-            return llvm_dir
-
-    if llvm_dir.exists():
-        shutil.rmtree(llvm_dir)
-
-    filename = f"llvm-{short_hash}-windows-x64.tar.gz"
-    download_url = f"{LLVM_BASE_URL}/{filename}"
-
-    print(f"Downloading LLVM for triton-windows...")
-    print(f"  Hash: {short_hash}")
-    print(f"  URL: {download_url}")
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        download_path = Path(temp_dir) / filename
-
-        print("  Downloading (this may take a few minutes, ~500MB)...")
-        try:
-            urllib.request.urlretrieve(download_url, download_path)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to download LLVM from {download_url}: {e}\n"
-                "You may need to download manually and extract to "
-                f"{llvm_dir}"
-            )
-
-        print("  Extracting...")
-        with tarfile.open(download_path, "r:gz") as tar:
-            # filter="data" requires Python 3.12+ (PEP 706) or a backport
-            # patch release (3.10.12+, 3.11.4+). cibuildwheel's bundled
-            # nuget-cpython for 3.10/3.11 isn't always a backported version,
-            # so guard the kwarg.
-            if sys.version_info >= (3, 12):
-                tar.extractall(triton_dir.parent, filter="data")
-            else:
-                tar.extractall(triton_dir.parent)
-
-        if not llvm_dir.exists():
-            raise RuntimeError(f"Extracted LLVM directory not found: {llvm_dir}")
-
-        llvm_hash_marker.write_text(full_hash)
-
-    print(f"  LLVM downloaded to: {llvm_dir}")
-    return llvm_dir
-
-
 def run_command(args: list[str | Path], cwd: Path, env: dict[str, str] | None = None):
     args = [str(arg) for arg in args]
     full_env = dict(os.environ)
@@ -490,7 +418,13 @@ class TritonXdnaBdistWheel(bdist_wheel):
         print(f"  TRITON_PLUGIN_DIRS={plugin_dirs}", file=sys.stderr)
         print(f"  Project root: {project_root}", file=sys.stderr)
 
-        llvm_build_dir = download_llvm_for_triton_windows(triton_dir)
+        # LLVM is resolved by triton-windows itself: its CMakeLists runs
+        # python/build_helpers.py download_and_copy_dependencies, which reads
+        # cmake/llvm-info.json and fetches the matching prebuilt. This mirrors
+        # the Linux path, where we likewise leave LLVM to triton. Older
+        # triton-windows pins carried cmake/llvm-hash.txt and needed us to
+        # download it here; that file is gone and the artifact naming now
+        # includes a build number, so hand-rolling it would only drift.
 
         # Prepare environment for triton-windows build.
         # Note: MSVC environment (vcvars64.bat) must already be set up.
@@ -498,10 +432,6 @@ class TritonXdnaBdistWheel(bdist_wheel):
         windows_env.update(
             {
                 "PYTHONUTF8": "1",
-                "LLVM_BUILD_DIR": str(llvm_build_dir),
-                "LLVM_INCLUDE_DIRS": str(llvm_build_dir / "include"),
-                "LLVM_LIBRARY_DIR": str(llvm_build_dir / "lib"),
-                "LLVM_SYSPATH": str(llvm_build_dir),
                 "TRITON_BUILD_PROTON": "OFF",
                 "TRITON_APPEND_CMAKE_ARGS": "-DCMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH=FALSE",
                 "TRITON_PLUGIN_DIRS": plugin_dirs,
