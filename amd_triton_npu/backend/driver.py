@@ -372,9 +372,10 @@ def _get_rocr_install() -> _RocrInstall:
         "(AMD_TRITON_NPU_RUNTIME=hsa) needs a ROCm prefix providing "
         + ", ".join("include/" + h for h in _ROCR_HEADERS)
         + " and lib/libhsa-runtime64.so. Stock ROCm releases do not ship "
-        "hsa/hsa_ext_amd_aie.h; build an AIE-capable ROCR with "
-        "scripts/build-rocr.sh and point AMD_NPU_ROCR_PATH at its install "
-        "prefix." + detail
+        "hsa/hsa_ext_amd_aie.h; install an AIE-capable ROCm with "
+        "'pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ "
+        "rocm-sdk-core' (2026-07-16 or later), or point AMD_NPU_ROCR_PATH at "
+        "the install prefix of one you built yourself." + detail
     )
 
 
