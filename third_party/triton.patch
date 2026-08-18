@@ -1,5 +1,23 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index efd8392b25..06ba410d5f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -327,6 +327,13 @@ if(TRITON_BUILD_PYTHON_MODULE)
+     set(Python_VERSION "${Python3_VERSION}")
+     set(Python_INTERPRETER_ID "${Python3_INTERPRETER_ID}")
+   endif()
++  # nanobind >= 2.14 also requires Python::Interpreter, not just Python::Module:
++  #   if (NOT TARGET Python::Interpreter OR NOT TARGET Python::Module)
++  # Without this alias the config fails with "You must invoke
++  # find_package(Python COMPONENTS Interpreter Development REQUIRED)".
++  if(NOT TARGET Python::Interpreter)
++    add_executable(Python::Interpreter ALIAS Python3::Interpreter)
++  endif()
+ 
+   find_package(nanobind CONFIG REQUIRED HINTS "${Python3_SITELIB}")
+   nanobind_build_library(nanobind-static)
 diff --git a/include/triton/Dialect/Triton/IR/Traits.h b/include/triton/Dialect/Triton/IR/Traits.h
-index 392436308b..482cd04b81 100644
+index 392436308b..21ff88021e 100644
 --- a/include/triton/Dialect/Triton/IR/Traits.h
 +++ b/include/triton/Dialect/Triton/IR/Traits.h
 @@ -21,7 +21,15 @@ namespace impl {
@@ -20,10 +38,10 @@ index 392436308b..482cd04b81 100644
  LogicalResult verifyTensorSize(Operation *op);
  LogicalResult verifyTensorLayouts(Operation *op);
 diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
-index 0c4d710496..538912ddf0 100644
+index 82d1f8e2da..f3f3d57be9 100644
 --- a/python/triton/runtime/autotuner.py
 +++ b/python/triton/runtime/autotuner.py
-@@ -119,7 +119,7 @@ class Autotuner(KernelInterface):
+@@ -124,7 +124,7 @@ class Autotuner(KernelInterface):
              )
              return
  
@@ -32,7 +50,7 @@ index 0c4d710496..538912ddf0 100644
      def do_bench(self):
          if self._do_bench is None:
              return driver.active.get_benchmarker()
-@@ -220,6 +220,8 @@ class Autotuner(KernelInterface):
+@@ -225,6 +225,8 @@ class Autotuner(KernelInterface):
                  if hasattr(arg, "dtype"):
                      key.append(str(arg.dtype))
              key = tuple(key)

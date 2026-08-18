@@ -5,8 +5,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
 
-namespace py = pybind11;
+namespace py = nanobind;
 
-void init_triton_amd_triton_npu(py::module &&m) {}
+void init_triton_amd_triton_npu(py::module_ &m) {}
