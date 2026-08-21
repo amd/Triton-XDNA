@@ -2013,6 +2013,30 @@ def _aircc_compile(
         ):
             os.environ["PATH"] = mlir_aie_bin + os.pathsep + os.environ.get("PATH", "")
 
+        # Same idea for the XRT SDK: aiecc shells out to aiebu-asm (and
+        # xclbinutil on the xclbin path) by bare name, and those ship in the
+        # XRT Windows SDK rather than with mlir-aie, so without help the ELF
+        # build dies with
+        #     aiecc: ShellCommand: tool 'aiebu-asm' not found in search paths
+        # We already know where the SDK is, so putting it on PATH here is
+        # strictly better than asking every user to do it by hand. Failure to
+        # locate an SDK is not fatal here -- aircc may not need it, and the
+        # launcher reports a far clearer error if it does.
+        try:
+            xrt_dir = _get_xrt_path()
+        except RuntimeError:
+            xrt_dir = None
+        if xrt_dir:
+            # xclbinutil.exe / aiebu-asm.exe sit at the SDK root; keep bin/ too
+            # for layouts that use it.
+            for tool_dir in (xrt_dir, os.path.join(xrt_dir, "bin")):
+                if os.path.isdir(tool_dir) and tool_dir not in os.environ.get(
+                    "PATH", ""
+                ):
+                    os.environ["PATH"] = (
+                        tool_dir + os.pathsep + os.environ.get("PATH", "")
+                    )
+
     if output_format == "elf":
         elf_path = os.path.join(air_proj_path, "aie.elf")
         aircc_cmd = [

@@ -5,9 +5,10 @@
 # Usage: . .\utils\env_setup.ps1
 #
 # Prerequisites:
-#   - Python 3.10, 3.11, or 3.12 (Xilinx Windows wheels do not yet support 3.13+)
+#   - Python 3.11-3.14 (3.13 recommended: the prebuilt pyxrt.pyd targets it)
 #   - A virtual environment activated (e.g. python -m venv venv && .\venv\Scripts\Activate.ps1)
-#   - XRT SDK at C:\Program Files\AMD\xrt (download xrt_windows_sdk.zip from XRT releases)
+#   - XRT SDK at C:\Program Files\AMD\xrt, or XRT_DEV_DIR pointing at it
+#     (download xrt_windows_sdk.zip from XRT releases)
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -107,9 +108,19 @@ Write-Host "Environment setup complete."
 # Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases and
 # extract the inner xrt_sdk/xrt/ directory to C:\Program Files\AMD\xrt
 # (the zip's top-level folder is xrt_sdk/, not xrt/).
-$xrtDefault = Join-Path $env:PROGRAMFILES "AMD\xrt"
-if (Test-Path (Join-Path $xrtDefault "include\xrt\xrt_bo.h")) {
-    Write-Host "XRT SDK found at: $xrtDefault"
+# Checked in the same order the backend searches, so this reports what the
+# build will actually find.
+$xrtCandidates = @()
+if ($env:AMD_TRITON_NPU_XRT_DIR) { $xrtCandidates += $env:AMD_TRITON_NPU_XRT_DIR }
+if ($env:XRT_DEV_DIR)            { $xrtCandidates += $env:XRT_DEV_DIR }
+$xrtCandidates += (Join-Path $env:PROGRAMFILES "AMD\xrt")
+
+$xrtFound = $xrtCandidates | Where-Object {
+    Test-Path (Join-Path $_ "include\xrt\xrt_bo.h")
+} | Select-Object -First 1
+
+if ($xrtFound) {
+    Write-Host "XRT SDK found at: $xrtFound"
 } else {
-    Write-Warning "XRT SDK not found at $xrtDefault. Download xrt_windows_sdk.zip from XRT releases and move the inner xrt_sdk/xrt/ folder there."
+    Write-Warning "XRT SDK not found (looked in: $($xrtCandidates -join ', ')). Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases, extract the inner xrt_sdk/xrt/ folder, and either place it at $(Join-Path $env:PROGRAMFILES 'AMD\xrt') or point XRT_DEV_DIR at it."
 }
