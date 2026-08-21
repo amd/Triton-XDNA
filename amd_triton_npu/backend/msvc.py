@@ -118,9 +118,18 @@ def vcvars_env():
 
     env = {}
     for line in out.split(_ENV_MARKER, 1)[1].splitlines():
-        if "=" in line:
+        # `set` also dumps cmd's per-drive current-directory pseudo-variables,
+        # which look like "=C:=C:\some\dir" (and "=ExitCode=00000000"). Naive
+        # splitting turns those into an entry with an empty key, and passing an
+        # environment with an empty key to subprocess fails on Windows with
+        # "OSError: [WinError 87] The parameter is incorrect" -- a long way from
+        # anything that would point back to here. They carry no build state, so
+        # drop them.
+        if not line.startswith("=") and "=" in line:
             key, value = line.split("=", 1)
-            env[key.strip()] = value
+            key = key.strip()
+            if key:
+                env[key] = value
     # A vcvars environment without INCLUDE did not actually initialise.
     return env if env.get("INCLUDE") else None
 
