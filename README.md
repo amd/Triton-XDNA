@@ -197,6 +197,18 @@ now. See [#88](https://github.com/amd/Triton-XDNA/issues/88).
 
 ### Windows Quick Start
 
+Configure git for LF **before cloning**. Windows defaults to
+`core.autocrlf=true`, which rewrites the submodule working trees to CRLF; the
+patches in `third_party/` are authored with LF, so they then fail to apply.
+The build recovers from this automatically (see
+[scripts/patching.py](scripts/patching.py)), but starting from LF avoids the
+question entirely and matches what CI does:
+
+```powershell
+git config --global core.autocrlf false
+git config --global core.eol lf
+```
+
 ```powershell
 git clone https://github.com/amd/Triton-XDNA.git
 cd Triton-XDNA
@@ -206,6 +218,11 @@ python -m venv venv
 .\venv\Scripts\activate
 pip install --upgrade pip setuptools wheel
 ```
+
+Visual Studio does **not** need to be activated first — the build locates
+`vcvars64.bat` itself, so an ordinary PowerShell prompt works. Running from an
+"x64 Native Tools Command Prompt" is still fine; that environment is used as-is
+when present.
 
 Prepare XRT development files (headers, import library, xclbinutil). Download
 `xrt_windows_sdk.zip` from [Xilinx/XRT releases](https://github.com/Xilinx/XRT/releases)
@@ -299,7 +316,18 @@ successfully on Windows but do not yet execute; see the limitation noted under
 | Variable | Purpose |
 |----------|---------|
 | `AIR_TRANSFORM_TILING_SCRIPT` | Path to MLIR transform dialect IR |
-| `XILINX_XRT` | (Optional) Override XRT SDK location if not in `C:\Program Files\AMD\xrt` |
+| `XRT_DEV_DIR` | (Optional) Override XRT SDK location if not in `C:\Program Files\AMD\xrt`. **Prefer this over `XILINX_XRT`** |
+| `AMD_TRITON_NPU_XRT_DIR` | (Optional) Same, taking precedence over `XRT_DEV_DIR`; also settable as `npu_config.xrt_dir` |
+| `XILINX_XRT` | (Optional, discouraged on Windows) Also honoured, but see below |
+
+**Do not use `XILINX_XRT` on Windows unless it points at a full XRT
+installation.** `xrt_coreutil.dll` reads the same variable and then requires an
+`xrt_core.dll` that the NPU driver does not ship, so pointing it at an SDK
+extracted from `xrt_windows_sdk.zip` breaks device detection and kernel
+dispatch with `No such library '...\xrt_core.dll'`. The backend detects this
+case, warns, and unsets the variable for its own process while still using it
+to locate the development files — but `XRT_DEV_DIR` avoids the problem
+outright.
 
 ### Windows Known Limitations
 

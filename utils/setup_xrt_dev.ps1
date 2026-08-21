@@ -16,9 +16,11 @@
 #   .\utils\setup_xrt_dev.ps1 [-XrtDll <path>] [-OutputDir <path>]
 #
 # After running, set the environment variable:
-#   $env:XILINX_XRT = "<OutputDir>"
-#   # -- or --
 #   $env:XRT_DEV_DIR = "<OutputDir>"
+#
+# Use XRT_DEV_DIR, not XILINX_XRT. Both are honoured, but xrt_coreutil.dll also
+# reads XILINX_XRT and then demands an xrt_core.dll that the Windows NPU driver
+# does not ship, which breaks device detection and kernel dispatch.
 #
 # Prerequisites:
 #   - Git
@@ -152,9 +154,11 @@ if ($headerOk -and $libOk -and $dllOk) {
     Write-Host " XRT development files ready!" -ForegroundColor Green
     Write-Host "========================================" -ForegroundColor Green
     Write-Host ""
-    Write-Host "Set one of these environment variables:"
-    Write-Host "  `$env:XILINX_XRT = `"$OutputDir`""
+    Write-Host "Set this environment variable:"
     Write-Host "  `$env:XRT_DEV_DIR = `"$OutputDir`""
+    Write-Host ""
+    Write-Host "Do not use XILINX_XRT for this: xrt_coreutil.dll reads it too" -ForegroundColor Yellow
+    Write-Host "and then requires an xrt_core.dll the NPU driver does not ship." -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Contents:"
     Write-Host "  include/xrt/       - XRT C++ headers"
