@@ -29,6 +29,9 @@ This is an experimental project and we welcome community contributions. Whether 
 
 ## Usage
 
+The instructions below are for Linux. For Windows, skip to
+[Windows Support](#windows-support).
+
 ### Clone the repository
 ```
 git clone https://github.com/amd/Triton-XDNA.git
@@ -173,31 +176,96 @@ system ROCR without AIE support would otherwise be picked up first.
 
 ## Windows Support
 
-Native Windows builds are supported using MSVC — no WSL or Linux required. The full
-compilation pipeline (Triton → MLIR → xclbin/ELF) runs natively on Windows.
+Triton-XDNA runs natively on Windows — no WSL, no Linux VM. The whole flow,
+from `@triton.jit` through MLIR to an NPU binary and kernel dispatch, executes
+on the Windows host using MSVC.
 
-**Kernel execution on Windows is currently validated on npu2 (AIE2P) devices only.**
-On npu1 (AIE2) the compile pipeline completes, but dispatch goes through the older
-xclbin/DPU path, which is not yet supported on the Windows NPU driver stack; kernels
-abort with `ERT_CMD_STATE_ABORT` and produce zeroed output. Use Linux for npu1 for
-now. See [#88](https://github.com/amd/Triton-XDNA/issues/88).
+Kernel execution is validated on **npu2 (AIE2P)** devices. Compilation itself
+needs no NPU at all, so any Windows machine can build and cross-compile
+artifacts.
 
-### Windows Requirements
+### Requirements
 
-- **Windows 10/11** (x64)
-- **AMD NPU: npu2 (AIE2P)** to *run* kernels. Building and compiling work on any
-  Windows host (no NPU required); npu1 (AIE2) can compile but not yet execute
-- **Visual Studio 2022** with "Desktop development with C++" workload
-- **Python 3.10–3.14** (3.13 recommended). Prebuilt Windows wheels are published
-  for all of these versions; 3.13 is recommended because it matches the prebuilt
-  `pyxrt.pyd` in the current XRT Windows SDK (see below), so the runtime binding
-  works without building it from source.
-- **CMake 3.20+** and **Ninja** (via pip or standalone)
-- **AMD NPU driver** (installs `xrt_coreutil.dll` runtime)
+| | |
+|---|---|
+| OS | Windows 10 or 11 (x64) |
+| NPU | npu2 (AIE2P) to run kernels; none required to compile |
+| Python | 3.11–3.14 (3.13 recommended — see [Set up XRT](#set-up-xrt)) |
+| Compiler | Visual Studio 2022 or newer, with "Desktop development with C++" |
+| Driver | AMD NPU driver |
 
-### Windows Quick Start
+Visual Studio does not need to be activated first — Triton-XDNA locates
+`vcvars64.bat` on its own, so an ordinary PowerShell prompt is enough. Running
+from an "x64 Native Tools Command Prompt" also works; that environment is used
+as-is when present.
+
+For the NPU driver itself, follow the
+[mlir-aie instructions](https://github.com/Xilinx/mlir-aie/blob/main/README.md).
+
+### Set up XRT
+
+Triton-XDNA compiles a small host shim for every kernel, so it needs the XRT
+SDK (headers and import library) in addition to the runtime DLL the driver
+installs.
+
+Download `xrt_windows_sdk.zip` from the
+[Xilinx/XRT releases](https://github.com/Xilinx/XRT/releases) page and extract
+the inner `xrt_sdk/xrt/` directory — note the zip's top-level folder is
+`xrt_sdk/` — to `C:\Program Files\AMD\xrt`, so that you have:
+
+```
+C:\Program Files\AMD\xrt\include\xrt\xrt_bo.h
+C:\Program Files\AMD\xrt\lib\xrt_coreutil.lib
+```
+
+To keep it somewhere else, point `XRT_DEV_DIR` at that directory instead:
 
 ```powershell
+$env:XRT_DEV_DIR = "<path-to>\xrt"
+```
+
+The same zip ships the Python binding `pyxrt.pyd` at
+`xrt_sdk/xrt/python/pyxrt.pyd`, which is used to identify the NPU. Copy it onto
+your interpreter's import path:
+
+```powershell
+Copy-Item "<path-to>\xrt_sdk\xrt\python\pyxrt.pyd" ".\venv\Lib\site-packages\"
+```
+
+The published `pyxrt.pyd` targets Python 3.13, which is why that version is
+recommended — on 3.13 it works as shipped. On other versions, build `pyxrt`
+from source against your interpreter.
+
+### Option 1: Install Pre-built Wheel (Recommended)
+
+Windows wheels are published for every supported Python version, so no compiler
+or source build is involved:
+
+```powershell
+python -m venv venv
+.\venv\Scripts\activate
+python -m pip install --upgrade pip
+
+pip install triton-xdna `
+  --find-links https://github.com/amd/Triton-XDNA/releases/expanded_assets/latest-wheels `
+  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 `
+  --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly `
+  --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
+
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+PyTorch is used by the examples as a CPU reference.
+
+### Option 2: Build from Source
+
+Check the sources out with LF line endings, which is what the vendored
+submodules expect:
+
+```powershell
+git config --global core.autocrlf false
+git config --global core.eol lf
+
 git clone https://github.com/amd/Triton-XDNA.git
 cd Triton-XDNA
 git submodule update --init
@@ -207,48 +275,16 @@ python -m venv venv
 pip install --upgrade pip setuptools wheel
 ```
 
-Prepare XRT development files (headers, import library, xclbinutil). Download
-`xrt_windows_sdk.zip` from [Xilinx/XRT releases](https://github.com/Xilinx/XRT/releases)
-and extract the inner `xrt_sdk/xrt/` directory (note the zip's top-level
-folder is `xrt_sdk/`) to `C:\Program Files\AMD\xrt`:
-
-```powershell
-# The contents of xrt_sdk/xrt/ inside the zip should end up at:
-#   C:\Program Files\AMD\xrt\include\xrt\xrt_bo.h
-#   C:\Program Files\AMD\xrt\lib\xrt_coreutil.lib
-```
-
-The same zip also contains the runtime Python binding `pyxrt.pyd` at
-`xrt_sdk/xrt/python/pyxrt.pyd`, which is required at execution time (the NPU
-launcher does `import pyxrt`). Copy it onto your interpreter's import path:
-
-```powershell
-# The current pyxrt.pyd targets Python 3.13. On a 3.13 venv, copy it into
-# site-packages (or any directory on PYTHONPATH):
-Copy-Item "path\to\xrt_sdk\xrt\python\pyxrt.pyd" ".\venv\Lib\site-packages\"
-```
-
-`pyxrt.pyd` loads `xrt_coreutil.dll` at import time, so ensure the AMD NPU driver
-is installed (it provides that DLL) and on `PATH`. On a Python version other than
-the one the `.pyd` targets, importing it raises `ImportError: DLL load failed`;
-in that case, build `pyxrt` from source against your interpreter.
-
-Run the automated environment setup (must be dot-sourced so PATH/env vars
-persist in the current shell):
+Then run the environment setup, which installs the MLIR-AIE/AIR/LLVM-AIE stack
+and the Triton-XDNA backend. Dot-source it so the environment persists in your
+shell:
 
 ```powershell
 . .\utils\env_setup.ps1
 ```
 
-This installs the pre-built wheels (`triton-windows`, `mlir-air[aie]` which
-transitively pulls `mlir-aie` and `llvm-aie`) and the Triton-XDNA backend.
-
-### Windows Manual Build
-
-Install build tools, PyTorch, and the MLIR-AIE/AIR/LLVM-AIE stack. The
-`mlir_air[aie]` extra transitively pins matching `mlir-aie` and pulls
-`llvm-aie`, so a single resolver pass installs the whole stack from the
-Xilinx release pages:
+To drive the install yourself instead, the `mlir_air[aie]` extra pins a matching
+`mlir-aie` and pulls `llvm-aie`, so one resolver pass installs the whole stack:
 
 ```powershell
 pip install cmake ninja lit numpy PyYAML nanobind scipy
@@ -258,30 +294,18 @@ pip install "mlir_air[aie]" `
   -f https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti `
   -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 `
   -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+
+pip install . --no-build-isolation
 ```
 
 To pin a specific mlir-air version, use the values from
 `utils/mlir-air-hash.txt`:
 `mlir_air[aie]==<Version>.<Timestamp>+<short-commit>.no.rtti`.
 
-Install Triton-XDNA:
+### Run examples
 
-```powershell
-$env:TRITON_PLUGIN_DIRS = "$PWD\third_party\triton_shared;$PWD\amd_triton_npu"
-pip install -e . --no-build-isolation -v
-```
-
-### Additional Windows Tools
-
-**xclbinutil** and **aiebu-asm** — Included in the XRT Windows SDK zip. Ensure they
-are on PATH or in `<mlir_aie_install>/bin/`.
-
-**DIA SDK** — If the mlir-air cmake build can't find DIA SDK:
-```powershell
-subst Z: "C:\Program Files\Microsoft Visual Studio\2022\Community\DIA SDK"
-```
-
-### Run examples (Windows)
+Browse the available operators and their AIE2/AIE2P coverage in the live
+[examples dashboard](https://amd.github.io/Triton-XDNA/).
 
 ```powershell
 cd examples\vec-add
@@ -289,29 +313,62 @@ $env:AIR_TRANSFORM_TILING_SCRIPT = "transform_aie2p.mlir"
 python vec-add.py
 ```
 
-`transform_aie2p.mlir` targets npu2 (AIE2P). The npu1 (AIE2) equivalents —
-`transform_aie2.mlir` with `$env:AMD_TRITON_NPU_TARGET = "npu1"` — compile
-successfully on Windows but do not yet execute; see the limitation noted under
-[Windows Support](#windows-support).
+Examples check their results against PyTorch and raise on mismatch, so a clean
+exit with no output means the kernel ran correctly on the NPU. The compiled
+artifacts and intermediate IR are left in `air_project\` next to the example.
+
+To run the whole suite:
+
+```powershell
+python scripts\run_tests.py --device aie2p
+```
+
+`transform_aie2p.mlir` targets npu2 (AIE2P); `transform_aie2.mlir` targets npu1
+(AIE2).
+
+Compilation does not require matching hardware. Setting
+`AMD_TRITON_NPU_TARGET` selects the device to compile for and
+`AMD_TRITON_NPU_COMPILE_ONLY=1` stops before dispatch, so any Windows machine
+can produce artifacts for either generation — they are written to
+`air_project\`. Note that the examples verify their results against PyTorch, so
+they are meant to be run with dispatch enabled; use compile-only when you want
+the artifacts rather than a pass/fail result.
 
 ### Windows Environment Variables
 
 | Variable | Purpose |
 |----------|---------|
-| `AIR_TRANSFORM_TILING_SCRIPT` | Path to MLIR transform dialect IR |
-| `XILINX_XRT` | (Optional) Override XRT SDK location if not in `C:\Program Files\AMD\xrt` |
+| `AIR_TRANSFORM_TILING_SCRIPT` | Path to the MLIR transform dialect tiling script |
+| `XRT_DEV_DIR` | XRT SDK location, if not at `C:\Program Files\AMD\xrt` |
+| `AMD_TRITON_NPU_XRT_DIR` | Same, taking precedence over `XRT_DEV_DIR`; also settable as `npu_config.xrt_dir` |
+| `AMD_TRITON_NPU_TARGET` | Force `npu1` or `npu2` instead of detecting the installed device |
+| `AMD_TRITON_NPU_COMPILE_ONLY` | `1` to compile without dispatching — build on a machine with no NPU |
+| `AMD_TRITON_NPU_OUTPUT_FORMAT` | Force `elf` or `xclbin`; defaults to `elf` on npu2, `xclbin` on npu1 |
+| `AMD_TRITON_NPU_BF16_EMULATION` | `1` to truncate f32 to bf16 before multiply, accumulating in f32 |
+| `AMD_TRITON_NPU_AIR_PROJECT_PATH` | Where intermediate IR and artifacts are written (default `.\air_project`) |
+| `AMD_TRITON_NPU_DEBUG` | `1` for verbose compiler and launcher output |
 
-### Windows Known Limitations
+Each of these is also settable from Python via `npu_config` — see
+`amd_triton_npu/backend/config.py`. The HSA runtime (`AMD_TRITON_NPU_RUNTIME`)
+is Linux-only.
 
-- Kernel execution is currently validated on npu2 (AIE2P) only. npu1 (AIE2)
-  compiles but does not yet execute on Windows — dispatch uses the xclbin/DPU
-  path, which the Windows NPU driver stack does not yet support, so kernels abort
-  (`ERT_CMD_STATE_ABORT`) and outputs come back zeroed. Use Linux for npu1 for
-  now. See [#88](https://github.com/amd/Triton-XDNA/issues/88)
-- Python 3.10–3.14 supported; 3.13 recommended so the prebuilt `pyxrt.pyd` in the
-  XRT Windows SDK can be used as-is. On other versions, build `pyxrt` from source
-  to match your interpreter
-- `pyxrt.pyd` (from the XRT Windows SDK zip) must be on `PYTHONPATH` /
-  site-packages, and the AMD NPU driver's `xrt_coreutil.dll` must be on `PATH`
-- xclbinutil and aiebu-asm must be on PATH (from XRT Windows SDK)
-- NPU driver must be installed
+### Troubleshooting
+
+**`ImportError: DLL load failed` when importing `pyxrt`** — the prebuilt
+`pyxrt.pyd` targets Python 3.13. Either use a 3.13 interpreter or build `pyxrt`
+from source against the version you are running.
+
+**`pyxrt` imports but finds no device** — `pyxrt.pyd` loads `xrt_coreutil.dll`
+from the AMD NPU driver. Confirm the driver is installed and that
+`xrt-smi examine` lists the device.
+
+**"XRT development files not found"** — the XRT SDK is missing or incomplete.
+The error lists every location that was searched; extract
+`xrt_windows_sdk.zip` as described in [Set up XRT](#set-up-xrt), or point
+`XRT_DEV_DIR` at it. A runtime-only install (just the driver's DLLs) is not
+enough to compile.
+
+**npu1 (AIE2) kernels abort with `ERT_CMD_STATE_ABORT` and return zeros** —
+npu1 dispatch uses the older xclbin/DPU path, which the Windows NPU driver stack
+does not yet support. npu1 compiles on Windows but must be run on Linux; see
+[#88](https://github.com/amd/Triton-XDNA/issues/88).

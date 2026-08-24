@@ -178,13 +178,82 @@ def _get_air_opt_path() -> str:
     return _find_mlir_air_binary(binary_name)
 
 
+# Set by _neutralize_hostile_xilinx_xrt() when it removes XILINX_XRT from the
+# environment: the value is still a perfectly good source of *development*
+# files, it just cannot be left visible to XRT's runtime loader.
+_stashed_xilinx_xrt = None
+_xrt_env_checked = False
+
+
+def _neutralize_hostile_xilinx_xrt() -> None:
+    """Remove XILINX_XRT from the environment when it would break XRT itself.
+
+    XILINX_XRT is overloaded. Triton-XDNA reads it to find development files
+    (headers + import lib), but on Windows ``xrt_coreutil.dll`` also reads it
+    and then treats the directory as a complete XRT installation, requiring
+    ``xrt_core.dll``. The Windows NPU driver stack ships only
+    ``xrt_coreutil.dll``, so pointing XILINX_XRT at an SDK extracted from
+    xrt_windows_sdk.zip makes both pyxrt device detection and kernel dispatch
+    die with::
+
+        RuntimeError: XRT runtime error: No such library '...\\xrt_core.dll'
+
+    When the directory has no xrt_core.dll, nothing can consume it as a runtime
+    anyway, so we take it out of the environment and remember it for
+    _get_xrt_path(). The user still gets their headers; XRT's loader falls back
+    to its own (working) default search.
+
+    Windows-only: on Linux XILINX_XRT is the standard way to select an XRT
+    installation and removing it would break the runtime rather than fix it.
+    Idempotent, and safe to call from several entry points.
+    """
+    global _stashed_xilinx_xrt, _xrt_env_checked
+    if _xrt_env_checked:
+        return
+    _xrt_env_checked = True
+
+    if not IS_WINDOWS:
+        return
+
+    env_path = os.environ.get("XILINX_XRT", "")
+    if not env_path:
+        return
+    if os.path.isfile(os.path.join(env_path, "xrt_core.dll")):
+        # A full XRT installation - leave it alone.
+        return
+
+    _stashed_xilinx_xrt = env_path
+    os.environ.pop("XILINX_XRT", None)
+    # warnings.warn, not logger.warning: this module's logger sits at CRITICAL
+    # unless AMD_TRITON_NPU_DEBUG=1, and quietly rewriting someone's
+    # environment deserves to be visible by default.
+    import warnings
+
+    warnings.warn(
+        f"XILINX_XRT={env_path} contains no xrt_core.dll. XRT's runtime "
+        "loader would fail on it ('No such library ...xrt_core.dll'), "
+        "breaking both device detection and kernel dispatch, so it has been "
+        "unset for this process. It is still used to locate XRT development "
+        "files. Set XRT_DEV_DIR (or npu_config.xrt_dir) instead to silence "
+        "this.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    logger.debug("Neutralized XILINX_XRT=%s (no xrt_core.dll)", env_path)
+
+
 def _get_xrt_path() -> str:
     """Get the path to the XRT development directory (headers + import lib).
 
     Search order:
-    1. XILINX_XRT environment variable (standard on both Linux and Windows)
-    2. (Windows) C:\\Program Files\\AMD\\xrt  (recommended install location)
-    3. (Linux) /opt/xilinx/xrt
+    1. ``npu_config.xrt_dir`` / ``AMD_TRITON_NPU_XRT_DIR``
+    2. ``XRT_DEV_DIR`` environment variable
+    3. ``XILINX_XRT`` environment variable
+    4. (Windows) C:\\Program Files\\AMD\\xrt  (recommended install location)
+    5. (Linux) /opt/xilinx/xrt
+
+    Prefer XRT_DEV_DIR over XILINX_XRT on Windows -- see
+    :func:`_neutralize_hostile_xilinx_xrt` for why the latter is hazardous.
 
     The returned directory must contain the SDK components (include/xrt headers
     and lib/) needed for JIT compilation.  A runtime-only installation (e.g.
@@ -193,6 +262,7 @@ def _get_xrt_path() -> str:
     On Windows, download xrt_windows_sdk.zip from the Xilinx/XRT releases page
     and extract the xrt/ directory to C:\\Program Files\\AMD\\xrt.
     """
+    _neutralize_hostile_xilinx_xrt()
 
     def _validate_xrt_sdk(path: str, source: str) -> str:
         """Ensure *path* contains the SDK components needed for compilation."""
@@ -215,28 +285,45 @@ def _get_xrt_path() -> str:
             )
         return ""  # path doesn't exist at all
 
-    env_path = os.getenv("XILINX_XRT", "")
-    if env_path:
-        result = _validate_xrt_sdk(env_path, "XILINX_XRT environment variable")
-        if result:
-            return result
-
     if IS_WINDOWS:
         program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
         default_path = os.path.join(program_files, "AMD", "xrt")
-        result = _validate_xrt_sdk(default_path, "default location")
-        if result:
-            return result
+        default_desc = "default location (%PROGRAMFILES%\\AMD\\xrt)"
     else:
-        result = _validate_xrt_sdk("/opt/xilinx/xrt", "default location")
+        default_path = "/opt/xilinx/xrt"
+        default_desc = "default location (/opt/xilinx/xrt)"
+
+    # (path, human-readable source) in priority order. _stashed_xilinx_xrt
+    # stands in for XILINX_XRT when it had to be removed from the environment.
+    candidates = [
+        (npu_config.xrt_dir, "npu_config.xrt_dir / AMD_TRITON_NPU_XRT_DIR"),
+        (os.getenv("XRT_DEV_DIR", ""), "XRT_DEV_DIR environment variable"),
+        (
+            _stashed_xilinx_xrt or os.getenv("XILINX_XRT", ""),
+            "XILINX_XRT environment variable",
+        ),
+        (default_path, default_desc),
+    ]
+
+    tried = []
+    for path, source in candidates:
+        if not path:
+            continue
+        tried.append(f"  - {source}: {path}")
+        result = _validate_xrt_sdk(path, source)
         if result:
             return result
 
+    tried_text = "\n".join(tried) if tried else "  (no candidate locations)"
     raise RuntimeError(
-        "XRT development files not found. "
-        "Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases "
-        "and extract the xrt/ directory to C:\\Program Files\\AMD\\xrt "
-        "(or set the XILINX_XRT environment variable to its location)."
+        "XRT development files not found. Download xrt_windows_sdk.zip from "
+        "https://github.com/Xilinx/XRT/releases and extract the inner xrt/ "
+        "directory (the one containing include/ and lib/) to "
+        "C:\\Program Files\\AMD\\xrt, or point XRT_DEV_DIR at it.\n"
+        "Locations tried:\n" + tried_text + "\n"
+        "Prefer XRT_DEV_DIR over XILINX_XRT on Windows: XILINX_XRT is also "
+        "read by xrt_coreutil.dll, which then requires an xrt_core.dll that "
+        "the NPU driver does not ship."
     )
 
 
@@ -588,6 +675,21 @@ def _get_msvc_env(cl_path: str) -> dict:
     if env.get("INCLUDE"):
         return env
 
+    # Prefer the environment vcvars64.bat itself produces: it is authoritative,
+    # tracks new Visual Studio and Windows SDK layouts for free, and brings
+    # along tools (rc.exe, mt.exe) that the manual derivation below omits. Fall
+    # back to that derivation when Visual Studio cannot be located this way --
+    # it is the path that has always been used here and still works.
+    try:
+        from .msvc import vcvars_env
+
+        vc_env = vcvars_env()
+    except Exception:
+        vc_env = None
+    if vc_env:
+        env.update(vc_env)
+        return env
+
     # Derive MSVC paths from cl.exe location:
     #   .../VC/Tools/MSVC/<ver>/bin/Hostx64/x64/cl.exe
     cl_dir = os.path.dirname(cl_path)  # .../bin/Hostx64/x64
@@ -748,6 +850,12 @@ def _pyxrt_device_name() -> str:
     come up empty on a host whose sysfs entries it cannot render even though
     the device node itself opens fine.
     """
+    # Must run before the first pyxrt call: a hostile XILINX_XRT makes
+    # pyxrt.device(0) fail outright. NPULauncher reaches device detection
+    # before it ever reaches _get_xrt_path, so this cannot be left to the
+    # latter.
+    _neutralize_hostile_xilinx_xrt()
+
     import pyxrt
 
     device = pyxrt.device(0)
@@ -1905,6 +2013,30 @@ def _aircc_compile(
         ):
             os.environ["PATH"] = mlir_aie_bin + os.pathsep + os.environ.get("PATH", "")
 
+        # Same idea for the XRT SDK: aiecc shells out to aiebu-asm (and
+        # xclbinutil on the xclbin path) by bare name, and those ship in the
+        # XRT Windows SDK rather than with mlir-aie, so without help the ELF
+        # build dies with
+        #     aiecc: ShellCommand: tool 'aiebu-asm' not found in search paths
+        # We already know where the SDK is, so putting it on PATH here is
+        # strictly better than asking every user to do it by hand. Failure to
+        # locate an SDK is not fatal here -- aircc may not need it, and the
+        # launcher reports a far clearer error if it does.
+        try:
+            xrt_dir = _get_xrt_path()
+        except RuntimeError:
+            xrt_dir = None
+        if xrt_dir:
+            # xclbinutil.exe / aiebu-asm.exe sit at the SDK root; keep bin/ too
+            # for layouts that use it.
+            for tool_dir in (xrt_dir, os.path.join(xrt_dir, "bin")):
+                if os.path.isdir(tool_dir) and tool_dir not in os.environ.get(
+                    "PATH", ""
+                ):
+                    os.environ["PATH"] = (
+                        tool_dir + os.pathsep + os.environ.get("PATH", "")
+                    )
+
     if output_format == "elf":
         elf_path = os.path.join(air_proj_path, "aie.elf")
         aircc_cmd = [
@@ -2548,6 +2680,9 @@ class NPUDriver(DriverBase):
             )
         # Exposed for introspection (e.g. triton.runtime.driver.active.runtime).
         self.runtime = runtime
+        # Do this once, up front, so every later XRT consumer in the process
+        # sees a sane environment (see _neutralize_hostile_xilinx_xrt).
+        _neutralize_hostile_xilinx_xrt()
         self.utils = NPUUtils()
         # Triton instantiates the launcher as ``launcher_cls(src, metadata)`` and
         # never passes the driver, so bind the chosen runtime here.

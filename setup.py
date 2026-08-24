@@ -65,18 +65,44 @@ AMD_TRITON_NPU_DIR = BASE_DIR / "amd_triton_npu"
 # same strategy as used in TheRock
 # https://github.com/ROCm/TheRock/pull/4006/changes#diff-6812ec4cd824b4a56416cd4ca74afdece86fe8d39c813300eddc0d17194b9e80R153-R155
 
-# Patch configuration: (submodule_name, patch_file)
-PATCHES = [
-    (
-        ("triton-windows", "triton-windows.patch")
-        if IS_WINDOWS
-        else ("triton", "triton.patch")
-    ),
-    ("triton_shared", "triton_shared.patch"),
-]
+# Patch application lives in scripts/patching.py so this file and
+# scripts/apply_patches.py share one implementation. They used to be
+# near-duplicates that had drifted: only one passed --ignore-whitespace, and
+# only the other knew Windows patches triton-windows rather than triton.
+sys.path.insert(0, str(BASE_DIR / "scripts"))
+from patching import PatchError  # noqa: E402
+from patching import apply_patches as _apply_patches  # noqa: E402
 
-# Marker file name to track if patches have been applied
-PATCH_MARKER_FILE = ".patches_applied"
+
+def apply_patches():
+    """Apply the submodule patches, aborting the build if any fails.
+
+    Failing here is the point. This step used to print a warning and carry on,
+    so an unapplied triton_shared.patch surfaced twenty minutes later as a
+    C2397 narrowing-conversion error in PtrAnalysis.cpp with nothing tying it
+    back to patching. sys.exit keeps the explanation readable instead of
+    burying it under a pip traceback.
+    """
+    try:
+        _apply_patches()
+    except PatchError as e:
+        sys.exit(f"\nERROR: {e}\n")
+
+
+def _load_msvc_helper():
+    """Load amd_triton_npu/backend/msvc.py without importing triton.
+
+    That package cannot be imported normally at build time (its __init__ pulls
+    in the triton backend), but msvc.py is deliberately stdlib-only, so load it
+    straight off disk.
+    """
+    import importlib.util
+
+    path = AMD_TRITON_NPU_DIR / "backend" / "msvc.py"
+    spec = importlib.util.spec_from_file_location("_triton_xdna_msvc", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def find_triton_shared_opt_binary(triton_source_dir: Path = None) -> Path:
@@ -123,92 +149,6 @@ def find_triton_shared_opt_binary(triton_source_dir: Path = None) -> Path:
 def check_env_flag(name: str, default: str = "") -> bool:
     """Check if an environment variable is set to a truthy value."""
     return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
-
-
-# =============================================================================
-# Patch Management
-# =============================================================================
-
-
-def apply_submodule_patches():
-    """
-    Apply local patches to third-party submodules before building.
-
-    This function applies patch files from third_party/ to their respective
-    submodules. It uses marker files to track whether patches have been applied
-    to avoid re-applying them on subsequent builds.
-    """
-    print("=" * 60, file=sys.stderr)
-    print("Checking/applying patches to submodules", file=sys.stderr)
-    print("=" * 60, file=sys.stderr)
-
-    for submodule_name, patch_name in PATCHES:
-        submodule_dir = THIRD_PARTY_DIR / submodule_name
-        patch_file = THIRD_PARTY_DIR / patch_name
-        marker_file = submodule_dir / PATCH_MARKER_FILE
-
-        print(f"\n[{submodule_name}]", file=sys.stderr)
-
-        # Check if submodule directory exists
-        if not submodule_dir.exists():
-            print(
-                f"  ⚠ Submodule directory not found: {submodule_dir}", file=sys.stderr
-            )
-            continue
-
-        # Check if patch file exists
-        if not patch_file.exists():
-            print(f"  ⚠ Patch file not found: {patch_file}", file=sys.stderr)
-            continue
-
-        # Check if already applied (marker exists)
-        if marker_file.exists():
-            print(f"  ✓ Patches already applied (marker exists)", file=sys.stderr)
-            continue
-
-        # Check if patch can be applied (dry run)
-        check_result = subprocess.run(
-            ["git", "apply", "--check", str(patch_file)],
-            cwd=submodule_dir,
-            capture_output=True,
-            text=True,
-        )
-
-        if check_result.returncode != 0:
-            # Check if patch is already applied by trying reverse
-            reverse_result = subprocess.run(
-                ["git", "apply", "--check", "--reverse", str(patch_file)],
-                cwd=submodule_dir,
-                capture_output=True,
-                text=True,
-            )
-
-            if reverse_result.returncode == 0:
-                print(f"  ✓ Patch already applied", file=sys.stderr)
-                marker_file.touch()
-            else:
-                print(
-                    f"  ✗ Patch conflict: {check_result.stderr.strip()}",
-                    file=sys.stderr,
-                )
-            continue
-
-        # Apply the patch
-        print(f"  Applying {patch_name}...", file=sys.stderr)
-        apply_result = subprocess.run(
-            ["git", "apply", str(patch_file)],
-            cwd=submodule_dir,
-            capture_output=True,
-            text=True,
-        )
-
-        if apply_result.returncode == 0:
-            print(f"  ✓ Patch applied successfully", file=sys.stderr)
-            marker_file.touch()
-        else:
-            print(f"  ✗ Failed to apply patch: {apply_result.stderr}", file=sys.stderr)
-
-    print("\n" + "=" * 60, file=sys.stderr)
 
 
 # =============================================================================
@@ -355,7 +295,7 @@ class TritonXdnaBdistWheel(bdist_wheel):
 
     def run(self):
         # Apply patches before building
-        apply_submodule_patches()
+        apply_patches()
 
         print("=" * 60, file=sys.stderr)
         print("Building Triton XDNA wheel", file=sys.stderr)
@@ -427,8 +367,22 @@ class TritonXdnaBdistWheel(bdist_wheel):
         # includes a build number, so hand-rolling it would only drift.
 
         # Prepare environment for triton-windows build.
-        # Note: MSVC environment (vcvars64.bat) must already be set up.
+        #
+        # A developer prompt is no longer required. If INCLUDE is unset we run
+        # vcvars64.bat ourselves and adopt the environment it produces; without
+        # it CMake only reports that it cannot find the compiler named by $CXX,
+        # which says nothing about Visual Studio.
         windows_env = dict(os.environ)
+        msvc = _load_msvc_helper()
+        if msvc.in_developer_environment():
+            print("  MSVC: using the developer environment already in scope")
+        else:
+            vc_env = msvc.vcvars_env()
+            if vc_env is None:
+                sys.exit(f"\nERROR: {msvc.SETUP_HINT}\n")
+            print(f"  MSVC: initialised from {msvc.find_vcvars()}")
+            windows_env.update(vc_env)
+
         windows_env.update(
             {
                 "PYTHONUTF8": "1",
@@ -885,7 +839,7 @@ class TritonXdnaDevelop(develop):
             self._copy_triton_shared_opt()
         else:
             # Build triton from source with plugins
-            apply_submodule_patches()
+            apply_patches()
             env = os.environ.copy()
             plugin_dirs = f"{TRITON_SHARED_DIR};{AMD_TRITON_NPU_DIR}"
             env["TRITON_PLUGIN_DIRS"] = plugin_dirs
@@ -967,7 +921,7 @@ class TritonXdnaInstall(install):
                     os.chmod(dst_binary, 0o755)
         else:
             # Build triton from source with plugins
-            apply_submodule_patches()
+            apply_patches()
 
             env = os.environ.copy()
             plugin_dirs = f"{TRITON_SHARED_DIR};{AMD_TRITON_NPU_DIR}"

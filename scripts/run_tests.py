@@ -109,6 +109,11 @@ def run_python_file(
             env=env,
             capture_output=True,
             text=True,
+            # Decode the example's output as UTF-8 rather than the platform
+            # default. Without this, one non-cp1252 byte from a kernel or a
+            # traceback takes down the whole run with UnicodeDecodeError.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_sec,
         )
     except subprocess.TimeoutExpired as e:
@@ -152,7 +157,31 @@ def run_python_file(
     return (result.returncode, result.stdout, result.stderr)
 
 
+def _make_output_unicode_safe():
+    """Stop the status emoji from killing the run on a non-UTF-8 console.
+
+    Windows consoles default to cp1252, and Python encodes stdout strictly, so
+    the first "📁" raised UnicodeEncodeError before a single example ran.
+    (stderr survived only because Python defaults it to backslashreplace.)
+    Reconfigure both to UTF-8, and fall back to replacing unencodable
+    characters if the stream cannot be switched.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main():
+    _make_output_unicode_safe()
+
     parser = argparse.ArgumentParser(
         description="Run each example under the examples directory and report pass/fail."
     )
@@ -204,7 +233,10 @@ def main():
     if args.log:
         now = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         log_path = args.log.format(now)
-        log_f = open(log_path, "w")
+        # Explicit encoding: the log carries captured subprocess output, which
+        # routinely contains characters the platform default (cp1252 on
+        # Windows) cannot represent.
+        log_f = open(log_path, "w", encoding="utf-8", errors="replace")
         # Intentionally leave open for entire run
 
     # Determine transform filename based on device

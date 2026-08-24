@@ -1,0 +1,10 @@
+# The patches in third_party/ are authored with LF context lines. Git's Windows
+# default (core.autocrlf=true) would rewrite them to CRLF on checkout, and
+# `git apply` then rejects every hunk -- historically a silent no-op that only
+# surfaced ~20 minutes later as a C2397 error in PtrAnalysis.cpp. Pin them so
+# they are LF regardless of the user's git configuration.
+#
+# Note this cannot govern the submodule working trees the patches are applied
+# to; each submodule has its own attributes. scripts/patching.py handles that
+# side with --ignore-whitespace and a --3way fallback.
+third_party/*.patch text eol=lf

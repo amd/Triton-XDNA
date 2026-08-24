@@ -62,6 +62,7 @@ class _NPUConfig:
         self._debug = MISSING
         self._target = MISSING
         self._runtime = MISSING
+        self._xrt_dir = MISSING
 
     # ---- compile_only ----
 
@@ -267,6 +268,30 @@ class _NPUConfig:
             )
         self._runtime = value
 
+    # ---- xrt_dir ----
+
+    @property
+    def xrt_dir(self):
+        """Directory holding the XRT *development* files (``include/xrt`` + ``lib``).
+
+        Set this to point the JIT compiler at an XRT SDK in a non-standard
+        location. Prefer it over ``XILINX_XRT``: on Windows that variable is
+        also read by ``xrt_coreutil.dll``, which then insists on ``xrt_core.dll``
+        -- a file the NPU-only driver stack does not ship -- so setting it
+        breaks device detection and kernel dispatch.
+
+        Env var fallback: ``AMD_TRITON_NPU_XRT_DIR``. Set to ``None`` to fall
+        back to the normal search (``XRT_DEV_DIR``, ``XILINX_XRT``, then the
+        platform default).
+        """
+        if self._xrt_dir is not MISSING:
+            return self._xrt_dir
+        return os.getenv("AMD_TRITON_NPU_XRT_DIR") or None
+
+    @xrt_dir.setter
+    def xrt_dir(self, value):
+        self._xrt_dir = value
+
     # ---- utilities ----
 
     def reset(self):
@@ -279,6 +304,7 @@ class _NPUConfig:
         self._debug = MISSING
         self._target = MISSING
         self._runtime = MISSING
+        self._xrt_dir = MISSING
 
 
 # Module-level singleton
@@ -309,6 +335,7 @@ def set_config(**kwargs):
         "air_project_path",
         "target",
         "runtime",
+        "xrt_dir",
     }
     for key, value in kwargs.items():
         if key not in valid_keys:
