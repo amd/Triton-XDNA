@@ -11,16 +11,16 @@ Weights loaded from HuggingFace state_dict.
 
 Two hetero modes route operators across iGPU and NPU:
   "hetero": consistent NPU/GPU split for both prefill and decode
-  - iGPU: Attention (QKV proj, Q@K^T, softmax, attn@V, output proj)
-  - NPU:  ln1, ln2, ln_f, MLP (up-proj, GELU, down-proj), residual add
+  - iGPU: embeddings, LayerNorm, attention (QKV proj, Q@K^T, softmax,
+          attn@V, output proj), residual add, LM head
+  - NPU:  the MLP (up-proj, GELU, down-proj) and its residual add
   "hetero-fast": GPU-only decode for lower TPOT latency
   - Prefill: same split as "hetero"
   - Decode:  ALL ops on iGPU (NPU dispatch overhead dominates tiny tensors)
 
-LayerNorm runs on NPU in hetero modes because the NPU kernel computes and
-outputs in float32, while the GPU kernel truncates to bf16.  This float32
-precision through layernorm is critical: bf16 layernorm output compounds
-into significant logit drift over 12 transformer layers.
+LayerNorm runs in float32 via torch rather than through triton_layernorm,
+whose kernel truncates to bf16.  That precision is critical: bf16 layernorm
+output compounds into significant logit drift over 12 transformer layers.
 """
 
 import os
@@ -115,7 +115,6 @@ GPT2_CONFIG = GPT2_CONFIGS["gpt2"]
 
 # Default hetero routing policy: which device runs each operator
 HETERO_ROUTING = {
-    "layernorm": "npu",
     "qkv_linear": "gpu",
     "attn_proj": "gpu",
     "softmax": "gpu",
@@ -925,11 +924,10 @@ class GPT2Model:
 
             elif hetero:
                 # --- HETERO PATH (prefill for hetero-fast, all steps for hetero) ---
-                # GPU for attention; NPU for LN/MLP/add.
+                # GPU for attention and LayerNorm; NPU for the MLP and its add.
                 # hetero-fast: weights are on GPU, use _cpu_layers for NPU ops
-                # hetero: LN/MLP weights are already on CPU in layer dict
+                # hetero: MLP weights are already on CPU in layer dict
                 npu_w = self._cpu_layers[i] if hasattr(self, "_cpu_layers") else layer
-                ln1_be = self.op_backend["layernorm"]
                 # LayerNorm on tiny (<=4x768) CPU tensors: NPU dispatch overhead
                 # (~1.5-4ms) dwarfs the compute, so normalize on host.
                 with self.timer.track("ln1"):
@@ -962,7 +960,6 @@ class GPT2Model:
 
                 # NPU ops: use CPU-resident weights
                 npu_w = self._cpu_layers[i] if hasattr(self, "_cpu_layers") else layer
-                ln2_be = self.op_backend["layernorm"]
                 with self.timer.track("ln2"):
                     x_norm = torch.nn.functional.layer_norm(
                         x.to(torch.float32),
