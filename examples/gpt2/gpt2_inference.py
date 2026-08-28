@@ -111,8 +111,11 @@ def run_triton_model(state_dict, input_ids, backend, profile=False, config=None)
 
 def compare_logits(ref_logits, triton_logits, tokenizer, input_ids):
     """Compare reference and Triton model logits."""
-    ref = ref_logits.to(torch.float32)
-    tri = triton_logits.to(torch.float32)
+    # forward() leaves logits on the compute device; the HuggingFace reference
+    # is on the host, so bring ours across here. This is a one-off at the end of
+    # a run, not something the per-token path pays.
+    ref = ref_logits.to(torch.float32).cpu()
+    tri = triton_logits.to(torch.float32).cpu()
 
     # Metrics
     max_diff = torch.max(torch.abs(ref - tri)).item()

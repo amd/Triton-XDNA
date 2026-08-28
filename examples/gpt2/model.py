@@ -13,10 +13,14 @@ Two hetero modes route operators across iGPU and NPU:
   "hetero": consistent NPU/GPU split for both prefill and decode
   - iGPU: embeddings, LayerNorm, attention (QKV proj, Q@K^T, softmax,
           attn@V, output proj), residual add, LM head
-  - NPU:  the MLP (up-proj, GELU, down-proj) and its residual add
+  - NPU:  the MLP (up-proj, GELU, down-proj) and its residual add, fused into
+          one dispatch over buffers both devices address (shared.py)
   "hetero-fast": GPU-only decode for lower TPOT latency
   - Prefill: same split as "hetero"
   - Decode:  ALL ops on iGPU (NPU dispatch overhead dominates tiny tensors)
+
+The hidden state stays iGPU-resident for a whole layer; the NPU reads and
+writes it in place rather than through a host round trip.
 
 LayerNorm runs in float32 via torch rather than through triton_layernorm,
 whose kernel truncates to bf16.  That precision is critical: bf16 layernorm
@@ -125,6 +129,11 @@ HETERO_ROUTING = {
 }
 
 
+# The iGPU the fused MLP's shared buffers are mapped into: the target of
+# share= at allocation, and what run() tests its operands against.
+_IGPU = "hip:0"
+
+
 def _next_pow2(n):
     return 1 << (n - 1).bit_length()
 
@@ -178,19 +187,57 @@ class _FusedMLP:
         self._mm = None
         self._gelu = None
         self._build_kernels()
-        # Persistent host staging buffers (shape fixed across all calls/layers).
-        # Reused every run() to avoid re-allocating/zeroing ~8MB per dispatch.
-        # Rows beyond M_real hold stale data but are discarded on readback (the
-        # matmul is row-independent and output is sliced to [:M_real]). K-padding
-        # columns (D+1:) stay zero (written once here, never touched again).
+        # Placeholders for the chain's device-only intermediates. They never
+        # carry host data -- the runner allocates their BOs and the kernels
+        # write them -- so only their shape and dtype matter here.
         from ml_dtypes import bfloat16 as _bf16
 
-        self._A_aug = np.zeros((self.BM, self.K0_pad), dtype=_bf16)
         self._C0 = np.zeros((self.BM, self.HID_pad), dtype=np.float32)
         self._G = np.zeros(self.BM * self.HID_pad, dtype=_bf16)
         self._C2 = np.zeros((self.BM, self.D), dtype=np.float32)
-        self._R = np.zeros((self.BM, self.D), dtype=np.float32)
-        self._OUT = np.zeros((self.BM, self.D), dtype=np.float32)
+        # Defined before setup, which is allowed to raise: close()/__del__ run
+        # regardless and must not turn that into an AttributeError.
+        self._sb_A = self._sb_R = self._sb_OUT = None
+        self._setup_shared_buffers()
+
+    def _setup_shared_buffers(self):
+        """Back the chain's three host-facing operands with shared NPU/iGPU memory.
+
+        A_aug, R and OUT are the only args that cross the host boundary every
+        dispatch (the weights are static, the rest are device intermediates).
+        Allocating them as XRT BOs that are also mapped into the iGPU lets the
+        producer write where the NPU will read, which removes both the numpy
+        staging and the host->BO memcpy. The buffers are shared across layers:
+        their shapes depend only on the MLP geometry, which is identical
+        everywhere. They are held directly rather than through a pool: nothing
+        looks them up by name, and their release has to be ordered against the
+        chain, which only this class knows about.
+
+        Raises if the interop is unavailable (no pyxrt, no ROCm torch, no
+        visible device) -- allocating is itself the check, so the error carries
+        the real cause. There is deliberately no host-staging fallback inside
+        the fused chain: GPT2Model already falls back to the unfused per-op NPU
+        path when _FusedMLP cannot be built, and a second, nested fallback would
+        be a path nothing ever runs -- which is exactly how the old one silently
+        rotted.
+        """
+        from triton.backends.amd_triton_npu import shared
+
+        # Allocated by XRT so the NPU can name the BO directly, then mapped into
+        # the iGPU. "xrt:0" resolves through the shared device cache, which is
+        # also where MultiLaunchRunner gets its handle -- a BO is only usable as
+        # a dispatch argument if it and the dispatch came from the same device
+        # object, and going through the string keeps that true by construction.
+        on = dict(device="xrt:0", share=_IGPU)
+        # The augmented-K bias fold requires the padding columns past D+1 to be
+        # zero, and column D to be 1.0. Both are invariant across every dispatch
+        # and every layer, so they are written once here rather than per launch.
+        self._sb_A = shared.zeros(self.BM, self.K0_pad, dtype=torch.bfloat16, **on)
+        self._sb_R = shared.zeros(self.BM, self.D, dtype=torch.float32, **on)
+        self._sb_OUT = shared.zeros_like(self._sb_R)
+        self._sb_A[:, self.D] = 1.0
+        torch.cuda.synchronize()
+        logger.info("zero-copy NPU/iGPU buffers enabled for the fused MLP")
 
     def _build_kernels(self):
         import triton
@@ -358,6 +405,14 @@ class _FusedMLP:
         if self._chain is not None:
             self._chain.close()
             self._chain = None
+        # After the chain: its cached BO set holds these very buffers, so
+        # unregistering their pages first would pull them out from under a
+        # dispatcher that still has them bound. GC order would not guarantee
+        # this, which is why release is explicit rather than left to __del__.
+        for buf in (self._sb_A, self._sb_R, self._sb_OUT):
+            if buf is not None:
+                buf.close()
+        self._sb_A = self._sb_R = self._sb_OUT = None
 
     def __del__(self):
         try:
@@ -371,60 +426,103 @@ class _FusedMLP:
         if layer_idx not in self._weights:
             B0, B2 = self._prep_weights(w_fc, b_fc, w_proj, b_proj)
             b_proj_np = b_proj.to(torch.float32).cpu().numpy()
-            self._weights[layer_idx] = (B0, B2, b_proj_np)
+            # The iGPU copy rides in the same cache rather than a parallel one,
+            # so it is created and released with everything else for the layer.
+            b_proj_dev = torch.from_numpy(b_proj_np).to("cuda")
+            self._weights[layer_idx] = (B0, B2, b_proj_np, b_proj_dev)
         return self._weights[layer_idx]
 
     def run(self, layer_idx, x_norm, residual, w_fc, b_fc, w_proj, b_proj):
-        """Run the fused MLP + residual add for one layer.
+        """Run the fused MLP + residual add for one layer, without staging.
 
-        x_norm: ln2(x) (B,S,D) tensor (CPU); residual: x (B,S,D) the block
-        hidden state added back after the MLP. Returns x + mlp(x_norm)
-        (B,S,D) torch f32 tensor -- i.e. the post-residual-add result, matching
-        `x = add(x, mlp_out)` in the unfused path.
+        x_norm: ln2(x) (B,S,D); residual: x (B,S,D), the block hidden state
+        added back after the MLP. Returns x + mlp(x_norm) as a (B,S,D) f32
+        tensor on the same device as x_norm -- i.e. the post-residual-add
+        result, matching `x = add(x, mlp_out)` in the unfused path.
+
+        Operands are written straight into the memory the NPU will read, and
+        the result is read out of the memory the NPU wrote. Which view is used
+        follows the caller's tensors: iGPU-resident inputs are copied
+        device-side, host-resident ones host-side, so neither case crosses the
+        boundary just to reach the buffer.
+
+        Inputs are taken through DLPack rather than assumed to be torch
+        tensors: any producer implementing the protocol is adopted zero-copy,
+        and the device test uses ``__dlpack_device__`` instead of ``.is_cuda``.
+        That distinction matters -- ``.is_cuda`` is true for *any* GPU, so a
+        tensor on a second device would take the fast path and then be copied
+        across devices behind our back. Comparing the DLPack device index
+        against the one the shared buffers are registered on sends that case
+        down the host path instead, which is correct if slower.
         """
-        from ml_dtypes import bfloat16
+        from triton.backends.amd_triton_npu.shared import as_torch, is_on_device
 
-        D, H, K0_pad, HID_pad = self.D, self.H, self.K0_pad, self.HID_pad
         chain = self._get_chain()
-        B0, B2, b_proj_np = self._weights_for(layer_idx, w_fc, b_fc, w_proj, b_proj)
-
+        B0, B2, b_proj_np, b_proj_dev = self._weights_for(
+            layer_idx, w_fc, b_fc, w_proj, b_proj
+        )
+        D = self.D
+        x_norm = as_torch(x_norm)
+        residual = as_torch(residual)
         orig_shape = x_norm.shape
-        x2d = x_norm.reshape(-1, D).to(torch.float32).cpu().numpy()  # (M_real, D)
-        res2d = residual.reshape(-1, D).to(torch.float32).cpu().numpy()
+        orig_device = x_norm.device
+        x2d = x_norm.reshape(-1, D)
+        res2d = residual.reshape(-1, D)
         M_real = x2d.shape[0]
-        M_pad = self.BM
-        if M_real > M_pad:
-            # Multiple M-blocks not handled by this single-block chain; caller
-            # should keep prefill on the unfused path for long sequences.
+        if M_real > self.BM:
             raise ValueError(
-                f"_FusedMLP only supports M<={M_pad} (got {M_real}); "
+                f"_FusedMLP only supports M<={self.BM} (got {M_real}); "
                 "use the unfused MLP path for longer sequences."
             )
-        # A_aug = [x | 1 | 0...]; reuse persistent buffers (only [:M_real] read
-        # back, so stale rows beyond M_real are harmless).
-        A_aug, C0, G, C2, R, OUT = (
-            self._A_aug,
-            self._C0,
-            self._G,
-            self._C2,
-            self._R,
-            self._OUT,
-        )
-        A_aug[:M_real, :D] = x2d.astype(bfloat16)
-        A_aug[:M_real, D] = bfloat16(1.0)
-        R[:M_real, :D] = res2d
 
-        # On-device: OUT = C2 + R (residual). Host: + b_proj broadcast over M,
-        # giving x + (mlp_proj_out + b_proj) = x + mlp_out.
-        out = chain.run(
-            [A_aug, B0, C0, G, B2, C2, R, OUT],
+        on_gpu = is_on_device(x2d, _IGPU) and is_on_device(res2d, _IGPU)
+        if on_gpu:
+            # copy_ converts dtype itself, so no cast temporaries here. Column D
+            # already holds the augmented-K 1.0 from setup.
+            self._sb_A[:M_real, :D].copy_(x2d)
+            self._sb_R[:M_real, :D].copy_(res2d)
+            # The NPU reads these pages directly, so the iGPU's writes have to
+            # have landed before the dispatch is submitted. The writes went to
+            # the current stream, so draining every stream is unnecessary.
+            torch.cuda.current_stream().synchronize()
+        else:
+            from ml_dtypes import bfloat16
+
+            A_np, R_np = self._sb_A.numpy(), self._sb_R.numpy()
+            # .cpu() rather than plain .numpy(): this branch also catches a
+            # tensor sitting on a *different* GPU than the shared buffers, which
+            # has to come back to the host first.
+            A_np[:M_real, :D] = x2d.to(torch.float32).cpu().numpy().astype(bfloat16)
+            R_np[:M_real, :D] = res2d.to(torch.float32).cpu().numpy()
+
+        chain.run(
+            [
+                self._sb_A.numpy(),
+                B0,
+                self._C0,
+                self._G,
+                B2,
+                self._C2,
+                self._sb_R.numpy(),
+                self._sb_OUT.numpy(),
+            ],
             bo_key=f"gpt2_mlp_L{layer_idx}",
             static_indices={1, 4},
             intermediate_indices={2, 3, 5},
             output_indices={7},
+            bound_buffers={0: self._sb_A.bo, 6: self._sb_R.bo, 7: self._sb_OUT.bo},
         )
-        res = out[7].astype(np.float32)[:M_real, :D] + b_proj_np  # host bias
-        return torch.from_numpy(res.copy()).reshape(orig_shape)
+
+        # mlp_proj's bias could not be folded into the augmented-K trick (its A
+        # is gelu's output), so it is applied here, on whichever side the caller
+        # is working.
+        if on_gpu:
+            return (self._sb_OUT[:M_real, :D] + b_proj_dev).reshape(orig_shape)
+        # .to(orig_device) matters for the case this branch exists to catch: a
+        # tensor on a different iGPU than the shared buffers still has to come
+        # back where it started.
+        res = self._sb_OUT.numpy()[:M_real, :D] + b_proj_np
+        return torch.from_numpy(res).reshape(orig_shape).to(orig_device)
 
 
 class GPT2Model:
@@ -507,13 +605,20 @@ class GPT2Model:
         if (self._is_hetero or backend == "npu") and os.getenv(
             "AMD_TRITON_NPU_FUSED_MLP", "1"
         ) == "1":
-            self._fused_mlp = _FusedMLP(
-                self.n_embd,
-                self.mlp_dim,
-                self.matmul_script,
-                self.gelu_f32in_script,
-                self.add_f32_script,
-            )
+            try:
+                self._fused_mlp = _FusedMLP(
+                    self.n_embd,
+                    self.mlp_dim,
+                    self.matmul_script,
+                    self.gelu_f32in_script,
+                    self.add_f32_script,
+                )
+            except Exception as e:
+                # The fused chain needs buffers both devices can address. Where
+                # that is unavailable the model still runs, just on the unfused
+                # per-op NPU path -- this is the one fallback, rather than a
+                # second one nested inside the chain.
+                logger.warning(f"fused MLP unavailable ({e}); using the unfused path")
 
     def _load_weights(self, sd):
         """Map HuggingFace GPT-2 weight names to internal parameters."""
@@ -574,15 +679,31 @@ class GPT2Model:
     def _place_weights(self):
         """Place weights for consistent hetero mode.
 
-        Attention weights → GPU; LN/MLP/add weights stay on CPU for NPU.
-        Same routing for both prefill and decode.
+        Attention *and* layernorm weights → GPU; only the MLP weights stay on
+        CPU. The hidden state is iGPU-resident for the whole layer (the NPU
+        reads it out of shared buffers rather than a host copy), so every op
+        that touches it runs on the iGPU and needs its weights there. The MLP
+        weights are the exception: ``_FusedMLP._prep_weights`` folds them into
+        padded numpy arrays once and never reads the tensors again, so pushing
+        the largest weights in the model to the iGPU would buy nothing.
         """
-        gpu_keys = {"qkv_weight", "qkv_bias", "attn_proj_weight", "attn_proj_bias"}
+        cpu_keys = {
+            "mlp_fc_weight",
+            "mlp_fc_bias",
+            "mlp_proj_weight",
+            "mlp_proj_bias",
+        }
         for layer in self.layers:
             for k, v in layer.items():
-                if k in gpu_keys:
+                if k not in cpu_keys:
                     layer[k] = v.to("cuda")
-        # ln_f weights stay on CPU for NPU layernorm (float32 precision)
+        self.ln_f_weight = self.ln_f_weight.to("cuda")
+        self.ln_f_bias = self.ln_f_bias.to("cuda")
+        self._cache_ln_f32()
+        # Embeddings too: they produce the hidden state, so doing the lookup on
+        # the iGPU is what keeps x from starting life on the host.
+        self.wte = self.wte.to("cuda")
+        self.wpe = self.wpe.to("cuda")
 
     def _place_weights_fast(self):
         """Place weights for hetero-fast mode: all on GPU, CPU copies for NPU prefill.
@@ -591,16 +712,13 @@ class GPT2Model:
         (~0.5-1ms per launch × 72 dispatches = ~36ms wasted). All weights must
         be GPU-resident for this fast path.
 
-        During prefill (S>1), MLP/ln2 ops run on NPU where larger tensors benefit
-        from AIE parallelism. NPU kernels expect CPU-resident weights, so we keep
-        CPU copies of the NPU-routed weights.
+        During prefill (S>1), the MLP runs on NPU where larger tensors benefit
+        from AIE parallelism. Only the MLP weights need host copies: the fused
+        chain folds them into padded numpy arrays once, while everything else
+        (LN, attention) now runs on the iGPU against the GPU-resident weights.
         """
         # CPU copies of NPU-routed weights (must be created before moving to GPU)
         npu_keys = {
-            "ln1_weight",
-            "ln1_bias",
-            "ln2_weight",
-            "ln2_bias",
             "mlp_fc_weight",
             "mlp_fc_bias",
             "mlp_proj_weight",
@@ -613,16 +731,32 @@ class GPT2Model:
                 cpu_layer[k] = layer[k].clone()  # already on CPU
             self._cpu_layers.append(cpu_layer)
 
-        # CPU copies of ln_f for NPU prefill
-        self._cpu_ln_f_weight = self.ln_f_weight.clone()
-        self._cpu_ln_f_bias = self.ln_f_bias.clone()
-
         # All weights to GPU (for decode fast path + attention)
         for layer in self.layers:
             for k, v in layer.items():
                 layer[k] = v.to("cuda")
         self.ln_f_weight = self.ln_f_weight.to("cuda")
         self.ln_f_bias = self.ln_f_bias.to("cuda")
+        # Embeddings too, so the hidden state starts on the iGPU and stays
+        # there for both the decode fast path and the hetero prefill.
+        self.wte = self.wte.to("cuda")
+        self.wpe = self.wpe.to("cuda")
+        self._cache_ln_f32()
+
+    def _cache_ln_f32(self):
+        """Pre-cast the LayerNorm weights the hetero path uses to float32.
+
+        Weights are stored bf16, but hetero LayerNorm runs in float32. Casting
+        at the call site meant six tiny device casts per layer on every forward
+        pass -- pure launch overhead for a value that never changes. Kept under
+        separate keys so triton_layernorm, which wants the bf16 originals, is
+        unaffected.
+        """
+        for layer in self.layers:
+            for k in ("ln1_weight", "ln1_bias", "ln2_weight", "ln2_bias"):
+                layer[k + "_f32"] = layer[k].to(torch.float32)
+        self.ln_f_weight_f32 = self.ln_f_weight.to(torch.float32)
+        self.ln_f_bias_f32 = self.ln_f_bias.to(torch.float32)
 
     def _to_gpu(self, x):
         """Move tensor to CUDA if not already there."""
@@ -861,12 +995,16 @@ class GPT2Model:
         # everything to GPU using GPU-resident weights instead.
         decode_gpu = self.backend == "hetero-fast" and S == 1
 
-        # Move input_ids to GPU for embedding lookup (weights already on GPU)
-        if self.backend == "gpu" and input_ids.device.type != "cuda":
+        # Move input_ids to GPU for embedding lookup (weights already on GPU).
+        # Hetero included: the embeddings live on the iGPU so the hidden state
+        # is born there and never has to be shipped across for attention.
+        if (
+            self.backend in ("gpu", "hetero", "hetero-fast")
+            and input_ids.device.type != "cuda"
+        ):
             input_ids = input_ids.to("cuda")
 
         # Token + position embeddings — stay in bf16 to avoid per-layer casts
-        # In hetero mode, embeddings are on CPU (wte/wpe stay on CPU)
         positions = torch.arange(
             pos_offset, pos_offset + S, dtype=torch.long, device=input_ids.device
         )
@@ -924,22 +1062,26 @@ class GPT2Model:
 
             elif hetero:
                 # --- HETERO PATH (prefill for hetero-fast, all steps for hetero) ---
-                # GPU for attention and LayerNorm; NPU for the MLP and its add.
-                # hetero-fast: weights are on GPU, use _cpu_layers for NPU ops
-                # hetero: MLP weights are already on CPU in layer dict
+                # The hidden state stays iGPU-resident for the whole layer. The
+                # NPU reaches it through shared buffers (shared.py) rather
+                # than a host copy, so there is no reason to bounce x to the
+                # host and back around the attention block: LN and the residual
+                # add run on the iGPU next to attention, and only the MLP's
+                # weights live on the host.
+                #
+                # LayerNorm stays in float32 (not the bf16 the GPU LN kernel
+                # would emit): bf16 LN output compounds into visible logit drift
+                # over the full stack, which is why this uses torch's LN rather
+                # than triton_layernorm.
                 npu_w = self._cpu_layers[i] if hasattr(self, "_cpu_layers") else layer
-                # LayerNorm on tiny (<=4x768) CPU tensors: NPU dispatch overhead
-                # (~1.5-4ms) dwarfs the compute, so normalize on host.
                 with self.timer.track("ln1"):
                     x_norm = torch.nn.functional.layer_norm(
                         x.to(torch.float32),
                         (self.n_embd,),
-                        npu_w["ln1_weight"].to(torch.float32),
-                        npu_w["ln1_bias"].to(torch.float32),
+                        layer["ln1_weight_f32"],
+                        layer["ln1_bias_f32"],
                         eps=LN_EPS,
                     )
-                with self.timer.track("to_gpu"):
-                    x_norm = self._to_gpu(x_norm)
 
                 layer_cache = kv_caches[i] if kv_caches else None
                 with self.timer.track("attention"):
@@ -948,24 +1090,19 @@ class GPT2Model:
                     )
                 new_kv_caches.append(new_cache)
 
-                with self.timer.track("to_cpu"):
-                    attn_out = self._to_cpu(attn_out)
-
                 add_be = self.op_backend["add"]
-                # add1 is a trivial elementwise residual add on tiny (<=4x768)
-                # CPU tensors; NPU dispatch overhead (~2.8ms) dwarfs the compute,
-                # so do it on host. No transfer (x and attn_out already on CPU).
+                # Residual add on the iGPU, alongside attention that produced
+                # attn_out. Dispatching this tiny elementwise op to the NPU would
+                # cost more in launch overhead than the arithmetic.
                 with self.timer.track("add1"):
                     x = x.to(torch.float32) + attn_out.to(torch.float32)
 
-                # NPU ops: use CPU-resident weights
-                npu_w = self._cpu_layers[i] if hasattr(self, "_cpu_layers") else layer
                 with self.timer.track("ln2"):
                     x_norm = torch.nn.functional.layer_norm(
                         x.to(torch.float32),
                         (self.n_embd,),
-                        npu_w["ln2_weight"].to(torch.float32),
-                        npu_w["ln2_bias"].to(torch.float32),
+                        layer["ln2_weight_f32"],
+                        layer["ln2_bias_f32"],
                         eps=LN_EPS,
                     )
 
@@ -997,6 +1134,13 @@ class GPT2Model:
                             npu_w["mlp_proj_bias"],
                         )
                 else:
+                    # Unfused NPU path (sequences too long for the single
+                    # M-block chain). These wrappers stage through host buffers
+                    # and dispatch per op, so the operands have to come back to
+                    # the host; the result is returned to the iGPU so the next
+                    # layer resumes on the fast path.
+                    x_norm = self._to_cpu(x_norm)
+                    x = self._to_cpu(x)
                     with self.timer.track("mlp_fc"):
                         h = self._linear(
                             x_norm,
@@ -1015,6 +1159,7 @@ class GPT2Model:
                         )
                     with self.timer.track("add2"):
                         x = self._add(x, mlp_out, backend=add_be)
+                    x = self._to_gpu(x)
 
             else:
                 # --- SINGLE-BACKEND PATH (gpu or npu) ---
@@ -1070,46 +1215,40 @@ class GPT2Model:
                         x = self._add(x, mlp_out)
 
         # Final LayerNorm
-        if hetero and not decode_gpu:
-            # Final LN on CPU: tiny tensor, NPU dispatch overhead dominates.
+        if hetero:
+            # On the iGPU, where x already is, and in float32 for the same
+            # precision reason as ln1/ln2. The LM head consumes it right after,
+            # also on the iGPU, so nothing crosses.
             with self.timer.track("ln_f"):
-                ln_f_w = (
-                    self._cpu_ln_f_weight
-                    if hasattr(self, "_cpu_ln_f_weight")
-                    else self.ln_f_weight
-                )
-                ln_f_b = (
-                    self._cpu_ln_f_bias
-                    if hasattr(self, "_cpu_ln_f_bias")
-                    else self.ln_f_bias
-                )
                 x = torch.nn.functional.layer_norm(
                     x.to(torch.float32),
                     (self.n_embd,),
-                    ln_f_w.to(torch.float32),
-                    ln_f_b.to(torch.float32),
+                    self.ln_f_weight_f32,
+                    self.ln_f_bias_f32,
                     eps=LN_EPS,
                 )
-        elif hetero:
-            with self.timer.track("ln_f"):
-                x = self._layernorm(x, self.ln_f_weight, self.ln_f_bias, backend="gpu")
         else:
             with self.timer.track("ln_f"):
                 x = self._layernorm(x, self.ln_f_weight, self.ln_f_bias)
 
         # Language model head: x @ wte^T (tied weights)
         # (B, S, 768) @ (768, 50257) -> (B, S, 50257)
+        #
+        # Logits are returned on the device that computed them, NOT copied to
+        # the host. At 50257 floats per position this is the single largest
+        # transfer in the model (~201 KB per token), and every consumer either
+        # takes an argmax -- which runs on the iGPU and yields 4 bytes -- or is
+        # doing a one-off comparison that can move it itself. Callers that
+        # genuinely need host logits should say so explicitly.
         with self.timer.track("lm_head"):
             if self._wte_lm_head is not None:
                 # NPU/hetero: run on GPU (~0.5ms vs ~20ms on CPU)
                 logits = (
                     x.to(device="cuda", dtype=torch.float32) @ self._wte_lm_head.t()
-                ).cpu()
+                )
             else:
                 # GPU: x and wte already on CUDA
                 logits = x.to(torch.float32) @ self.wte.to(torch.float32).t()
-                if logits.device.type == "cuda":
-                    logits = logits.cpu()
 
         return logits, new_kv_caches
 
@@ -1168,11 +1307,12 @@ class GPT2Model:
         t0 = time.perf_counter()
         with torch.no_grad():
             logits, kv_caches = self.forward(input_ids, kv_caches=kv_caches)
+        # Greedy: pick last token's argmax. Inside the timed region on purpose --
+        # .item() is what forces the device sync, so leaving it outside would
+        # make TTFT measure kernel enqueue rather than time-to-first-token.
+        next_token = torch.argmax(logits[0, -1]).item()
         t1 = time.perf_counter()
         timing["prefill_ms"] = (t1 - t0) * 1000
-
-        # Greedy: pick last token's argmax
-        next_token = torch.argmax(logits[0, -1]).item()
         generated_ids.append(next_token)
         pos_offset = prompt_len
         if progress_callback is not None:
@@ -1180,17 +1320,21 @@ class GPT2Model:
 
         # Decode loop
         for step in range(max_new_tokens - 1):
-            next_input = torch.tensor([[next_token]], dtype=torch.long)
+            # Built on the compute device: forward() would otherwise ship this
+            # one token across, and even a 32-byte transfer costs a full
+            # host->device round trip -- once per step, for the whole decode.
+            next_input = torch.tensor([[next_token]], dtype=torch.long, device=device)
 
             t0 = time.perf_counter()
             with torch.no_grad():
                 logits, kv_caches = self.forward(
                     next_input, kv_caches=kv_caches, pos_offset=pos_offset
                 )
+            # See the prefill note: the argmax is the sync point, so TPOT only
+            # means anything if it is measured inside.
+            next_token = torch.argmax(logits[0, -1]).item()
             t1 = time.perf_counter()
             timing["decode_times_ms"].append((t1 - t0) * 1000)
-
-            next_token = torch.argmax(logits[0, -1]).item()
             generated_ids.append(next_token)
             pos_offset += 1
             if progress_callback is not None:

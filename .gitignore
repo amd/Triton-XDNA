@@ -45,3 +45,5 @@ xrt-dev/
 
 # llvm windows prebuilt images
 third_party/llvm-*
+.cline_storage/
+.triton-home/
