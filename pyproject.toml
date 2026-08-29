@@ -5,13 +5,8 @@
 # amd_triton_npu plugin uses to describe shared buffers to DLPack consumers
 # (amd_triton_npu.cc).
 #
-# The >=3.0 floor comes from that second use: 3.0 is the first release whose
-# ndarray raises BufferError for copy=True and for a mismatched dl_device
-# instead of accepting and ignoring them. Because we build triton without
-# isolation, this pin also overrides the nanobind==2.10.2 in
-# third_party/triton/pyproject.toml -- which would otherwise silently drop
-# those two refusals. examples/npu_gpu_dlpack/shared_buffer_test.py asserts
-# them, so the failure is loud either way.
+# 3.0 is the first release whose ndarray raises BufferError for copy=True and
+# for a mismatched dl_device instead of accepting and ignoring them.
 requires = ["setuptools>=70.1", "wheel", "pip", "build", "pybind11", "nanobind>=3.0", "cmake>=3.20", "ninja"]
 build-backend = "setuptools.build_meta"
 
