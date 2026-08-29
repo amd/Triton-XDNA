@@ -50,8 +50,7 @@ void init_triton_amd_triton_npu(py::module_ &m) {
   m.def(
       "dlpack_ndarray",
       [](uintptr_t data, const std::vector<size_t> &shape, uint8_t code,
-         uint8_t bits, int32_t deviceType, int32_t deviceId,
-         py::object owner) {
+         uint8_t bits, int32_t deviceType, int32_t deviceId, py::object owner) {
         // `owner` is required, not optional: without one nanobind falls back to
         // copying the contents, which it cannot do for a bare pointer, and the
         // call fails outright. The Python side passes a sentinel rather than
