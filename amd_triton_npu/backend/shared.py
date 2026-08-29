@@ -50,10 +50,15 @@ its ``_Attachment`` subclass, which is the only place that has to change when a
 runtime's import story does.
 
 DLPack appears here only as the interchange format: it is how a buffer describes
-itself to torch, CuPy or JAX without a copy. The helpers for consuming *other*
-producers (``as_torch``, ``dlpack_device``, ``is_on_device``) are the one part
-of this file that has nothing to do with shared buffers, and they are grouped
-together for that reason.
+itself to torch, CuPy or JAX without a copy. DLPack is the protocol; nanobind is
+the implementation. The plugin returns a nanobind ndarray and the protocol
+methods delegate to it, so nothing here hand-rolls the ABI -- but the names stay
+DLPack's, because that is what the protocol is called and what a reader looking
+for ``__dlpack__`` will search for.
+
+The helpers for consuming *other* producers (``as_torch``, ``dlpack_device``,
+``is_on_device``) are the one part of this file that has nothing to do with
+shared buffers, and they are grouped together for that reason.
 
 Sharing is not free, but it is paid once per buffer rather than once per
 dispatch, and the design assumes buffers outlive many dispatches. Reads and
@@ -119,7 +124,8 @@ __all__ = [
     "zeros_like",
 ]
 
-# DLPack device types (dlpack.h). A buffer shared with a HIP device is described
+# DLPack device types, as the spec numbers them. A buffer shared with a HIP
+# device is described
 # as a ROCm tensor: the pages are host-allocated, but the pointer handed out is
 # the iGPU-side mapping, so the consumer must treat it as device memory. With no
 # HIP device attached it is plain host memory and is described as such.
@@ -127,7 +133,8 @@ kDLCPU = 1
 kDLCUDA = 2
 kDLROCM = 10
 
-# DLPack dtype codes.
+# DLPack dtype codes. Same values as nanobind's dlpack::dtype_code, which is
+# what these are ultimately handed to.
 _kDLInt, _kDLUInt, _kDLFloat, _kDLBfloat = 0, 1, 2, 4
 
 # hipHostRegisterMapped / hipHostMallocMapped: map the pinned range into the
@@ -155,7 +162,7 @@ class SharedBufferError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Native pieces: the HIP runtime and the DLManagedTensor builder
+# Native pieces: the HIP runtime and the DLPack producer
 # ---------------------------------------------------------------------------
 @functools.lru_cache(maxsize=1)
 def _hip() -> ctypes.CDLL:
@@ -211,6 +218,7 @@ def _dlpack_ndarray() -> Callable[..., Any]:
 def _void_capsule(ptr: int) -> Any:
     """Wrap a raw address in an unnamed ``PyCapsule``.
 
+    Unrelated to DLPack, despite the type: this one is an argument to pyxrt.
     pyxrt binds the ``void* userptr`` constructor of ``xrt::ext::bo``, and
     pybind11 marshals a bare ``void*`` as a capsule -- there is no overload that
     takes an integer address, so this is the only way to hand XRT a pointer that
@@ -916,7 +924,7 @@ class SharedBuffer:
         device_type, device_id, _ = self._dlpack_source()
         return (device_type, device_id)
 
-    def _dlpack_ndarray(self) -> Any:
+    def _as_ndarray(self) -> Any:
         """A ``nanobind.nb_ndarray`` describing this buffer.
 
         Built fresh per call rather than cached: it is cheap, and a cached one
@@ -957,7 +965,7 @@ class SharedBuffer:
         is the NPU, which is not on a HIP stream at all. Callers must fence
         explicitly around the hand-off (``_FusedMLP.run`` does).
         """
-        return self._dlpack_ndarray().__dlpack__(
+        return self._as_ndarray().__dlpack__(
             stream=stream,
             max_version=max_version,
             dl_device=dl_device,
@@ -969,7 +977,8 @@ class SharedBuffer:
 
         An iGPU tensor when a HIP device is attached, a CPU one otherwise.
         Cached: the view is stable for as long as the attachment set is, and
-        re-deriving it would mint a capsule per call for no benefit.
+        re-deriving it would build an ndarray and a capsule per call for no
+        benefit.
         """
         if self._torch_view is None:
             import torch

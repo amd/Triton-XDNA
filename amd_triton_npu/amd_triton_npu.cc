@@ -32,10 +32,10 @@ namespace py = nanobind;
 // which is not on a HIP stream at all, so there is no producer stream to order
 // against and callers must fence explicitly around the hand-off.
 //
-// Requires nanobind >= 3.0. 2.10.2 has the versioned-capsule negotiation but
-// merely accepts and ignores ``copy`` and ``dl_device`` instead of refusing
-// them; shared_buffer_test.py asserts the refusals, so a build against the
-// older pin fails there rather than silently losing them.
+// This is why pyproject.toml floors nanobind at 3.0: 2.10.2 has the versioned-
+// capsule negotiation but merely accepts and ignores ``copy`` and ``dl_device``
+// instead of refusing them. shared_buffer_test.py asserts the refusals, so an
+// older nanobind fails there rather than silently losing them.
 //
 // This lives in the compiled plugin rather than a shim built at import time so
 // that the managed tensor's deleter is an ordinary C++ function: the consumer

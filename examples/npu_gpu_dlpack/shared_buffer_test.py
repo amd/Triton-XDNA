@@ -19,8 +19,9 @@ Covers every combination the API admits:
   * a real Triton-compiled NPU kernel dispatched on shared BOs, once with XRT
     owning the pages and once with HIP owning them -- the second is the userptr
     import, which is the part that is easy to get subtly wrong;
-  * a clean interpreter exit -- the original ctypes-callback DLPack deleter
-    segfaulted at shutdown, which the C deleter is supposed to fix.
+  * a clean interpreter exit -- an early ctypes-callback DLPack deleter
+    segfaulted at shutdown, which is why the producer is compiled into the
+    plugin and its deleter is nanobind's rather than a Python callback.
 
 Exit status is the result, so this doubles as a regression test.
 
