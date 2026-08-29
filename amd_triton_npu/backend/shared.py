@@ -136,6 +136,20 @@ _HIP_HOST_REGISTER_MAPPED = 0x2
 _HIP_HOST_MALLOC_MAPPED = 0x2
 
 
+#: Stand-in owner for the DLPack views handed to consumers.
+#:
+#: nanobind needs *an* owner object or it tries to copy the contents, which it
+#: cannot do for a bare pointer. Nothing Python-side actually owns these pages
+#: -- the attachment does, and close() releases them explicitly -- so a
+#: sentinel is the honest answer.
+#:
+#: Passing the SharedBuffer would read better and would keep the wrapper alive
+#: behind a consumer's tensor, but it leaks: nanobind's ndarray is not
+#: GC-tracked, so buffer -> cached torch view -> ndarray -> buffer is invisible
+#: to the cycle collector and __del__ never runs. Measured, not assumed.
+_NDARRAY_OWNER = object()
+
+
 class SharedBufferError(RuntimeError):
     """Raised when a buffer cannot be allocated, shared, or reached."""
 
@@ -181,17 +195,17 @@ def _hip_check(rc: int, what: str) -> None:
 
 
 @functools.lru_cache(maxsize=1)
-def _dlpack_capsule() -> Callable[..., Any]:
+def _dlpack_ndarray() -> Callable[..., Any]:
     """The DLPack producer, compiled into the backend plugin.
 
-    Lives in C++ (``amd_triton_npu/amd_triton_npu.cc``) rather than a shim built
-    at import time so the managed tensor's deleter and the capsule's destructor
-    are ordinary functions the consumer can hold for the tensor's whole life,
-    interpreter shutdown included.
+    Returns a ``nanobind.nb_ndarray`` over a raw pointer. nanobind owns the
+    DLPack ABI and the consumer-facing protocol -- see the comment in
+    ``amd_triton_npu/amd_triton_npu.cc`` for what that covers and why it is
+    compiled in rather than built at import time.
     """
     from triton._C.libtriton import amd_triton_npu as _plugin
 
-    return _plugin.dlpack_capsule
+    return _plugin.dlpack_ndarray
 
 
 def _void_capsule(ptr: int) -> Any:
@@ -902,6 +916,25 @@ class SharedBuffer:
         device_type, device_id, _ = self._dlpack_source()
         return (device_type, device_id)
 
+    def _dlpack_ndarray(self) -> Any:
+        """A ``nanobind.nb_ndarray`` describing this buffer.
+
+        Built fresh per call rather than cached: it is cheap, and a cached one
+        would go stale the moment ``share_with`` changed which mapping the
+        buffer should describe itself by.
+        """
+        device_type, device_id, pointer = self._dlpack_source()
+        code, bits, _ = _dtype_info(self.dtype)
+        return _dlpack_ndarray()(
+            pointer,
+            list(self.shape),
+            code,
+            bits,
+            device_type,
+            device_id,
+            _NDARRAY_OWNER,
+        )
+
     def __dlpack__(
         self,
         *,
@@ -912,46 +945,24 @@ class SharedBuffer:
     ) -> Any:
         """A DLPack capsule over this buffer.
 
-        Each call produces a fresh capsule: DLPack transfers ownership of the
-        managed tensor to the consumer, so handing the same one out twice would
-        double-free it.
+        Delegated to nanobind, which implements the whole negotiation: a fresh
+        capsule per call (ownership transfers to the consumer, so handing the
+        same one out twice would double-free it), legacy or versioned according
+        to ``max_version``, and ``BufferError`` for ``copy=True`` or a
+        ``dl_device`` this buffer is not on.
 
-        Version negotiation is honoured rather than left to the consumer's
-        fallback. torch asks for ``max_version=(1, 0)`` and only retries the
-        legacy call if that raises ``TypeError`` -- it does not honour the
-        ``BufferError`` the array API standard prescribes -- so a producer that
-        simply refuses the argument works by accident. Both capsule flavours are
-        produced here instead.
-
-        ``stream`` is accepted and ignored, which needs saying: the other writer
-        of these pages is the NPU, which is not on a HIP stream at all, so there
-        is no stream for the producer to order against. Callers must fence
-        explicitly around the hand-off (``_FusedMLP._run_shared`` does).
+        The signature is spelled out rather than ``**kwargs`` so the accepted
+        arguments stay discoverable, and because ``stream`` deserves saying out
+        loud: it is accepted and ignored, since the other writer of these pages
+        is the NPU, which is not on a HIP stream at all. Callers must fence
+        explicitly around the hand-off (``_FusedMLP.run`` does).
         """
-        if copy:
-            raise BufferError("SharedBuffer cannot satisfy copy=True")
-        device_type, device_id, pointer = self._dlpack_source()
-        here = (device_type, device_id)
-        if dl_device is not None and tuple(dl_device) != here:
-            raise BufferError(
-                f"SharedBuffer is on {here}, cannot move to {tuple(dl_device)}"
-            )
-        code, bits, _ = _dtype_info(self.dtype)
-        versioned = max_version is not None and tuple(max_version)[0] >= 1
-        # The capsule carries a destructor, so one the consumer never takes
-        # ownership of frees its managed tensor instead of leaking.
-        capsule = _dlpack_capsule()(
-            pointer,
-            list(self.shape),
-            code,
-            bits,
-            device_type,
-            device_id,
-            versioned,
+        return self._dlpack_ndarray().__dlpack__(
+            stream=stream,
+            max_version=max_version,
+            dl_device=dl_device,
+            copy=copy,
         )
-        if capsule is None:
-            raise SharedBufferError("DLPack managed tensor allocation failed")
-        return capsule
 
     def torch(self) -> Tensor:
         """A torch tensor aliasing this buffer.
