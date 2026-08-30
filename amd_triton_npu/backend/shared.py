@@ -547,6 +547,14 @@ class _HipAttachment(_Attachment):
         finally:
             hip.hipSetDevice(previous)
 
+    def _release_on_error(self, step: Callable[[], None]) -> None:
+        """Run ``step``, undoing this attachment's pin/allocation if it raises."""
+        try:
+            step()
+        except Exception:
+            self.release()
+            raise
+
     def _resolve_device_ptr(self) -> None:
         """Fill in the iGPU-side alias of ``self._host_ptr``."""
         dev = ctypes.c_void_p()
@@ -575,7 +583,11 @@ class _HipAttachment(_Attachment):
             raise SharedBufferError("hipHostMalloc returned a null pointer")
         self._host_ptr = ptr.value
         self._owned = True
-        self._resolve_device_ptr()
+        # Past this point the pages are pinned, so a failure has to undo it
+        # here: the caller has no handle on this attachment yet -- SharedBuffer
+        # only records it once allocate()/attach() returns -- so nothing else
+        # would ever call release().
+        self._release_on_error(self._resolve_device_ptr)
         return self._host_ptr
 
     def attach(self, host_ptr: int, nbytes: int) -> None:
@@ -590,7 +602,7 @@ class _HipAttachment(_Attachment):
             )
         self._host_ptr = host_ptr
         self._registered = True
-        self._resolve_device_ptr()
+        self._release_on_error(self._resolve_device_ptr)
 
     def release(self) -> None:
         # Swallowed: release() runs from close() and from __del__, and __del__

@@ -230,18 +230,22 @@ def main() -> int:
     _sync()
 
     chain = add_chain.build("zero_copy_bench_add", N)
-
-    # Shared buffers: allocated and registered once, reused every iteration.
-    # Allocating is also the availability check -- there is no separate probe.
-    try:
-        # XRT owns the pages (the NPU dispatch names the BO); the iGPU borrows
-        # them, which is what lets torch.matmul write straight into the input.
-        c_buf = shared.empty(N, dtype=torch.float32, device="xrt:0", share="hip:0")
-        out_buf = shared.empty_like(c_buf)
-    except SharedBufferError as e:
-        sys.exit(f"shared NPU/iGPU buffers unavailable: {e}")
+    # Bound before the try so the finally can close whatever got as far as
+    # existing -- empty_like can fail after empty succeeded.
+    c_buf = out_buf = None
 
     try:
+        # Shared buffers: allocated and registered once, reused every iteration.
+        # Allocating is also the availability check, so there is no separate
+        # probe. XRT owns the pages (the NPU dispatch names the BO); the iGPU
+        # borrows them, which is what lets torch.matmul write straight into the
+        # input.
+        try:
+            c_buf = shared.empty(N, dtype=torch.float32, device="xrt:0", share="hip:0")
+            out_buf = shared.empty_like(c_buf)
+        except SharedBufferError as e:
+            sys.exit(f"shared NPU/iGPU buffers unavailable: {e}")
+
         print("\n  warming up (JIT, ELF build, BO allocation)...")
         run_copy(chain, a, b, e1_host, e2_host, WARMUP)
         run_shared(chain, a, b, c_buf, out_buf, e1_host, e2_host, WARMUP)
@@ -285,7 +289,8 @@ def main() -> int:
     finally:
         chain.close()
         for buf in (out_buf, c_buf):
-            buf.close()
+            if buf is not None:
+                buf.close()
 
 
 if __name__ == "__main__":

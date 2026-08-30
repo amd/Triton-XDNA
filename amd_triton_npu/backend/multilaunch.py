@@ -290,13 +290,12 @@ class MultiLaunchRunner:
                 not implied: they are staged from the host every call unless
                 also named here.
             output_indices: indices synced device->host and returned (default:
-                {len(inputs)-1}). The kernel overwrites these, so like
-                intermediates they are only written host->device on the first
-                call (to define the memory); re-uploading the host copy every
-                dispatch just ships bytes the device is about to discard. A
-                kernel that accumulates into its output instead of overwriting
-                it would need that host copy every call -- no chain does today,
-                so there is no knob for it.
+                {len(inputs)-1}). This says only "read this back"; it makes no
+                claim about whether the kernel fully writes the operand, so an
+                output is still staged from the host on every dispatch. A kernel
+                that overwrites its output entirely can skip that by naming the
+                index in intermediate_indices as well -- but only if it really
+                does, since intermediates are zeroed on the first call.
 
         Returns:
             dict {idx: numpy array view} for each output index.
@@ -342,6 +341,14 @@ class MultiLaunchRunner:
             )
         cached_sizes, bos = self._bos[bo_key]
         if not first_call:
+            # Repeated from the first-call block: indexing bos[i] below would
+            # otherwise raise a bare IndexError instead of this message.
+            for i in bound:
+                if not 0 <= i < len(inputs):
+                    raise ValueError(
+                        f"bound buffer index {i} is out of range for "
+                        f"{len(inputs)} args"
+                    )
             if sizes != cached_sizes:
                 raise ValueError(
                     f"bo_key '{bo_key}' was sized {cached_sizes} but this "
@@ -456,6 +463,15 @@ class NPUChain:
     ``args``/``constexprs`` are only used to drive warmup compilation (shapes +
     grid determine the lowered IR); the actual data is passed to ``run`` as numpy
     arrays in combined-arg order.
+
+    Known defect -- do not build a chain of exactly one op if you intend to
+    dispatch it more than once. A single-op chain returns correct data on its
+    first dispatch and corrupt data on every dispatch after that. It reproduces
+    on an unmodified checkout with plain host staging and no shared buffers, so
+    it is in the lowering or the ELF stitching rather than anything above.
+    Chains of two or more ops are unaffected. Until this is fixed, pad a
+    one-op chain with a second, trivial op -- see
+    ``examples/npu_gpu_dlpack/add_chain.py``, which does exactly that.
     """
 
     def __init__(self, name, air_project_path=None):

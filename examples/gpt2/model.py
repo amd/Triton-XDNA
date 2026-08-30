@@ -418,6 +418,10 @@ class _FusedMLP:
         # this, which is why release is explicit rather than left to __del__.
         # Views before buffers: they alias pages close() is about to release.
         self._views = ()
+        # The per-layer cache holds an iGPU b_proj copy per layer; releasing the
+        # buffers but keeping those would leave device memory live behind a
+        # closed object.
+        self._weights.clear()
         for buf in (self._sb_A, self._sb_R, self._sb_OUT):
             if buf is not None:
                 buf.close()
@@ -614,6 +618,8 @@ class GPT2Model:
         if (self._is_hetero or backend == "npu") and os.getenv(
             "AMD_TRITON_NPU_FUSED_MLP", "1"
         ) == "1":
+            from triton.backends.amd_triton_npu.shared import SharedBufferError
+
             try:
                 self._fused_mlp = _FusedMLP(
                     self.n_embd,
@@ -622,11 +628,16 @@ class GPT2Model:
                     self.gelu_f32in_script,
                     self.add_f32_script,
                 )
-            except Exception as e:
+            except (SharedBufferError, ImportError) as e:
                 # The fused chain needs buffers both devices can address. Where
                 # that is unavailable the model still runs, just on the unfused
                 # per-op NPU path -- this is the one fallback, rather than a
                 # second one nested inside the chain.
+                #
+                # Deliberately only those two: a bare `except Exception` would
+                # also swallow a Triton/MLIR failure or a missing transform
+                # script and quietly report ~10x-slower numbers under the
+                # "hetero" label. Those should fail loudly.
                 logger.warning(f"fused MLP unavailable ({e}); using the unfused path")
 
     def _load_weights(self, sd):
