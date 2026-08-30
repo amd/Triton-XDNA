@@ -73,15 +73,17 @@ access patterns this exists to serve.
 # is deliberately imported inside the function that needs it.
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import functools
 import glob
 import math
 import os
+import weakref
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Iterator, Sequence
     from typing import TypeAlias
 
     import numpy as np
@@ -141,20 +143,6 @@ _kDLInt, _kDLUInt, _kDLFloat, _kDLBfloat = 0, 1, 2, 4
 # device address space, which is what makes hipHostGetDevicePointer work.
 _HIP_HOST_REGISTER_MAPPED = 0x2
 _HIP_HOST_MALLOC_MAPPED = 0x2
-
-
-#: Stand-in owner for the DLPack views handed to consumers.
-#:
-#: nanobind needs *an* owner object or it tries to copy the contents, which it
-#: cannot do for a bare pointer. Nothing Python-side actually owns these pages
-#: -- the attachment does, and close() releases them explicitly -- so a
-#: sentinel is the honest answer.
-#:
-#: Passing the SharedBuffer would read better and would keep the wrapper alive
-#: behind a consumer's tensor, but it leaks: nanobind's ndarray is not
-#: GC-tracked, so buffer -> cached torch view -> ndarray -> buffer is invisible
-#: to the cycle collector and __del__ never runs. Measured, not assumed.
-_NDARRAY_OWNER = object()
 
 
 class SharedBufferError(RuntimeError):
@@ -536,14 +524,28 @@ class _HipAttachment(_Attachment):
         self._owned = False
         self._registered = False
 
-    def _select(self) -> None:
-        """Make this attachment's device current.
+    @contextlib.contextmanager
+    def _selected(self) -> Iterator[None]:
+        """Make this attachment's device current for the enclosing block.
 
         The host-memory calls below act on whatever device HIP considers
         current, not on one passed in, so a buffer asked for HIP device 1 would
         otherwise silently land on device 0.
+
+        The previous device is restored on the way out, which is not
+        housekeeping: torch caches its own idea of the current device and skips
+        hipSetDevice when it believes nothing changed. Leaving ours set would
+        make the next ``torch.empty(device="cuda")`` allocate on this device
+        instead of the one torch thinks it is on.
         """
-        _hip_check(_hip().hipSetDevice(ctypes.c_int(self.index)), "hipSetDevice")
+        hip = _hip()
+        previous = ctypes.c_int()
+        _hip_check(hip.hipGetDevice(ctypes.byref(previous)), "hipGetDevice")
+        _hip_check(hip.hipSetDevice(ctypes.c_int(self.index)), "hipSetDevice")
+        try:
+            yield
+        finally:
+            hip.hipSetDevice(previous)
 
     def _resolve_device_ptr(self) -> None:
         """Fill in the iGPU-side alias of ``self._host_ptr``."""
@@ -559,16 +561,16 @@ class _HipAttachment(_Attachment):
         self._device_ptr = dev.value
 
     def allocate(self, nbytes: int) -> int:
-        self._select()
         ptr = ctypes.c_void_p()
-        _hip_check(
-            _hip().hipHostMalloc(
-                ctypes.byref(ptr),
-                ctypes.c_size_t(nbytes),
-                ctypes.c_uint(_HIP_HOST_MALLOC_MAPPED),
-            ),
-            "hipHostMalloc",
-        )
+        with self._selected():
+            _hip_check(
+                _hip().hipHostMalloc(
+                    ctypes.byref(ptr),
+                    ctypes.c_size_t(nbytes),
+                    ctypes.c_uint(_HIP_HOST_MALLOC_MAPPED),
+                ),
+                "hipHostMalloc",
+            )
         if ptr.value is None:
             raise SharedBufferError("hipHostMalloc returned a null pointer")
         self._host_ptr = ptr.value
@@ -577,15 +579,15 @@ class _HipAttachment(_Attachment):
         return self._host_ptr
 
     def attach(self, host_ptr: int, nbytes: int) -> None:
-        self._select()
-        _hip_check(
-            _hip().hipHostRegister(
-                ctypes.c_void_p(host_ptr),
-                ctypes.c_size_t(nbytes),
-                ctypes.c_uint(_HIP_HOST_REGISTER_MAPPED),
-            ),
-            "hipHostRegister",
-        )
+        with self._selected():
+            _hip_check(
+                _hip().hipHostRegister(
+                    ctypes.c_void_p(host_ptr),
+                    ctypes.c_size_t(nbytes),
+                    ctypes.c_uint(_HIP_HOST_REGISTER_MAPPED),
+                ),
+                "hipHostRegister",
+            )
         self._host_ptr = host_ptr
         self._registered = True
         self._resolve_device_ptr()
@@ -785,7 +787,7 @@ class SharedBuffer:
         self._attachments = {}
         self._primary = None
         self._host_ptr: int | None = None
-        self._torch_view: Tensor | None = None
+        self._torch_view: weakref.ref[Tensor] | None = None
         self._numpy_view: np.ndarray | None = None
         self.shape = tuple(shape)
         self.dtype = dtype
@@ -933,14 +935,19 @@ class SharedBuffer:
         """
         device_type, device_id, pointer = self._dlpack_source()
         code, bits, _ = _dtype_info(self.dtype)
+        # self as owner: nanobind needs one (without it it tries to copy, which
+        # it cannot do for a bare pointer), and it makes a consumer's tensor keep
+        # this buffer alive. That matters -- `shared.zeros(...).torch()` drops
+        # the buffer at the end of the expression, and without the back-reference
+        # the tensor is left over pages __del__ has already released.
+        #
+        # The obvious cycle this would form, buffer -> cached view -> ndarray ->
+        # buffer, is broken on the first edge: torch() holds the view weakly.
+        # It has to be broken there, because nanobind's ndarray is not
+        # GC-tracked, so the cycle would be invisible to the collector and
+        # __del__ would never run.
         return _dlpack_ndarray()(
-            pointer,
-            list(self.shape),
-            code,
-            bits,
-            device_type,
-            device_id,
-            _NDARRAY_OWNER,
+            pointer, list(self.shape), code, bits, device_type, device_id, self
         )
 
     def __dlpack__(
@@ -980,11 +987,13 @@ class SharedBuffer:
         re-deriving it would build an ndarray and a capsule per call for no
         benefit.
         """
-        if self._torch_view is None:
+        cached = self._torch_view() if self._torch_view is not None else None
+        if cached is None:
             import torch
 
-            self._torch_view = torch.from_dlpack(self)
-        return self._torch_view
+            cached = torch.from_dlpack(self)
+            self._torch_view = weakref.ref(cached)
+        return cached
 
     def numpy(self) -> np.ndarray:
         """A host numpy view aliasing this buffer (no copy).
@@ -1109,6 +1118,28 @@ def empty(
     return SharedBuffer(_normalize_size(size), dtype, device, share)
 
 
+def _written(buf: SharedBuffer, fill: Callable[[Tensor], Any]) -> SharedBuffer:
+    """Apply ``fill`` to the buffer's torch view and make the write visible.
+
+    The fence is the point. On an iGPU-shared buffer the fill is a device write
+    on the current stream, and the NPU is not on that stream -- so a factory
+    that returned before draining it would hand back a buffer whose contents
+    are not there yet, and the next dispatch would read whatever was in those
+    pages. Doing it here rather than asking every caller to remember is the
+    whole reason these factories exist.
+
+    Only the current stream is drained; a buffer with no HIP device attached is
+    plain host memory and its fill was synchronous.
+    """
+    view = buf.torch()
+    fill(view)
+    if view.is_cuda:
+        import torch
+
+        torch.cuda.current_stream().synchronize()
+    return buf
+
+
 def zeros(
     *size: int | Sequence[int],
     dtype: torch.dtype | None = None,
@@ -1117,13 +1148,14 @@ def zeros(
 ) -> SharedBuffer:
     """A zero-filled shared buffer, like ``torch.zeros``.
 
-    Zeroed through the torch view rather than the host mapping, so on a buffer
-    shared with an iGPU the fill happens there -- and, like any other device
-    write, needs a ``torch.cuda.synchronize()`` before the NPU reads it.
+    Zeroed through the torch view rather than the host mapping, so on an
+    iGPU-shared buffer the fill happens there. The write is fenced before
+    returning; see ``_written``.
     """
-    buf = empty(*size, dtype=dtype, device=device, share=share)
-    buf.torch().zero_()
-    return buf
+    return _written(
+        empty(*size, dtype=dtype, device=device, share=share),
+        lambda view: view.zero_(),
+    )
 
 
 def ones(
@@ -1133,9 +1165,10 @@ def ones(
     share: Shared = (),
 ) -> SharedBuffer:
     """A one-filled shared buffer, like ``torch.ones``. See ``zeros``."""
-    buf = empty(*size, dtype=dtype, device=device, share=share)
-    buf.torch().fill_(1)
-    return buf
+    return _written(
+        empty(*size, dtype=dtype, device=device, share=share),
+        lambda view: view.fill_(1),
+    )
 
 
 def empty_like(
@@ -1184,9 +1217,10 @@ def zeros_like(
     Inherits from ``other`` on the same terms as ``empty_like``; see ``zeros``
     for how the fill is issued.
     """
-    buf = empty_like(other, dtype=dtype, device=device, share=share)
-    buf.torch().zero_()
-    return buf
+    return _written(
+        empty_like(other, dtype=dtype, device=device, share=share),
+        lambda view: view.zero_(),
+    )
 
 
 def from_tensor(
@@ -1220,11 +1254,12 @@ def from_tensor(
     out of it -- more machinery, and a lifetime tied to torch's segment rather
     than to the tensor. Allocating the buffer here avoids both.
     """
-    buf = empty(
-        tuple(tensor.shape),
-        dtype=dtype if dtype is not None else tensor.dtype,
-        device=device,
-        share=share,
+    return _written(
+        empty(
+            tuple(tensor.shape),
+            dtype=dtype if dtype is not None else tensor.dtype,
+            device=device,
+            share=share,
+        ),
+        lambda view: view.copy_(tensor),
     )
-    buf.torch().copy_(tensor)
-    return buf

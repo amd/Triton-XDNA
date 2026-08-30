@@ -198,6 +198,7 @@ class _FusedMLP:
         # Defined before setup, which is allowed to raise: close()/__del__ run
         # regardless and must not turn that into an AttributeError.
         self._sb_A = self._sb_R = self._sb_OUT = None
+        self._views = ()
         self._setup_shared_buffers()
 
     def _setup_shared_buffers(self):
@@ -224,10 +225,10 @@ class _FusedMLP:
         from triton.backends.amd_triton_npu import shared
 
         # Allocated by XRT so the NPU can name the BO directly, then mapped into
-        # the iGPU. "xrt:0" resolves through the shared device cache, which is
-        # also where MultiLaunchRunner gets its handle -- a BO is only usable as
-        # a dispatch argument if it and the dispatch came from the same device
-        # object, and going through the string keeps that true by construction.
+        # the iGPU. The BOs and the chain's dispatch end up on different
+        # pyxrt.device handles -- each opens its own -- which is fine: handles to
+        # the same device are interchangeable, and shared_buffer_test.py pins
+        # that down by dispatching cross-handle on every run.
         on = dict(device="xrt:0", share=_IGPU)
         # The augmented-K bias fold requires the padding columns past D+1 to be
         # zero, and column D to be 1.0. Both are invariant across every dispatch
@@ -237,6 +238,12 @@ class _FusedMLP:
         self._sb_OUT = shared.zeros_like(self._sb_R)
         self._sb_A[:, self.D] = 1.0
         torch.cuda.synchronize()
+        # Hold the torch views. SharedBuffer keeps them weakly, so that a
+        # consumer's tensor can own its buffer without forming a cycle the
+        # collector cannot see -- which means an unheld view is re-derived on
+        # every access (~4 us against ~0.04 cached). run() touches all three
+        # per layer, so holding them here is worth ~140 us per token.
+        self._views = (self._sb_A.torch(), self._sb_R.torch(), self._sb_OUT.torch())
         logger.info("zero-copy NPU/iGPU buffers enabled for the fused MLP")
 
     def _build_kernels(self):
@@ -409,6 +416,8 @@ class _FusedMLP:
         # unregistering their pages first would pull them out from under a
         # dispatcher that still has them bound. GC order would not guarantee
         # this, which is why release is explicit rather than left to __del__.
+        # Views before buffers: they alias pages close() is about to release.
+        self._views = ()
         for buf in (self._sb_A, self._sb_R, self._sb_OUT):
             if buf is not None:
                 buf.close()

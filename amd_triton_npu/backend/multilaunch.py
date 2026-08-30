@@ -236,8 +236,8 @@ class MultiLaunchRunner:
       - persist {device, elf, hw_context, kernel} for this ELF (one ctx);
       - cache the xrt.bo set per ``bo_key`` and reuse across calls;
       - ``static_indices``  : args written to device on first call only (weights);
-      - ``intermediate_indices`` : args the kernel overwrites (DDR hand-off
-        scratch) -> never written from host;
+      - ``intermediate_indices`` : args carrying no host data (DDR hand-off
+        scratch) -> zeroed once, then never written from host;
       - ``output_indices``  : args synced device->host after the run (default:
         last arg).
 
@@ -285,7 +285,10 @@ class MultiLaunchRunner:
                 zero-filled: their contents belong to the caller.
             bo_key: cache key for the BO set (e.g. f"{name}_L{layer}").
             static_indices: indices written host->device on first call only.
-            intermediate_indices: indices never written from host.
+            intermediate_indices: indices carrying no host data. Zeroed on
+                the first call for a bo_key, skipped thereafter. Outputs are
+                not implied: they are staged from the host every call unless
+                also named here.
             output_indices: indices synced device->host and returned (default:
                 {len(inputs)-1}). The kernel overwrites these, so like
                 intermediates they are only written host->device on the first
@@ -303,10 +306,14 @@ class MultiLaunchRunner:
         from ml_dtypes import bfloat16
 
         bound = bound_buffers or {}
-        # Args the kernel overwrites (intermediates and outputs) need host
-        # data only on the first call, to define the memory.
+        # Two different declarations, deliberately not merged. `readback` is
+        # only "sync this back after the run" -- it says nothing about whether
+        # the kernel fully writes the operand, so an output is still staged from
+        # the host every call. `scratch` is the caller promising the operand
+        # carries no host data, which is what licenses zeroing it once and
+        # skipping it thereafter.
         readback = {len(inputs) - 1} if output_indices is None else set(output_indices)
-        device_written = set(intermediate_indices) | readback
+        scratch = set(intermediate_indices)
         static_set = set(static_indices)
         sizes = [a.size * a.itemsize for a in inputs]
         first_call = bo_key not in self._bos
@@ -353,19 +360,21 @@ class MultiLaunchRunner:
         # the BO's memory, so a copy would be from a buffer to itself.
         for i, a in enumerate(inputs):
             if i in bound:
-                # A buffer the device overwrites has nothing to flush; the
-                # caller's writes to it, if any, were only meaningful once.
-                if first_call or i not in device_written:
+                # Nothing to copy -- the caller's array is the BO's memory -- but
+                # still sync, which is a cache operation rather than a transfer.
+                # Skipping it for operands the device overwrites would assume no
+                # host write landed since the last dispatch, which is the
+                # caller's business, not ours.
+                if first_call or i not in scratch:
                     bos[i].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
                 continue
-            if not first_call and (i in static_set or i in device_written):
+            if not first_call and (i in static_set or i in scratch):
                 continue
-            if i in device_written and i not in static_set:
-                # First call only, by construction: no meaningful host data, but
-                # write zeros so device memory is defined. Statics are exempt --
-                # an index that is both static and an output is a buffer the
-                # kernel updates in place, so its incoming contents matter and
-                # zeroing the caller's array would destroy them.
+            if i in scratch and i not in static_set:
+                # First call only, by construction: the caller declared this
+                # carries no host data, so zero it to leave device memory
+                # defined. Only scratch -- zeroing an output would destroy
+                # whatever the caller had put in its own array.
                 a.fill(0)
             buf = a.view(np.int16) if a.dtype == bfloat16 else a
             mv = bos[i].map()
