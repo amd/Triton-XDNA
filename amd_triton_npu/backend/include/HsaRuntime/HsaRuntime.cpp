@@ -14,12 +14,17 @@
 //   (coarse-grained, non-allocatable), loaded once per (pdi, insts) and cached.
 // * Tensor I/O: the vmem API (handle_create -> reserve -> map -> set_access),
 //   RW-accessible to CPU and AIE agents, pooled and reused across dispatches.
+// * Shared regions: the same vmem API, but owned by the caller rather than the
+//   pool, and either allocated here or imported from a dma-buf another runtime
+//   exported. A dispatch naming one runs on it in place -- no staging buffer,
+//   neither copy -- which is the whole point of them.
 // * Kernel arguments: a fixed-slot pool (one slot per ring slot); slot(i) is
 //   pure pointer arithmetic, no HSA call on the hot path.
 
 #include "HsaRuntime/HsaRuntime.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +39,9 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <sys/stat.h> // fstat(), to size the object a dma-buf names
+#include <unistd.h>   // close(), for the dma-buf an import is reached through
 
 #include "hsa/hsa.h"
 #include "hsa/hsa_ext_amd.h"
@@ -165,6 +173,35 @@ struct DeviceBuffer {
   std::size_t size{};
 };
 
+// How each tensor argument reached the device, counted since the process
+// started. Outside HsaRuntime on purpose: reading a counter must not be able to
+// bring the runtime up, or asking "is my buffer being shared?" from a process
+// driving the NPU through XRT would try to open a queue XRT already holds.
+// Written under the dispatch lock, read without it.
+std::atomic<std::uint64_t> g_in_place{0};
+std::atomic<std::uint64_t> g_staged{0};
+
+// Which agents a vmem range is granted access to. Locally allocated ranges take
+// CPU_AND_AIE, so the host can stage into them; an imported range can only take
+// AIE_ONLY, because ROCR rejects a CPU grant on memory another runtime owns
+// (whether the CPU can reach it is then that runtime's business, not ours).
+enum class Access { CPU_AND_AIE, AIE_ONLY };
+
+// A caller-owned range both the AIE agent and someone else can address.
+//
+// `size` is what the caller asked for, not the granule-rounded `buf.size`: it
+// is what bounds checking must use, since the tail of the rounding is not the
+// caller's memory.
+struct SharedRegion {
+  DeviceBuffer buf{};   // the vmem allocation or import behind it
+  void *aie_va{};       // what the dispatch packet needs; buf.va, or an
+                        // offset into it when the mapping covers more than
+                        // the caller's range (see vmem_import)
+  std::size_t size{};   // requested size
+  bool imported{false}; // someone else's memory, mapped here -- which decides
+                        // both how it was granted and how it is released
+};
+
 } // namespace
 
 // A prepared program is just its two device buffers; the opaque handle in the
@@ -187,6 +224,12 @@ public:
   HsaRuntime() { init(); }
 
   ~HsaRuntime() {
+    // Regions first, and before hsa_shut_down: a caller that leaked a shared
+    // buffer would otherwise leave a mapping to unmap after the runtime it
+    // belongs to is gone. Through shared_free, so that the several keys that
+    // may name one region are retired together rather than freed once each.
+    while (!regions_.empty())
+      shared_free(reinterpret_cast<void *>(regions_.begin()->first));
     for (auto &kv : vmem_pool_)
       for (auto &b : kv.second)
         vmem_free(b);
@@ -253,13 +296,30 @@ public:
     std::lock_guard<std::mutex> dlock(dispatch_mtx_);
 
     std::array<DeviceBuffer, TRITON_NPU_HSA_MAX_KERNARGS> bufs{};
-    std::uint32_t acquired = 0;
+    // What the device is given for tensor i: its own address when it is
+    // already in a shared region, otherwise the staging buffer's.
+    std::array<void *, TRITON_NPU_HSA_MAX_KERNARGS> dev_addr{};
     try {
-      // Acquire an I/O buffer per tensor (from the pool) and copy inputs in.
+      // A shared tensor is already memory the AIE agent can reach: dispatch on
+      // it in place. Every other one gets a pooled I/O buffer and a copy in.
       for (std::uint32_t i = 0; i < num_tensors; ++i) {
+        if (sizes[i] == 0)
+          // Otherwise this surfaces further down as an HSA argument error
+          // about a zero-byte allocation, which says nothing about which
+          // operand the caller got wrong.
+          throw std::runtime_error(
+              "tensor argument " + std::to_string(i) +
+              " is empty; there is nothing to give the device for it");
+        if (void *shared =
+                resolve_shared(host_ptrs[i], (std::size_t)sizes[i])) {
+          dev_addr[i] = shared;
+          ++g_in_place;
+          continue;
+        }
         bufs[i] = acquire((std::size_t)sizes[i]);
-        acquired = i + 1;
         std::memcpy(bufs[i].va, host_ptrs[i], (std::size_t)sizes[i]);
+        dev_addr[i] = bufs[i].va;
+        ++g_staged;
       }
 
       // Claim a ring slot. Only *peek* at the write index here; the advance is
@@ -277,7 +337,7 @@ public:
       auto *kernargs =
           static_cast<std::uint64_t *>(kernarg_slot((std::uint32_t)pkt_idx));
       for (std::uint32_t i = 0; i < num_tensors; ++i) {
-        kernargs[i] = reinterpret_cast<std::uint64_t>(bufs[i].va);
+        kernargs[i] = reinterpret_cast<std::uint64_t>(dev_addr[i]);
         kernargs[num_tensors + i] = sizes[i];
       }
 
@@ -317,12 +377,14 @@ public:
         throw std::runtime_error("AIE dispatch failed: completion signal = " +
                                  std::to_string((long long)sig_val));
 
-      // Copy every tensor buffer back to its host pointer. We cannot know which
+      // Copy every staged tensor back to its host pointer. We cannot know which
       // argument(s) the kernel writes, so copying all back is correct
       // regardless of output position (unmodified inputs just copy identical
-      // bytes).
+      // bytes). A shared tensor has no staging buffer and needs no copy: the
+      // device wrote where the caller reads.
       for (std::uint32_t i = 0; i < num_tensors; ++i)
-        std::memcpy(host_ptrs[i], bufs[i].va, (std::size_t)sizes[i]);
+        if (bufs[i].va)
+          std::memcpy(host_ptrs[i], bufs[i].va, (std::size_t)sizes[i]);
 
       for (std::uint32_t i = 0; i < num_tensors; ++i)
         release(bufs[i]);
@@ -338,14 +400,94 @@ public:
       // past a dispatch that never completed, so the next dispatch takes the
       // following slot and it would take a full lap of the ring to reuse the
       // one still in the device's hands.
+      //
+      // Shared regions are not ours to abandon either way: they belong to the
+      // caller, who must not free one while a dispatch on it may still be
+      // outstanding. Nothing enforces that, for the same reason nothing stops
+      // a caller freeing a tensor mid-launch.
       throw;
     } catch (...) {
       // Ordinary failure: the device is done with (or never saw) these
-      // buffers, so return them to the pool rather than leaking them.
-      for (std::uint32_t i = 0; i < acquired; ++i)
+      // buffers, so return them to the pool rather than leaking them. Slots
+      // that were never filled -- a shared tensor takes none, and a failure
+      // partway leaves the rest empty -- are ignored by release().
+      for (std::uint32_t i = 0; i < num_tensors; ++i)
         release(bufs[i]);
       throw;
     }
+  }
+
+  // ---- Shared regions ------------------------------------------------------
+  // Allocate a region the CPU and the AIE agent can both reach, and register
+  // it under its own address.
+  void *shared_alloc(std::size_t size) {
+    if (size == 0)
+      throw std::runtime_error("shared region size must be non-zero");
+    auto region = std::make_shared<SharedRegion>();
+    region->buf = vmem_alloc(size);
+    region->aie_va = region->buf.va;
+    region->size = size;
+    std::lock_guard<std::mutex> lock(regions_mtx_);
+    regions_[reinterpret_cast<std::uintptr_t>(region->aie_va)] = region;
+    return region->aie_va;
+  }
+
+  // Map memory another agent owns for the AIE agent, and register it under
+  // both that agent's address for it and our own.
+  void *shared_import(void *ptr, std::size_t size) {
+    if (size == 0)
+      throw std::runtime_error("shared region size must be non-zero");
+    if (!ptr)
+      throw std::runtime_error("cannot import a null address");
+    auto region = std::make_shared<SharedRegion>();
+    vmem_import(ptr, size, *region);
+    std::lock_guard<std::mutex> lock(regions_mtx_);
+    regions_[reinterpret_cast<std::uintptr_t>(region->aie_va)] = region;
+    if (ptr != region->aie_va)
+      regions_[reinterpret_cast<std::uintptr_t>(ptr)] = region;
+    return region->aie_va;
+  }
+
+  // Register one more address for an existing region.
+  void shared_alias(void *alias, void *va, std::size_t size) {
+    if (!alias)
+      throw std::runtime_error("alias address must not be null");
+    std::lock_guard<std::mutex> lock(regions_mtx_);
+    const RegionHit hit = find_region(va);
+    if (!hit.region)
+      throw std::runtime_error("no shared region at the given address");
+    if (hit.offset != 0)
+      throw std::runtime_error(
+          "an alias must name the start of a region, not an offset into it");
+    if (size > hit.region->size)
+      throw std::runtime_error("alias covers " + std::to_string(size) +
+                               " bytes but the region is " +
+                               std::to_string(hit.region->size));
+    regions_[reinterpret_cast<std::uintptr_t>(alias)] = hit.region;
+  }
+
+  // Forget one address, leaving the region and its other addresses alone.
+  void shared_unalias(void *alias) {
+    std::lock_guard<std::mutex> lock(regions_mtx_);
+    regions_.erase(reinterpret_cast<std::uintptr_t>(alias));
+  }
+
+  // Release a region and forget every address that named it. Silent about an
+  // address that names no region, so the Python side can release twice.
+  void shared_free(void *va) {
+    std::shared_ptr<SharedRegion> region;
+    {
+      std::lock_guard<std::mutex> lock(regions_mtx_);
+      region = find_region(va).region;
+      if (!region)
+        return;
+      for (auto it = regions_.begin(); it != regions_.end();)
+        it = (it->second == region) ? regions_.erase(it) : std::next(it);
+    }
+    // Unmapped outside the lock: the teardown is several HSA calls and holding
+    // regions_mtx_ across them would block every concurrent dispatch's lookup.
+    // Safe because the region is unreachable by then -- no key names it.
+    vmem_free(region->buf, region->imported);
   }
 
 private:
@@ -354,8 +496,9 @@ private:
   hsa_amd_memory_pool_t data_pool_{};
   hsa_queue_t *queue_ = nullptr;
   hsa_signal_t signal_{};
-  std::vector<hsa_amd_memory_access_desc_t> access_descs_; // RW, built once
-  std::vector<hsa_amd_memory_access_desc_t> revoke_descs_; // NONE, built once
+  // The agents a vmem range can be granted to, discovered once in init().
+  std::vector<hsa_agent_t> aie_agents_;
+  std::vector<hsa_agent_t> cpu_agents_;
   std::size_t data_granule_ = 0;
 
   // Watchdog. Zero duration means "wait forever" (the default) and disables
@@ -381,8 +524,75 @@ private:
   std::map<std::string, std::unique_ptr<triton_npu_hsa_program>> programs_;
   std::mutex programs_mtx_;
 
+  // Shared regions, keyed by every address a caller may name one by. Ordered,
+  // because a dispatch resolves an address that may point *into* a region, not
+  // just at its base. shared_ptr rather than a value: several keys (a region
+  // and its aliases) name one region, and dropping one key must not disturb
+  // the others.
+  std::map<std::uintptr_t, std::shared_ptr<SharedRegion>> regions_;
+
+  // Guards regions_ only. Deliberately not dispatch_mtx_: buffers are
+  // registered and released from Python while a dispatch may be running, so
+  // the two are not serialized against each other. A dispatch takes this one
+  // while holding dispatch_mtx_ and the shared_* entry points never take
+  // dispatch_mtx_, so the pair cannot deadlock.
+  std::mutex regions_mtx_;
+
   // Serializes dispatches (one shared queue, one packet in flight).
   std::mutex dispatch_mtx_;
+
+  // Where `ptr` lands: the region it is inside and how far into it. `region`
+  // is null when it is inside none, and `offset` is then meaningless.
+  struct RegionHit {
+    std::shared_ptr<SharedRegion> region;
+    std::size_t offset{};
+  };
+
+  // The region `ptr` falls inside, with its offset. Caller holds regions_mtx_.
+  //
+  // The nearest key at or below `ptr` is the only candidate: no two regions
+  // overlap, since each is a separate mapping, and each alias names memory
+  // some other runtime allocated separately.
+  //
+  // An alias shares the region's layout by construction -- it is a second
+  // address for the same pages -- so the offset from whichever key matched is
+  // the offset into the region.
+  RegionHit find_region(void *ptr) const {
+    const auto p = reinterpret_cast<std::uintptr_t>(ptr);
+    auto it = regions_.upper_bound(p);
+    if (it == regions_.begin())
+      return {};
+    --it;
+    const std::size_t offset = p - it->first;
+    if (offset >= it->second->size)
+      return {};
+    return {it->second, offset};
+  }
+
+  // The AIE-side address for [ptr, ptr+size), or null when ptr names no shared
+  // region -- in which case the caller stages the tensor as usual.
+  //
+  // A tensor that starts inside a region but runs past its end throws rather
+  // than falling back to staging: the fallback would memcpy an address that is
+  // only partly the caller's, which on unified memory reads back as plausible
+  // data instead of faulting.
+  //
+  // The span is taken as ptr + size because that is what the dispatch ABI says
+  // a tensor occupies. A strided view does not occupy that span, but no more so
+  // here than in the staging path, which copies exactly those bytes.
+  void *resolve_shared(void *ptr, std::size_t size) {
+    std::lock_guard<std::mutex> lock(regions_mtx_);
+    const RegionHit hit = find_region(ptr);
+    if (!hit.region)
+      return nullptr;
+    if (hit.offset + size > hit.region->size)
+      throw std::runtime_error(
+          "tensor at offset " + std::to_string(hit.offset) + " spanning " +
+          std::to_string(size) + " bytes runs past the end of the " +
+          std::to_string(hit.region->size) +
+          "-byte shared region it starts in");
+    return static_cast<std::byte *>(hit.region->aie_va) + hit.offset;
+  }
 
   // One-time setup: init HSA, discover the AIE + CPU agents and the
   // dev/data/kernarg pools, build the vmem access-descriptor list, create the
@@ -401,20 +611,12 @@ private:
           "no HSA AIE agent found (is the NPU driver loaded?)");
     aie_agent_ = aies.front();
 
-    // Every vmem I/O buffer must be RW-accessible to the CPU (host memcpy) and
-    // the AIE agent (execution). Build that descriptor list once, here.
-    std::vector<hsa_agent_t> access_agents;
-    for (auto c : cpus)
-      access_agents.push_back(c);
-    for (auto a : aies)
-      access_agents.push_back(a);
-    access_descs_.reserve(access_agents.size());
-    revoke_descs_.reserve(access_agents.size());
-    for (auto a : access_agents) {
-      access_descs_.push_back({HSA_ACCESS_PERMISSION_RW, a});
-      // The mirror image, used to drop those grants before unmapping.
-      revoke_descs_.push_back({HSA_ACCESS_PERMISSION_NONE, a});
-    }
+    // Who a vmem range can be granted to: the AIE agent always (execution), and
+    // the CPU when the range is ours to grant (host staging). Kept as agents
+    // rather than as ready-made descriptor lists, since the permission varies
+    // as much as the audience does -- see set_vmem_access.
+    aie_agents_ = aies;
+    cpu_agents_ = cpus;
 
     // dev pool: coarse-grained, non-allocatable (PDI + instructions).
     if (!discover_pool(HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED, false,
@@ -583,21 +785,38 @@ private:
                  m ? m : "unknown HSA error");
   }
 
-  // Grant (RW to every CPU and AIE agent) or revoke (no access at all) access
-  // to a mapped vmem range.
-  hsa_status_t set_vmem_access(void *va, std::size_t size, bool grant) {
-    const auto &d = grant ? access_descs_ : revoke_descs_;
+  // Give the agents `who` names permission `perm` over a mapped vmem range;
+  // HSA_ACCESS_PERMISSION_NONE revokes. Off every hot path -- once per
+  // allocation and once per teardown -- so the descriptor list is built here
+  // rather than cached per (permission, agent set) combination.
+  hsa_status_t set_vmem_access(void *va, std::size_t size,
+                               hsa_access_permission_t perm, Access who) {
+    std::vector<hsa_amd_memory_access_desc_t> d;
+    d.reserve(aie_agents_.size() + cpu_agents_.size());
+    for (auto a : aie_agents_)
+      d.push_back({perm, a});
+    if (who == Access::CPU_AND_AIE)
+      for (auto a : cpu_agents_)
+        d.push_back({perm, a});
     return hsa_amd_vmem_set_access(va, size, d.data(), d.size());
   }
 
   // Tear down a vmem buffer. Access must be revoked before unmapping: ROCR
   // rejects an unmap while agents still hold access grants, and since the range
   // then stays mapped, the next reservation at that address fails too.
-  void vmem_free(DeviceBuffer &b) {
+  //
+  // Except on an imported range, where ROCR refuses the revoke -- the grant is
+  // over memory it does not own -- and the unmap drops it anyway. Asking would
+  // only print a failure for something that then works. So `imported` decides
+  // both halves, which is why it is the only thing the caller has to say: how
+  // the range was granted follows from where it came from.
+  void vmem_free(DeviceBuffer &b, bool imported = false) {
     if (!b.va)
       return;
-    log_status("hsa_amd_vmem_set_access(NONE)",
-               set_vmem_access(b.va, b.size, false));
+    if (!imported)
+      log_status("hsa_amd_vmem_set_access(NONE)",
+                 set_vmem_access(b.va, b.size, HSA_ACCESS_PERMISSION_NONE,
+                                 Access::CPU_AND_AIE));
     log_status("hsa_amd_vmem_unmap", hsa_amd_vmem_unmap(b.va, b.size));
     release_address(b);
     release_handle(b);
@@ -652,36 +871,29 @@ private:
     return b;
   }
 
-  // Allocate a fresh vmem buffer of at least `size` bytes (rounded up to the
-  // pool granule), mapped and granted RW access to the CPU and AIE agents.
-  // Each step is undone if a later one fails. This is not just leak hygiene:
-  // a half-built buffer strands a *mapping*, and a stranded mapping makes the
-  // next allocation that reserves the same virtual address fail -- so leaking
-  // here breaks unrelated allocations later, not merely this one.
-  DeviceBuffer vmem_alloc(std::size_t size) {
-    size = round_up(size);
-    DeviceBuffer b{};
-    b.size = size;
-    hsa_status_t st = hsa_amd_vmem_handle_create(
-        data_pool_, size, MEMORY_TYPE_PINNED, 0, &b.handle);
-    if (st != HSA_STATUS_SUCCESS)
-      throw hsa_error("hsa_amd_vmem_handle_create", st);
-
-    st = hsa_amd_vmem_address_reserve_align(&b.va, size, 0, 0,
-                                            HSA_AMD_VMEM_ADDRESS_NO_REGISTER);
+  // Reserve `b.size` bytes of address space for the handle `b` already holds,
+  // map it there, and grant `who` RW access. Each step is undone if a later one
+  // fails. This is not just leak hygiene: a half-built buffer strands a
+  // *mapping*, and a stranded mapping makes the next allocation that reserves
+  // the same virtual address fail -- so leaking here breaks unrelated
+  // allocations later, not merely this one. Which is also why both ways of
+  // obtaining a handle share this one ladder rather than each having its own.
+  void vmem_publish(DeviceBuffer &b, Access who) {
+    hsa_status_t st = hsa_amd_vmem_address_reserve_align(
+        &b.va, b.size, 0, 0, HSA_AMD_VMEM_ADDRESS_NO_REGISTER);
     if (st != HSA_STATUS_SUCCESS) {
       release_handle(b);
       throw hsa_error("hsa_amd_vmem_address_reserve_align", st);
     }
 
-    st = hsa_amd_vmem_map(b.va, size, 0, b.handle, 0);
+    st = hsa_amd_vmem_map(b.va, b.size, 0, b.handle, 0);
     if (st != HSA_STATUS_SUCCESS) {
       release_address(b);
       release_handle(b);
       throw hsa_error("hsa_amd_vmem_map", st);
     }
 
-    st = set_vmem_access(b.va, size, true);
+    st = set_vmem_access(b.va, b.size, HSA_ACCESS_PERMISSION_RW, who);
     if (st != HSA_STATUS_SUCCESS) {
       // Access was never granted, so unmapping directly is safe here (the
       // revoke in vmem_free exists to drop grants that *were* applied).
@@ -690,6 +902,18 @@ private:
       release_handle(b);
       throw hsa_error("hsa_amd_vmem_set_access", st);
     }
+  }
+
+  // Allocate a fresh vmem buffer of at least `size` bytes (rounded up to the
+  // pool granule), mapped and granted RW access to the CPU and AIE agents.
+  DeviceBuffer vmem_alloc(std::size_t size) {
+    DeviceBuffer b{};
+    b.size = round_up(size);
+    hsa_status_t st = hsa_amd_vmem_handle_create(
+        data_pool_, b.size, MEMORY_TYPE_PINNED, 0, &b.handle);
+    if (st != HSA_STATUS_SUCCESS)
+      throw hsa_error("hsa_amd_vmem_handle_create", st);
+    vmem_publish(b, Access::CPU_AND_AIE);
     return b;
   }
 
@@ -705,6 +929,67 @@ private:
   void release_handle(const DeviceBuffer &b) {
     log_status("hsa_amd_vmem_handle_release",
                hsa_amd_vmem_handle_release(b.handle));
+  }
+
+  // Map memory another agent owns, granting it to the AIE agents (see Access
+  // for why they are the only ones), and fill in `region` -- the whole buffer
+  // object becomes the mapping, and the caller's range is a slice of it.
+  //
+  // The range is reached through its dma-buf, and an iGPU allocation is rarely
+  // a whole buffer object -- ROCm packs several into one, and a descriptor
+  // names the object, not the allocation. Hence the offset, which the export
+  // reports; asking HIP for the descriptor instead would not have reported it,
+  // which is why the export is done here.
+  //
+  // The whole object is mapped and the offset applied to the address handed
+  // out, rather than passing it to the map as `in_offset`: the AIE path
+  // accepts that argument and ignores it, so a range at a non-zero offset
+  // would be mapped from the object's start -- reading and writing a
+  // neighbour's memory, with nothing reporting a problem.
+  //
+  // Two consequences of mapping the whole object, both accepted. The AIE agent
+  // can reach whatever else shares it -- those are this process's own
+  // allocations, and ROCR offers no finer granularity. And two ranges from one
+  // object are mapped twice rather than once: the same pages, at two addresses,
+  // costing address space and a second set of page-table entries but no
+  // physical memory. Deduplicating would mean identifying the object behind a
+  // descriptor and refcounting the mapping, which is more machinery than the
+  // handful of buffers a caller shares is worth.
+  void vmem_import(void *ptr, std::size_t size, SharedRegion &region) {
+    int dmabuf_fd = -1;
+    std::uint64_t offset = 0;
+    hsa_status_t st =
+        hsa_amd_portable_export_dmabuf(ptr, size, &dmabuf_fd, &offset);
+    if (st != HSA_STATUS_SUCCESS)
+      throw hsa_error("hsa_amd_portable_export_dmabuf", st);
+
+    // The descriptor's size is the object's size, which is what has to be
+    // mapped for the tail of it to be reachable.
+    struct stat info {};
+    const bool sized = ::fstat(dmabuf_fd, &info) == 0 && info.st_size > 0;
+    region.buf.size =
+        sized ? (std::size_t)info.st_size : round_up(offset + size);
+
+    st = hsa_amd_vmem_import_shareable_handle(dmabuf_fd, &region.buf.handle);
+    // The import holds its own reference to the underlying allocation, so the
+    // descriptor has done its job either way and closing it here keeps its
+    // lifetime inside this function.
+    ::close(dmabuf_fd);
+    if (st != HSA_STATUS_SUCCESS)
+      throw hsa_error("hsa_amd_vmem_import_shareable_handle", st);
+
+    if (offset + size > region.buf.size) {
+      release_handle(region.buf);
+      throw std::runtime_error(
+          "the exported buffer object is " + std::to_string(region.buf.size) +
+          " bytes but the range starts at " + std::to_string(offset) +
+          " and runs for " + std::to_string(size));
+    }
+
+    vmem_publish(region.buf, Access::AIE_ONLY);
+    region.aie_va = static_cast<std::byte *>(region.buf.va) + offset;
+    region.size = size;
+    region.imported = true;
   }
 
   // Get a buffer of at least `size` bytes: reuse a pooled one of the matching
@@ -789,6 +1074,73 @@ extern "C" int triton_npu_hsa_dispatch(triton_npu_hsa_program_t program,
   } catch (const std::exception &e) {
     write_err(errbuf, errbuf_len,
               std::string("HSA dispatch failed: ") + e.what());
+    return -1;
+  }
+}
+
+extern "C" void triton_npu_hsa_dispatch_counts(uint64_t *in_place,
+                                               uint64_t *staged) {
+  // No runtime() here, and so nothing that can throw: see g_in_place.
+  if (in_place)
+    *in_place = g_in_place.load();
+  if (staged)
+    *staged = g_staged.load();
+}
+
+extern "C" void *triton_npu_hsa_shared_alloc(uint64_t size, char *errbuf,
+                                             size_t errbuf_len) {
+  try {
+    return runtime().shared_alloc((size_t)size);
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len,
+              std::string("HSA shared allocation failed: ") + e.what());
+    return nullptr;
+  }
+}
+
+extern "C" void *triton_npu_hsa_shared_import(void *ptr, uint64_t size,
+                                              char *errbuf, size_t errbuf_len) {
+  try {
+    return runtime().shared_import(ptr, (size_t)size);
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len,
+              std::string("HSA shared import failed: ") + e.what());
+    return nullptr;
+  }
+}
+
+extern "C" int triton_npu_hsa_shared_alias(void *alias, void *va, uint64_t size,
+                                           char *errbuf, size_t errbuf_len) {
+  try {
+    runtime().shared_alias(alias, va, (size_t)size);
+    return 0;
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len,
+              std::string("HSA shared alias failed: ") + e.what());
+    return -1;
+  }
+}
+
+extern "C" int triton_npu_hsa_shared_unalias(void *alias, char *errbuf,
+                                             size_t errbuf_len) {
+  try {
+    runtime().shared_unalias(alias);
+    return 0;
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len,
+              std::string("HSA shared unalias failed: ") + e.what());
+    return -1;
+  }
+}
+
+extern "C" int triton_npu_hsa_shared_free(void *va, char *errbuf,
+                                          size_t errbuf_len) {
+  try {
+    runtime().shared_free(va);
+    return 0;
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len,
+              std::string("HSA shared release failed: ") + e.what());
     return -1;
   }
 }

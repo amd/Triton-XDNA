@@ -174,6 +174,36 @@ the matching `libhsa-runtime64` is loaded without setting `LD_LIBRARY_PATH`. Set
 `LD_LIBRARY_PATH` only to force a different one ahead of it — for example when a
 system ROCR without AIE support would otherwise be picked up first.
 
+#### Sharing a process with PyTorch
+
+An rpath decides where a library is *found*, not whether it is looked for at
+all: a `libhsa-runtime64.so.1` already loaded satisfies the dependency first. A
+ROCm build of PyTorch bundles its own copy and loads it at import, so in a
+process that uses both the iGPU and the NPU, `import torch` hands the AIE agent
+to a ROCR that was never built for it — and that aborts inside ROCR rather than
+raising. Preload the right one to settle it first:
+
+```bash
+LD_PRELOAD=$(python -c "from triton.backends.amd_triton_npu.driver import \
+  _get_rocr_install; print(_get_rocr_install().lib_path)") python your_script.py
+```
+
+HIP then uses that ROCR too, so one runtime serves both devices.
+`scripts/dev-env.sh` sets this for the heterogeneous examples, and the backend
+reports the problem with this instruction when the preload is missing.
+
+#### Shared buffers
+
+Under HSA a buffer from `triton.backends.amd_triton_npu.shared` is dispatched on
+where it lives — the runtime recognises it and skips the staging copies it makes
+for an ordinary tensor. It works in both directions: the NPU can allocate pages
+the iGPU maps (`device="hsa:0", share="hip:0"`), and the iGPU can allocate pages
+the NPU maps (`device="hip:0", share="hsa:0"`). A buffer names one NPU runtime
+or the other; XRT and HSA cannot map each other's pages, and asking for both is
+refused. `shared.hsa_dispatch_counts()` reports how many tensor arguments were
+dispatched in place and how many were staged, which is the way to confirm a
+buffer is doing what it was allocated for.
+
 ## Windows Support
 
 Triton-XDNA runs natively on Windows — no WSL, no Linux VM. The whole flow,

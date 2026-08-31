@@ -35,12 +35,19 @@ A device string, spelled the way ``torch.device`` spells one, with a bare
     The Nth HIP device. The buffer has a device pointer there, so torch sees
     an iGPU tensor.
 ``hsa:N``
-    The Nth HSA agent. Not implemented yet.
+    The Nth HSA AIE agent -- the same NPU as ``xrt:N``, reached through ROCR
+    instead. The buffer is memory the AIE agent can address, which is what an
+    NPU dispatch under the HSA runtime (``NPUDriver("hsa")``) runs on directly,
+    with no staging copy. Only agent 0 exists today.
 
 A ``(kind, handle)`` pair is also accepted, and is the only way to name a
 runtime object the caller already holds -- ``("XRT", pyxrt.device(0))`` when it
 has to be *that* handle -- though for XRT any handle to the same device
 will do, since they are interchangeable.
+
+A buffer names one NPU runtime or the other, never both: XRT and HSA have no
+way to map each other's pages, and asking for both is refused rather than
+half-honoured.
 
 What lives where
 ----------------
@@ -120,6 +127,7 @@ __all__ = [
     "empty",
     "empty_like",
     "from_tensor",
+    "hsa_dispatch_counts",
     "is_on_device",
     "ones",
     "zeros",
@@ -127,10 +135,11 @@ __all__ = [
 ]
 
 # DLPack device types, as the spec numbers them. A buffer shared with a HIP
-# device is described
-# as a ROCm tensor: the pages are host-allocated, but the pointer handed out is
-# the iGPU-side mapping, so the consumer must treat it as device memory. With no
-# HIP device attached it is plain host memory and is described as such.
+# device is described as a ROCm tensor: the pointer handed out is the one the
+# iGPU addresses -- an alias of host pages, or a real device allocation,
+# depending on which runtimes hold the buffer -- so the consumer must treat it
+# as device memory either way. With no HIP device attached the buffer is plain
+# host memory and is described as such.
 kDLCPU = 1
 kDLCUDA = 2
 kDLROCM = 10
@@ -187,6 +196,77 @@ def _hip_check(rc: int, what: str) -> None:
         raw = _hip().hipGetErrorName(rc)
         name = raw.decode() if raw else "unknown"
         raise SharedBufferError(f"{what} failed: {rc} ({name})")
+
+
+@functools.lru_cache(maxsize=1)
+def _hsa() -> ctypes.CDLL:
+    """The backend's HSA runtime library.
+
+    The very same one kernel dispatches go through, deliberately: a shared
+    region is only shared because *that* runtime knows about it, and the AIE
+    agent permits a single queue, so a second ``hsa_init`` here would be a
+    second runtime that neither sees our regions nor can dispatch on them.
+    """
+    try:
+        from .driver import load_hsa_runtime
+    except ImportError as e:  # pragma: no cover - the driver is always present
+        raise SharedBufferError(f"the NPU backend driver is unavailable: {e}")
+    try:
+        return load_hsa_runtime()
+    except Exception as e:
+        # Everything that can go wrong here -- no AIE-capable ROCR, no NPU, a
+        # ROCR already bound by something else -- arrives as some other
+        # runtime's exception type, and the message is the useful part.
+        raise SharedBufferError(f"the NPU's HSA runtime is unavailable: {e}") from None
+
+
+def _hsa_call(name: str, *args: Any, restype: Any = ctypes.c_int) -> Any:
+    """Call one of the runtime's shared-region entry points, or raise.
+
+    They share a convention worth writing once: every one takes an error buffer
+    as its last two arguments, and reports failure by returning NULL (pointers)
+    or a non-zero value (ints), with the reason written into that buffer.
+
+    The arguments are ctypes instances, so they describe the signature as well
+    as carry the values -- declaring ``argtypes`` alongside them would be the
+    same list written twice, with nothing to catch the two drifting apart.
+    """
+    fn = getattr(_hsa(), name)
+    fn.restype = restype
+    fn.argtypes = [*(type(a) for a in args), ctypes.c_char_p, ctypes.c_size_t]
+    err = ctypes.create_string_buffer(512)
+    result = fn(*args, err, len(err))
+    # A NULL pointer comes back from ctypes as None, not as 0.
+    ok = result is not None if restype is ctypes.c_void_p else result == 0
+    if not ok:
+        raise SharedBufferError(
+            err.value.decode("utf-8", errors="replace") or f"{name} failed"
+        )
+    return result
+
+
+def hsa_dispatch_counts() -> tuple[int, int]:
+    """``(in_place, staged)`` tensor arguments dispatched through the NPU's
+    HSA runtime since this process started.
+
+    Sharing is invisible in results -- a staged buffer produces the same answer
+    as a shared one, only slower -- so this is how a caller confirms that a
+    buffer really is being dispatched on where it lives. ``staged`` growing
+    across a launch means something about that operand was not recognised: not
+    a shared buffer, a device the runtime does not know, or a view reaching
+    past the region.
+
+    Counts dispatches through the *HSA* runtime only, and does not start it:
+    ``(0, 0)`` from a process driving the NPU through XRT means there have been
+    none, not that sharing failed.
+    """
+    in_place = ctypes.c_uint64()
+    staged = ctypes.c_uint64()
+    fn = _hsa().triton_npu_hsa_dispatch_counts
+    fn.restype = None
+    fn.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+    fn(ctypes.byref(in_place), ctypes.byref(staged))
+    return in_place.value, staged.value
 
 
 @functools.lru_cache(maxsize=1)
@@ -392,13 +472,40 @@ class _Attachment:
             return (self.kind, self.handle)
         return f"{self.kind.lower()}:{index}"
 
-    def allocate(self, nbytes: int) -> int:
-        """Obtain ``nbytes`` of shareable pages; returns their host address."""
+    def allocate(self, nbytes: int, peers: frozenset[str]) -> int:
+        """Obtain ``nbytes`` of shareable pages; returns their host address.
+
+        ``peers`` names the kinds this buffer will be shared with, because for
+        HIP that decides *what to allocate*: pages the AIE agent can be given
+        are a different kind of memory from pinned host pages, and only one of
+        the two can be exported (see ``_HipAttachment``). Runtimes that
+        allocate the same way regardless ignore it.
+        """
         raise NotImplementedError
 
-    def attach(self, host_ptr: int, nbytes: int) -> None:
-        """Map an existing host range into this device."""
+    def attach(self, host_ptr: int, nbytes: int, primary: _Attachment) -> None:
+        """Map a range the ``primary`` attachment allocated into this device.
+
+        ``primary`` is passed rather than just its address because importing is
+        not always a matter of naming pages: the HSA path needs a dma-buf that
+        only the owning runtime can mint. It is also what lets each runtime keep
+        its own refusals -- which pairings it cannot serve -- on its own class.
+        """
         raise NotImplementedError
+
+    def on_peer_attached(self, peer: _Attachment) -> None:
+        """Note that ``peer`` also holds this buffer.
+
+        Called both ways once a new attachment maps the pages -- each existing
+        one hears about the newcomer and the newcomer hears about each of them
+        -- so an attachment learns its peers whatever order they arrived in.
+        Only the HSA attachment does anything with it: it has to be told the
+        address a peer will name those pages by, since a dispatch that sees an
+        unfamiliar address has no way back to the region.
+        """
+
+    def on_peer_released(self, peer: _Attachment) -> None:
+        """Note that ``peer`` is about to drop its hold; the inverse of above."""
 
     def release(self) -> None:
         """Undo allocate()/attach(). Idempotent; never raises."""
@@ -456,7 +563,7 @@ class _XrtAttachment(_Attachment):
         """The handle is an opened device, so the index is kept alongside it."""
         return self._index
 
-    def allocate(self, nbytes: int) -> int:
+    def allocate(self, nbytes: int, peers: frozenset[str]) -> int:
         import pyxrt
 
         self._bo = pyxrt.ext.bo(self.handle, nbytes)
@@ -470,9 +577,12 @@ class _XrtAttachment(_Attachment):
         mv = self._bo.map()
         return ctypes.addressof(ctypes.c_char.from_buffer(mv))
 
-    def attach(self, host_ptr: int, nbytes: int) -> None:
+    def attach(self, host_ptr: int, nbytes: int, primary: _Attachment) -> None:
         import pyxrt
 
+        # Whatever XRT is asked to map is a host range: the only pages it could
+        # not pin are the iGPU-allocated ones, and those only exist on a buffer
+        # that named HSA, which _check_device_mix refuses before we get here.
         self._bo = pyxrt.ext.bo(self.handle, _void_capsule(host_ptr), nbytes)
 
     def release(self) -> None:
@@ -485,28 +595,41 @@ class _XrtAttachment(_Attachment):
 
 
 class _HipAttachment(_Attachment):
-    """HIP's hold: pinned pages with an iGPU-side alias.
+    """HIP's hold: an address the iGPU can reach.
 
-    As primary it calls ``hipHostMalloc``; as secondary it pins pages another
-    runtime owns with ``hipHostRegister``. Either way
-    ``hipHostGetDevicePointer`` yields the address the iGPU uses, which is what
-    ``__dlpack__`` hands to torch.
+    As secondary it pins pages another runtime owns with ``hipHostRegister``
+    and asks ``hipHostGetDevicePointer`` for the iGPU-side alias. As primary it
+    allocates, and *what* it allocates depends on who else will hold the buffer:
+
+    * with an XRT device, or alone -- ``hipHostMalloc``. Pinned host pages,
+      which is what XRT's userptr BO can wrap.
+    * with an HSA device -- ``hipMalloc``. An iGPU allocation, which is the only
+      kind that can be exported as a dma-buf, and a dma-buf is the only way
+      pages the iGPU owns can be handed to the AIE agent. On an APU that memory
+      is host-visible as well, which is what keeps the host views working.
+
+    The two are mutually exclusive, which is why the choice is made from the
+    device set at construction rather than adapted to later: XRT cannot pin
+    device memory (the userptr ioctl returns ``ENOMEM``) and pinned pages
+    cannot be exported at all, so there is no allocation that serves both and
+    no way to convert one into the other in place.
 
     Why pinning and not an external-memory import
     ---------------------------------------------
-    The obvious route for the secondary role -- export the BO as a dma-buf and
-    import it into ROCm -- does not work. ``AMDKFD_IOC_GET_DMABUF_INFO``
-    returns ``EINVAL`` for an ``amdxdna``-exported dma-buf (a ``drm``-exported
-    one succeeds), because KFD can only describe buffers it can resolve back to
-    an amdgpu object. That surfaces as ``hipErrorOutOfMemory`` from
-    ``hipImportExternalMemory``, which is misleading. The vmem paths
-    (``hipMemImportFromShareableHandle``,
-    ``hsa_amd_vmem_import_shareable_handle``) fail too: they are matched-pair
-    APIs that only accept handles minted by their own exporter, not arbitrary
-    dma-bufs.
+    In the secondary role the obvious route -- export the other runtime's
+    buffer as a dma-buf and import it into ROCm -- does not work for an
+    *XRT*-owned BO. ``AMDKFD_IOC_GET_DMABUF_INFO`` returns ``EINVAL`` for an
+    ``amdxdna``-exported dma-buf (a ``drm``-exported one succeeds), because KFD
+    can only describe buffers it can resolve back to an amdgpu object. That
+    surfaces as ``hipErrorOutOfMemory`` from ``hipImportExternalMemory``, which
+    is misleading, and the vmem import paths fail on the same fd for the same
+    reason.
 
     ``hipHostRegister`` sidesteps all of it by never touching the fd -- it pins
     an existing host mapping and hands back a device pointer for the same pages.
+    It works on an HSA-allocated range too, so both NPU runtimes are served by
+    one secondary path. (The reverse direction, HIP's own pages into the AIE
+    agent, *does* go through a dma-buf; see ``_HsaAttachment``.)
     """
 
     kind = "HIP"
@@ -519,10 +642,17 @@ class _HipAttachment(_Attachment):
         self.index = index
         self._host_ptr: int | None = None
         self._device_ptr: int | None = None
-        # Which of the two undo paths release() owes: freeing what we malloc'd,
-        # or unregistering what we pinned. Never both.
-        self._owned = False
-        self._registered = False
+        #: Whether the pages are an iGPU allocation rather than pinned host
+        #: memory -- which is what decides whether the AIE agent can be given
+        #: them, so the HSA attachment reads it before trying.
+        self.device_memory = False
+        # What release() owes, set when the memory is obtained: free the host
+        # pages we pinned, free the iGPU allocation we made, or unregister
+        # pages another runtime owns. A name rather than a bound callable: the
+        # callable would be a method with extra steps, and it would hold a
+        # reference back to the attachment for as long as the attachment holds
+        # it.
+        self._held: str | None = None
 
     @contextlib.contextmanager
     def _selected(self) -> Iterator[None]:
@@ -568,7 +698,13 @@ class _HipAttachment(_Attachment):
             raise SharedBufferError("hipHostGetDevicePointer returned null")
         self._device_ptr = dev.value
 
-    def allocate(self, nbytes: int) -> int:
+    def allocate(self, nbytes: int, peers: frozenset[str]) -> int:
+        if _HsaAttachment.kind in peers:
+            return self._allocate_device(nbytes)
+        return self._allocate_pinned(nbytes)
+
+    def _allocate_pinned(self, nbytes: int) -> int:
+        """Pinned host pages, with an iGPU-side alias."""
         ptr = ctypes.c_void_p()
         with self._selected():
             _hip_check(
@@ -582,7 +718,7 @@ class _HipAttachment(_Attachment):
         if ptr.value is None:
             raise SharedBufferError("hipHostMalloc returned a null pointer")
         self._host_ptr = ptr.value
-        self._owned = True
+        self._held = "pinned"
         # Past this point the pages are pinned, so a failure has to undo it
         # here: the caller has no handle on this attachment yet -- SharedBuffer
         # only records it once allocate()/attach() returns -- so nothing else
@@ -590,7 +726,29 @@ class _HipAttachment(_Attachment):
         self._release_on_error(self._resolve_device_ptr)
         return self._host_ptr
 
-    def attach(self, host_ptr: int, nbytes: int) -> None:
+    def _allocate_device(self, nbytes: int) -> int:
+        """An iGPU allocation, which is the flavour HIP will export.
+
+        There is no separate host address to resolve: the allocation *is* the
+        device address, and on the APUs this module exists for it is
+        host-visible at the same value, which is what lets the buffer keep
+        offering host views of it.
+        """
+        ptr = ctypes.c_void_p()
+        with self._selected():
+            _hip_check(
+                _hip().hipMalloc(ctypes.byref(ptr), ctypes.c_size_t(nbytes)),
+                "hipMalloc",
+            )
+        if ptr.value is None:
+            raise SharedBufferError("hipMalloc returned a null pointer")
+        self._host_ptr = ptr.value
+        self._device_ptr = ptr.value
+        self.device_memory = True
+        self._held = "device"
+        return self._host_ptr
+
+    def attach(self, host_ptr: int, nbytes: int, primary: _Attachment) -> None:
         with self._selected():
             _hip_check(
                 _hip().hipHostRegister(
@@ -601,7 +759,7 @@ class _HipAttachment(_Attachment):
                 "hipHostRegister",
             )
         self._host_ptr = host_ptr
-        self._registered = True
+        self._held = "registered"
         self._release_on_error(self._resolve_device_ptr)
 
     def release(self) -> None:
@@ -609,14 +767,15 @@ class _HipAttachment(_Attachment):
         # can run during interpreter teardown, where raising is reported as an
         # unraisable and can mask the real cause of a shutdown failure.
         try:
-            if self._registered:
-                _hip().hipHostUnregister(ctypes.c_void_p(self._host_ptr))
-            elif self._owned:
+            if self._held == "pinned":
                 _hip().hipHostFree(ctypes.c_void_p(self._host_ptr))
+            elif self._held == "device":
+                _hip().hipFree(ctypes.c_void_p(self._device_ptr))
+            elif self._held == "registered":
+                _hip().hipHostUnregister(ctypes.c_void_p(self._host_ptr))
         except Exception:
             pass
-        self._registered = False
-        self._owned = False
+        self._held = None
         self._device_ptr = None
 
     def dlpack_device(self) -> tuple[int, int]:
@@ -627,26 +786,148 @@ class _HipAttachment(_Attachment):
 
 
 class _HsaAttachment(_Attachment):
-    """Placeholder for sharing through HSA directly. Not implemented.
+    """The NPU's hold when it is driven through ROCR rather than XRT.
 
-    Present so that "HSA" is a recognised kind everywhere a device is named,
-    and asking for it fails with one clear message instead of an unknown-kind
-    error that reads like a typo.
+    A *shared region* in the backend's HSA runtime: memory the AIE agent can
+    address, registered there so a dispatch naming it runs on it in place. That
+    registration is the whole point -- without it the runtime would stage the
+    tensor through a pooled buffer and copy it twice, which is exactly what a
+    shared buffer exists to avoid.
 
-    Filling this in means ``hsa_amd_memory_lock_to_pool`` for the secondary
-    role and ``hsa_amd_memory_pool_allocate`` from a fine-grained system pool
-    for the primary one. Both need the ``hsa_agent_t`` rather than the plain
-    index this stub accepts, so the handle convention will have to grow with
-    the implementation.
+    Both roles go through the vmem API, in the two ways it offers:
+
+    * primary -- ``hsa_amd_vmem_handle_create`` on the AIE agent's data pool,
+      mapped and granted to the CPU and the AIE agent. The result is ordinary
+      addressable memory, so a HIP secondary can pin it with
+      ``hipHostRegister`` like any other host range.
+    * secondary -- ``hsa_amd_vmem_import_shareable_handle`` on the iGPU
+      allocation the HIP primary owns, which the runtime reaches through a
+      dma-buf it exports for it, then maps and grants to the AIE agent. ROCR
+      refuses to grant an imported range to the CPU, so the host keeps reaching
+      those pages by HIP's address for them, not this one.
+
+    Only an XRT primary has no route: KFD cannot describe an ``amdxdna``-backed
+    dma-buf, and there is no reason to try -- both name the same NPU, so a
+    buffer wanting the NPU should name whichever runtime it will dispatch on.
+
+    Nothing here touches ROCR until the buffer actually asks for memory:
+    ``_make_attachment`` runs on every ``is_shared_with`` query, including from
+    processes driving the NPU through XRT, and initialising ROCR there would
+    have it open a device XRT is already using -- on an agent that permits a
+    single queue.
     """
 
     kind = "HSA"
 
-    def allocate(self, nbytes: int) -> int:
-        raise SharedBufferError("HSA buffers are not implemented yet")
+    def __init__(self, handle: DeviceHandle) -> None:
+        index = 0 if handle is None else int(handle)
+        if index != 0:
+            # The runtime binds the first AIE agent it finds, so any other
+            # index would silently land on agent 0.
+            raise SharedBufferError(
+                f"hsa:{index} does not exist; the NPU is agent 0 (hsa:0)"
+            )
+        super().__init__(index)
+        #: Address the AIE agent reaches the region by, and the key the runtime
+        #: knows it by. Also the CPU's address when we allocated it ourselves.
+        self._va: int | None = None
+        self._nbytes = 0
+        #: Peer addresses registered as aliases of this region, so they can be
+        #: retired before the mappings behind them go away.
+        self._aliases: list[int] = []
 
-    def attach(self, host_ptr: int, nbytes: int) -> None:
-        raise SharedBufferError("HSA sharing is not implemented yet")
+    def allocate(self, nbytes: int, peers: frozenset[str]) -> int:
+        va = _hsa_call(
+            "triton_npu_hsa_shared_alloc",
+            ctypes.c_uint64(nbytes),
+            restype=ctypes.c_void_p,
+        )
+        self._va = va
+        self._nbytes = nbytes
+        return va
+
+    def attach(self, host_ptr: int, nbytes: int, primary: _Attachment) -> None:
+        # An XRT primary never reaches here (_check_device_mix refuses that
+        # buffer), so what is left is an iGPU one -- and only its exportable
+        # flavour will do. Pinned host pages cannot be exported at all, which
+        # is worth saying here rather than letting the export fail: the
+        # allocation that would have worked is one the buffer can no longer go
+        # back and make.
+        if not getattr(primary, "device_memory", False):
+            raise SharedBufferError(
+                "the AIE agent can only be given iGPU memory allocated for it; "
+                f"this buffer's pages came from {primary.kind}. Name the HSA "
+                "device in share= when the buffer is created, so its pages are "
+                "allocated as iGPU memory in the first place"
+            )
+        self._va = _hsa_call(
+            "triton_npu_hsa_shared_import",
+            ctypes.c_void_p(host_ptr),
+            ctypes.c_uint64(nbytes),
+            restype=ctypes.c_void_p,
+        )
+        self._nbytes = nbytes
+        # The import registered the iGPU's address as well, since that is what
+        # a torch tensor over these pages carries into a dispatch.
+        self._aliases.append(host_ptr)
+
+    def on_peer_attached(self, peer: _Attachment) -> None:
+        """Register the address ``peer`` names these pages by.
+
+        A HIP secondary over an HSA-owned region gets its own address for the
+        pages -- ``hipHostGetDevicePointer`` returns an alias, not the range it
+        was handed -- and that alias is what a torch tensor carries into a
+        dispatch. Without it the runtime would not recognise the pointer and
+        would stage a copy of memory it already had.
+        """
+        if self._va is None:
+            return
+        alias = peer.data_ptr()
+        if alias is None or alias == self._va or alias in self._aliases:
+            return
+        _hsa_call(
+            "triton_npu_hsa_shared_alias",
+            ctypes.c_void_p(alias),
+            ctypes.c_void_p(self._va),
+            ctypes.c_uint64(self._nbytes),
+        )
+        self._aliases.append(alias)
+
+    def on_peer_released(self, peer: _Attachment) -> None:
+        """Retire a peer's alias before the mapping behind it goes away.
+
+        Otherwise a dispatch could resolve an address the peer has handed back
+        to its own runtime, which may by then belong to something else.
+        """
+        alias = peer.data_ptr()
+        if alias is None or alias not in self._aliases:
+            return
+        try:
+            _hsa_call("triton_npu_hsa_shared_unalias", ctypes.c_void_p(alias))
+        except SharedBufferError:
+            pass  # teardown path; see release()
+        self._aliases.remove(alias)
+
+    def release(self) -> None:
+        # Swallowed for the same reason as _HipAttachment.release: this runs
+        # from __del__ too, where raising only obscures a shutdown failure.
+        try:
+            if self._va is not None:
+                _hsa_call("triton_npu_hsa_shared_free", ctypes.c_void_p(self._va))
+        except Exception:
+            pass
+        self._va = None
+        self._aliases.clear()
+
+    def data_ptr(self) -> int | None:
+        """The AIE agent's address for the region.
+
+        Not a host address: in the secondary role it is granted to the AIE
+        agent alone, and dereferencing it faults. ``dlpack_device`` stays None
+        so nothing hands it to a framework -- it is here to be inspected, and
+        for the buffer's ``aie_ptr``.
+        """
+        return self._va
 
 
 #: Binds the attachment selectors below to the runtime-specific subtype the
@@ -674,8 +955,15 @@ def _split_device_string(text: str) -> tuple[str, int | None]:
         ) from None
 
 
-def _make_attachment(device: DeviceSpec) -> _Attachment:
-    """Build the attachment named by a device spec.
+def _parse_spec(device: DeviceSpec) -> tuple[str, DeviceHandle]:
+    """The kind and handle a device spec names, without building anything.
+
+    Separate from ``_make_attachment`` because a buffer has to know which kinds
+    it will be shared with *before* its primary allocates -- HIP allocates a
+    different kind of memory depending on whether the NPU will reach it through
+    HSA -- and constructing the attachments to ask them is not free: opening an
+    XRT device is a real device operation, and building an HSA one would
+    initialise ROCR.
 
     Three spellings, all naming the same thing:
 
@@ -699,14 +987,39 @@ def _make_attachment(device: DeviceSpec) -> _Attachment:
                 f"device must be a device string like 'hip:0' or a "
                 f"(kind, handle) pair, got {device!r}"
             ) from None
-    try:
-        cls = _BACKENDS[str(kind).upper()]
-    except KeyError:
+    name = str(kind).upper()
+    if name not in _BACKENDS:
         raise SharedBufferError(
             f"unknown device kind {kind!r}; known kinds are "
             f"{', '.join(sorted(_BACKENDS))}"
-        ) from None
-    return cls(handle)
+        )
+    return name, handle
+
+
+def _make_attachment(device: DeviceSpec) -> _Attachment:
+    """Build the attachment named by a device spec; see ``_parse_spec``."""
+    kind, handle = _parse_spec(device)
+    return _BACKENDS[kind](handle)
+
+
+def _check_device_mix(kinds: set[str]) -> None:
+    """Refuse a device set naming both NPU runtimes.
+
+    They are two ways to reach the same device, and neither can map the other's
+    pages: XRT cannot pin an HSA allocation's device memory, and KFD cannot
+    describe an XRT-exported dma-buf. Caught here, from the whole device set,
+    because the pair is not always adjacent -- a HIP buffer shared with both is
+    refused by neither runtime's own check until it is too late to allocate
+    differently.
+    """
+    if {_XrtAttachment.kind, _HsaAttachment.kind} <= kinds:
+        raise SharedBufferError(
+            "a buffer cannot be shared with both XRT and HSA devices: they are "
+            "the same NPU reached two ways, and neither can map the other's "
+            "pages -- XRT cannot pin the iGPU memory that an HSA-shared buffer "
+            "has to be allocated as, and the AIE agent cannot be given an "
+            "XRT-exported buffer. Name the runtime you will dispatch on"
+        )
 
 
 def _as_device_list(
@@ -805,14 +1118,36 @@ class SharedBuffer:
         self.dtype = dtype
 
         _, bits, _ = _dtype_info(dtype)
+        # Checked here, once, rather than left to whichever runtime allocates:
+        # each reports a shape it cannot serve in its own terms and its own
+        # exception type -- a raw ``mmap_range(len=0)`` from XRT, a pybind11
+        # TypeError, a null pointer from HIP -- and two of those are not
+        # SharedBufferError, which is what callers are told to catch.
+        if any(dim < 0 for dim in self.shape):
+            raise SharedBufferError(
+                f"shape {tuple(self.shape)} has a negative dimension"
+            )
+        if math.prod(self.shape) == 0:
+            raise SharedBufferError(
+                f"shape {tuple(self.shape)} holds no elements; there is nothing "
+                "for a device to map"
+            )
         self._nbytes = math.prod(self.shape) * (bits // 8)
 
-        primary_att = _make_attachment(device)
-        self._host_ptr = primary_att.allocate(self._nbytes)
+        # Parsed before anything is allocated: the primary allocates according
+        # to who else will hold the buffer, and a device set that cannot work
+        # should be refused while there is still nothing to unwind.
+        secondaries = _as_device_list(share)
+        primary_kind, primary_handle = _parse_spec(device)
+        peers = frozenset(_parse_spec(s)[0] for s in secondaries)
+        _check_device_mix({primary_kind, *peers})
+
+        primary_att = _BACKENDS[primary_kind](primary_handle)
+        self._host_ptr = primary_att.allocate(self._nbytes, peers)
         self._primary = primary_att
         self._attachments[primary_att.key] = primary_att
         try:
-            for secondary in _as_device_list(share):
+            for secondary in secondaries:
                 self.share_with(secondary)
         except Exception:
             # A half-shared buffer is not something the caller can use or
@@ -833,8 +1168,30 @@ class SharedBuffer:
         attachment = _make_attachment(device)
         if attachment.key in self._attachments:
             return self
-        attachment.attach(self._host_ptr, self._nbytes)
+        _check_device_mix(
+            {attachment.kind, *(a.kind for a in self._attachments.values())}
+        )
+        assert self._primary is not None  # a live buffer always has one
+        attachment.attach(self._host_ptr, self._nbytes, self._primary)
+        # Recorded before the announcements below, which can fail: an
+        # attachment that has mapped the pages but is not in the dict is one
+        # nothing can ever release, and a stranded mapping outlives the buffer.
         self._attachments[attachment.key] = attachment
+        try:
+            # Announced after the fact, so a peer that needs an address only the
+            # new attachment can supply -- the HSA runtime does -- gets it once
+            # that address exists.
+            for existing in self._attachments.values():
+                if existing is attachment:
+                    continue
+                existing.on_peer_attached(attachment)
+                attachment.on_peer_attached(existing)
+        except Exception:
+            # Leave the buffer as it was found: a half-announced attachment is
+            # one the runtime may not recognise at dispatch.
+            del self._attachments[attachment.key]
+            attachment.release()
+            raise
         # Adding a HIP device changes which pointer the DLPack view should
         # carry, so a torch view minted before this one is now describing the
         # buffer as the wrong kind of memory.
@@ -901,12 +1258,32 @@ class SharedBuffer:
 
     @property
     def host_ptr(self) -> int | None:
-        """Address of the pages in this process, valid for every attachment."""
+        """The primary device's address for the pages, in this process.
+
+        Not "the host address": each runtime holding the buffer has its own
+        address for the same memory, and this is the one the pages were
+        allocated at. It is what the other attachments were handed to map, and
+        what the host views are built on -- which is why an XRT-owned buffer's
+        BO maps at exactly this address.
+        """
         return self._host_ptr
 
     def device_ptr(self) -> int | None:
         """The iGPU-side address of the pages."""
         return self._one_of_kind(_HipAttachment).data_ptr()
+
+    def aie_ptr(self) -> int | None:
+        """The NPU-side address of the pages under the HSA runtime.
+
+        The address a dispatch through ROCR runs on, and the counterpart of
+        ``bo`` for that runtime -- though unlike a BO it is not something a
+        caller passes anywhere: the runtime resolves it from whichever address
+        the caller does pass. Here to be looked at.
+
+        Not necessarily readable from the host: when the iGPU owns the pages,
+        the NPU's mapping of them is granted to the AIE agent alone.
+        """
+        return self._one_of_kind(_HsaAttachment).data_ptr()
 
     # -- views --------------------------------------------------------------
     def _dlpack_source(self) -> tuple[int, int, int]:
@@ -1010,10 +1387,16 @@ class SharedBuffer:
     def numpy(self) -> np.ndarray:
         """A host numpy view aliasing this buffer (no copy).
 
-        Always available, whatever the buffer is shared with: every attachment
-        maps the same host pages. Cached like the torch view -- the mapping is
-        fixed for the buffer's lifetime, and callers on the dispatch path ask
-        for it several times per launch.
+        Reads and writes the primary's pages directly, whatever else holds
+        them. For an XRT- or HSA-owned buffer those are host pages and this is
+        unremarkable. For an iGPU-owned one they are an iGPU allocation, and
+        the view works because the two processors share physical memory --
+        which is the premise this whole module rests on, but is worth saying
+        where a raw address is handed to numpy.
+
+        Cached like the torch view: the mapping is fixed for the buffer's
+        lifetime, and callers on the dispatch path ask for it several times per
+        launch.
         """
         if self._numpy_view is None:
             import numpy as np
@@ -1073,6 +1456,12 @@ class SharedBuffer:
         # key, so it is always the first entry -- reversed() releases it last
         # without needing to single it out.
         for attachment in reversed(list(self._attachments.values())):
+            # Tell the others first: an attachment's address stops meaning
+            # anything the moment it lets go, and whoever recorded it has to
+            # forget it while it is still theirs to forget.
+            for other in self._attachments.values():
+                if other is not attachment:
+                    other.on_peer_released(attachment)
             attachment.release()
         self._primary = None
         self._attachments.clear()
