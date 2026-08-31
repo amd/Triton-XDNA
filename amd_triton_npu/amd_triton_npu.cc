@@ -1,4 +1,5 @@
-//===- amd_triton_npu.cc -------------------------------------------*- C++ -*-===//
+//===- amd_triton_npu.cc -------------------------------------------*- C++
+//-*-===//
 //
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
@@ -53,9 +54,10 @@ void init_triton_amd_triton_npu(py::module_ &m) {
          uint8_t bits, int32_t deviceType, int32_t deviceId, py::object owner) {
         // `owner` is required, not optional: without one nanobind falls back to
         // copying the contents, which it cannot do for a bare pointer, and the
-        // call fails outright. The Python side passes a sentinel rather than
-        // the buffer -- see _NDARRAY_OWNER in shared.py for why the descriptive
-        // choice leaks.
+        // call fails outright. The Python side passes the buffer itself, so a
+        // consumer's tensor keeps the pages it describes alive -- see
+        // SharedBuffer._as_ndarray in shared.py for why, and for how the cycle
+        // that would otherwise form is broken.
         return py::ndarray<py::array_api>(
             reinterpret_cast<void *>(data), shape.size(), shape.data(), owner,
             /*strides=*/nullptr, py::dlpack::dtype{code, bits, 1}, deviceType,

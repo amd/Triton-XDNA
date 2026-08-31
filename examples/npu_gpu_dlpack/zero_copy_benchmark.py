@@ -163,6 +163,13 @@ def run_shared(
 
         # No transfer -- only a fence, so the NPU does not read pages the iGPU
         # has not finished writing.
+        #
+        # It costs nothing here because the _sync() that timed the matmul has
+        # already drained the queue, and it is kept anyway: the copy path is
+        # measured from that same drained state, so the two hand-off phases are
+        # comparable, and a program that is not being timed still needs this
+        # fence. Removing it would make the phase read 0 for the wrong reason
+        # and leave the example wrong to copy.
         torch.cuda.current_stream().synchronize()
         t2 = time.perf_counter()
 

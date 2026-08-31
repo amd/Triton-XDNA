@@ -185,6 +185,23 @@ std::atomic<std::uint64_t> g_staged{0};
 // CPU_AND_AIE, so the host can stage into them; an imported range can only take
 // AIE_ONLY, because ROCR rejects a CPU grant on memory another runtime owns
 // (whether the CPU can reach it is then that runtime's business, not ours).
+//
+// This is our own vocabulary because HSA has none that fits, which is worth
+// recording since both of its candidates look like they would do:
+//
+// * hsa_access_permission_t says what an agent gets, not whether it may be
+//   asked about. Naming a CPU agent with HSA_ACCESS_PERMISSION_NONE on an
+//   imported range is refused exactly as RW is -- the refusal is about the
+//   agent appearing in the request at all -- so NONE cannot mean "leave this
+//   one out". It cannot mean both that and "revoke", which is what
+//   vmem_free needs it for.
+// * hsa_amd_memory_pool_access_t, via the pool behind the handle, is not
+//   available for an import: hsa_amd_vmem_get_alloc_properties_from_handle
+//   returns a null pool there and the per-agent query then fails with
+//   INVALID_MEMORY_POOL. For a range we allocated it answers, but answers
+//   NEVER_ALLOWED for the CPU on the very pool whose CPU grant this file
+//   depends on and the tests exercise -- so it describes something other than
+//   what set_access will accept.
 enum class Access { CPU_AND_AIE, AIE_ONLY };
 
 // A caller-owned range both the AIE agent and someone else can address.
@@ -303,13 +320,19 @@ public:
       // A shared tensor is already memory the AIE agent can reach: dispatch on
       // it in place. Every other one gets a pooled I/O buffer and a copy in.
       for (std::uint32_t i = 0; i < num_tensors; ++i) {
+        // Both of these describe an operand that cannot be dispatched on, and
+        // both are worth naming here: left alone, the first surfaces further
+        // down as an HSA argument error about a zero-byte allocation, and the
+        // second as a segfault in the staging memcpy below -- inside a block
+        // that has released the GIL, so Python never gets to report it.
         if (sizes[i] == 0)
-          // Otherwise this surfaces further down as an HSA argument error
-          // about a zero-byte allocation, which says nothing about which
-          // operand the caller got wrong.
           throw std::runtime_error(
               "tensor argument " + std::to_string(i) +
               " is empty; there is nothing to give the device for it");
+        if (host_ptrs[i] == nullptr)
+          throw std::runtime_error("tensor argument " + std::to_string(i) +
+                                   " claims " + std::to_string(sizes[i]) +
+                                   " bytes at a null address");
         if (void *shared =
                 resolve_shared(host_ptrs[i], (std::size_t)sizes[i])) {
           dev_addr[i] = shared;

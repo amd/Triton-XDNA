@@ -261,6 +261,10 @@ def test_degenerate_shapes(buffers: _Buffers) -> None:
         ("an empty buffer", (0,)),
         ("a zero-length dimension", (4, 0, 8)),
         ("a negative dimension", (-4,)),
+        ("a non-integer dimension", (4.5,)),
+        # Byte counts become a size_t on the way to every runtime, so this one
+        # used to wrap and hand back a 4 KiB buffer describing 2**62 elements.
+        ("a size that does not fit a size_t", ((1 << 62) + 1024,)),
     ):
         for where, spec in (("alone", (NPU, ())), ("shared", (NPU, [HIP]))):
             check_raises(

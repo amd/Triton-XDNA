@@ -85,6 +85,7 @@ import ctypes
 import functools
 import glob
 import math
+import operator
 import os
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar, cast
@@ -1114,7 +1115,16 @@ class SharedBuffer:
         self._host_ptr: int | None = None
         self._torch_view: weakref.ref[Tensor] | None = None
         self._numpy_view: np.ndarray | None = None
-        self.shape = tuple(shape)
+        # ``operator.index`` both validates and normalizes: it accepts anything
+        # that is an integer (a numpy or torch dimension as readily as an int)
+        # and refuses anything that merely looks like one, which is what keeps
+        # a float dimension from reaching math.prod as a float.
+        try:
+            self.shape = tuple(operator.index(dim) for dim in shape)
+        except TypeError:
+            raise SharedBufferError(
+                f"shape {tuple(shape)} has a non-integer dimension"
+            ) from None
         self.dtype = dtype
 
         _, bits, _ = _dtype_info(dtype)
@@ -1133,6 +1143,15 @@ class SharedBuffer:
                 "for a device to map"
             )
         self._nbytes = math.prod(self.shape) * (bits // 8)
+        # A byte count is a size_t everywhere below, and Python's integers are
+        # not: an oversized request wraps modulo 2**64 on the way into ctypes,
+        # so 16 EB quietly becomes a 4 KiB allocation that the buffer then
+        # describes as holding 2**62 elements. Refused rather than truncated.
+        if self._nbytes >= 1 << 64:
+            raise SharedBufferError(
+                f"shape {tuple(self.shape)} of {dtype} needs {self._nbytes} "
+                "bytes, which does not fit the size a device is asked for"
+            )
 
         # Parsed before anything is allocated: the primary allocates according
         # to who else will hold the buffer, and a device set that cannot work
