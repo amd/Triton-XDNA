@@ -23,7 +23,7 @@ with the same tiling script -- ``--runtime`` chooses only how it is dispatched:
 
 The variants, per runtime:
 
-**copy / staged** -- what the boundary costs by default. ``C`` comes back to
+**copy** -- what the boundary costs by default. ``C`` comes back to
 the host and the result returns to the iGPU. Under XRT the launch then stages
 each operand into a BO and back; under HSA the runtime does the same into a
 pooled vmem buffer, invisibly, on every launch.
@@ -302,8 +302,13 @@ def _add(x, y, out, n):
     )
 
 
-def run_staged(a, b, shape, e1_host, e2_host, iters):
-    """The default path: the host sees every operand, and so does the runtime."""
+def run_copy_hsa(a, b, shape, e1_host, e2_host, iters):
+    """The default path: the host sees every operand, and so does the runtime.
+
+    "Staged" in the summary counts what the runtime does *inside* the launch --
+    a pooled vmem buffer per operand, a memcpy in and a memcpy out -- which is
+    on top of the host round trip this function times explicitly.
+    """
     rows, cols, _ = shape
     n = rows * cols
     tmp_host = torch.zeros(n, dtype=torch.float32)
@@ -402,14 +407,14 @@ def bench_hsa(args):
         _sync()
 
         print("\n  warming up (JIT, PDI build, first dispatch)...")
-        run_staged(a, b, args.shape, e1_host, e2_host, args.warmup)
+        run_copy_hsa(a, b, args.shape, e1_host, e2_host, args.warmup)
         for bufs in sets.values():
             run_shared_hsa(a, b, args.shape, bufs, args.warmup)
 
         results = {}
         before = shared.hsa_dispatch_counts()
-        ph, res = run_staged(a, b, args.shape, e1_host, e2_host, args.iters)
-        results["staged (via host)"] = (
+        ph, res = run_copy_hsa(a, b, args.shape, e1_host, e2_host, args.iters)
+        results["copy (via host)"] = (
             ph,
             res,
             _counts(before, shared.hsa_dispatch_counts(), args.iters),
