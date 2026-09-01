@@ -213,6 +213,25 @@ refused. `shared.hsa_dispatch_counts()` reports how many tensor arguments were
 dispatched in place and how many were staged, which is the way to confirm a
 buffer is doing what it was allocated for.
 
+A buffer goes wherever a tensor goes — operators, methods, `out=`,
+`np.asarray` — and adds the per-device handles a dispatch needs:
+
+```python
+from triton.backends.amd_triton_npu import shared
+
+with shared.empty(128, 768, dtype=torch.float32,
+                  device="hsa:0", share="hip:0") as c:
+    torch.matmul(a, b, out=c)     # the iGPU writes where the NPU reads
+    kernel[grid](c, ...)          # dispatched on those same pages
+```
+
+`device=` also takes a `torch.device`, so `device=t.device` works on a tensor
+you already have. Closing a buffer returns its pages to a pool rather than
+unmapping them, because mapping costs about 11 ms regardless of size and a
+whole zero-copy dispatch costs under 1 ms — so allocating per iteration, as
+torch code does, is cheap after the first. `shared.empty_cache()` and
+`shared.set_cache_enabled(False)` are there for when it should not be.
+
 ## Windows Support
 
 Triton-XDNA runs natively on Windows — no WSL, no Linux VM. The whole flow,

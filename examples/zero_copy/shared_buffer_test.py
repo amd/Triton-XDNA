@@ -54,6 +54,7 @@ import sys
 from collections.abc import Callable, Sequence
 from typing import Any
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -77,6 +78,9 @@ RUNTIME = npu_config.runtime
 NPU = f"{RUNTIME}:0"
 OTHER_NPU = "hsa:0" if RUNTIME == "xrt" else "xrt:0"
 HIP = "hip:0"
+#: The same device as HIP, named the way torch names it. torch calls the iGPU
+#: "cuda" on a ROCm build, so this is what ``tensor.device`` carries.
+HIP_TORCH = torch.device("cuda:0")
 
 #: Told to the harness when the environment cannot run this test at all -- no
 #: iGPU, no ROCm build of torch, no NPU runtime. Distinct from a failure, which
@@ -229,10 +233,22 @@ def test_device_specs(buffers: _Buffers) -> None:
     two = buffers.new((4,), torch.float32, NPU, [HIP, HIP])
     check("duplicate secondaries collapse", len(two.devices) == 2)
 
+    # torch spells the iGPU "cuda" even on a ROCm build, so that spelling and a
+    # torch.device carrying it have to name the same device HIP does -- the
+    # point being that device=t.device works on a tensor you already have.
+    for label, spec in (
+        ("a cuda: string", "cuda:0"),
+        ("a rocm: string", "rocm:0"),
+        ("a torch.device", torch.device("cuda:0")),
+        ("a bare torch.device", torch.device("cuda")),
+    ):
+        aliased = buffers.new((4,), torch.float32, NPU, spec)
+        check(f"{label} names the HIP device", aliased.devices == (NPU, HIP))
+
     new = buffers.new
     bad: tuple[tuple[str, Any], ...] = (
         ("unknown kind", ("VULKAN", 0)),
-        ("unknown kind as a string", "cuda:0"),
+        ("unknown kind as a string", "vulkan:0"),
         ("non-numeric index", "hip:zero"),
         ("malformed spec", 17),
     )
@@ -359,6 +375,219 @@ def test_factories(buffers: _Buffers) -> None:
     # device= has no default, on purpose: which runtime owns the pages decides
     # how they are allocated, and a silent default would hide that.
     check_raises("empty demands a device", TypeError, lambda: shared.empty(4))
+
+    # -- the rest of torch's constructor set --------------------------------
+    # full takes its value either way round: torch's spelling, and this
+    # module's varargs one. Both have to mean the same thing.
+    positional = new(shared.full, (2, 3), 7.0, dtype=torch.float32, **on)
+    keyword = new(shared.full, 2, 3, fill_value=7.0, dtype=torch.float32, **on)
+    torch.cuda.synchronize()
+    check(
+        "full spelled either way agrees",
+        float(positional.sum()) == float(keyword.sum()) == 42.0,
+    )
+    check_raises(
+        "full without a value says how to give one",
+        SharedBufferError,
+        lambda: shared.full(2, 3, **on),
+    )
+
+    ones_l = new(shared.ones_like, z)
+    filled_l = new(shared.full_like, z, 2.0)
+    torch.cuda.synchronize()
+    check("ones_like is filled", float(ones_l.min()) == 1.0)
+    check("ones_like inherits devices", ones_l.devices == z.devices)
+    check("full_like is filled", float(filled_l.max()) == 2.0)
+
+    # Drawn through the torch view, so on a shared buffer these come from the
+    # iGPU's generator -- the check is that they landed here at all.
+    uniform = new(shared.rand, 4096, dtype=torch.float32, **on)
+    normal = new(shared.randn, 4096, dtype=torch.float32, **on)
+    torch.cuda.synchronize()
+    check(
+        "rand is uniform on [0, 1)",
+        bool((uniform >= 0).all() and (uniform < 1).all())
+        and float(uniform.std()) > 0.2,
+    )
+    check("randn is standard normal", 0.85 < float(normal.std()) < 1.15)
+
+    counted = new(shared.arange, 5, device=NPU, share=HIP)
+    stepped = new(shared.arange, 2, 10, 3, device=NPU, share=HIP)
+    real = new(shared.arange, 5.0, device=NPU, share=HIP)
+    torch.cuda.synchronize()
+    # torch's dtype rule: integral arguments give an integral buffer.
+    check("arange(5) counts, in int64", counted.torch().tolist() == [0, 1, 2, 3, 4])
+    check("arange dtype follows its arguments", counted.dtype == torch.int64)
+    check("arange(2, 10, 3) steps", stepped.torch().tolist() == [2, 5, 8])
+    check("arange(5.0) is float", real.dtype == torch.get_default_dtype())
+    check_raises(
+        "an empty arange is refused like any empty shape",
+        SharedBufferError,
+        lambda: shared.arange(0, device=NPU),
+    )
+    check_raises(
+        "a zero step is refused",
+        SharedBufferError,
+        lambda: shared.arange(0, 10, 0, device=NPU),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Behaving like a tensor
+# ---------------------------------------------------------------------------
+def test_tensor_surface(buffers: _Buffers) -> None:
+    """A buffer wherever a tensor goes.
+
+    The point of the section is that none of this needs ``.torch()``: a caller
+    who has a buffer writes what they would write for a tensor. What is checked
+    for each is that the operation reached the *buffer's own pages* rather than
+    a copy -- an ``out=`` that quietly allocated would pass a value check and
+    fail the whole purpose.
+    """
+    print("\n-- tensor surface --")
+    from triton.backends.amd_triton_npu import shared
+
+    buf = buffers.new((8, 4), torch.float32, NPU, HIP)
+    buf.zero_()
+    torch.cuda.synchronize()
+    twos = torch.full((8, 4), 2.0, device="cuda")
+
+    # Metadata, which would otherwise be a hundred forwarding methods.
+    check(
+        "shape metadata matches a tensor's",
+        (buf.ndim, buf.numel(), buf.nbytes, buf.element_size()) == (2, 32, 128, 4),
+    )
+    check("len() is the first dimension", len(buf) == 8)
+    check("iterates rows", tuple(next(iter(buf)).shape) == (4,))
+    check("tensor-shaped attributes work", tuple(buf.T.shape) == (4, 8))
+    # A missing name has to be an AttributeError and not something from inside
+    # torch, or every hasattr() probe against a buffer turns into an error.
+    check("an unknown attribute is still unknown", not hasattr(buf, "no_such_thing"))
+
+    # Operators. Python resolves these against the type and never asks
+    # __getattr__, so they are the half __torch_function__ cannot reach.
+    check("buf + 1", bool(((buf + 1) == 1).all()))
+    check("2 * buf reflected", bool(((2 * buf) == 0).all()))
+    check("elementwise ==", bool((buf == 0).all()))
+    check("in-place op returns the buffer", (buf.fill_(1), buf.__iadd__(1))[1] is buf)
+    torch.cuda.synchronize()
+    check("...and wrote through", float(buf.torch().min()) == 2.0)
+
+    # out=, which is the one that matters: it is how an iGPU kernel writes
+    # where the NPU is about to read.
+    torch.add(twos, twos, out=buf)
+    torch.cuda.synchronize()
+    check("torch.add(out=buf) wrote the pages", float(buf.torch().min()) == 4.0)
+    torch.matmul(twos, torch.eye(4, device="cuda"), out=buf)
+    torch.cuda.synchronize()
+    check("torch.matmul(out=buf) wrote the pages", float(buf.torch().max()) == 2.0)
+    check("torch.cat takes buffers", tuple(torch.cat([buf, buf]).shape) == (16, 4))
+    check("methods work", float(buf.sum()) == 64.0)
+
+    # numpy's hook. Without it np.asarray wraps the buffer in a 0-d object
+    # array, which is not an error and is the wrong answer.
+    array = np.asarray(buf)
+    check("np.asarray gives the real array", array.shape == (8, 4))
+    buf[0, 0] = 99.0
+    torch.cuda.synchronize()
+    check("np.asarray aliases the pages", float(array[0, 0]) == 99.0)
+
+    # A buffer is a resource as well as a value, and this is how you say so.
+    with shared.zeros(4, dtype=torch.float32, device=NPU, share=HIP) as scoped:
+        scoped.fill_(1)
+        torch.cuda.synchronize()
+        inside = float(scoped.sum())
+    check("with closes the buffer", inside == 4.0 and scoped.host_ptr is None)
+
+
+# ---------------------------------------------------------------------------
+# Reuse
+# ---------------------------------------------------------------------------
+def test_buffer_pool() -> None:
+    """Closed buffers are reused, and reuse is invisible except in the timing.
+
+    Mapping costs milliseconds and does not scale with size, so a caller
+    allocating per iteration -- which is how torch code is written -- would pay
+    far more than sharing saves. The risk of reuse is that a buffer comes back
+    subtly wrong, so what is checked here is that it comes back *only* for a
+    request that matches, and looking like the request rather than its
+    predecessor.
+    """
+    print("\n-- buffer pool --")
+    from triton.backends.amd_triton_npu import shared
+
+    shared.empty_cache()
+    before = shared.cache_stats()
+
+    first = shared.empty(256, 256, dtype=torch.float32, device=NPU, share=HIP)
+    pages = first.host_ptr
+    first.close()
+    check("a closed buffer is pooled", shared.cache_stats()["buffers"] == 1)
+
+    second = shared.empty(256, 256, dtype=torch.float32, device=NPU, share=HIP)
+    check("the next request takes those pages", second.host_ptr == pages)
+    check("counted as a hit", shared.cache_stats()["hits"] == before["hits"] + 1)
+    check("and the pool is empty again", shared.cache_stats()["buffers"] == 0)
+    second.close()
+
+    # Shape and dtype are views over the pages, so they are not part of what a
+    # request needs mapped -- but the buffer must describe itself by what was
+    # asked for, not by what the pages were last used as.
+    reshaped = shared.zeros(1024, 64, dtype=torch.float32, device=NPU, share=HIP)
+    torch.cuda.synchronize()
+    check("the same bytes serve another shape", reshaped.host_ptr == pages)
+    check("described by the request", tuple(reshaped.shape) == (1024, 64))
+    check("and zeros() still zeroes them", float(reshaped.abs().max()) == 0.0)
+    reshaped.close()
+
+    # The two ways a request can differ. Handing back pages mapped into the
+    # wrong devices would be the serious failure here: the buffer would look
+    # right until a dispatch named a device that never mapped it. Asked of the
+    # hit counter rather than the address, because a freshly released mapping
+    # is very often handed straight back at the same address.
+    hits = shared.cache_stats()["hits"]
+    lonely = shared.empty(256, 256, dtype=torch.float32, device=NPU)
+    check(
+        "a different device set does not reuse",
+        shared.cache_stats()["hits"] == hits and lonely.devices == (NPU,),
+    )
+    lonely.close()
+    smaller = shared.empty(128, 256, dtype=torch.float32, device=NPU, share=HIP)
+    check("a different size does not reuse", shared.cache_stats()["hits"] == hits)
+    smaller.close()
+
+    # Two buffers alive at once are two buffers, whatever the pool holds.
+    live_a = shared.zeros(32, 32, dtype=torch.float32, device=NPU, share=HIP)
+    live_b = shared.zeros(32, 32, dtype=torch.float32, device=NPU, share=HIP)
+    live_a.fill_(1)
+    torch.cuda.synchronize()
+    check("live buffers never share pages", live_a.host_ptr != live_b.host_ptr)
+    check("...and do not see each other's writes", float(live_b.abs().max()) == 0.0)
+    live_a.close()
+    live_b.close()
+
+    shared.empty_cache()
+    check("empty_cache releases what is held", shared.cache_stats()["buffers"] == 0)
+
+    # Off, close() has to mean unmap now -- which is what a measurement wants,
+    # and what a caller wants who needs the NPU to stop reaching the pages.
+    shared.set_cache_enabled(False)
+    try:
+        off = shared.empty(64, 64, dtype=torch.float32, device=NPU, share=HIP)
+        off.close()
+        check("disabled: nothing is pooled", shared.cache_stats()["buffers"] == 0)
+        hits = shared.cache_stats()["hits"]
+        again = shared.empty(64, 64, dtype=torch.float32, device=NPU, share=HIP)
+        # Not "a different address": freeing a mapping and asking for another
+        # of the same size very often gets the same one back, so the address
+        # proves nothing either way. Whether the pool served it does.
+        check(
+            "disabled: allocated rather than reused",
+            shared.cache_stats()["hits"] == hits,
+        )
+        again.close()
+    finally:
+        shared.set_cache_enabled(True)
 
 
 # ---------------------------------------------------------------------------
@@ -608,8 +837,10 @@ def test_is_shared_with(buffers: _Buffers) -> None:
     check_raises(
         "unknown kind raises rather than answering False",
         SharedBufferError,
-        lambda: buf.is_shared_with(("CUDA", 0)),
+        lambda: buf.is_shared_with(("VULKAN", 0)),
     )
+    # ...whereas an alias of a kind we do know is a legitimate yes.
+    check("a torch.device answers for its HIP device", buf.is_shared_with(HIP_TORCH))
 
 
 def test_lifetime(buffers: _Buffers) -> None:
@@ -944,6 +1175,8 @@ def main() -> int:
         test_device_specs(buffers)
         test_degenerate_shapes(buffers)
         test_factories(buffers)
+        test_tensor_surface(buffers)
+        test_buffer_pool()
         test_npu_primary_alone(buffers)
         test_npu_primary_hip_secondary(buffers)
         test_hip_primary_alone(buffers)

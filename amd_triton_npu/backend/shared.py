@@ -13,15 +13,40 @@ Allocate through the torch-shaped factories at the bottom of the file::
 
     from triton.backends.amd_triton_npu import shared
 
-    c = shared.empty(128, 768, dtype=torch.float32,
-                     device="xrt:0", share="hip:0")
-
-    torch.matmul(a, b, out=c.torch())          # iGPU writes where the NPU reads
-    chain.run(..., bound_buffers={0: c.bo})    # NPU names the same pages
-    c.close()                                  # release before the dispatcher
+    with shared.empty(128, 768, dtype=torch.float32,
+                      device="xrt:0", share="hip:0") as c:
+        torch.matmul(a, b, out=c)              # iGPU writes where the NPU reads
+        chain.run(..., bound_buffers={0: c.bo})  # NPU names the same pages
 
 ``SharedBuffer(shape, dtype, primary, secondary)`` is the same thing with a
 shape tuple and no defaults; the factories are what most code should reach for.
+
+Using one
+---------
+A buffer goes wherever a tensor goes. ``torch.matmul(a, b, out=c)``,
+``c.sum()``, ``c[:4]``, ``c += 1``, ``torch.cat([c, t])`` and
+``np.asarray(c)`` all mean what they would mean for the tensor over the same
+pages -- see ``SharedBuffer.__torch_function__`` and ``__getattr__`` for how,
+and ``torch()`` for the view itself, which is still there when something wants
+a real tensor. What a buffer has *beyond* a tensor is the per-device handles a
+dispatch needs (``bo``, ``aie_ptr``) and a lifetime worth being explicit about.
+
+Which is the one way it does not behave like a tensor: pages mapped into three
+runtimes are a resource, not a value, so a buffer is closed rather than
+collected. ``with`` is the way to say that.
+
+Allocation is cheap after the first
+-----------------------------------
+Mapping a buffer costs about 11 ms and does not depend on its size -- it is a
+fixed sequence of ioctls per device -- while a whole zero-copy dispatch on a
+384 KB operand costs 0.6 ms. Allocating per iteration, which is how torch code
+is written because torch's allocator makes it free, would cost twenty times
+what sharing saves.
+
+So ``close()`` does not usually unmap: it returns the pages to a pool, and the
+next request for that size and device set takes them, at about 3 us. See
+``_Pool``, and ``empty_cache``/``set_cache_enabled`` for the two cases that
+want the pages actually released.
 
 Naming a device
 ---------------
@@ -39,6 +64,10 @@ A device string, spelled the way ``torch.device`` spells one, with a bare
     instead. The buffer is memory the AIE agent can address, which is what an
     NPU dispatch under the HSA runtime (``NPUDriver("hsa")``) runs on directly,
     with no staging copy. Only agent 0 exists today.
+
+A ``torch.device`` is accepted wherever a string is, so ``device=t.device``
+works on a tensor you already have; ``cuda`` and ``rocm`` both mean ``hip``,
+since ``cuda`` is what torch calls the iGPU even on a ROCm build.
 
 A ``(kind, handle)`` pair is also accepted, and is the only way to name a
 runtime object the caller already holds -- ``("XRT", pyxrt.device(0))`` when it
@@ -80,6 +109,7 @@ access patterns this exists to serve.
 # is deliberately imported inside the function that needs it.
 from __future__ import annotations
 
+import atexit
 import contextlib
 import ctypes
 import functools
@@ -87,6 +117,7 @@ import glob
 import math
 import operator
 import os
+import threading
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar, cast
 
@@ -123,14 +154,23 @@ if TYPE_CHECKING:
 __all__ = [
     "SharedBuffer",
     "SharedBufferError",
+    "arange",
     "as_torch",
+    "cache_stats",
     "dlpack_device",
     "empty",
+    "empty_cache",
     "empty_like",
     "from_tensor",
+    "full",
+    "full_like",
     "hsa_dispatch_counts",
     "is_on_device",
     "ones",
+    "ones_like",
+    "rand",
+    "randn",
+    "set_cache_enabled",
     "zeros",
     "zeros_like",
 ]
@@ -938,6 +978,12 @@ _A = TypeVar("_A", bound=_Attachment)
 #: Device kind -> attachment class. Also the set of names a spec may use.
 _BACKENDS = {cls.kind: cls for cls in (_XrtAttachment, _HipAttachment, _HsaAttachment)}
 
+#: Other names for a kind. ``cuda`` is how torch spells the iGPU even on a ROCm
+#: build, so it is what a ``torch.device`` carries and what anyone coming from
+#: torch will type; ``rocm`` is what the same device is called everywhere else.
+#: Both mean HIP here, so ``device=t.device`` works on a tensor's own device.
+_KIND_ALIASES = {"CUDA": "HIP", "ROCM": "HIP"}
+
 
 def _split_device_string(text: str) -> tuple[str, int | None]:
     """``"hip:0"`` -> ``("hip", 0)``; ``"hip"`` -> ``("hip", None)``.
@@ -956,6 +1002,22 @@ def _split_device_string(text: str) -> tuple[str, int | None]:
         ) from None
 
 
+def _is_torch_device(obj: Any) -> bool:
+    """Whether ``obj`` is a ``torch.device``, without importing torch.
+
+    Duck-typed on purpose: this runs from ``_as_device_list`` on every spec,
+    including in processes that have no torch, and importing it to answer a
+    question about an object that plainly is not one would be backwards. The
+    two attributes are what a ``torch.device`` has and what a string or a
+    ``(kind, handle)`` pair does not.
+    """
+    return (
+        not isinstance(obj, (str, tuple, list))
+        and hasattr(obj, "type")
+        and hasattr(obj, "index")
+    )
+
+
 def _parse_spec(device: DeviceSpec) -> tuple[str, DeviceHandle]:
     """The kind and handle a device spec names, without building anything.
 
@@ -966,33 +1028,39 @@ def _parse_spec(device: DeviceSpec) -> tuple[str, DeviceHandle]:
     XRT device is a real device operation, and building an HSA one would
     initialise ROCR.
 
-    Three spellings, all naming the same thing:
+    Four spellings, all naming the same thing:
 
     * ``"hip:0"`` -- a device string, as ``torch.device`` writes them, and the
       form to prefer. A bare ``"hip"`` means index 0.
+    * ``torch.device("cuda:0")`` -- a torch device, so ``device=t.device``
+      works on a tensor you already have. torch spells the iGPU ``cuda`` even
+      on a ROCm build; that and ``rocm`` both mean ``hip`` here.
     * ``("HIP", 0)`` -- a ``(kind, index)`` pair.
     * ``("XRT", pyxrt.device(0))`` -- a pair carrying a handle the caller
       already owns, for when it has one to hand.
 
-    The kind is matched case-insensitively. All three resolve to the same
+    The kind is matched case-insensitively. All four resolve to the same
     device identity, so a buffer named one way is recognised when named
     another.
     """
     if isinstance(device, str):
         kind, handle = _split_device_string(device)
+    elif _is_torch_device(device):
+        kind, handle = device.type, device.index
     else:
         try:
             kind, handle = device
         except (TypeError, ValueError):
             raise SharedBufferError(
-                f"device must be a device string like 'hip:0' or a "
-                f"(kind, handle) pair, got {device!r}"
+                f"device must be a device string like 'hip:0', a torch.device, "
+                f"or a (kind, handle) pair, got {device!r}"
             ) from None
-    name = str(kind).upper()
+    name = _KIND_ALIASES.get(str(kind).upper(), str(kind).upper())
     if name not in _BACKENDS:
         raise SharedBufferError(
             f"unknown device kind {kind!r}; known kinds are "
-            f"{', '.join(sorted(_BACKENDS))}"
+            f"{', '.join(sorted(_BACKENDS))} "
+            f"({', '.join(sorted(_KIND_ALIASES))} also mean HIP)"
         )
     return name, handle
 
@@ -1040,7 +1108,7 @@ def _as_device_list(
     """
     if devices is None:
         return []
-    if isinstance(devices, str):
+    if isinstance(devices, str) or _is_torch_device(devices):
         return [devices]
     if (
         isinstance(devices, (tuple, list))
@@ -1055,6 +1123,230 @@ def _as_device_list(
     return list(cast("Iterable[DeviceSpec]", devices))
 
 
+def _pool_key(
+    nbytes: int,
+    primary: tuple[str, DeviceHandle],
+    secondaries: Sequence[DeviceSpec],
+) -> tuple[Any, ...] | None:
+    """What a request needs mapped, as a hashable value; None if it cannot pool.
+
+    Size and device set only. Shape and dtype are absent on purpose: they are
+    views over the pages, so a 256x256 float32 buffer and a 1024x64 one are the
+    same request as far as anything expensive is concerned.
+
+    A caller-supplied runtime handle makes a request unpoolable. Two handles to
+    one device are interchangeable for dispatch, but they are not the same
+    object, and a buffer built from a pooled attachment would then report a
+    different handle in ``devices`` than the caller passed in -- a surprise for
+    a saving on a path nobody takes in a loop.
+    """
+    keys = []
+    for kind, handle in [primary, *(_parse_spec(s) for s in secondaries)]:
+        if handle is not None and not isinstance(handle, int):
+            return None
+        keys.append((kind, 0 if handle is None else handle))
+    return (nbytes, tuple(keys))
+
+
+# ---------------------------------------------------------------------------
+# The page cache
+# ---------------------------------------------------------------------------
+#: How many bytes of retired pages to keep mapped. Past this the oldest are
+#: really released. Sized to hold a few working buffers rather than a whole
+#: model's worth: these are pinned or device pages, and on the APUs this module
+#: exists for they come out of the same DRAM the CPU is using.
+_CACHE_BYTES = int(os.environ.get("TRITON_XDNA_SHARED_CACHE_BYTES", 512 << 20))
+
+#: Set to 0 to have close() release immediately, which is what you want when
+#: measuring how long mapping actually takes, or when a buffer must stop being
+#: reachable from the NPU the moment it is closed.
+_CACHE_ENABLED = os.environ.get("TRITON_XDNA_SHARED_CACHE", "1") != "0"
+
+
+class _Pages:
+    """A retired buffer's mappings, kept for the next buffer of the same shape.
+
+    Everything expensive about a shared buffer is in here: the allocation, each
+    secondary's mapping of it, and every cross-registration between them. What
+    is *not* in here is the shape, the dtype and the views -- those are the
+    cheap part, and they are what differs between the buffer that returned
+    these pages and the one that takes them.
+    """
+
+    __slots__ = ("key", "nbytes", "host_ptr", "primary", "attachments")
+
+    def __init__(
+        self,
+        key: Any,
+        nbytes: int,
+        host_ptr: int,
+        primary: _Attachment,
+        attachments: dict[DeviceKey, _Attachment],
+    ) -> None:
+        self.key = key
+        self.nbytes = nbytes
+        self.host_ptr = host_ptr
+        self.primary = primary
+        self.attachments = attachments
+
+    def release(self) -> None:
+        """Really let the pages go; the teardown half of ``SharedBuffer.close``."""
+        for attachment in reversed(list(self.attachments.values())):
+            for other in self.attachments.values():
+                if other is not attachment:
+                    other.on_peer_released(attachment)
+            attachment.release()
+        self.attachments.clear()
+
+
+class _Pool:
+    """Retired pages, held for reuse.
+
+    Mapping a shared buffer costs about 11 ms on this hardware and does not
+    depend on its size -- it is a fixed sequence of ioctls per device, not a
+    copy -- while a whole zero-copy dispatch on a 384 KB operand costs 0.6 ms.
+    So a caller who allocates per iteration, which is exactly how torch code is
+    written because torch's own allocator makes it free, pays about twenty
+    iterations' worth of overhead to save one. Reuse is what makes the
+    torch-shaped factories on this module honest.
+
+    Pages are reused only for a request naming the same size and the same
+    devices, so what comes back is already mapped where it needs to be and no
+    runtime is asked to do anything. Contents are whatever the previous buffer
+    left: ``empty`` promises nothing about them, and every other factory writes
+    the whole buffer before returning.
+
+    A scan of a list rather than an index: the pool holds one entry per size
+    and device set retired but not yet reused, which is tens of entries, and a
+    scan of those is nothing beside the allocation it avoids.
+    """
+
+    def __init__(self) -> None:
+        # Held under a lock because the pool is process-global, where a buffer
+        # is not: two threads each allocating their own buffers do not race,
+        # but they would race here.
+        self._lock = threading.Lock()
+        self._entries: list[_Pages] = []
+        self._bytes = 0
+        self.hits = 0
+        self.misses = 0
+
+    def take(self, key: Any) -> _Pages | None:
+        """Pages already mapped exactly as ``key`` describes, if any are free."""
+        with self._lock:
+            if not _CACHE_ENABLED:
+                return None
+            # Reverse order: the most recently retired pages are the ones most
+            # likely to still be in the TLB and the page cache.
+            for i in range(len(self._entries) - 1, -1, -1):
+                if self._entries[i].key == key:
+                    pages = self._entries.pop(i)
+                    self._bytes -= pages.nbytes
+                    self.hits += 1
+                    return pages
+            self.misses += 1
+            return None
+
+    def give(self, pages: _Pages) -> bool:
+        """Offer retired pages to the pool; False if the caller must release them.
+
+        Refused rather than queued when the pool is disabled, so ``close()``
+        keeps meaning "release now" for a caller that turned caching off.
+        """
+        with self._lock:
+            if not _CACHE_ENABLED:
+                return False
+            self._entries.append(pages)
+            self._bytes += pages.nbytes
+            # Evict oldest-first, which for a steady-state loop over one size
+            # is exactly the entries that will not be asked for again.
+            stale = []
+            while self._bytes > _CACHE_BYTES and self._entries:
+                evicted = self._entries.pop(0)
+                self._bytes -= evicted.nbytes
+                stale.append(evicted)
+        # Released outside the lock: a release calls into three runtimes, and
+        # holding a lock across a driver call is how a deadlock is built.
+        for evicted in stale:
+            evicted.release()
+        return True
+
+    def clear(self) -> None:
+        with self._lock:
+            stale, self._entries = self._entries, []
+            self._bytes = 0
+        for pages in stale:
+            pages.release()
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "buffers": len(self._entries),
+                "bytes": self._bytes,
+                "hits": self.hits,
+                "misses": self.misses,
+            }
+
+
+_POOL = _Pool()
+
+
+def _drain_at_exit() -> None:
+    """Release the pool while the runtimes are still up.
+
+    Registered with ``atexit``, which runs before the interpreter starts
+    tearing modules down -- otherwise the pooled attachments are released from
+    ``__del__`` at an arbitrary point in shutdown, when the libraries they call
+    into may already be gone.
+
+    Caching is turned off rather than only drained, so a buffer still alive at
+    this point releases its pages on the way out instead of handing them to a
+    pool nothing will empty again.
+    """
+    global _CACHE_ENABLED
+    _CACHE_ENABLED = False
+    _POOL.clear()
+
+
+atexit.register(_drain_at_exit)
+
+
+def empty_cache() -> None:
+    """Release every retired buffer the pool is holding, like
+    ``torch.cuda.empty_cache``.
+
+    Only pages no live buffer is using; this cannot free a buffer someone still
+    holds. Worth calling before handing the machine to something else that
+    needs pinned memory, and in a test that wants to observe real allocation.
+    """
+    _POOL.clear()
+
+
+def set_cache_enabled(enabled: bool) -> None:
+    """Turn buffer reuse on or off; on by default.
+
+    Off makes ``close()`` release immediately, which is what a measurement of
+    mapping cost wants, and what a caller wants who needs a closed buffer to
+    stop being reachable from the NPU at once rather than eventually. Turning
+    it off also drains what is already pooled.
+    """
+    global _CACHE_ENABLED
+    _CACHE_ENABLED = bool(enabled)
+    if not _CACHE_ENABLED:
+        _POOL.clear()
+
+
+def cache_stats() -> dict[str, int]:
+    """``buffers``, ``bytes``, ``hits`` and ``misses`` for the buffer pool.
+
+    ``hits`` counts allocations served from retired pages. A loop allocating
+    the same shape each iteration should show one miss and then all hits; if it
+    does not, something about the request differs -- a different size, or a
+    different device set.
+    """
+    return _POOL.stats()
+
+
 # ---------------------------------------------------------------------------
 # The shared buffer
 # ---------------------------------------------------------------------------
@@ -1066,6 +1358,12 @@ class SharedBuffer:
     reports what is already mapped. Views are cheap and non-owning: the pages
     live and die with this object, so a tensor handed out by ``torch()`` must
     not outlive it.
+
+    Behaves as the tensor over those pages for anything torch can do to one --
+    operators, methods, ``out=``, numpy conversion -- and as a resource for the
+    rest: it is closed rather than collected, and it can name its pages to a
+    dispatch on any device holding them. The module docstring has the shape of
+    it; ``__torch_function__`` and ``__getattr__`` have the mechanism.
 
     Not thread-safe: concurrent dispatches sharing one buffer need external
     serialisation, which is also what the NPU's single command queue implies.
@@ -1080,6 +1378,7 @@ class SharedBuffer:
         "dtype",
         "_torch_view",
         "_numpy_view",
+        "_pool_key",
     )
 
     def __init__(
@@ -1115,6 +1414,7 @@ class SharedBuffer:
         self._host_ptr: int | None = None
         self._torch_view: weakref.ref[Tensor] | None = None
         self._numpy_view: np.ndarray | None = None
+        self._pool_key: Any = None
         # ``operator.index`` both validates and normalizes: it accepts anything
         # that is an integer (a numpy or torch dimension as readily as an int)
         # and refuses anything that merely looks like one, which is what keeps
@@ -1161,6 +1461,18 @@ class SharedBuffer:
         peers = frozenset(_parse_spec(s)[0] for s in secondaries)
         _check_device_mix({primary_kind, *peers})
 
+        # Pages retired by an earlier buffer of this size, mapped into these
+        # same devices, are already everything the work below would produce.
+        pool_key = _pool_key(self._nbytes, (primary_kind, primary_handle), secondaries)
+        if pool_key is not None:
+            pages = _POOL.take(pool_key)
+            if pages is not None:
+                self._host_ptr = pages.host_ptr
+                self._primary = pages.primary
+                self._attachments = pages.attachments
+                self._pool_key = pool_key
+                return
+
         primary_att = _BACKENDS[primary_kind](primary_handle)
         self._host_ptr = primary_att.allocate(self._nbytes, peers)
         self._primary = primary_att
@@ -1173,6 +1485,10 @@ class SharedBuffer:
             # reason about, so unwind rather than hand one back.
             self.close()
             raise
+        # Adopted only now that the buffer is whole. share_with() clears the
+        # key, which is right for a device added after the fact but not for the
+        # secondaries above -- those are the ones the key already names.
+        self._pool_key = pool_key
 
     # -- sharing ------------------------------------------------------------
     def share_with(self, device: DeviceSpec) -> SharedBuffer:
@@ -1215,6 +1531,10 @@ class SharedBuffer:
         # carry, so a torch view minted before this one is now describing the
         # buffer as the wrong kind of memory.
         self._torch_view = None
+        # The device set no longer matches the one this buffer's pages were
+        # keyed by, and re-deriving the key here would let these pages come
+        # back for a request that never asked for the extra device.
+        self._pool_key = None
         return self
 
     def is_shared_with(self, device: DeviceSpec) -> bool:
@@ -1233,6 +1553,15 @@ class SharedBuffer:
         """The device the pages were allocated on, as a spec you can pass back.
 
         ``devices`` is the whole set; this is the one that owns the memory.
+
+        Not the torch device, which is the one place a buffer answers a tensor
+        question differently from the tensor: ``buf.device`` is ``'xrt:0'``
+        where ``buf.torch().device`` is ``cuda:0``. Both are true, of different
+        things -- the pages belong to the NPU and the iGPU can reach them --
+        and a buffer's own answer is the one that decides where it can be
+        dispatched. Nothing silently misreads the other: a torch device spec
+        is a ``torch.device`` and this is a string neither runtime would
+        accept for the other's purpose.
         """
         if self._primary is None:
             raise SharedBufferError("buffer is closed")
@@ -1430,16 +1759,115 @@ class SharedBuffer:
     def __getitem__(self, index: Any) -> Tensor:
         """Index the buffer as its torch view: ``buf[:4]`` is ``buf.torch()[:4]``.
 
-        Sugar, but it removes the accessor from the common case -- slicing and
-        in-place writes -- which is most of what call sites do with a buffer.
-        Whole-buffer operations still go through ``torch()`` or ``numpy()``,
-        which is the right seam to be explicit about.
+        The result is a plain tensor, not a shared buffer: it aliases the same
+        pages, but the runtimes were told about the whole allocation and a
+        dispatch can only name that. Handing back something that looked shared
+        but that the NPU could not be given would be the worse answer.
         """
         return self.torch()[index]
 
     def __setitem__(self, index: Any, value: Any) -> None:
         """Write through the torch view; see ``__getitem__``."""
         self.torch()[index] = value
+
+    # -- behaving like a tensor ---------------------------------------------
+    @classmethod
+    def __torch_function__(
+        cls,
+        func: Callable[..., Any],
+        types: Any,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Let torch operate on a buffer wherever it would take a tensor.
+
+        torch checks for this hook on every argument of every one of its
+        functions, so implementing it is what makes ``torch.matmul(a, b,
+        out=buf)`` and ``torch.cat([buf, t])`` work -- no subclassing of
+        ``Tensor`` involved, which this type could not do anyway: it is a
+        handle on pages several runtimes hold, and it has to be constructible
+        in a process that never imports torch.
+
+        Buffers are swapped for their views and the call goes through
+        unchanged, so torch decides everything about the operation. Results
+        come back as plain tensors, including from ``out=``: the buffer the
+        caller passed is written in place and is still theirs, and returning it
+        instead would make ``x = torch.add(a, b, out=buf)`` hand out a second
+        owner of the same pages.
+        """
+        kwargs = kwargs or {}
+
+        def unwrap(value: Any) -> Any:
+            if isinstance(value, SharedBuffer):
+                return value.torch()
+            # torch.cat and friends take their tensors in a sequence, so an
+            # argument that is not itself a buffer may still contain one.
+            if isinstance(value, (list, tuple)):
+                return type(value)(unwrap(item) for item in value)
+            return value
+
+        return func(
+            *(unwrap(a) for a in args), **{k: unwrap(v) for k, v in kwargs.items()}
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Fall back to the torch view for anything a tensor has and we do not.
+
+        This is what supplies ``numel()``, ``ndim``, ``sum()``, ``fill_()`` and
+        the rest of the tensor surface, which would otherwise be a hundred
+        forwarding methods that could only ever drift from torch's.
+
+        Only names torch itself defines are forwarded. Anything else has to
+        raise ``AttributeError``, or every misspelling and every ``hasattr``
+        probe by some library reaches ``torch()`` and gets that failure instead
+        -- and a closed buffer would raise ``SharedBufferError`` from
+        ``hasattr``, which does not catch it.
+
+        Private names never forward: this runs before ``__init__`` has filled
+        the slots in, and looking one of those up through ``torch()`` -- which
+        reads them -- would recurse until the stack ran out.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        import torch
+
+        if not hasattr(torch.Tensor, name):
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            )
+        return getattr(self.torch(), name)
+
+    def __len__(self) -> int:
+        """Size of the first dimension, as for a tensor."""
+        if not self.shape:
+            raise TypeError("len() of a 0-d SharedBuffer")
+        return self.shape[0]
+
+    def __iter__(self) -> Iterator[Tensor]:
+        """Iterate the first dimension, as for a tensor."""
+        return iter(self.torch())
+
+    def __array__(self, dtype: Any = None, copy: bool | None = None) -> np.ndarray:
+        """Numpy's hook, so ``np.asarray(buf)`` is the host view.
+
+        Without it numpy finds no protocol it recognises and wraps the buffer
+        in a zero-dimensional object array -- which is not an error, and is the
+        kind of wrong answer that survives all the way to a plot.
+
+        Unlike torch, this works for an iGPU-owned buffer too: the pages are
+        host-visible, which is what ``numpy()`` already relies on.
+        """
+        import numpy as np
+
+        array = self.numpy()
+        if dtype is not None and np.dtype(dtype) != array.dtype:
+            if copy is False:
+                raise ValueError(
+                    f"cannot view {array.dtype} pages as {np.dtype(dtype)} "
+                    "without copying"
+                )
+            return array.astype(dtype)
+        return array.copy() if copy else array
 
     def __repr__(self) -> str:
         """Shape, dtype and where it is reachable -- what a tensor repr shows.
@@ -1460,31 +1888,51 @@ class SharedBuffer:
 
     # -- lifetime -----------------------------------------------------------
     def close(self) -> None:
-        """Release every mapping and the pages. Idempotent.
+        """Give up this buffer's hold on its pages. Idempotent.
 
-        Order matters and is the reverse of construction: views first, since
-        they point into pages that are about to stop being addressable; then
-        the secondaries, which only borrow the primary's pages; then the
-        primary, which owns them. Every secondary's undo step names an address
-        that is only meaningful while the pages are still mapped, so releasing
-        the primary first leaves each of them operating on freed memory.
+        The pages themselves usually survive, in the pool, to be handed to the
+        next buffer of the same size and device set -- mapping them is the
+        expensive part and none of it depends on the shape or dtype that just
+        went away. What is released here for certain is this object's claim on
+        them: the views, which point into memory this buffer no longer owns,
+        and every accessor stops working.
+
+        Use ``empty_cache()`` to release what the pool is holding, or
+        ``set_cache_enabled(False)`` for a process where closing must unmap at
+        once.
         """
         self._torch_view = None
         self._numpy_view = None
-        # The primary is inserted first and share_with() ignores a duplicate
-        # key, so it is always the first entry -- reversed() releases it last
-        # without needing to single it out.
-        for attachment in reversed(list(self._attachments.values())):
-            # Tell the others first: an attachment's address stops meaning
-            # anything the moment it lets go, and whoever recorded it has to
-            # forget it while it is still theirs to forget.
-            for other in self._attachments.values():
-                if other is not attachment:
-                    other.on_peer_released(attachment)
-            attachment.release()
+        # Let go of all three together and before anything can fail, so the
+        # pages have exactly one owner at every point: this buffer, then the
+        # _Pages, then either the pool or nothing. This is also what makes
+        # close() idempotent -- a second call finds nothing to hand over.
+        attachments, primary, host_ptr = (
+            self._attachments,
+            self._primary,
+            self._host_ptr,
+        )
+        self._attachments = {}
         self._primary = None
-        self._attachments.clear()
         self._host_ptr = None
+        if not attachments:
+            return
+        assert primary is not None and host_ptr is not None  # a live buffer has both
+        pages = _Pages(self._pool_key, self._nbytes, host_ptr, primary, attachments)
+        if self._pool_key is None or not _POOL.give(pages):
+            pages.release()
+
+    def __enter__(self) -> SharedBuffer:
+        """Buffers are a resource, so ``with`` closes one.
+
+        Worth preferring over a bare ``close()``: these pages are pinned or
+        allocated on a device, and leaving them to ``__del__`` means leaving
+        them until the collector happens to run.
+        """
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
     def __del__(self) -> None:
         """Best-effort release.
@@ -1497,6 +1945,70 @@ class SharedBuffer:
             self.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Operators
+# ---------------------------------------------------------------------------
+# Python looks the operator dunders up on the type and never consults
+# __getattr__ for them, so the tensor surface stops at the operators unless
+# they are defined. They are generated rather than written out because there
+# are forty of them and they differ only in a name -- forty near-identical
+# methods is where a typo lives, and where torch adding one leaves us behind.
+#
+# __torch_function__ is not enough on its own: `buf + 1` never reaches torch,
+# because Python resolves it against SharedBuffer, which has no __add__. It
+# does cover `tensor + buf`, since torch sees a buffer among its arguments.
+
+#: Operators with a reflected and an in-place form: `buf * 2`, `2 * buf`,
+#: `buf *= 2`.
+_BINARY_OPS = (
+    "add", "sub", "mul", "truediv", "floordiv", "mod", "pow", "matmul",
+    "and", "or", "xor", "lshift", "rshift",
+)  # fmt: skip
+
+#: Operators taking only the buffer: `-buf`, `abs(buf)`, `~buf`.
+_UNARY_OPS = ("neg", "pos", "abs", "invert")
+
+#: Elementwise comparisons, which is what they mean on a tensor -- so `buf ==
+#: other` is a mask, not a truth value, exactly as torch has it. Buffers stay
+#: hashable by identity, which is torch's answer too.
+_COMPARISON_OPS = ("lt", "le", "gt", "ge", "eq", "ne")
+
+
+def _tensor_operator(name: str, *, inplace: bool = False) -> Callable[..., Any]:
+    """One operator, forwarded to the buffer's torch view.
+
+    ``NotImplemented`` when torch has no such method, which is what lets Python
+    fall back -- ``buf @= x`` becoming ``buf = buf @ x`` when tensors have no
+    ``__imatmul__`` -- rather than failing with an AttributeError that names an
+    operator the user never typed.
+
+    An in-place operator returns the buffer, not the view. Python rebinds the
+    name to whatever comes back, so returning the view would quietly turn
+    ``buf += 1`` into a plain tensor and drop the buffer the caller had.
+    """
+
+    def operator_(self: SharedBuffer, *args: Any) -> Any:
+        method = getattr(self.torch(), name, None)
+        if method is None:
+            return NotImplemented
+        result = method(*args)
+        return self if inplace else result
+
+    operator_.__name__ = name
+    operator_.__qualname__ = f"SharedBuffer.{name}"
+    operator_.__doc__ = f"``{name}`` on this buffer's torch view."
+    return operator_
+
+
+for _op in _BINARY_OPS:
+    setattr(SharedBuffer, f"__{_op}__", _tensor_operator(f"__{_op}__"))
+    setattr(SharedBuffer, f"__r{_op}__", _tensor_operator(f"__r{_op}__"))
+    setattr(SharedBuffer, f"__i{_op}__", _tensor_operator(f"__i{_op}__", inplace=True))
+for _op in (*_UNARY_OPS, *_COMPARISON_OPS):
+    setattr(SharedBuffer, f"__{_op}__", _tensor_operator(f"__{_op}__"))
+del _op
 
 
 # ---------------------------------------------------------------------------
@@ -1591,6 +2103,127 @@ def ones(
     )
 
 
+#: Distinguishes "no fill value passed" from a legitimate ``fill_value=None``.
+_MISSING: Any = object()
+
+
+def _size_and_fill(
+    size: tuple[Any, ...], fill_value: Any
+) -> tuple[tuple[int, ...], Any]:
+    """Split ``full``'s arguments into a shape and the value to fill it with.
+
+    Two spellings, because ``full`` is the one factory where torch's own
+    signature and this module's varargs shape disagree:
+
+    * ``full((2, 3), 7.0)`` -- torch's, and unambiguous: a shape sequence
+      followed by one more argument leaves nothing else that argument could be.
+    * ``full(2, 3, fill_value=7.0)`` -- this module's, matching every other
+      factory here.
+
+    ``full(2, 3, 7.0)`` is deliberately not a third: it is indistinguishable
+    from a three-dimensional shape.
+    """
+    if fill_value is not _MISSING:
+        return _normalize_size(size), fill_value
+    if len(size) == 2 and isinstance(size[0], (tuple, list)):
+        return tuple(size[0]), size[1]
+    raise SharedBufferError(
+        "full() needs a fill value: full((2, 3), 7.0) or full(2, 3, fill_value=7.0)"
+    )
+
+
+def full(
+    *size: Any,
+    fill_value: Any = _MISSING,
+    dtype: torch.dtype | None = None,
+    device: DeviceSpec,
+    share: Shared = (),
+) -> SharedBuffer:
+    """A shared buffer filled with one value, like ``torch.full``.
+
+    Takes the fill value either way round -- ``full((2, 3), 7.0)`` or
+    ``full(2, 3, fill_value=7.0)``. See ``zeros`` for how the fill is issued.
+    """
+    shape, value = _size_and_fill(size, fill_value)
+    return _written(
+        empty(shape, dtype=dtype, device=device, share=share),
+        lambda view: view.fill_(value),
+    )
+
+
+def rand(
+    *size: int | Sequence[int],
+    dtype: torch.dtype | None = None,
+    device: DeviceSpec,
+    share: Shared = (),
+) -> SharedBuffer:
+    """A shared buffer of uniform ``[0, 1)`` samples, like ``torch.rand``.
+
+    Drawn through the torch view, so on an iGPU-shared buffer they come from
+    torch's device generator and follow ``torch.cuda.manual_seed``.
+    """
+    return _written(
+        empty(*size, dtype=dtype, device=device, share=share),
+        lambda view: view.uniform_(),
+    )
+
+
+def randn(
+    *size: int | Sequence[int],
+    dtype: torch.dtype | None = None,
+    device: DeviceSpec,
+    share: Shared = (),
+) -> SharedBuffer:
+    """A shared buffer of standard-normal samples, like ``torch.randn``.
+    See ``rand``."""
+    return _written(
+        empty(*size, dtype=dtype, device=device, share=share),
+        lambda view: view.normal_(),
+    )
+
+
+def arange(
+    start: float,
+    end: float | None = None,
+    step: float = 1,
+    *,
+    dtype: torch.dtype | None = None,
+    device: DeviceSpec,
+    share: Shared = (),
+) -> SharedBuffer:
+    """A 1-D shared buffer of evenly spaced values, like ``torch.arange``.
+
+    ``arange(5)`` counts to five; ``arange(2, 10, 3)`` steps by three. The
+    dtype follows torch's rule -- an integer one when every argument is an
+    integer, the default float dtype otherwise -- so ``arange(5)`` holds
+    int64 and ``arange(5.0)`` holds float32.
+    """
+    import torch
+
+    if end is None:
+        start, end = 0, start
+    if step == 0:
+        raise SharedBufferError("arange() step must not be zero")
+    if dtype is None:
+        integral = all(isinstance(v, int) for v in (start, end, step))
+        dtype = torch.int64 if integral else torch.get_default_dtype()
+    length = max(0, math.ceil((end - start) / step))
+    if length == 0:
+        # Every other factory refuses an empty buffer, and this is the one
+        # place a caller can ask for one without writing a zero: arange(0),
+        # or a range the step walks away from.
+        raise SharedBufferError(
+            f"arange({start}, {end}, {step}) is empty; there is nothing for a "
+            "device to map"
+        )
+    return _written(
+        empty(length, dtype=dtype, device=device, share=share),
+        lambda view: view.copy_(
+            torch.arange(start, end, step, dtype=view.dtype, device=view.device)
+        ),
+    )
+
+
 def empty_like(
     other: SharedBuffer | Tensor,
     *,
@@ -1640,6 +2273,42 @@ def zeros_like(
     return _written(
         empty_like(other, dtype=dtype, device=device, share=share),
         lambda view: view.zero_(),
+    )
+
+
+def ones_like(
+    other: SharedBuffer | Tensor,
+    *,
+    dtype: torch.dtype | None = None,
+    device: DeviceSpec | None = None,
+    share: Shared | None = None,
+) -> SharedBuffer:
+    """A one-filled buffer shaped like ``other``, like ``torch.ones_like``.
+
+    Inherits from ``other`` on the same terms as ``empty_like``.
+    """
+    return _written(
+        empty_like(other, dtype=dtype, device=device, share=share),
+        lambda view: view.fill_(1),
+    )
+
+
+def full_like(
+    other: SharedBuffer | Tensor,
+    fill_value: Any,
+    *,
+    dtype: torch.dtype | None = None,
+    device: DeviceSpec | None = None,
+    share: Shared | None = None,
+) -> SharedBuffer:
+    """A buffer shaped like ``other``, filled with one value, like
+    ``torch.full_like``.
+
+    Inherits from ``other`` on the same terms as ``empty_like``.
+    """
+    return _written(
+        empty_like(other, dtype=dtype, device=device, share=share),
+        lambda view: view.fill_(fill_value),
     )
 
 
