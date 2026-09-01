@@ -1384,6 +1384,7 @@ class SharedBuffer:
         "_torch_view",
         "_numpy_view",
         "_pool_key",
+        "_aliased",
     )
 
     def __init__(
@@ -1420,6 +1421,9 @@ class SharedBuffer:
         self._torch_view: weakref.ref[Tensor] | None = None
         self._numpy_view: np.ndarray | None = None
         self._pool_key: Any = None
+        #: Whether an alias has been handed out that this buffer cannot track
+        #: -- a DLPack capsule or a numpy view. See ``close``.
+        self._aliased = False
         # ``operator.index`` both validates and normalizes: it accepts anything
         # that is an integer (a numpy or torch dimension as readily as an int)
         # and refuses anything that merely looks like one, which is what keeps
@@ -1713,6 +1717,10 @@ class SharedBuffer:
         is the NPU, which is not on a HIP stream at all. Callers must fence
         explicitly around the hand-off (``_FusedMLP.run`` does).
         """
+        # A capsule goes to a consumer this buffer has no handle on and cannot
+        # ask about later, so from here on its pages are never pooled; see
+        # ``close``. ``torch()`` deliberately does not come through here.
+        self._aliased = True
         return self._as_ndarray().__dlpack__(
             stream=stream,
             max_version=max_version,
@@ -1724,15 +1732,24 @@ class SharedBuffer:
         """A torch tensor aliasing this buffer.
 
         An iGPU tensor when a HIP device is attached, a CPU one otherwise.
-        Cached: the view is stable for as long as the attachment set is, and
-        re-deriving it would build an ndarray and a capsule per call for no
-        benefit.
+        Cached weakly: the view is stable for as long as the attachment set is,
+        and re-deriving it would build an ndarray and a capsule per call for no
+        benefit -- but holding it strongly would form a cycle through nanobind's
+        owner reference that the collector cannot see, so ``__del__`` would
+        never run and the pages would never come back.
+
+        Built from the ndarray rather than from ``self`` so that it does not go
+        through ``__dlpack__``. Same tensor either way; the difference is that
+        this is the one alias the buffer can still ask about afterwards, via the
+        weakref, and ``close()`` uses that to decide whether pooling these pages
+        is safe. Routing it through the public protocol would make every buffer
+        that ever had a view look like one whose pages escaped.
         """
         cached = self._torch_view() if self._torch_view is not None else None
         if cached is None:
             import torch
 
-            cached = torch.from_dlpack(self)
+            cached = torch.from_dlpack(self._as_ndarray())
             self._torch_view = weakref.ref(cached)
         return cached
 
@@ -1746,9 +1763,13 @@ class SharedBuffer:
         which is the premise this whole module rests on, but is worth saying
         where a raw address is handed to numpy.
 
-        Cached like the torch view: the mapping is fixed for the buffer's
-        lifetime, and callers on the dispatch path ask for it several times per
-        launch.
+        Cached like the torch view, and for the same reason: the mapping is
+        fixed for the buffer's lifetime, and callers on the dispatch path ask
+        for it several times per launch. Unlike the torch view it is cached
+        strongly, because there is nothing to make a cycle with -- which is
+        also why it cannot be asked whether the caller still holds one, so a
+        buffer that has handed out a host view never pools its pages; see
+        ``close``.
         """
         if self._numpy_view is None:
             import numpy as np
@@ -1758,6 +1779,7 @@ class SharedBuffer:
             _, _, dt = _dtype_info(self.dtype)
             buf = (ctypes.c_char * self._nbytes).from_address(self._host_ptr)
             self._numpy_view = np.frombuffer(buf, dtype=dt).reshape(self.shape)
+            self._aliased = True
         return self._numpy_view
 
     def __getitem__(self, index: Any) -> Tensor:
@@ -1806,7 +1828,10 @@ class SharedBuffer:
                 return value.torch()
             # torch.cat and friends take their tensors in a sequence, so an
             # argument that is not itself a buffer may still contain one.
-            if isinstance(value, (list, tuple)):
+            # Rebuilt positionally, which a namedtuple's constructor does not
+            # accept -- and torch hands its own results back as those, so one
+            # fed straight to an out= would fail here rather than in torch.
+            if isinstance(value, (list, tuple)) and not hasattr(value, "_fields"):
                 return type(value)(unwrap(item) for item in value)
             return value
 
@@ -1823,9 +1848,15 @@ class SharedBuffer:
 
         Only names torch itself defines are forwarded. Anything else has to
         raise ``AttributeError``, or every misspelling and every ``hasattr``
-        probe by some library reaches ``torch()`` and gets that failure instead
-        -- and a closed buffer would raise ``SharedBufferError`` from
-        ``hasattr``, which does not catch it.
+        probe by some library reaches ``torch()`` and is answered by whatever
+        that fails with.
+
+        A name torch *does* define, asked of a closed buffer, still raises
+        ``SharedBufferError`` from ``torch()`` -- so a ``hasattr`` probe on one
+        propagates rather than answering False. That is the intended answer:
+        the attribute is not missing, the buffer is closed, and saying so is
+        more use than a False that sends the caller down a path where the
+        object merely is not a tensor.
 
         Private names never forward: this runs before ``__init__`` has filled
         the slots in, and looking one of those up through ``torch()`` -- which
@@ -1846,6 +1877,16 @@ class SharedBuffer:
     def __iter__(self) -> Iterator[Tensor]:
         """Iterate the first dimension, as for a tensor."""
         return iter(self.torch())
+
+    def __bool__(self) -> bool:
+        """Truth value, as for a tensor -- so the element's, not the length's.
+
+        Defined because ``__len__`` exists: without it Python falls back to
+        ``len(self) != 0``, which would call a buffer of one zero true and
+        would answer at all for a buffer of many elements, where torch refuses
+        as ambiguous. Both are answers this type has no business inventing.
+        """
+        return bool(self.torch())
 
     def __array__(self, dtype: Any = None, copy: bool | None = None) -> np.ndarray:
         """Numpy's hook, so ``np.asarray(buf)`` is the host view.
@@ -1907,7 +1948,17 @@ class SharedBuffer:
         # but pooling changes what it costs: the pages would be handed to
         # another live buffer and the stale view would silently alias someone
         # else's data. Released instead, so it stays the fault it used to be.
-        escaped = self._torch_view is not None and self._torch_view() is not None
+        #
+        # Three ways a view gets out, and the buffer can only ask after the
+        # fact about one of them: the torch view, which it holds weakly, so a
+        # live weakref means someone else still has it. A DLPack capsule and a
+        # numpy array are handed to consumers this buffer keeps no handle on,
+        # so those are recorded when they are given out rather than asked about
+        # here -- conservative, and the buffers that do it are the long-lived
+        # ones that had least to gain from pooling anyway.
+        escaped = self._aliased or (
+            self._torch_view is not None and self._torch_view() is not None
+        )
         self._torch_view = None
         self._numpy_view = None
         assert self._host_ptr is not None  # a live buffer always has one
@@ -1991,6 +2042,12 @@ def _tensor_operator(name: str, *, inplace: bool = False) -> Callable[..., Any]:
         if method is None:
             return NotImplemented
         result = method(*args)
+        # Passed through rather than folded into the in-place case below:
+        # tensors return NotImplemented for an operand they cannot take, and
+        # answering `self` there would report a write that never happened and
+        # rob the other operand of its reflected turn.
+        if result is NotImplemented:
+            return NotImplemented
         return self if inplace else result
 
     operator_.__name__ = name

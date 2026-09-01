@@ -49,6 +49,7 @@ ROCm build of torch, or no NPU runtime.
 from __future__ import annotations
 
 import ctypes
+import operator
 import os
 import sys
 from collections.abc import Callable, Sequence
@@ -473,6 +474,25 @@ def test_tensor_surface(buffers: _Buffers) -> None:
     buf += 1
     check("in-place op keeps the buffer", isinstance(buf, SharedBuffer))
     torch.cuda.synchronize()
+
+    # An operand a tensor will not take has to come back NotImplemented, or
+    # Python takes the in-place op's word for it: the write never happened and
+    # the other operand never gets its reflected turn. Through operator.iadd
+    # rather than __iadd__ directly, because it is the ``+=`` protocol that
+    # turns a NotImplemented into the TypeError; the dunder just returns it.
+    check_raises("an impossible in-place op raises", TypeError, operator.iadd, buf, "x")
+
+    # Truthiness is the tensor's, not the length's, which is what defining
+    # __len__ without __bool__ would have made it.
+    single = buffers.new((1,), torch.float32, NPU, HIP)
+    single.zero_()
+    torch.cuda.synchronize()
+    check("a one-element zero buffer is falsy", not single)
+    check_raises(
+        "a many-element buffer is ambiguous, as torch has it",
+        RuntimeError,
+        lambda: bool(buf),
+    )
     check("...and wrote through", float(buf.torch().min()) == 2.0)
 
     # out=, which is the one that matters: it is how an iGPU kernel writes
@@ -517,6 +537,7 @@ def test_buffer_pool() -> None:
     """
     print("\n-- buffer pool --")
     from triton.backends.amd_triton_npu import shared
+    from triton.backends.amd_triton_npu.shared import as_torch
 
     def hits() -> int:
         return shared.cache_stats()["hits"]
@@ -576,12 +597,20 @@ def test_buffer_pool() -> None:
     # A view outliving its buffer used to fault on unmapped pages. Pooling would
     # instead hand those pages to the next buffer and leave the stale view
     # aliasing someone else's data, so a buffer whose view escaped is released.
-    escapee = shared.zeros(16, 16, dtype=torch.float32, device=NPU, share=HIP)
-    held = escapee.torch()
-    shared.empty_cache()
-    escapee.close()
-    check("a buffer whose view escaped is not pooled", pooled() == 0)
-    del held
+    # All three ways one gets out, since they are tracked by three mechanisms:
+    # the torch view weakly, a DLPack capsule and a numpy array by being
+    # recorded when handed over.
+    for label, alias in (
+        ("a torch view", lambda b: b.torch()),
+        ("a DLPack consumer", as_torch),
+        ("a numpy view", np.asarray),
+    ):
+        escapee = shared.zeros(16, 16, dtype=torch.float32, device=NPU, share=HIP)
+        held = alias(escapee)
+        shared.empty_cache()
+        escapee.close()
+        check(f"{label} outstanding stops the pages being pooled", pooled() == 0)
+        del held
 
     shared.empty_cache()
     check("empty_cache releases what is held", pooled() == 0)
