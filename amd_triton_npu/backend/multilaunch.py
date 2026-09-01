@@ -471,7 +471,7 @@ class NPUChain:
     it is in the lowering or the ELF stitching rather than anything above.
     Chains of two or more ops are unaffected. Until this is fixed, pad a
     one-op chain with a second, trivial op -- see
-    ``examples/npu_gpu_dlpack/add_chain.py``, which does exactly that.
+    ``examples/zero_copy/common/add_chain.py``, which does exactly that.
     """
 
     def __init__(self, name, air_project_path=None):

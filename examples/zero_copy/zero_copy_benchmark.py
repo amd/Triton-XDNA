@@ -59,9 +59,9 @@ on the clock either.
 Run it::
 
     source scripts/hsa-env.sh
-    python examples/npu_gpu_dlpack/zero_copy_benchmark.py
-    python examples/npu_gpu_dlpack/zero_copy_benchmark.py --runtime hsa
-    python examples/npu_gpu_dlpack/zero_copy_benchmark.py --rows 512 --cols 2048 -k 1024
+    python examples/zero_copy/zero_copy_benchmark.py
+    python examples/zero_copy/zero_copy_benchmark.py --runtime hsa
+    python examples/zero_copy/zero_copy_benchmark.py --rows 512 --cols 2048 -k 1024
 
 Exits 77 -- which scripts/run_tests.py grades as a skip -- on a host without an
 iGPU, a ROCm build of torch, or the NPU runtime asked for.
@@ -77,7 +77,7 @@ import numpy as np
 import torch
 import triton
 
-import add_chain
+from common import add_chain
 from triton.backends.amd_triton_npu import shared
 from triton.backends.amd_triton_npu.config import npu_config
 from triton.backends.amd_triton_npu.driver import NPUDriver

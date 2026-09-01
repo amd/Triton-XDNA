@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: MIT
 #
 # Environment for driving the NPU through HSA/ROCR alongside the iGPU -- the
-# heterogeneous examples under examples/npu_gpu_dlpack and examples/hsa_matmul.
+# heterogeneous examples under examples/zero_copy and examples/hsa_matmul.
 # Source it, don't execute it.
 #
 #     source scripts/hsa-env.sh
-#     python examples/npu_gpu_dlpack/shared_buffer_test.py
+#     python examples/zero_copy/shared_buffer_test.py
 #
 # A pure-XRT run needs none of this; utils/env_setup.sh plus the XRT setup
 # script is enough. What is specific to HSA is the LD_PRELOAD below.

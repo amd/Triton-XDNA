@@ -33,8 +33,8 @@ pages. So this file runs against whichever one is selected --
 runtime's sections as SKIP. Run it twice to cover both::
 
     source scripts/hsa-env.sh
-    python examples/npu_gpu_dlpack/shared_buffer_test.py
-    AMD_TRITON_NPU_RUNTIME=hsa python examples/npu_gpu_dlpack/shared_buffer_test.py
+    python examples/zero_copy/shared_buffer_test.py
+    AMD_TRITON_NPU_RUNTIME=hsa python examples/zero_copy/shared_buffer_test.py
 
 One process *can* drive both -- an XRT dispatch and an HSA one, in either
 order, work in the same process, on separate buffers. They are kept apart here
@@ -721,7 +721,7 @@ def test_npu_dispatch_xrt(buffers: _Buffers) -> None:
     print("\n-- NPU dispatch on shared buffers (XRT) --")
     import numpy as np
 
-    import add_chain
+    from common import add_chain
 
     chain = add_chain.build("shared_buffer_add", N)
     # Host-side operands: the intermediate never leaves the NPU and the zero

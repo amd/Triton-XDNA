@@ -7,6 +7,11 @@
 a compiled NPU chain over N f32 elements whose first and last operands can be
 bound to shared buffers -- so it is built once here rather than twice.
 
+It lives under ``common/`` rather than beside them because it is a helper, not
+an example: scripts/run_tests.py runs every ``*.py`` directly under an example
+directory, and a module with nothing to run would report a pass that means
+nothing.
+
 The combined-arg layout is fixed by the chain and is what callers index with::
 
     0 IN_A   caller-supplied, per dispatch
@@ -35,7 +40,7 @@ BLOCK_SIZE = 1024
 #: the ordinary Triton path, and the two runtimes are only comparable if they
 #: lower it the same way. aie2p only, like the rest of the gpt2 scripts.
 TRANSFORM_SCRIPT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "gpt2",
     "transform_add_f32_aie2p.mlir",
 )
