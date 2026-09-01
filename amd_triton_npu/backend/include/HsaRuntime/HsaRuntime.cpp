@@ -556,7 +556,11 @@ private:
   // Prepared programs, keyed by "pdi\0insts"; owns the loaded PDI/insts and
   // makes prepare() idempotent (a repeated (pdi, insts) reuses one dev
   // allocation rather than loading/leaking a second copy).
-  std::map<std::string, std::unique_ptr<triton_npu_hsa_program>> programs_;
+  //
+  // Unordered: every use is an exact-key lookup, and the one iteration is the
+  // destructor freeing them all. Unlike regions_ below, which cannot be.
+  std::unordered_map<std::string, std::unique_ptr<triton_npu_hsa_program>>
+      programs_;
   std::mutex programs_mtx_;
 
   // Shared regions, keyed by every address a caller may name one by. Ordered,
