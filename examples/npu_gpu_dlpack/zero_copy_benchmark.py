@@ -31,6 +31,21 @@ crosses. Under HSA this is measured twice, once with the NPU owning the pages
 and once with the iGPU owning them -- the latter being a native ``hipMalloc``
 allocation the NPU imports, which answers whether it matters who allocates.
 
+What is comparable
+------------------
+Within a runtime: copy against shared. Same kernel, same shapes, same dispatch
+machinery, and only the hand-off differs -- which is the whole point of the
+file.
+
+Across runtimes: nothing here. The two dispatch different NPU work (two
+elementwise adds against a matmul), on different dtypes, through different
+machinery, and their baselines are not even handicapped alike -- XRT's chain is
+told which operands are static and stages them once per BO set, while the HSA
+dispatch ABI has no way to say an operand has not changed, so the runtime
+re-stages all of them every launch. Asked for the same 256x256x256 shape, the
+NPU phase reads 0.43 ms under XRT and 1.01 ms under HSA, which says only that
+two adds are cheaper than a matmul.
+
 Both are timed per phase, not just end to end. The two variants differ only in
 the hand-off, and the hand-off is the small term next to the NPU dispatch that
 surrounds it, so a whole-pipeline number mixes the part that changed with a
@@ -603,6 +618,11 @@ def main(argv=None) -> int:
                 "back, per launch, on top of the bytes\n  that crossed the "
                 "host to get there."
             )
+        print(
+            f"\n  These rows compare the variants within {args.runtime}. The two "
+            "runtimes\n  dispatch different NPU work and do not compare to each "
+            "other -- see\n  the module docstring."
+        )
         print("=" * 64)
         return 0 if max(errors.values()) < tol else 1
     finally:
