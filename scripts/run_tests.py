@@ -10,6 +10,13 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+# Exit code an example uses to say "this environment cannot run me" -- the
+# autotools convention. Graded as a skip rather than a failure, because a host
+# without an iGPU, a ROCm build of torch, or an NPU runtime has not found a
+# defect; it has declined the test. Anything else non-zero is still a failure,
+# so an example cannot hide a real one behind this.
+SKIP_EXIT_CODE = 77
+
 # Example directories skipped by default unless explicitly selected via --select
 DEFAULT_SKIPPED_EXAMPLES = {
     "layernorm",
@@ -308,6 +315,15 @@ def main():
             elif rc == -1:
                 print(f"   ⏰ TIMEOUT: {py_file.name}")
                 timeouts += 1
+            elif rc == SKIP_EXIT_CODE:
+                # The example explains itself on its way out; show that line
+                # rather than the exit code, which says nothing on its own.
+                reason = next(
+                    (ln for ln in reversed(stdout.splitlines()) if ln.strip()),
+                    "no reason given",
+                )
+                print(f"   ⏭️  SKIP: {py_file.name} -- {reason.strip()}")
+                skipped += 1
             else:
                 print(f"   ❌ FAIL: {py_file.name} (exit code {rc})")
                 failed += 1

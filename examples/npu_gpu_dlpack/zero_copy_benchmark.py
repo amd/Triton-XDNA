@@ -52,6 +52,11 @@ N = ROWS * COLS
 ITERS = 50
 WARMUP = 5
 
+#: Told to the harness when the environment cannot run this at all -- no iGPU,
+#: no ROCm build of torch, no NPU. Distinct from a failure, which is what any
+#: other non-zero status means.
+SKIP_EXIT_CODE = 77
+
 # The chain computes OUT = (C + E1) + E2. C is rewritten every iteration;
 # both addends are held fixed, so they stage once per BO set.
 I_C, I_E1, I_TMP, I_E2, I_OUT = (
@@ -221,6 +226,13 @@ def main() -> int:
     print("=" * 64)
     print("  iGPU matmul -> NPU add: copies vs shared buffers")
     print("=" * 64)
+    # Checked before the first iGPU allocation below, since that is the point
+    # where an absent device stops being a question and starts being a
+    # traceback. A host with no iGPU has declined this benchmark, not failed
+    # it; 77 is what scripts/run_tests.py grades as a skip.
+    if not torch.cuda.is_available():
+        print("  SKIP: no ROCm device visible to torch")
+        return SKIP_EXIT_CODE
     print(f"  device   : {torch.cuda.get_device_name(0)}")
     print(f"  matmul   : ({ROWS},{K}) @ ({K},{COLS}) -> ({ROWS},{COLS}) f32")
     print(f"  npu add  : {N} elements, {N * 4 / 1024:.0f} KB per operand")
@@ -251,7 +263,10 @@ def main() -> int:
             c_buf = shared.empty(N, dtype=torch.float32, device="xrt:0", share="hip:0")
             out_buf = shared.empty_like(c_buf)
         except SharedBufferError as e:
-            sys.exit(f"shared NPU/iGPU buffers unavailable: {e}")
+            # The iGPU was there a moment ago, so this is the NPU half: no XRT,
+            # no device, no pyxrt. Declined rather than failed, as above.
+            print(f"  SKIP: shared NPU/iGPU buffers unavailable: {e}")
+            sys.exit(SKIP_EXIT_CODE)
 
         print("\n  warming up (JIT, ELF build, BO allocation)...")
         run_copy(chain, a, b, e1_host, e2_host, WARMUP)

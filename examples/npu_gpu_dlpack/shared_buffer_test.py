@@ -40,9 +40,10 @@ One process *can* drive both -- an XRT dispatch and an HSA one, in either
 order, work in the same process, on separate buffers. They are kept apart here
 so that a failure names a runtime rather than a combination.
 
-Exit status is the result, so this doubles as a regression test. A selected
-runtime that is unavailable is a failure, not a skip -- asking for it is what
-selects it.
+Exit status is the result, so this doubles as a regression test: 0 for pass, 1
+for a real failure, and 77 -- the autotools convention, which scripts/run_tests.py
+grades as a skip -- for a host that cannot run this at all, meaning no iGPU, no
+ROCm build of torch, or no NPU runtime.
 """
 
 from __future__ import annotations
@@ -77,10 +78,10 @@ NPU = f"{RUNTIME}:0"
 OTHER_NPU = "hsa:0" if RUNTIME == "xrt" else "xrt:0"
 HIP = "hip:0"
 
-# The dispatch section compiles a kernel, which needs the driver bound to the
-# runtime we are testing. Done here rather than inside that section so every
-# section runs against the same driver, as a real program would.
-triton.runtime.driver.set_active(NPUDriver(RUNTIME))
+#: Told to the harness when the environment cannot run this test at all -- no
+#: iGPU, no ROCm build of torch, no NPU runtime. Distinct from a failure, which
+#: is what any other non-zero status means.
+SKIP_EXIT_CODE = 77
 
 _failures: list[str] = []
 _skipped: list[str] = []
@@ -913,15 +914,29 @@ def main() -> int:
     print("  shared multi-device buffer test")
     print("=" * 70)
 
+    # The dispatch section compiles a kernel, which needs the driver bound to
+    # the runtime under test; done before the sections so they all run against
+    # the same driver, as a real program would.
+    try:
+        triton.runtime.driver.set_active(NPUDriver(RUNTIME))
+    except Exception as e:
+        print(f"  SKIP: the {RUNTIME} NPU driver is unavailable: {e}")
+        return SKIP_EXIT_CODE
+
     buffers = _Buffers()
     # Allocating is the availability check; the error names what is missing.
     # Scoped to this one call so a SharedBufferError raised by a *test* is
-    # reported as a failure rather than as a missing environment. A failure
-    # here is a failure: this run was asked for this runtime by name.
+    # reported as a failure rather than as a missing environment.
+    #
+    # Unavailable is a skip, not a failure: a host with no iGPU, no ROCm build
+    # of torch, or no NPU runtime has not found a defect in what this tests. It
+    # is reported as one, loudly, rather than passed over in silence -- and it
+    # stays distinct from a real failure, which is any other non-zero status.
     try:
         buffers.new((1,), torch.float32, NPU, [HIP])
     except SharedBufferError as e:
-        sys.exit(f"shared NPU/iGPU buffers unavailable for {RUNTIME}: {e}")
+        print(f"  SKIP: shared NPU/iGPU buffers unavailable for {RUNTIME}: {e}")
+        return SKIP_EXIT_CODE
 
     try:
         print(f"  runtime: {RUNTIME}")
