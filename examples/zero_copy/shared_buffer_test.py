@@ -387,6 +387,15 @@ def test_factories(buffers: _Buffers) -> None:
         "full spelled either way agrees",
         float(positional.sum()) == float(keyword.sum()) == 42.0,
     )
+    # torch.full takes its dtype from the value when none is given, and a
+    # buffer's dtype is what picks a kernel's operand type -- so a caller
+    # following the "like torch.full" docstring must not get a different one.
+    integral = new(shared.full, (2, 3), 7, **on)
+    check("full infers its dtype from the value", integral.dtype == torch.int64)
+    check(
+        "...while ones keeps the default dtype",
+        new(shared.ones, 4, **on).dtype == torch.get_default_dtype(),
+    )
     check_raises(
         "full without a value says how to give one",
         SharedBufferError,
@@ -473,6 +482,11 @@ def test_tensor_surface(buffers: _Buffers) -> None:
     buf.fill_(1)
     buf += 1
     check("in-place op keeps the buffer", isinstance(buf, SharedBuffer))
+    # The same for torch's in-place *methods*, which return the tensor they
+    # wrote: `buf = buf.fill_(0)` is how that idiom is written, and answering
+    # with the view would leave the caller holding no buffer.
+    check("an in-place method keeps the buffer", buf.fill_(2) is buf)
+    check("a plain method still answers with a tensor", buf.sum() is not buf)
     torch.cuda.synchronize()
 
     # An operand a tensor will not take has to come back NotImplemented, or
@@ -600,10 +614,15 @@ def test_buffer_pool() -> None:
     # All three ways one gets out, since they are tracked by three mechanisms:
     # the torch view weakly, a DLPack capsule and a numpy array by being
     # recorded when handed over.
+    # detach/.data/untyped_storage are the ones a weakref to the tensor cannot
+    # see: they alias the same memory without keeping the tensor object alive.
     for label, alias in (
         ("a torch view", lambda b: b.torch()),
         ("a DLPack consumer", as_torch),
         ("a numpy view", np.asarray),
+        ("a detach() of the view", lambda b: b.torch().detach()),
+        ("the view's .data", lambda b: b.torch().data),
+        ("the view's storage", lambda b: b.torch().untyped_storage()),
     ):
         escapee = shared.zeros(16, 16, dtype=torch.float32, device=NPU, share=HIP)
         held = alias(escapee)
@@ -617,6 +636,10 @@ def test_buffer_pool() -> None:
 
     # Off, close() has to mean unmap now -- which is what a measurement wants,
     # and what a caller wants who needs the NPU to stop reaching the pages.
+    # Restored to what it was, not to True: a run with the cache turned off in
+    # the environment would otherwise have every later section silently
+    # running with it on, since a programmatic value outranks the env var.
+    was_enabled = npu_config.shared_cache
     shared.set_cache_enabled(False)
     try:
         with buffer(64, 64):
@@ -630,7 +653,7 @@ def test_buffer_pool() -> None:
             # does.
             check("disabled: allocated rather than reused", hits() == was)
     finally:
-        shared.set_cache_enabled(True)
+        shared.set_cache_enabled(was_enabled)
 
 
 # ---------------------------------------------------------------------------

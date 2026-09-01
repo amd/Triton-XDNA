@@ -1241,7 +1241,14 @@ class _Pool:
         # Held under a lock because the pool is process-global, where a buffer
         # is not: two threads each allocating their own buffers do not race,
         # but they would race here.
-        self._lock = threading.Lock()
+        #
+        # Reentrant, because the thread holding it can re-enter: every method
+        # below allocates while holding it, an allocation can trigger a cyclic
+        # collection, and collecting an unreachable SharedBuffer runs its
+        # __del__ -> close() -> retire() on this same thread. A plain Lock
+        # would deadlock there. The operations are each self-consistent, so
+        # taking it twice is safe as well as necessary.
+        self._lock = threading.RLock()
         self._entries: list[tuple[Any, _Pages]] = []
         self._bytes = 0
         self.hits = 0
@@ -1254,18 +1261,33 @@ class _Pool:
         ``_pool_key`` -- and is answered like any other miss, so the caller has
         one path rather than a test of its own.
         """
+        found: _Pages | None = None
+        stale: list[_Pages] = []
         with self._lock:
-            if key is not None and npu_config.shared_cache:
+            if not npu_config.shared_cache:
+                # Turned off since the last allocation, possibly by a route
+                # that does not run the setter: npu_config.reset() and the exit
+                # from config_context both restore the field directly. Noticed
+                # here rather than left until process exit, which is how long
+                # these pinned pages would otherwise sit in a pool that can no
+                # longer be served from.
+                stale = [pages for _, pages in self._entries]
+                self._entries = []
+                self._bytes = 0
+            elif key is not None:
                 # Reverse order: the most recently retired pages are the ones
                 # most likely to still be in the TLB and the page cache.
                 for i in reversed(range(len(self._entries))):
                     if self._entries[i][0] == key:
-                        _, pages = self._entries.pop(i)
-                        self._bytes -= pages.nbytes
-                        self.hits += 1
-                        return pages
-            self.misses += 1
-            return None
+                        _, found = self._entries.pop(i)
+                        self._bytes -= found.nbytes
+                        break
+            self.hits += found is not None
+            self.misses += found is None
+        # Outside the lock, as in retire(): a release calls into three runtimes.
+        for pages in stale:
+            pages.release()
+        return found
 
     def retire(self, key: Any, pages: _Pages) -> None:
         """Take pages a buffer has finished with, pooling them or releasing them.
@@ -1352,6 +1374,40 @@ def cache_stats() -> dict[str, int]:
 atexit.register(set_cache_enabled, False)
 
 
+def _returning_self(buffer: SharedBuffer, method: Callable[..., Any]) -> Any:
+    """``method``, but answering with the buffer rather than the view.
+
+    For torch's in-place methods reached through ``SharedBuffer.__getattr__``.
+    A plain function rather than a closure per call site so that what it
+    captures is exactly these two names.
+    """
+
+    @functools.wraps(method)
+    def in_place(*args: Any, **kwargs: Any) -> Any:
+        method(*args, **kwargs)
+        return buffer
+
+    return in_place
+
+
+class _Alias:
+    """Stands for one view handed out of a buffer, so its lifetime is visible.
+
+    Whatever a DLPack consumer does with what it is given -- a tensor, then a
+    ``detach()`` of it, then that tensor's storage -- it holds on to the owner
+    nanobind was handed, and that is this. So a buffer can ask "is any view of
+    me still out there?" by keeping these weakly and seeing which survive,
+    which is the question ``close()`` has to answer before pooling pages.
+
+    It holds the buffer, so a view keeps the pages it aliases alive.
+    """
+
+    __slots__ = ("buffer", "__weakref__")
+
+    def __init__(self, buffer: SharedBuffer) -> None:
+        self.buffer = buffer
+
+
 # ---------------------------------------------------------------------------
 # The shared buffer
 # ---------------------------------------------------------------------------
@@ -1385,6 +1441,7 @@ class SharedBuffer:
         "_numpy_view",
         "_pool_key",
         "_aliased",
+        "_aliases_out",
     )
 
     def __init__(
@@ -1421,9 +1478,12 @@ class SharedBuffer:
         self._torch_view: weakref.ref[Tensor] | None = None
         self._numpy_view: np.ndarray | None = None
         self._pool_key: Any = None
-        #: Whether an alias has been handed out that this buffer cannot track
-        #: -- a DLPack capsule or a numpy view. See ``close``.
+        #: Whether a host view has been handed out, which is the one alias
+        #: nothing can be asked about later. See ``close``.
         self._aliased = False
+        #: The views handed out through DLPack, held weakly so that the ones
+        #: still in someone's hands are exactly the ones that survive.
+        self._aliases_out: weakref.WeakSet[_Alias] = weakref.WeakSet()
         # ``operator.index`` both validates and normalizes: it accepts anything
         # that is an integer (a numpy or torch dimension as readily as an int)
         # and refuses anything that merely looks like one, which is what keeps
@@ -1677,22 +1737,29 @@ class SharedBuffer:
         Built fresh per call rather than cached: it is cheap, and a cached one
         would go stale the moment ``share_with`` changed which mapping the
         buffer should describe itself by.
+
+        The owner is an ``_Alias`` rather than the buffer itself, for a reason
+        that is not about ownership -- it holds the buffer, so a consumer's
+        tensor still keeps these pages alive, which is what makes
+        ``shared.zeros(...).torch()`` safe when the buffer was a temporary.
+        What the indirection buys is that the buffer can weakly track the
+        aliases it has handed out, and so answer whether any is still held; see
+        ``close``. A weakref to the *tensor* cannot answer that, because
+        ``detach()``, ``.data`` and ``untyped_storage()`` all share the storage
+        without keeping the tensor object alive.
+
+        The cycle this would otherwise form is broken at the tracking edge: the
+        buffer's set of aliases is weak, so an alias nobody holds is collected
+        and ``__del__`` still runs. It has to be broken there, because
+        nanobind's ndarray is not GC-tracked and a strong cycle through it
+        would be invisible to the collector.
         """
         device_type, device_id, pointer = self._dlpack_source()
         code, bits, _ = _dtype_info(self.dtype)
-        # self as owner: nanobind needs one (without it it tries to copy, which
-        # it cannot do for a bare pointer), and it makes a consumer's tensor keep
-        # this buffer alive. That matters -- `shared.zeros(...).torch()` drops
-        # the buffer at the end of the expression, and without the back-reference
-        # the tensor is left over pages __del__ has already released.
-        #
-        # The obvious cycle this would form, buffer -> cached view -> ndarray ->
-        # buffer, is broken on the first edge: torch() holds the view weakly.
-        # It has to be broken there, because nanobind's ndarray is not
-        # GC-tracked, so the cycle would be invisible to the collector and
-        # __del__ would never run.
+        alias = _Alias(self)
+        self._aliases_out.add(alias)
         return _dlpack_ndarray()(
-            pointer, list(self.shape), code, bits, device_type, device_id, self
+            pointer, list(self.shape), code, bits, device_type, device_id, alias
         )
 
     def __dlpack__(
@@ -1717,10 +1784,6 @@ class SharedBuffer:
         is the NPU, which is not on a HIP stream at all. Callers must fence
         explicitly around the hand-off (``_FusedMLP.run`` does).
         """
-        # A capsule goes to a consumer this buffer has no handle on and cannot
-        # ask about later, so from here on its pages are never pooled; see
-        # ``close``. ``torch()`` deliberately does not come through here.
-        self._aliased = True
         return self._as_ndarray().__dlpack__(
             stream=stream,
             max_version=max_version,
@@ -1738,12 +1801,9 @@ class SharedBuffer:
         owner reference that the collector cannot see, so ``__del__`` would
         never run and the pages would never come back.
 
-        Built from the ndarray rather than from ``self`` so that it does not go
-        through ``__dlpack__``. Same tensor either way; the difference is that
-        this is the one alias the buffer can still ask about afterwards, via the
-        weakref, and ``close()`` uses that to decide whether pooling these pages
-        is safe. Routing it through the public protocol would make every buffer
-        that ever had a view look like one whose pages escaped.
+        Built from the ndarray rather than from ``self``, which is the same
+        tensor by a shorter route: ``torch.from_dlpack(self)`` would call back
+        into ``__dlpack__`` to reach exactly this.
         """
         cached = self._torch_view() if self._torch_view is not None else None
         if cached is None:
@@ -1771,6 +1831,17 @@ class SharedBuffer:
         buffer that has handed out a host view never pools its pages; see
         ``close``.
         """
+        array = self._host_array()
+        self._aliased = True
+        return array
+
+    def _host_array(self) -> np.ndarray:
+        """The cached host view, without recording that one has been given out.
+
+        Split from ``numpy()`` so that ``__array__`` can build a copy from it
+        without marking this buffer's pages unpoolable: a copy aliases nothing,
+        and the recording is only there to cover the alias.
+        """
         if self._numpy_view is None:
             import numpy as np
 
@@ -1779,7 +1850,6 @@ class SharedBuffer:
             _, _, dt = _dtype_info(self.dtype)
             buf = (ctypes.c_char * self._nbytes).from_address(self._host_ptr)
             self._numpy_view = np.frombuffer(buf, dtype=dt).reshape(self.shape)
-            self._aliased = True
         return self._numpy_view
 
     def __getitem__(self, index: Any) -> Tensor:
@@ -1861,12 +1931,23 @@ class SharedBuffer:
         Private names never forward: this runs before ``__init__`` has filled
         the slots in, and looking one of those up through ``torch()`` -- which
         reads them -- would recurse until the stack ran out.
+
+        torch's in-place methods return the tensor they wrote, and the ones
+        reached through here return the buffer instead, for the same reason the
+        in-place operators do: ``buf = buf.fill_(0)`` is how that idiom is
+        written, and answering with the view would quietly leave the caller
+        holding a tensor with no buffer behind it.
         """
         if name.startswith("_") or name not in _tensor_attributes():
             raise AttributeError(
                 f"{type(self).__name__!r} object has no attribute {name!r}"
             )
-        return getattr(self.torch(), name)
+        attribute = getattr(self.torch(), name)
+        # torch's convention, and the only thing distinguishing the two: an
+        # in-place method's name ends in an underscore.
+        if name.endswith("_") and callable(attribute):
+            return _returning_self(self, attribute)
+        return attribute
 
     def __len__(self) -> int:
         """Size of the first dimension, as for a tensor."""
@@ -1897,10 +1978,13 @@ class SharedBuffer:
 
         Unlike torch, this works for an iGPU-owned buffer too: the pages are
         host-visible, which is what ``numpy()`` already relies on.
+
+        Only the aliasing answers are recorded as such: ``np.array(buf)`` and a
+        dtype conversion both copy, and a copy cannot outlive anything.
         """
         import numpy as np
 
-        array = self.numpy()
+        array = self._host_array()
         if dtype is not None and np.dtype(dtype) != array.dtype:
             if copy is False:
                 raise ValueError(
@@ -1908,7 +1992,10 @@ class SharedBuffer:
                     "without copying"
                 )
             return array.astype(dtype)
-        return array.copy() if copy else array
+        if copy:
+            return array.copy()
+        self._aliased = True
+        return array
 
     def __repr__(self) -> str:
         """Shape, dtype and where it is reachable -- what a tensor repr shows.
@@ -1949,16 +2036,18 @@ class SharedBuffer:
         # another live buffer and the stale view would silently alias someone
         # else's data. Released instead, so it stays the fault it used to be.
         #
-        # Three ways a view gets out, and the buffer can only ask after the
-        # fact about one of them: the torch view, which it holds weakly, so a
-        # live weakref means someone else still has it. A DLPack capsule and a
-        # numpy array are handed to consumers this buffer keeps no handle on,
-        # so those are recorded when they are given out rather than asked about
-        # here -- conservative, and the buffers that do it are the long-lived
-        # ones that had least to gain from pooling anyway.
-        escaped = self._aliased or (
-            self._torch_view is not None and self._torch_view() is not None
-        )
+        # Everything that reaches these pages through DLPack -- the torch view,
+        # a consumer's own tensor, and anything either of those was derived
+        # from without keeping the tensor object alive, which includes
+        # detach(), .data and untyped_storage() -- holds an _Alias. Those are
+        # tracked weakly, so the ones still alive are exactly the ones someone
+        # still has.
+        #
+        # A numpy view is the exception: it is a raw address with nothing to
+        # hold, so it is recorded when handed out rather than asked about here.
+        # Conservative, and the callers that take one are the long-lived
+        # buffers that had least to gain from pooling anyway.
+        escaped = self._aliased or any(self._aliases_out)
         self._torch_view = None
         self._numpy_view = None
         assert self._host_ptr is not None  # a live buffer always has one
@@ -2150,8 +2239,13 @@ def ones(
     device: DeviceSpec,
     share: Shared = (),
 ) -> SharedBuffer:
-    """A one-filled shared buffer, like ``torch.ones``. See ``zeros``."""
-    return full(*size, fill_value=1, dtype=dtype, device=device, share=share)
+    """A one-filled shared buffer, like ``torch.ones``. See ``zeros``.
+
+    The fill value is written ``1.0`` so that, with no dtype, ``full``'s
+    inference lands on the default dtype -- which is what ``torch.ones`` gives
+    and what an integer 1 would not.
+    """
+    return full(*size, fill_value=1.0, dtype=dtype, device=device, share=share)
 
 
 #: Distinguishes "no fill value passed" from a legitimate ``fill_value=None``.
@@ -2194,8 +2288,17 @@ def full(
 
     Takes the fill value either way round -- ``full((2, 3), 7.0)`` or
     ``full(2, 3, fill_value=7.0)``. See ``zeros`` for how the fill is issued.
+
+    With no dtype the value picks one, as it does for ``torch.full``: an
+    integer fills an integer buffer. This is the one factory where the default
+    dtype would be the wrong answer -- ``full((2, 3), 7)`` giving float32 would
+    hand a kernel a differently-typed operand than the same call to torch.
     """
     shape, value = _size_and_fill(size, fill_value)
+    if dtype is None:
+        import torch
+
+        dtype = torch.as_tensor(value).dtype
     return _written(
         empty(shape, dtype=dtype, device=device, share=share),
         lambda view: view.fill_(value),
