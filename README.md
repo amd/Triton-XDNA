@@ -154,12 +154,21 @@ silently installs a runtime too old to work.
 
 The backend searches, in order: `AMD_NPU_ROCR_PATH`, `ROCM_PATH`, a pip-installed ROCm (TheRock's `rocm-sdk` wheels), then `/opt/rocm`. A candidate is accepted only if it provides *all* the headers the runtime includes — including `hsa/hsa_ext_amd_aie.h` — plus `libhsa-runtime64`, so an installation without AIE support is reported at startup rather than failing later in the compile. If nothing qualifies, the error lists every candidate and what each was missing. Set `AMD_NPU_ROCR_PATH` to override the search with a specific prefix — a locally built rocr-runtime, for instance.
 
+The runtime is a property of the environment, not of a particular example, so
+any example that selects the NPU backend with a bare `NPUDriver()` runs under
+either one:
+
 ```bash
-cd examples/hsa_matmul
-python hsa_matmul.py
+cd examples/matmul_bf16_m64_n64_k64
+AMD_TRITON_NPU_RUNTIME=hsa AIR_TRANSFORM_TILING_SCRIPT=transform_aie2p.mlir \
+  python matmul_bf16_m64_n64_k64.py
 ```
 
-Or activate it programmatically:
+An example that imports torch — most of them do — also needs the ROCR preload
+described in [Sharing a process with PyTorch](#sharing-a-process-with-pytorch)
+below, or it will abort inside ROCR before reaching the kernel.
+
+Or pin the runtime in the code, ignoring the environment:
 
 ```python
 import triton

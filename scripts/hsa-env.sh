@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: MIT
 #
 # Environment for driving the NPU through HSA/ROCR alongside the iGPU -- the
-# heterogeneous examples under examples/zero_copy and examples/hsa_matmul.
+# heterogeneous examples under examples/zero_copy, and any example run with
+# AMD_TRITON_NPU_RUNTIME=hsa.
 # Source it, don't execute it.
 #
 #     source scripts/hsa-env.sh
