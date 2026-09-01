@@ -4,28 +4,31 @@
 
 """Hand a tensor from the iGPU to the NPU, with and without copies.
 
-The pipeline crosses the boundary twice, and what the NPU does in the middle
-depends on how it is being driven::
+The pipeline is the simplest thing that crosses the boundary twice::
 
-    A   = X @ Y            on the iGPU
-    C   = f(A)             on the NPU
-    (C consumed)           on the iGPU
+    C   = A @ B            on the iGPU
+    OUT = (C + E1) + E2    on the NPU  (two chained elementwise adds)
+    (OUT consumed)         on the iGPU
 
-``--runtime xrt`` (the default) dispatches a two-op add chain through a
-multi-launch ELF, binding an ``xrt::bo`` per operand. ``--runtime hsa``
-dispatches a matmul through ROCR the ordinary Triton way, where there is no BO
-to bind and the runtime decides for itself whether each operand can be used
-where it lies. Both are the same measurement of the same boundary; they are in
-one file so the numbers are produced by one harness rather than two.
+Both runtimes run that same NPU work, on the same shapes and the same f32 data,
+with the same tiling script -- ``--runtime`` chooses only how it is dispatched:
+
+``xrt`` (the default)
+    The two adds are stitched into one multi-launch ELF and dispatched with an
+    ``xrt::bo`` bound per operand, which is where XRT's zero-copy comes from.
+``hsa``
+    The same add kernel, twice, through the ordinary Triton launch path. There
+    is no BO to bind; the runtime looks at each operand and decides for itself
+    whether it can be used where it lies.
 
 The variants, per runtime:
 
-**copy / staged** -- what the boundary costs by default. ``A`` comes back to
-the host and the result returns to the iGPU. Under XRT the launch stages each
-operand into a BO and back; under HSA the runtime does the same into a pooled
-vmem buffer, invisibly, on every launch.
+**copy / staged** -- what the boundary costs by default. ``C`` comes back to
+the host and the result returns to the iGPU. Under XRT the launch then stages
+each operand into a BO and back; under HSA the runtime does the same into a
+pooled vmem buffer, invisibly, on every launch.
 
-**shared** -- the iGPU writes ``A`` *into* the buffer the NPU will read, the
+**shared** -- the iGPU writes ``C`` *into* the buffer the NPU will read, the
 dispatch names that buffer, and the result is already an iGPU tensor. Nothing
 crosses. Under HSA this is measured twice, once with the NPU owning the pages
 and once with the iGPU owning them -- the latter being a native ``hipMalloc``
@@ -34,17 +37,16 @@ allocation the NPU imports, which answers whether it matters who allocates.
 What is comparable
 ------------------
 Within a runtime: copy against shared. Same kernel, same shapes, same dispatch
-machinery, and only the hand-off differs -- which is the whole point of the
-file.
+machinery, only the hand-off differs -- which is the point of the file.
 
-Across runtimes: nothing here. The two dispatch different NPU work (two
-elementwise adds against a matmul), on different dtypes, through different
-machinery, and their baselines are not even handicapped alike -- XRT's chain is
-told which operands are static and stages them once per BO set, while the HSA
-dispatch ABI has no way to say an operand has not changed, so the runtime
-re-stages all of them every launch. Asked for the same 256x256x256 shape, the
-NPU phase reads 0.43 ms under XRT and 1.01 ms under HSA, which says only that
-two adds are cheaper than a matmul.
+Across runtimes: the NPU work is now identical, so the phases mean the same
+thing, with one difference to keep in mind. XRT fuses the two adds into a
+single dispatch and HSA issues two, because stitching is a multi-launch ELF
+feature and the ROCR path has no equivalent -- so its dispatch phase carries
+two launches' overhead. The baselines also differ in what they can be told:
+XRT's chain is given ``static_indices`` and stages the fixed addends once per
+BO set, while the HSA dispatch ABI has no way to say an operand has not
+changed, so its counters show all of them re-staged every launch.
 
 Both are timed per phase, not just end to end. The two variants differ only in
 the hand-off, and the hand-off is the small term next to the NPU dispatch that
@@ -68,20 +70,17 @@ iGPU, a ROCm build of torch, or the NPU runtime asked for.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 
 import numpy as np
 import torch
 import triton
-import triton.language as tl
 
 import add_chain
 from triton.backends.amd_triton_npu import shared
 from triton.backends.amd_triton_npu.config import npu_config
-from triton.backends.amd_triton_npu.driver import NPUDriver, detect_npu_version
-from triton.backends.amd_triton_npu.multilaunch import NPUChain
+from triton.backends.amd_triton_npu.driver import NPUDriver
 from triton.backends.amd_triton_npu.shared import SharedBuffer, SharedBufferError
 
 #: Told to the harness when the environment cannot run this at all -- no iGPU,
@@ -89,12 +88,9 @@ from triton.backends.amd_triton_npu.shared import SharedBuffer, SharedBufferErro
 #: what any other non-zero status means.
 SKIP_EXIT_CODE = 77
 
-#: Shapes each runtime is known to work at. XRT's are free within the element
-#: count rule below; HSA's are the ones its tiling script was written for.
-DEFAULT_SHAPE = {"xrt": (128, 768, 512), "hsa": (256, 256, 256)}
-
-#: The tile the HSA matmul is dispatched in, fixed by that tiling script.
-HSA_TILE = 256
+#: ROWS x COLS is the shape the matmul produces; K is its reduction depth. The
+#: element count must be a multiple of the chain's BLOCK_SIZE, which is checked.
+DEFAULT_SHAPE = (128, 768, 512)
 
 # The chain computes OUT = (C + E1) + E2. C is rewritten every iteration;
 # both addends are held fixed, so they stage once per BO set.
@@ -131,7 +127,7 @@ def _sync() -> None:
     torch.cuda.synchronize()
 
 
-def report(label: str, ph: Phase, iters: int) -> tuple[float, float, int]:
+def report(label: str, ph: Phase, iters: int) -> None:
     ms, by = ph.per_iter(iters)
     print(f"\n  {label}")
     print(f"    {'phase':<24} {'ms/iter':>9} {'host bytes':>12}")
@@ -139,19 +135,26 @@ def report(label: str, ph: Phase, iters: int) -> tuple[float, float, int]:
     for k in ms:
         b = f"{by[k]/1024:.0f} KB" if by[k] else "-"
         print(f"    {k:<24} {ms[k]:>9.3f} {b:>12}")
-    total_ms = sum(ms.values())
-    total_b = sum(by.values())
-    handoff = sum(v for k, v in ms.items() if k.startswith("hand-off"))
+    total_ms, _, total_b = _totals(ph, iters)
     print(f"    {'-'*24} {'-'*9} {'-'*12}")
     print(
         f"    {'TOTAL':<24} {total_ms:>9.3f} "
         f"{(str(int(total_b/1024)) + ' KB') if total_b else '0':>12}"
     )
-    return total_ms, handoff, total_b
+
+
+def _totals(ph: Phase, iters: int) -> tuple[float, float, int]:
+    """(end to end ms, hand-off ms, host bytes) per iteration."""
+    ms, by = ph.per_iter(iters)
+    return (
+        sum(ms.values()),
+        sum(v for k, v in ms.items() if k.startswith("hand-off")),
+        sum(by.values()),
+    )
 
 
 # ---------------------------------------------------------------------------
-# XRT: an add chain dispatched through a multi-launch ELF, on bound BOs
+# XRT: the two adds stitched into one ELF, dispatched on bound BOs
 # ---------------------------------------------------------------------------
 def run_copy(chain, a, b, shape, e1_host, e2_host, iters):
     """The default path: every hand-off goes through host memory."""
@@ -248,21 +251,15 @@ def run_shared_xrt(chain, a, b, shape, c_buf, out_buf, e1_host, e2_host, iters):
 
 
 def bench_xrt(args):
-    """Set up and run both XRT variants; returns (results, reference)."""
+    """Set up and run both XRT variants."""
     rows, cols, k = args.shape
     n = rows * cols
-    a = torch.randn(rows, k, dtype=torch.float32, device="cuda")
-    b = torch.randn(k, cols, dtype=torch.float32, device="cuda")
-    _sync()
-    # The two NPU-side addends. Static operands, so they are staged once per BO
-    # set and are not part of the per-iteration hand-off either way.
+    a, b, reference = _operands(args)
     e1_host: np.ndarray = np.full(n, 0.5, dtype=np.float32)
     e2_host: np.ndarray = np.full(n, 0.25, dtype=np.float32)
-    reference = (torch.matmul(a, b).reshape(-1) + 0.75).reshape(rows, cols)
-    _sync()
 
     chain = add_chain.build("zero_copy_bench_add", n)
-    buffers = []
+    buffers: list[SharedBuffer] = []
     try:
         # Shared buffers: allocated and registered once, reused every iteration.
         # Allocating is also the availability check, so there is no separate
@@ -296,108 +293,64 @@ def bench_xrt(args):
 
 
 # ---------------------------------------------------------------------------
-# HSA: a matmul dispatched through ROCR, where the runtime stages for itself
+# HSA: the same two adds, dispatched one at a time through ROCR
 # ---------------------------------------------------------------------------
-@triton.jit
-def _matmul_kernel(
-    A,
-    B,
-    C,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    stride_am: tl.constexpr,
-    stride_ak: tl.constexpr,
-    stride_bk: tl.constexpr,
-    stride_bn: tl.constexpr,
-    stride_cm: tl.constexpr,
-    stride_cn: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    """One tile of C = A @ B; the kernel examples/hsa_matmul dispatches."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a = tl.load(A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b = tl.load(B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-    tl.store(
-        C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, tl.dot(a, b)
+def _add(x, y, out, n):
+    """out = x + y on the NPU: one launch of the chain's own kernel."""
+    add_chain.add_kernel[(n // add_chain.BLOCK_SIZE,)](
+        x, y, out, n, BLOCK_SIZE=add_chain.BLOCK_SIZE
     )
 
 
-def _dispatch_hsa(a, b, c, shape):
-    """C = A @ B on the NPU, on whatever three operands are handed in."""
-    rows, cols, k = shape
-    grid = lambda meta: (  # noqa: E731 - Triton's own idiom for a grid
-        triton.cdiv(rows, meta["BLOCK_SIZE_M"]),
-        triton.cdiv(cols, meta["BLOCK_SIZE_N"]),
-    )
-    _matmul_kernel[grid](
-        a,
-        b,
-        c,
-        rows,
-        cols,
-        k,
-        k,
-        1,
-        cols,
-        1,
-        cols,
-        1,
-        BLOCK_SIZE_M=HSA_TILE,
-        BLOCK_SIZE_N=HSA_TILE,
-        BLOCK_SIZE_K=k,
-    )
-
-
-def run_staged(x, y, b_host, shape, iters):
-    """The default path: the host sees every operand, twice per launch."""
-    rows, cols, k = shape
+def run_staged(a, b, shape, e1_host, e2_host, iters):
+    """The default path: the host sees every operand, and so does the runtime."""
+    rows, cols, _ = shape
+    n = rows * cols
+    tmp_host = torch.zeros(n, dtype=torch.float32)
+    out_host = torch.zeros(n, dtype=torch.float32)
     ph = Phase()
     result = None
     for _ in range(iters):
         _sync()
         t0 = time.perf_counter()
-        a = torch.matmul(x, y)
+        c = torch.matmul(a, b)
         _sync()
         t1 = time.perf_counter()
 
         # iGPU -> host, so the dispatch has something it can name. The runtime
-        # then stages this again, into a vmem buffer and back, every launch.
-        a_host = a.cpu()
-        c_host = torch.zeros(rows, cols, dtype=torch.float32)
+        # then stages each operand again, into a vmem buffer and back, every
+        # launch -- including the addends, which never change.
+        c_host = c.reshape(-1).cpu()
         t2 = time.perf_counter()
 
-        _dispatch_hsa(a_host, b_host, c_host, shape)
+        _add(c_host, e1_host, tmp_host, n)
+        _add(tmp_host, e2_host, out_host, n)
         t3 = time.perf_counter()
 
         # host -> iGPU, so the next stage can use it.
-        result = c_host.to("cuda")
+        result = out_host.to("cuda").reshape(rows, cols)
         _sync()
         t4 = time.perf_counter()
 
         ph.add("igpu matmul", (t1 - t0) * 1e3)
-        ph.add("hand-off out (D2H)", (t2 - t1) * 1e3, rows * k * 2)
+        ph.add("hand-off out (D2H)", (t2 - t1) * 1e3, n * 4)
         ph.add("npu dispatch", (t3 - t2) * 1e3)
-        ph.add("hand-off back (H2D)", (t4 - t3) * 1e3, rows * cols * 4)
+        ph.add("hand-off back (H2D)", (t4 - t3) * 1e3, n * 4)
     return ph, result
 
 
-def run_shared_hsa(x, y, trio, shape, iters):
-    """Zero-copy: the iGPU writes where the NPU reads, either way round."""
-    a_buf, b_buf, c_buf = trio
-    a_view, b_view, c_view = a_buf.torch(), b_buf.torch(), c_buf.torch()
+def run_shared_hsa(a, b, shape, bufs, iters):
+    """Zero-copy: every operand is dispatched on where it already lives."""
+    rows, cols, _ = shape
+    n = rows * cols
+    c_buf, e1_buf, tmp_buf, e2_buf, out_buf = bufs
+    c_view = c_buf.torch().view(rows, cols)
     ph = Phase()
     result = None
     for _ in range(iters):
         _sync()
         t0 = time.perf_counter()
-        torch.matmul(x, y, out=a_view)
+        torch.matmul(a, b, out=c_view)
         _sync()
         t1 = time.perf_counter()
 
@@ -405,10 +358,11 @@ def run_shared_hsa(x, y, trio, shape, iters):
         torch.cuda.current_stream().synchronize()
         t2 = time.perf_counter()
 
-        _dispatch_hsa(a_view, b_view, c_view, shape)
+        _add(c_buf.torch(), e1_buf.torch(), tmp_buf.torch(), n)
+        _add(tmp_buf.torch(), e2_buf.torch(), out_buf.torch(), n)
         t3 = time.perf_counter()
 
-        result = c_view
+        result = out_buf.torch().view(rows, cols)
         _sync()
         t4 = time.perf_counter()
 
@@ -422,60 +376,51 @@ def run_shared_hsa(x, y, trio, shape, iters):
 def bench_hsa(args):
     """Set up and run the staged and both shared HSA variants."""
     rows, cols, k = args.shape
+    n = rows * cols
     triton.runtime.driver.set_active(NPUDriver("hsa"))
-    npu_config.transform_tiling_script = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "matmul_bf16_m64_n64_k64",
-        f"transform_{'aie2' if detect_npu_version() == 'npu1' else 'aie2p'}.mlir",
-    )
+    # The same script the chain lowers its ops with, so both runtimes compile
+    # the same kernel the same way.
+    npu_config.transform_tiling_script = add_chain.TRANSFORM_SCRIPT
 
-    x = torch.randn(rows, k, dtype=torch.bfloat16, device="cuda")
-    y = torch.randn(k, k, dtype=torch.bfloat16, device="cuda")
-    b_gpu = torch.randn(k, cols, dtype=torch.bfloat16, device="cuda")
-    _sync()
-    reference = torch.matmul(torch.matmul(x, y).float(), b_gpu.float())
-    _sync()
+    a, b, reference = _operands(args)
+    e1_host = torch.full((n,), 0.5, dtype=torch.float32)
+    e2_host = torch.full((n,), 0.25, dtype=torch.float32)
 
     owned = {"NPU-owned": ("hsa:0", "hip:0"), "iGPU-owned": ("hip:0", "hsa:0")}
     buffers: list[SharedBuffer] = []
     try:
-        trios = {}
+        sets = {}
         for label, (primary, secondary) in owned.items():
-            trio = (
-                shared.empty(
-                    rows, k, dtype=torch.bfloat16, device=primary, share=secondary
-                ),
-                shared.empty(
-                    k, cols, dtype=torch.bfloat16, device=primary, share=secondary
-                ),
-                shared.zeros(
-                    rows, cols, dtype=torch.float32, device=primary, share=secondary
-                ),
+            bufs = tuple(
+                shared.zeros(n, dtype=torch.float32, device=primary, share=secondary)
+                for _ in range(5)
             )
-            buffers.extend(trio)
-            trio[1].torch().copy_(b_gpu)
-            trios[label] = trio
+            buffers.extend(bufs)
+            bufs[1].torch().fill_(0.5)  # E1
+            bufs[3].torch().fill_(0.25)  # E2
+            sets[label] = bufs
         _sync()
 
-        b_host = b_gpu.cpu()
         print("\n  warming up (JIT, PDI build, first dispatch)...")
-        run_staged(x, y, b_host, args.shape, args.warmup)
-        for trio in trios.values():
-            run_shared_hsa(x, y, trio, args.shape, args.warmup)
+        run_staged(a, b, args.shape, e1_host, e2_host, args.warmup)
+        for bufs in sets.values():
+            run_shared_hsa(a, b, args.shape, bufs, args.warmup)
 
         results = {}
         before = shared.hsa_dispatch_counts()
-        ph, res = run_staged(x, y, b_host, args.shape, args.iters)
-        after = shared.hsa_dispatch_counts()
-        results["staged (via host)"] = (ph, res, _per_iter_counts(before, after, args))
-        for label, trio in trios.items():
+        ph, res = run_staged(a, b, args.shape, e1_host, e2_host, args.iters)
+        results["staged (via host)"] = (
+            ph,
+            res,
+            _counts(before, shared.hsa_dispatch_counts(), args.iters),
+        )
+        for label, bufs in sets.items():
             before = shared.hsa_dispatch_counts()
-            ph, res = run_shared_hsa(x, y, trio, args.shape, args.iters)
-            after = shared.hsa_dispatch_counts()
+            ph, res = run_shared_hsa(a, b, args.shape, bufs, args.iters)
             results[f"shared, {label} pages"] = (
                 ph,
                 res,
-                _per_iter_counts(before, after, args),
+                _counts(before, shared.hsa_dispatch_counts(), args.iters),
             )
         return results, reference, buffers, None
     except Exception:
@@ -484,28 +429,38 @@ def bench_hsa(args):
         raise
 
 
-def _per_iter_counts(before, after, args):
-    """(in place, staged) operands per launch, from the runtime's own counters."""
-    return ((after[0] - before[0]) // args.iters, (after[1] - before[1]) // args.iters)
+def _counts(before, after, iters):
+    """(in place, staged) operands per iteration, from the runtime's counters."""
+    return ((after[0] - before[0]) // iters, (after[1] - before[1]) // iters)
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _operands(args):
+    """The iGPU inputs and the reference both runtimes are checked against."""
+    rows, cols, k = args.shape
+    a = torch.randn(rows, k, dtype=torch.float32, device="cuda")
+    b = torch.randn(k, cols, dtype=torch.float32, device="cuda")
+    _sync()
+    reference = (torch.matmul(a, b).reshape(-1) + 0.75).reshape(rows, cols)
+    _sync()
+    return a, b, reference
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Measure the iGPU/NPU hand-off with and without copies.",
-        epilog="The element count must suit the NPU stage: a multiple of "
-        f"{add_chain.BLOCK_SIZE} under xrt (the chain's block), and a multiple "
-        f"of {HSA_TILE} per dimension under hsa (the matmul's tile). Only the "
-        "defaults are validated on hardware.",
+        epilog="Both runtimes run the same NPU work, so the element count must "
+        f"be a multiple of the chain's {add_chain.BLOCK_SIZE}-element block "
+        "either way. Only the default shape is validated on hardware.",
     )
     p.add_argument(
         "--runtime",
-        choices=sorted(DEFAULT_SHAPE),
+        choices=("xrt", "hsa"),
         default="xrt",
-        help="how the NPU is driven: an add chain through XRT, or a matmul "
-        "through ROCR (default: %(default)s)",
+        help="how the adds are dispatched: stitched into one ELF through XRT, "
+        "or one launch each through ROCR (default: %(default)s)",
     )
     p.add_argument("--rows", type=int, help="rows of A and of the result")
     p.add_argument("--cols", type=int, help="columns of B and of the result")
@@ -514,16 +469,14 @@ def parse_args(argv=None):
     p.add_argument("--warmup", type=int, default=5, help="untimed iterations first")
     args = p.parse_args(argv)
 
-    rows, cols, k = DEFAULT_SHAPE[args.runtime]
+    rows, cols, k = DEFAULT_SHAPE
     args.shape = (args.rows or rows, args.cols or cols, args.depth or k)
     rows, cols, _ = args.shape
-    if args.runtime == "xrt" and (rows * cols) % add_chain.BLOCK_SIZE:
+    if (rows * cols) % add_chain.BLOCK_SIZE:
         p.error(
             f"{rows}x{cols} is {rows * cols} elements, which the chain's "
             f"{add_chain.BLOCK_SIZE}-element blocks do not divide"
         )
-    if args.runtime == "hsa" and (rows % HSA_TILE or cols % HSA_TILE):
-        p.error(f"{rows}x{cols} is not a whole number of {HSA_TILE}-wide tiles")
     return args
 
 
@@ -533,8 +486,8 @@ def main(argv=None) -> int:
     rows, cols, k = args.shape
     print("=" * 64)
     print(
-        f"  iGPU matmul -> NPU {'add' if args.runtime == 'xrt' else 'matmul'}"
-        f" via {args.runtime.upper()}: copies vs shared buffers"
+        f"  iGPU matmul -> NPU add via {args.runtime.upper()}: "
+        "copies vs shared buffers"
     )
     print("=" * 64)
     # Checked before the first iGPU allocation below, since that is the point
@@ -545,8 +498,14 @@ def main(argv=None) -> int:
         print("  SKIP: no ROCm device visible to torch")
         return SKIP_EXIT_CODE
     print(f"  device   : {torch.cuda.get_device_name(0)}")
-    print(f"  matmul   : ({rows},{k}) @ ({k},{cols}) -> ({rows},{cols})")
-    print(f"  npu stage: {rows * cols} elements out")
+    print(f"  matmul   : ({rows},{k}) @ ({k},{cols}) -> ({rows},{cols}) f32")
+    print(
+        f"  npu add  : {rows * cols} elements, "
+        f"{rows * cols * 4 / 1024:.0f} KB per operand"
+    )
+    print(
+        f"  dispatch : {'one stitched ELF' if args.runtime == 'xrt' else 'two launches'}"
+    )
     print(f"  iters    : {args.iters} (plus {args.warmup} warmup)")
 
     chain = None
@@ -570,12 +529,9 @@ def main(argv=None) -> int:
         _sync()
         # Against an independent reference, not just against each other: if the
         # NPU stage were wrong both variants would be wrong identically and a
-        # mutual comparison would pass. The tolerance is the NPU stage's, not
-        # the hand-off's: bf16 inputs accumulated in f32 under HSA, exact f32
-        # adds under XRT.
-        tol = 1e-3 if args.runtime == "xrt" else 20.0
+        # mutual comparison would pass.
         errors = {
-            label: float((res.float() - reference).abs().max().cpu())
+            label: float((res - reference).abs().max().cpu())
             for label, (_, res, _) in results.items()
         }
         print(
@@ -586,22 +542,19 @@ def main(argv=None) -> int:
         )
 
         baseline = next(iter(results))
-        print("\n" + "=" * 64)
         counted = any(counts for _, _, counts in results.values())
+        print("\n" + "=" * 64)
         head = f"  {'variant':<26} {'total ms':>9} {'host KB':>9}"
         print(head + (f" {'in place':>9} {'staged':>7}" if counted else ""))
         for label, (ph, _, counts) in results.items():
-            ms, by = ph.per_iter(args.iters)
-            row = (
-                f"  {label:<26} {sum(ms.values()):>9.3f} "
-                f"{sum(by.values()) / 1024:>9.0f}"
-            )
+            total_ms, _, total_b = _totals(ph, args.iters)
+            row = f"  {label:<26} {total_ms:>9.3f} {total_b / 1024:>9.0f}"
             print(row + (f" {counts[0]:>9} {counts[1]:>7}" if counts else ""))
 
         base_ms, base_handoff, base_bytes = _totals(results[baseline][0], args.iters)
         best = min(
-            (l for l in results if l != baseline),
-            key=lambda l: _totals(results[l][0], args.iters)[0],
+            (label for label in results if label != baseline),
+            key=lambda label: _totals(results[label][0], args.iters)[0],
         )
         best_ms, best_handoff, _ = _totals(results[best][0], args.iters)
         ratio = f" ({base_handoff / best_handoff:.1f}x)" if best_handoff else ""
@@ -618,27 +571,13 @@ def main(argv=None) -> int:
                 "back, per launch, on top of the bytes\n  that crossed the "
                 "host to get there."
             )
-        print(
-            f"\n  These rows compare the variants within {args.runtime}. The two "
-            "runtimes\n  dispatch different NPU work and do not compare to each "
-            "other -- see\n  the module docstring."
-        )
         print("=" * 64)
-        return 0 if max(errors.values()) < tol else 1
+        return 0 if max(errors.values()) < 1e-3 else 1
     finally:
         for buf in buffers:
             buf.close()
         if chain is not None:
             chain.close()
-
-
-def _totals(ph: Phase, iters: int) -> tuple[float, float, int]:
-    ms, by = ph.per_iter(iters)
-    return (
-        sum(ms.values()),
-        sum(v for k, v in ms.items() if k.startswith("hand-off")),
-        sum(by.values()),
-    )
 
 
 if __name__ == "__main__":

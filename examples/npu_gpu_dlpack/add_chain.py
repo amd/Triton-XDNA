@@ -30,6 +30,16 @@ from triton.backends.amd_triton_npu.multilaunch import NPUChain
 
 BLOCK_SIZE = 1024
 
+#: How the add is tiled. Named here rather than built inside build() because
+#: the HSA half of zero_copy_benchmark.py dispatches this same kernel through
+#: the ordinary Triton path, and the two runtimes are only comparable if they
+#: lower it the same way. aie2p only, like the rest of the gpt2 scripts.
+TRANSFORM_SCRIPT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "gpt2",
+    "transform_add_f32_aie2p.mlir",
+)
+
 #: Combined-arg positions; see the module docstring.
 I_A, I_B, I_TMP, I_ADDEND, I_OUT = range(5)
 
@@ -68,11 +78,6 @@ def build(name: str, n: int) -> NPUChain:
     back to one op: both callers dispatch repeatedly, so they would report
     wrong results for a reason that has nothing to do with what they measure.
     """
-    script = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "gpt2",
-        "transform_add_f32_aie2p.mlir",
-    )
     zeros = torch.zeros(n, dtype=torch.float32)
     chain = NPUChain(name)
     for arg_map in ({0: I_A, 1: I_B, 2: I_TMP}, {0: I_TMP, 1: I_ADDEND, 2: I_OUT}):
@@ -82,6 +87,6 @@ def build(name: str, n: int) -> NPUChain:
             arg_map=arg_map,
             args=(zeros, zeros, zeros, n),
             constexprs={"BLOCK_SIZE": BLOCK_SIZE},
-            transform_script=script,
+            transform_script=TRANSFORM_SCRIPT,
         )
     return chain
