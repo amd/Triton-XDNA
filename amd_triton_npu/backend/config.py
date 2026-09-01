@@ -63,6 +63,8 @@ class _NPUConfig:
         self._target = MISSING
         self._runtime = MISSING
         self._xrt_dir = MISSING
+        self._shared_cache = MISSING
+        self._shared_cache_bytes = MISSING
 
     # ---- compile_only ----
 
@@ -292,6 +294,57 @@ class _NPUConfig:
     def xrt_dir(self, value):
         self._xrt_dir = value
 
+    # ---- shared_cache ----
+
+    @property
+    def shared_cache(self) -> bool:
+        """Whether closing a ``shared.SharedBuffer`` pools its pages for reuse.
+
+        On by default. Mapping a shared buffer costs milliseconds and does not
+        scale with its size, so reuse is what makes allocating one per
+        iteration affordable; see ``shared._Pool``.
+
+        Turn it off to have ``close()`` unmap at once -- which is what a
+        measurement of mapping cost wants, and what a caller wants who needs a
+        closed buffer to stop being reachable from the NPU immediately.
+
+        Env var fallback: ``AMD_TRITON_NPU_SHARED_CACHE`` (``"0"`` to disable).
+        """
+        if self._shared_cache is not MISSING:
+            return self._shared_cache
+        return os.getenv("AMD_TRITON_NPU_SHARED_CACHE", "1") != "0"
+
+    @shared_cache.setter
+    def shared_cache(self, value: bool):
+        self._shared_cache = bool(value)
+        # Turning it off has to drain what is already held, or the setting
+        # would only apply to buffers closed from here on.
+        if not self._shared_cache:
+            from .shared import empty_cache
+
+            empty_cache()
+
+    # ---- shared_cache_bytes ----
+
+    @property
+    def shared_cache_bytes(self) -> int:
+        """How many bytes of retired shared-buffer pages to keep mapped.
+
+        Past this the oldest are really released. Sized to hold a few working
+        buffers rather than a whole model's worth: these are pinned or device
+        pages, and on the APUs shared buffers exist for they come out of the
+        same DRAM the CPU is using.
+
+        Env var fallback: ``AMD_TRITON_NPU_SHARED_CACHE_BYTES``.
+        """
+        if self._shared_cache_bytes is not MISSING:
+            return self._shared_cache_bytes
+        return int(os.getenv("AMD_TRITON_NPU_SHARED_CACHE_BYTES", 512 << 20))
+
+    @shared_cache_bytes.setter
+    def shared_cache_bytes(self, value: int):
+        self._shared_cache_bytes = int(value)
+
     # ---- utilities ----
 
     def reset(self):
@@ -305,6 +358,8 @@ class _NPUConfig:
         self._target = MISSING
         self._runtime = MISSING
         self._xrt_dir = MISSING
+        self._shared_cache = MISSING
+        self._shared_cache_bytes = MISSING
 
 
 # Module-level singleton
@@ -336,6 +391,8 @@ def set_config(**kwargs):
         "target",
         "runtime",
         "xrt_dir",
+        "shared_cache",
+        "shared_cache_bytes",
     }
     for key, value in kwargs.items():
         if key not in valid_keys:

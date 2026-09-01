@@ -37,16 +37,12 @@ collected. ``with`` is the way to say that.
 
 Allocation is cheap after the first
 -----------------------------------
-Mapping a buffer costs about 11 ms and does not depend on its size -- it is a
-fixed sequence of ioctls per device -- while a whole zero-copy dispatch on a
-384 KB operand costs 0.6 ms. Allocating per iteration, which is how torch code
-is written because torch's allocator makes it free, would cost twenty times
-what sharing saves.
-
-So ``close()`` does not usually unmap: it returns the pages to a pool, and the
-next request for that size and device set takes them, at about 3 us. See
-``_Pool``, and ``empty_cache``/``set_cache_enabled`` for the two cases that
-want the pages actually released.
+``close()`` does not usually unmap: it returns the pages to a pool, and the
+next request for the same size and device set takes them already mapped.
+Mapping is expensive and does not scale with size, so this is what makes
+allocating a buffer per iteration -- how torch code is written -- affordable.
+``_Pool`` has the numbers; ``empty_cache`` and ``set_cache_enabled`` are for
+the two cases that want the pages actually released.
 
 Naming a device
 ---------------
@@ -117,9 +113,15 @@ import glob
 import math
 import operator
 import os
+import sys
 import threading
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar, cast
+
+# The one eager import: config is stdlib-only, and the pool reads its settings
+# per operation so that an override takes effect when it is made rather than
+# whenever this module happened to be imported.
+from .config import npu_config
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
@@ -322,6 +324,19 @@ def _dlpack_ndarray() -> Callable[..., Any]:
     from triton._C.libtriton import amd_triton_npu as _plugin
 
     return _plugin.dlpack_ndarray
+
+
+@functools.lru_cache(maxsize=1)
+def _tensor_attributes() -> frozenset[str]:
+    """Every name ``torch.Tensor`` defines.
+
+    What ``SharedBuffer.__getattr__`` forwards, and the reason it is a set
+    rather than a ``hasattr`` per miss: the lookup is on the path of every
+    forwarded method call, and the answer cannot change while the process runs.
+    """
+    import torch
+
+    return frozenset(dir(torch.Tensor))
 
 
 def _void_capsule(ptr: int) -> Any:
@@ -1005,17 +1020,18 @@ def _split_device_string(text: str) -> tuple[str, int | None]:
 def _is_torch_device(obj: Any) -> bool:
     """Whether ``obj`` is a ``torch.device``, without importing torch.
 
-    Duck-typed on purpose: this runs from ``_as_device_list`` on every spec,
-    including in processes that have no torch, and importing it to answer a
-    question about an object that plainly is not one would be backwards. The
-    two attributes are what a ``torch.device`` has and what a string or a
-    ``(kind, handle)`` pair does not.
+    Asked of ``sys.modules`` rather than by importing: this runs from
+    ``_as_device_list`` on every spec, including in processes that have no
+    torch -- and if the object really is a ``torch.device`` then torch is
+    already imported, so a miss there is a definite no.
+
+    A real ``isinstance`` rather than a duck-type. Anything else carrying a
+    ``type`` and an ``index`` attribute would otherwise be read as a device and
+    reported as an unknown *kind*, which is a confusing way to say that a spec
+    was malformed.
     """
-    return (
-        not isinstance(obj, (str, tuple, list))
-        and hasattr(obj, "type")
-        and hasattr(obj, "index")
-    )
+    torch = sys.modules.get("torch")
+    return torch is not None and isinstance(obj, torch.device)
 
 
 def _parse_spec(device: DeviceSpec) -> tuple[str, DeviceHandle]:
@@ -1055,7 +1071,8 @@ def _parse_spec(device: DeviceSpec) -> tuple[str, DeviceHandle]:
                 f"device must be a device string like 'hip:0', a torch.device, "
                 f"or a (kind, handle) pair, got {device!r}"
             ) from None
-    name = _KIND_ALIASES.get(str(kind).upper(), str(kind).upper())
+    name = str(kind).upper()
+    name = _KIND_ALIASES.get(name, name)
     if name not in _BACKENDS:
         raise SharedBufferError(
             f"unknown device kind {kind!r}; known kinds are "
@@ -1151,18 +1168,6 @@ def _pool_key(
 # ---------------------------------------------------------------------------
 # The page cache
 # ---------------------------------------------------------------------------
-#: How many bytes of retired pages to keep mapped. Past this the oldest are
-#: really released. Sized to hold a few working buffers rather than a whole
-#: model's worth: these are pinned or device pages, and on the APUs this module
-#: exists for they come out of the same DRAM the CPU is using.
-_CACHE_BYTES = int(os.environ.get("TRITON_XDNA_SHARED_CACHE_BYTES", 512 << 20))
-
-#: Set to 0 to have close() release immediately, which is what you want when
-#: measuring how long mapping actually takes, or when a buffer must stop being
-#: reachable from the NPU the moment it is closed.
-_CACHE_ENABLED = os.environ.get("TRITON_XDNA_SHARED_CACHE", "1") != "0"
-
-
 class _Pages:
     """A retired buffer's mappings, kept for the next buffer of the same shape.
 
@@ -1173,24 +1178,35 @@ class _Pages:
     these pages and the one that takes them.
     """
 
-    __slots__ = ("key", "nbytes", "host_ptr", "primary", "attachments")
+    __slots__ = ("nbytes", "host_ptr", "primary", "attachments")
 
     def __init__(
         self,
-        key: Any,
         nbytes: int,
         host_ptr: int,
         primary: _Attachment,
         attachments: dict[DeviceKey, _Attachment],
     ) -> None:
-        self.key = key
         self.nbytes = nbytes
         self.host_ptr = host_ptr
         self.primary = primary
         self.attachments = attachments
 
     def release(self) -> None:
-        """Really let the pages go; the teardown half of ``SharedBuffer.close``."""
+        """Really let the pages go.
+
+        Order matters and is the reverse of construction: the secondaries,
+        which only borrow the primary's pages, and then the primary, which owns
+        them. Every secondary's undo step names an address that is only
+        meaningful while the pages are still mapped, so releasing the primary
+        first leaves each of them operating on freed memory. The primary was
+        inserted first and never duplicated, so it is always the first entry
+        and ``reversed()`` releases it last without singling it out.
+
+        The peers are told before each release, not after: an attachment's
+        address stops meaning anything the moment it lets go, and whoever
+        recorded it has to forget it while it is still theirs to forget.
+        """
         for attachment in reversed(list(self.attachments.values())):
             for other in self.attachments.values():
                 if other is not attachment:
@@ -1226,56 +1242,61 @@ class _Pool:
         # is not: two threads each allocating their own buffers do not race,
         # but they would race here.
         self._lock = threading.Lock()
-        self._entries: list[_Pages] = []
+        self._entries: list[tuple[Any, _Pages]] = []
         self._bytes = 0
         self.hits = 0
         self.misses = 0
 
     def take(self, key: Any) -> _Pages | None:
-        """Pages already mapped exactly as ``key`` describes, if any are free."""
+        """Pages already mapped exactly as ``key`` describes, if any are free.
+
+        A ``None`` key is a request that cannot be described -- see
+        ``_pool_key`` -- and is answered like any other miss, so the caller has
+        one path rather than a test of its own.
+        """
         with self._lock:
-            if not _CACHE_ENABLED:
-                return None
-            # Reverse order: the most recently retired pages are the ones most
-            # likely to still be in the TLB and the page cache.
-            for i in range(len(self._entries) - 1, -1, -1):
-                if self._entries[i].key == key:
-                    pages = self._entries.pop(i)
-                    self._bytes -= pages.nbytes
-                    self.hits += 1
-                    return pages
+            if key is not None and npu_config.shared_cache:
+                # Reverse order: the most recently retired pages are the ones
+                # most likely to still be in the TLB and the page cache.
+                for i in reversed(range(len(self._entries))):
+                    if self._entries[i][0] == key:
+                        _, pages = self._entries.pop(i)
+                        self._bytes -= pages.nbytes
+                        self.hits += 1
+                        return pages
             self.misses += 1
             return None
 
-    def give(self, pages: _Pages) -> bool:
-        """Offer retired pages to the pool; False if the caller must release them.
+    def retire(self, key: Any, pages: _Pages) -> None:
+        """Take pages a buffer has finished with, pooling them or releasing them.
 
-        Refused rather than queued when the pool is disabled, so ``close()``
-        keeps meaning "release now" for a caller that turned caching off.
+        Whether they are worth keeping is the pool's question, not the
+        caller's: a ``None`` key or caching turned off means release now, which
+        is what ``close()`` has to mean for a caller that asked for it.
         """
+        stale = []
         with self._lock:
-            if not _CACHE_ENABLED:
-                return False
-            self._entries.append(pages)
-            self._bytes += pages.nbytes
-            # Evict oldest-first, which for a steady-state loop over one size
-            # is exactly the entries that will not be asked for again.
-            stale = []
-            while self._bytes > _CACHE_BYTES and self._entries:
-                evicted = self._entries.pop(0)
-                self._bytes -= evicted.nbytes
-                stale.append(evicted)
+            if key is None or not npu_config.shared_cache:
+                stale.append(pages)
+            else:
+                self._entries.append((key, pages))
+                self._bytes += pages.nbytes
+                # Evict oldest-first, which for a steady-state loop over one
+                # size is exactly the entries that will not be asked for again.
+                while self._bytes > npu_config.shared_cache_bytes and self._entries:
+                    _, evicted = self._entries.pop(0)
+                    self._bytes -= evicted.nbytes
+                    stale.append(evicted)
         # Released outside the lock: a release calls into three runtimes, and
         # holding a lock across a driver call is how a deadlock is built.
         for evicted in stale:
             evicted.release()
-        return True
 
     def clear(self) -> None:
         with self._lock:
             stale, self._entries = self._entries, []
             self._bytes = 0
-        for pages in stale:
+        for _, pages in stale:
             pages.release()
 
     def stats(self) -> dict[str, int]:
@@ -1289,26 +1310,6 @@ class _Pool:
 
 
 _POOL = _Pool()
-
-
-def _drain_at_exit() -> None:
-    """Release the pool while the runtimes are still up.
-
-    Registered with ``atexit``, which runs before the interpreter starts
-    tearing modules down -- otherwise the pooled attachments are released from
-    ``__del__`` at an arbitrary point in shutdown, when the libraries they call
-    into may already be gone.
-
-    Caching is turned off rather than only drained, so a buffer still alive at
-    this point releases its pages on the way out instead of handing them to a
-    pool nothing will empty again.
-    """
-    global _CACHE_ENABLED
-    _CACHE_ENABLED = False
-    _POOL.clear()
-
-
-atexit.register(_drain_at_exit)
 
 
 def empty_cache() -> None:
@@ -1325,26 +1326,30 @@ def empty_cache() -> None:
 def set_cache_enabled(enabled: bool) -> None:
     """Turn buffer reuse on or off; on by default.
 
-    Off makes ``close()`` release immediately, which is what a measurement of
-    mapping cost wants, and what a caller wants who needs a closed buffer to
-    stop being reachable from the NPU at once rather than eventually. Turning
-    it off also drains what is already pooled.
+    The same switch as ``npu_config.shared_cache``, which is where it lives
+    along with every other backend setting and its environment variable; this
+    is the spelling that reads naturally beside ``empty_cache()``.
     """
-    global _CACHE_ENABLED
-    _CACHE_ENABLED = bool(enabled)
-    if not _CACHE_ENABLED:
-        _POOL.clear()
+    npu_config.shared_cache = enabled
 
 
 def cache_stats() -> dict[str, int]:
     """``buffers``, ``bytes``, ``hits`` and ``misses`` for the buffer pool.
 
-    ``hits`` counts allocations served from retired pages. A loop allocating
-    the same shape each iteration should show one miss and then all hits; if it
-    does not, something about the request differs -- a different size, or a
-    different device set.
+    ``hits`` counts allocations served from retired pages, ``misses`` those
+    that had to map. A loop allocating the same shape each iteration should
+    show one miss and then all hits; if it does not, something about the
+    request differs -- a different size, or a different device set.
     """
     return _POOL.stats()
+
+
+# Turned off and drained before the interpreter starts tearing modules down.
+# Otherwise the pooled attachments are released from __del__ at an arbitrary
+# point in shutdown, when the libraries they call into may already be gone --
+# and a buffer still alive at that point would hand its pages to a pool nothing
+# will empty again, rather than releasing them on the way out.
+atexit.register(set_cache_enabled, False)
 
 
 # ---------------------------------------------------------------------------
@@ -1464,14 +1469,13 @@ class SharedBuffer:
         # Pages retired by an earlier buffer of this size, mapped into these
         # same devices, are already everything the work below would produce.
         pool_key = _pool_key(self._nbytes, (primary_kind, primary_handle), secondaries)
-        if pool_key is not None:
-            pages = _POOL.take(pool_key)
-            if pages is not None:
-                self._host_ptr = pages.host_ptr
-                self._primary = pages.primary
-                self._attachments = pages.attachments
-                self._pool_key = pool_key
-                return
+        pages = _POOL.take(pool_key)
+        if pages is not None:
+            self._host_ptr = pages.host_ptr
+            self._primary = pages.primary
+            self._attachments = pages.attachments
+            self._pool_key = pool_key
+            return
 
         primary_att = _BACKENDS[primary_kind](primary_handle)
         self._host_ptr = primary_att.allocate(self._nbytes, peers)
@@ -1827,11 +1831,7 @@ class SharedBuffer:
         the slots in, and looking one of those up through ``torch()`` -- which
         reads them -- would recurse until the stack ran out.
         """
-        if name.startswith("_"):
-            raise AttributeError(name)
-        import torch
-
-        if not hasattr(torch.Tensor, name):
+        if name.startswith("_") or name not in _tensor_attributes():
             raise AttributeError(
                 f"{type(self).__name__!r} object has no attribute {name!r}"
             )
@@ -1894,33 +1894,30 @@ class SharedBuffer:
         next buffer of the same size and device set -- mapping them is the
         expensive part and none of it depends on the shape or dtype that just
         went away. What is released here for certain is this object's claim on
-        them: the views, which point into memory this buffer no longer owns,
-        and every accessor stops working.
+        them: the views, and every accessor stops working.
 
-        Use ``empty_cache()`` to release what the pool is holding, or
-        ``set_cache_enabled(False)`` for a process where closing must unmap at
-        once.
+        The exception is a buffer whose torch view someone else is still
+        holding, which is released outright; see below. Use ``empty_cache()``
+        to release what the pool is holding, or ``set_cache_enabled(False)``
+        for a process where closing must unmap at once.
         """
+        if self._primary is None:  # already closed; idempotent, stated once
+            return
+        # A view that outlives its buffer is the caller's mistake either way,
+        # but pooling changes what it costs: the pages would be handed to
+        # another live buffer and the stale view would silently alias someone
+        # else's data. Released instead, so it stays the fault it used to be.
+        escaped = self._torch_view is not None and self._torch_view() is not None
         self._torch_view = None
         self._numpy_view = None
-        # Let go of all three together and before anything can fail, so the
-        # pages have exactly one owner at every point: this buffer, then the
-        # _Pages, then either the pool or nothing. This is also what makes
-        # close() idempotent -- a second call finds nothing to hand over.
-        attachments, primary, host_ptr = (
-            self._attachments,
-            self._primary,
-            self._host_ptr,
-        )
+        assert self._host_ptr is not None  # a live buffer always has one
+        pages = _Pages(self._nbytes, self._host_ptr, self._primary, self._attachments)
+        # Let go before handing over, so the pages have exactly one owner at
+        # every point: this buffer, then the _Pages, then the pool or nothing.
         self._attachments = {}
         self._primary = None
         self._host_ptr = None
-        if not attachments:
-            return
-        assert primary is not None and host_ptr is not None  # a live buffer has both
-        pages = _Pages(self._pool_key, self._nbytes, host_ptr, primary, attachments)
-        if self._pool_key is None or not _POOL.give(pages):
-            pages.release()
+        _POOL.retire(None if escaped else self._pool_key, pages)
 
     def __enter__(self) -> SharedBuffer:
         """Buffers are a resource, so ``with`` closes one.
@@ -2097,10 +2094,7 @@ def ones(
     share: Shared = (),
 ) -> SharedBuffer:
     """A one-filled shared buffer, like ``torch.ones``. See ``zeros``."""
-    return _written(
-        empty(*size, dtype=dtype, device=device, share=share),
-        lambda view: view.fill_(1),
-    )
+    return full(*size, fill_value=1, dtype=dtype, device=device, share=share)
 
 
 #: Distinguishes "no fill value passed" from a legitimate ``fill_value=None``.
@@ -2197,6 +2191,13 @@ def arange(
     dtype follows torch's rule -- an integer one when every argument is an
     integer, the default float dtype otherwise -- so ``arange(5)`` holds
     int64 and ``arange(5.0)`` holds float32.
+
+    torch is asked for the values first and the buffer is sized from what came
+    back, rather than the length and the dtype being worked out here. Both
+    rules are torch's and both are fiddlier than they look -- where a float
+    range ends, what promotes to what -- and deriving them separately would be
+    a second implementation to keep in step with the one actually filling the
+    buffer.
     """
     import torch
 
@@ -2204,11 +2205,8 @@ def arange(
         start, end = 0, start
     if step == 0:
         raise SharedBufferError("arange() step must not be zero")
-    if dtype is None:
-        integral = all(isinstance(v, int) for v in (start, end, step))
-        dtype = torch.int64 if integral else torch.get_default_dtype()
-    length = max(0, math.ceil((end - start) / step))
-    if length == 0:
+    values = torch.arange(start, end, step, dtype=dtype)
+    if values.numel() == 0:
         # Every other factory refuses an empty buffer, and this is the one
         # place a caller can ask for one without writing a zero: arange(0),
         # or a range the step walks away from.
@@ -2216,12 +2214,7 @@ def arange(
             f"arange({start}, {end}, {step}) is empty; there is nothing for a "
             "device to map"
         )
-    return _written(
-        empty(length, dtype=dtype, device=device, share=share),
-        lambda view: view.copy_(
-            torch.arange(start, end, step, dtype=view.dtype, device=view.device)
-        ),
-    )
+    return from_tensor(values, device=device, share=share)
 
 
 def empty_like(
@@ -2287,10 +2280,7 @@ def ones_like(
 
     Inherits from ``other`` on the same terms as ``empty_like``.
     """
-    return _written(
-        empty_like(other, dtype=dtype, device=device, share=share),
-        lambda view: view.fill_(1),
-    )
+    return full_like(other, 1, dtype=dtype, device=device, share=share)
 
 
 def full_like(

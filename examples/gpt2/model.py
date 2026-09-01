@@ -416,7 +416,9 @@ class _FusedMLP:
         # unregistering their pages first would pull them out from under a
         # dispatcher that still has them bound. GC order would not guarantee
         # this, which is why release is explicit rather than left to __del__.
-        # Views before buffers: they alias pages close() is about to release.
+        # Views before buffers: a buffer whose view is still held is released
+        # rather than pooled, so dropping these first is also what lets the
+        # pages be reused by the next model rather than unmapped and remapped.
         self._views = ()
         # The per-layer cache holds an iGPU b_proj copy per layer; releasing the
         # buffers but keeping those would leave device memory live behind a

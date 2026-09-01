@@ -469,7 +469,9 @@ def test_tensor_surface(buffers: _Buffers) -> None:
     check("buf + 1", bool(((buf + 1) == 1).all()))
     check("2 * buf reflected", bool(((2 * buf) == 0).all()))
     check("elementwise ==", bool((buf == 0).all()))
-    check("in-place op returns the buffer", (buf.fill_(1), buf.__iadd__(1))[1] is buf)
+    buf.fill_(1)
+    buf += 1
+    check("in-place op keeps the buffer", isinstance(buf, SharedBuffer))
     torch.cuda.synchronize()
     check("...and wrote through", float(buf.torch().min()) == 2.0)
 
@@ -516,76 +518,88 @@ def test_buffer_pool() -> None:
     print("\n-- buffer pool --")
     from triton.backends.amd_triton_npu import shared
 
+    def hits() -> int:
+        return shared.cache_stats()["hits"]
+
+    def pooled() -> int:
+        return shared.cache_stats()["buffers"]
+
+    def buffer(*shape: int, share: Any = HIP) -> Any:
+        return shared.empty(*shape, dtype=torch.float32, device=NPU, share=share)
+
     shared.empty_cache()
-    before = shared.cache_stats()
 
-    first = shared.empty(256, 256, dtype=torch.float32, device=NPU, share=HIP)
-    pages = first.host_ptr
-    first.close()
-    check("a closed buffer is pooled", shared.cache_stats()["buffers"] == 1)
+    with buffer(256, 256) as first:
+        pages = first.host_ptr
+    check("a closed buffer is pooled", pooled() == 1)
 
-    second = shared.empty(256, 256, dtype=torch.float32, device=NPU, share=HIP)
-    check("the next request takes those pages", second.host_ptr == pages)
-    check("counted as a hit", shared.cache_stats()["hits"] == before["hits"] + 1)
-    check("and the pool is empty again", shared.cache_stats()["buffers"] == 0)
-    second.close()
+    was = hits()
+    with buffer(256, 256) as second:
+        check("the next request takes those pages", second.host_ptr == pages)
+        check("counted as a hit", hits() == was + 1)
+        check("and the pool is empty again", pooled() == 0)
 
     # Shape and dtype are views over the pages, so they are not part of what a
     # request needs mapped -- but the buffer must describe itself by what was
     # asked for, not by what the pages were last used as.
-    reshaped = shared.zeros(1024, 64, dtype=torch.float32, device=NPU, share=HIP)
-    torch.cuda.synchronize()
-    check("the same bytes serve another shape", reshaped.host_ptr == pages)
-    check("described by the request", tuple(reshaped.shape) == (1024, 64))
-    check("and zeros() still zeroes them", float(reshaped.abs().max()) == 0.0)
-    reshaped.close()
+    with shared.zeros(1024, 64, dtype=torch.float32, device=NPU, share=HIP) as reshaped:
+        torch.cuda.synchronize()
+        check("the same bytes serve another shape", reshaped.host_ptr == pages)
+        check("described by the request", tuple(reshaped.shape) == (1024, 64))
+        check("and zeros() still zeroes them", float(reshaped.abs().max()) == 0.0)
 
     # The two ways a request can differ. Handing back pages mapped into the
     # wrong devices would be the serious failure here: the buffer would look
     # right until a dispatch named a device that never mapped it. Asked of the
     # hit counter rather than the address, because a freshly released mapping
     # is very often handed straight back at the same address.
-    hits = shared.cache_stats()["hits"]
-    lonely = shared.empty(256, 256, dtype=torch.float32, device=NPU)
-    check(
-        "a different device set does not reuse",
-        shared.cache_stats()["hits"] == hits and lonely.devices == (NPU,),
-    )
-    lonely.close()
-    smaller = shared.empty(128, 256, dtype=torch.float32, device=NPU, share=HIP)
-    check("a different size does not reuse", shared.cache_stats()["hits"] == hits)
-    smaller.close()
+    was = hits()
+    with buffer(256, 256, share=()) as lonely:
+        check(
+            "a different device set does not reuse",
+            hits() == was and lonely.devices == (NPU,),
+        )
+    with buffer(128, 256):
+        check("a different size does not reuse", hits() == was)
 
     # Two buffers alive at once are two buffers, whatever the pool holds.
-    live_a = shared.zeros(32, 32, dtype=torch.float32, device=NPU, share=HIP)
-    live_b = shared.zeros(32, 32, dtype=torch.float32, device=NPU, share=HIP)
-    live_a.fill_(1)
-    torch.cuda.synchronize()
-    check("live buffers never share pages", live_a.host_ptr != live_b.host_ptr)
-    check("...and do not see each other's writes", float(live_b.abs().max()) == 0.0)
-    live_a.close()
-    live_b.close()
+    with shared.zeros(32, 32, dtype=torch.float32, device=NPU, share=HIP) as live_a:
+        with shared.zeros(32, 32, dtype=torch.float32, device=NPU, share=HIP) as live_b:
+            live_a.fill_(1)
+            torch.cuda.synchronize()
+            check("live buffers never share pages", live_a.host_ptr != live_b.host_ptr)
+            check(
+                "...and do not see each other's writes",
+                float(live_b.abs().max()) == 0.0,
+            )
+
+    # A view outliving its buffer used to fault on unmapped pages. Pooling would
+    # instead hand those pages to the next buffer and leave the stale view
+    # aliasing someone else's data, so a buffer whose view escaped is released.
+    escapee = shared.zeros(16, 16, dtype=torch.float32, device=NPU, share=HIP)
+    held = escapee.torch()
+    shared.empty_cache()
+    escapee.close()
+    check("a buffer whose view escaped is not pooled", pooled() == 0)
+    del held
 
     shared.empty_cache()
-    check("empty_cache releases what is held", shared.cache_stats()["buffers"] == 0)
+    check("empty_cache releases what is held", pooled() == 0)
 
     # Off, close() has to mean unmap now -- which is what a measurement wants,
     # and what a caller wants who needs the NPU to stop reaching the pages.
     shared.set_cache_enabled(False)
     try:
-        off = shared.empty(64, 64, dtype=torch.float32, device=NPU, share=HIP)
-        off.close()
-        check("disabled: nothing is pooled", shared.cache_stats()["buffers"] == 0)
-        hits = shared.cache_stats()["hits"]
-        again = shared.empty(64, 64, dtype=torch.float32, device=NPU, share=HIP)
-        # Not "a different address": freeing a mapping and asking for another
-        # of the same size very often gets the same one back, so the address
-        # proves nothing either way. Whether the pool served it does.
-        check(
-            "disabled: allocated rather than reused",
-            shared.cache_stats()["hits"] == hits,
-        )
-        again.close()
+        with buffer(64, 64):
+            pass
+        check("disabled: nothing is pooled", pooled() == 0)
+        was = hits()
+        with buffer(64, 64):
+            # Not "a different address": freeing a mapping and asking for
+            # another of the same size very often gets the same one back, so
+            # the address proves nothing either way. Whether the pool served it
+            # does.
+            check("disabled: allocated rather than reused", hits() == was)
     finally:
         shared.set_cache_enabled(True)
 
@@ -1120,6 +1134,20 @@ def test_npu_dispatch_hsa(buffers: _Buffers) -> None:
         check(
             f"all three operands dispatched in place ({label})",
             moved == (3, 0),
+            f"in place {moved[0]}, staged {moved[1]}",
+        )
+
+        # The buffers themselves, not their views. Triton decides an argument
+        # is a tensor by looking for data_ptr/dtype and the launcher then asks
+        # for numel/element_size, all of which a buffer answers -- so this is
+        # the form the README documents, and it has to keep working.
+        tc.zero_()
+        torch.cuda.synchronize()
+        moved = matmul(a, b, c)
+        torch.cuda.synchronize()
+        check(
+            f"a buffer dispatches directly, without .torch() ({label})",
+            moved == (3, 0) and float((tc - expected).abs().max()) < 20.0,
             f"in place {moved[0]}, staged {moved[1]}",
         )
 
