@@ -210,13 +210,15 @@ enum class Access { CPU_AND_AIE, AIE_ONLY };
 // is what bounds checking must use, since the tail of the rounding is not the
 // caller's memory.
 struct SharedRegion {
-  DeviceBuffer buf{};   // the vmem allocation or import behind it
-  void *aie_va{};       // what the dispatch packet needs; buf.va, or an
-                        // offset into it when the mapping covers more than
-                        // the caller's range (see vmem_import)
-  std::size_t size{};   // requested size
-  bool imported{false}; // someone else's memory, mapped here -- which decides
-                        // both how it was granted and how it is released
+  DeviceBuffer buf{};    // the vmem allocation or import behind it
+  void *aie_va{};        // what the dispatch packet needs; buf.va, or an
+                         // offset into it when the mapping covers more than
+                         // the caller's range (see vmem_import)
+  std::size_t size{};    // requested size
+  bool imported{false};  // someone else's memory, mapped here -- which decides
+                         // both how it was granted and how it is released
+  bool abandoned{false}; // given to a dispatch that then timed out, so the
+                         // mapping has to outlive its owner (abandon_shared)
 };
 
 } // namespace
@@ -424,10 +426,13 @@ public:
       // following slot and it would take a full lap of the ring to reuse the
       // one still in the device's hands.
       //
-      // Shared regions are not ours to abandon either way: they belong to the
-      // caller, who must not free one while a dispatch on it may still be
-      // outstanding. Nothing enforces that, for the same reason nothing stops
-      // a caller freeing a tensor mid-launch.
+      // Shared regions need the same treatment, and cannot get it from the
+      // caller: the buffer they belong to is about to have close() called on
+      // it by an ordinary `finally`, and nothing on the Python side can know
+      // when the device is finished with memory a timed-out dispatch was
+      // given. So the runtime keeps them mapped itself -- an obligation the
+      // caller could not have discharged is not one to hand them.
+      abandon_shared(num_tensors, host_ptrs);
       throw;
     } catch (...) {
       // Ordinary failure: the device is done with (or never saw) these
@@ -510,6 +515,13 @@ public:
     // Unmapped outside the lock: the teardown is several HSA calls and holding
     // regions_mtx_ across them would block every concurrent dispatch's lookup.
     // Safe because the region is unreachable by then -- no key names it.
+    //
+    // Except when a timed-out dispatch was given this region: the device may
+    // still be writing to it, so it stays mapped and is merely forgotten. The
+    // caller's buffer is released as far as it can tell; the pages are the
+    // price of the watchdog, the same price its staging buffers pay.
+    if (region->abandoned)
+      return;
     vmem_free(region->buf, region->imported);
   }
 
@@ -554,11 +566,15 @@ private:
   // the others.
   std::map<std::uintptr_t, std::shared_ptr<SharedRegion>> regions_;
 
-  // Guards regions_ only. Deliberately not dispatch_mtx_: buffers are
-  // registered and released from Python while a dispatch may be running, so
-  // the two are not serialized against each other. A dispatch takes this one
-  // while holding dispatch_mtx_ and the shared_* entry points never take
-  // dispatch_mtx_, so the pair cannot deadlock.
+  // Regions a timed-out dispatch was given: held so their mappings outlive the
+  // buffers that owned them. Never emptied -- that is the point.
+  std::vector<std::shared_ptr<SharedRegion>> abandoned_regions_;
+
+  // Guards regions_ and abandoned_regions_. Deliberately not dispatch_mtx_:
+  // buffers are registered and released from Python while a dispatch may be
+  // running, so the two are not serialized against each other. A dispatch takes
+  // this one while holding dispatch_mtx_ and the shared_* entry points never
+  // take dispatch_mtx_, so the pair cannot deadlock.
   std::mutex regions_mtx_;
 
   // Serializes dispatches (one shared queue, one packet in flight).
@@ -590,6 +606,22 @@ private:
     if (offset >= it->second->size)
       return {};
     return {it->second, offset};
+  }
+
+  // Keep every shared region this dispatch was given mapped for the rest of
+  // the process, and remember it so the caller's release() cannot unmap it.
+  // Off the hot path entirely: the regions are looked up again here rather
+  // than carried through a successful dispatch that will never need them.
+  void abandon_shared(std::uint32_t num_tensors, void *const *host_ptrs) {
+    std::lock_guard<std::mutex> lock(regions_mtx_);
+    for (std::uint32_t i = 0; i < num_tensors; ++i) {
+      const RegionHit hit = find_region(host_ptrs[i]);
+      if (!hit.region || hit.region->abandoned)
+        continue;
+      hit.region->abandoned = true;
+      // A strong reference, so the mapping outlives every other holder.
+      abandoned_regions_.push_back(hit.region);
+    }
   }
 
   // The AIE-side address for [ptr, ptr+size), or null when ptr names no shared

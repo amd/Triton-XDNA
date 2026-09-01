@@ -63,9 +63,13 @@ triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *pdi_path,
 // accepted) arms a watchdog on the runtime's internal waits. Two caveats:
 //
 // * It is off by default because recovering from a timeout means permanently
-//   abandoning the completion signal and the I/O buffers of the timed-out
-//   dispatch -- the device may still write to them -- so a timeout set too low
-//   for a legitimately slow kernel leaks memory on every launch.
+//   abandoning the completion signal, the I/O buffers, and the mapping of any
+//   shared region the timed-out dispatch was given -- the device may still
+//   write to all of them -- so a timeout set too low for a legitimately slow
+//   kernel leaks memory on every launch. A shared region is abandoned by the
+//   runtime rather than by its owner: releasing the buffer it belongs to then
+//   frees nothing, since the caller has no way to know when the device is
+//   done and would otherwise hand those pages to the next allocation.
 // * It does NOT currently make a hung dispatch recoverable. Ringing the AIE
 //   doorbell submits synchronously, so the whole dispatch happens inside a
 //   ROCR call that takes no timeout; the waits the watchdog does bound are
