@@ -771,15 +771,20 @@ class _HipAttachment(_Attachment):
                 ),
                 "hipHostMalloc",
             )
-        if ptr.value is None:
-            raise SharedBufferError("hipHostMalloc returned a null pointer")
-        self._host_ptr = ptr.value
-        self._held = "pinned"
-        # Past this point the pages are pinned, so a failure has to undo it
-        # here: the caller has no handle on this attachment yet -- SharedBuffer
-        # only records it once allocate()/attach() returns -- so nothing else
-        # would ever call release().
-        self._release_on_error(self._resolve_device_ptr)
+            if ptr.value is None:
+                raise SharedBufferError("hipHostMalloc returned a null pointer")
+            self._host_ptr = ptr.value
+            self._held = "pinned"
+            # Past this point the pages are pinned, so a failure has to undo it
+            # here: the caller has no handle on this attachment yet --
+            # SharedBuffer only records it once allocate()/attach() returns --
+            # so nothing else would ever call release().
+            #
+            # Inside the block, because hipHostGetDevicePointer resolves the
+            # mapping against the current device like everything else here: run
+            # after it, a buffer asked for hip:1 would pin there and then take
+            # device 0's answer for where those pages are.
+            self._release_on_error(self._resolve_device_ptr)
         return self._host_ptr
 
     def _allocate_device(self, nbytes: int) -> int:
@@ -814,9 +819,10 @@ class _HipAttachment(_Attachment):
                 ),
                 "hipHostRegister",
             )
-        self._host_ptr = host_ptr
-        self._held = "registered"
-        self._release_on_error(self._resolve_device_ptr)
+            self._host_ptr = host_ptr
+            self._held = "registered"
+            # Inside the block; see _allocate_pinned.
+            self._release_on_error(self._resolve_device_ptr)
 
     def release(self) -> None:
         # Swallowed: release() runs from close() and from __del__, and __del__

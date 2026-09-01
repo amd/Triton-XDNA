@@ -1020,6 +1020,17 @@ private:
 
     // The descriptor's size is the object's size, which is what has to be
     // mapped for the tail of it to be reachable.
+    //
+    // Not rounded to the data granule, unlike every size this class chooses
+    // for itself: an imported handle's extent is the exporter's, and b.size
+    // goes to hsa_amd_vmem_map as well as to the reserve, so rounding it up
+    // would ask to map past the end of the object. The fallback below does
+    // round, because there the size is a guess -- fstat failed, so the object's
+    // extent is unknown and the granule is the best available guess at it.
+    //
+    // In practice the question does not arise: an amdgpu export is a whole
+    // 2 MB-aligned buffer object, so it is already aligned to any granule an
+    // AIE data pool reports.
     struct stat info {};
     const bool sized = ::fstat(dmabuf_fd, &info) == 0 && info.st_size > 0;
     region.buf.size =

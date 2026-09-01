@@ -81,7 +81,7 @@ from common import add_chain
 from triton.backends.amd_triton_npu import shared
 from triton.backends.amd_triton_npu.config import npu_config
 from triton.backends.amd_triton_npu.driver import NPUDriver
-from triton.backends.amd_triton_npu.shared import SharedBuffer, SharedBufferError
+from triton.backends.amd_triton_npu.shared import SharedBuffer
 
 #: Told to the harness when the environment cannot run this at all -- no iGPU,
 #: no ROCm build of torch, no NPU runtime. Distinct from a failure, which is
@@ -513,19 +513,31 @@ def main(argv=None) -> int:
     )
     print(f"  iters    : {args.iters} (plus {args.warmup} warmup)")
 
-    chain = None
-    buffers: list[SharedBuffer] = []
+    # Availability is probed here and only here: binding the driver and
+    # allocating one shared element are what fail on a host without this
+    # runtime, and everything after is the thing being measured.
+    #
+    # Deliberately narrow, because SharedBufferError is a RuntimeError and so
+    # is almost everything a Triton compile or an NPU dispatch raises. Wrapping
+    # the whole run -- warmup, every iteration, every dispatch -- would report a
+    # genuine regression as a skip, and scripts/run_tests.py grades 77 as "not
+    # run" rather than as a failure. shared_buffer_test.py scopes its own probe
+    # the same way, for the same reason.
     try:
-        bench = bench_xrt if args.runtime == "xrt" else bench_hsa
-        results, reference, buffers, chain = bench(args)
-    except SharedBufferError as e:
+        triton.runtime.driver.set_active(NPUDriver(args.runtime))
+        shared.empty(
+            1, dtype=torch.float32, device=f"{args.runtime}:0", share="hip:0"
+        ).close()
+    except RuntimeError as e:
         # The iGPU was there a moment ago, so this is the NPU half: no XRT or
         # ROCR, no device, no pyxrt. Declined rather than failed, as above.
-        print(f"  SKIP: shared NPU/iGPU buffers unavailable: {e}")
-        return SKIP_EXIT_CODE
-    except RuntimeError as e:
         print(f"  SKIP: the {args.runtime} runtime is unavailable: {e}")
         return SKIP_EXIT_CODE
+
+    chain = None
+    buffers: list[SharedBuffer] = []
+    bench = bench_xrt if args.runtime == "xrt" else bench_hsa
+    results, reference, buffers, chain = bench(args)
 
     try:
         for label, (ph, _, _) in results.items():
