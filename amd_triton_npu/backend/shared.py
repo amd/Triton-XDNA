@@ -1156,13 +1156,18 @@ def _pool_key(
     object, and a buffer built from a pooled attachment would then report a
     different handle in ``devices`` than the caller passed in -- a surprise for
     a saving on a path nobody takes in a loop.
+
+    Duplicates are dropped, because ``share_with`` drops them: naming a device
+    twice makes one attachment, so keying on what was *said* rather than on
+    what was built would file those pages under a key no ordinary request can
+    match. Order is kept, since it is the order ``devices`` reports.
     """
     keys = []
     for kind, handle in [primary, *(_parse_spec(s) for s in secondaries)]:
         if handle is not None and not isinstance(handle, int):
             return None
         keys.append((kind, 0 if handle is None else handle))
-    return (nbytes, tuple(keys))
+    return (nbytes, tuple(dict.fromkeys(keys)))
 
 
 # ---------------------------------------------------------------------------
@@ -1669,7 +1674,17 @@ class SharedBuffer:
         Raises when there is none: a dispatch cannot name a buffer XRT does not
         know about, and returning ``None`` would defer that to a confusing
         failure inside the launch.
+
+        Handing this out costs the buffer its pooling, for the same reason a
+        host view does: the BO is a live object with its own lifetime, and the
+        thing you pass it to keeps it -- ``NPUChain`` caches a whole bound set
+        across dispatches. Pooled pages would come back attached to that same
+        BO, so a chain still holding it would write into whichever buffer took
+        them. The pointer accessors below do not do this: an address is inert,
+        and using one past the buffer's life is already the caller's to get
+        right.
         """
+        self._aliased = True
         return self._one_of_kind(_XrtAttachment).bo
 
     @property
@@ -1825,10 +1840,16 @@ class SharedBuffer:
 
         Cached like the torch view, and for the same reason: the mapping is
         fixed for the buffer's lifetime, and callers on the dispatch path ask
-        for it several times per launch. Unlike the torch view it is cached
-        strongly, because there is nothing to make a cycle with -- which is
-        also why it cannot be asked whether the caller still holds one, so a
-        buffer that has handed out a host view never pools its pages; see
+        for it several times per launch. Cached strongly, unlike the torch
+        view, because nothing here forms a cycle back to the buffer.
+
+        Which is also why handing one out costs this buffer its pooling, where
+        a torch view does not: there is no way to ask afterwards whether the
+        caller still has it. An ndarray *can* be weakly referenced, but numpy
+        collapses ``.base`` to the ultimate owner -- for one of these, the
+        ctypes window onto the address -- so a slice of this array keeps
+        neither the array nor anything else of ours alive. A weakref would
+        answer "nobody holds it" while a live slice reads the pages. See
         ``close``.
         """
         array = self._host_array()
@@ -2104,8 +2125,19 @@ _BINARY_OPS = (
     "and", "or", "xor", "lshift", "rshift",
 )  # fmt: skip
 
-#: Operators taking only the buffer: `-buf`, `abs(buf)`, `~buf`.
-_UNARY_OPS = ("neg", "pos", "abs", "invert")
+#: ``matmul`` has no in-place form on a tensor, so `buf @= x` is `buf = buf @ x`
+#: -- Python's own fallback, and what it does for a plain tensor too. Generating
+#: an ``__imatmul__`` that only ever answers NotImplemented would be the same
+#: behaviour spelled as if it were not. The result is a tensor, not a buffer,
+#: which is inherent to the fallback rather than something to paper over.
+_NO_INPLACE_FORM = frozenset({"matmul"})
+
+#: Operators taking only the buffer: `-buf`, `abs(buf)`, `~buf`, and the
+#: conversions -- `float(buf)` is the idiom for reading a one-element result,
+#: and Python resolves it on the type, so __getattr__ cannot supply it.
+_UNARY_OPS = (
+    "neg", "pos", "abs", "invert", "float", "int", "index", "complex",
+)  # fmt: skip
 
 #: Elementwise comparisons, which is what they mean on a tensor -- so `buf ==
 #: other` is a mask, not a truth value, exactly as torch has it. Buffers stay
@@ -2116,10 +2148,10 @@ _COMPARISON_OPS = ("lt", "le", "gt", "ge", "eq", "ne")
 def _tensor_operator(name: str, *, inplace: bool = False) -> Callable[..., Any]:
     """One operator, forwarded to the buffer's torch view.
 
-    ``NotImplemented`` when torch has no such method, which is what lets Python
-    fall back -- ``buf @= x`` becoming ``buf = buf @ x`` when tensors have no
-    ``__imatmul__`` -- rather than failing with an AttributeError that names an
-    operator the user never typed.
+    ``NotImplemented`` when the tensor has no such method, or answers so for
+    the operand it was given, rather than an AttributeError naming an operator
+    the user never typed: it is what lets Python fall back to the reflected
+    call, which is the whole protocol.
 
     An in-place operator returns the buffer, not the view. Python rebinds the
     name to whatever comes back, so returning the view would quietly turn
@@ -2148,7 +2180,10 @@ def _tensor_operator(name: str, *, inplace: bool = False) -> Callable[..., Any]:
 for _op in _BINARY_OPS:
     setattr(SharedBuffer, f"__{_op}__", _tensor_operator(f"__{_op}__"))
     setattr(SharedBuffer, f"__r{_op}__", _tensor_operator(f"__r{_op}__"))
-    setattr(SharedBuffer, f"__i{_op}__", _tensor_operator(f"__i{_op}__", inplace=True))
+    if _op not in _NO_INPLACE_FORM:
+        setattr(
+            SharedBuffer, f"__i{_op}__", _tensor_operator(f"__i{_op}__", inplace=True)
+        )
 for _op in (*_UNARY_OPS, *_COMPARISON_OPS):
     setattr(SharedBuffer, f"__{_op}__", _tensor_operator(f"__{_op}__"))
 del _op

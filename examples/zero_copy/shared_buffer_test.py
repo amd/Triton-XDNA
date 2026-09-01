@@ -291,12 +291,14 @@ def test_degenerate_shapes(buffers: _Buffers) -> None:
                 lambda s=shape, d=spec: buffers.new((s), torch.float32, d[0], d[1]),
             )
 
-    # A scalar is not degenerate: one element is something to map.
+    # A scalar is not degenerate: one element is something to map. Read with
+    # float(), which is the idiom for a one-element result and which Python
+    # resolves on the type, so it only works because it is generated.
     scalar = buffers.new((), torch.float32, NPU)
-    scalar.torch().fill_(3.0)
+    scalar.fill_(3.0)
     check(
         "a scalar shape is a buffer of one element",
-        scalar.shape == () and float(scalar.numpy()) == 3.0,
+        scalar.shape == () and float(scalar) == 3.0,
     )
 
 
@@ -489,6 +491,14 @@ def test_tensor_surface(buffers: _Buffers) -> None:
     check("a plain method still answers with a tensor", buf.sum() is not buf)
     torch.cuda.synchronize()
 
+    # matmul has no in-place form on a tensor either, so `buf @= x` is Python's
+    # own fallback to `buf = buf @ x`. Generating an __imatmul__ that only ever
+    # answered NotImplemented would spell that as if it were something else.
+    check(
+        "no __imatmul__ is invented where tensors have none",
+        hasattr(SharedBuffer, "__imatmul__") == hasattr(torch.Tensor, "__imatmul__"),
+    )
+
     # An operand a tensor will not take has to come back NotImplemented, or
     # Python takes the in-place op's word for it: the write never happened and
     # the other operand never gets its reflected turn. Through operator.iadd
@@ -596,6 +606,30 @@ def test_buffer_pool() -> None:
         )
     with buffer(128, 256):
         check("a different size does not reuse", hits() == was)
+
+    # Naming a device twice builds one attachment, so the key has to describe
+    # what was built, not what was said -- otherwise these pages are filed
+    # under something no ordinary request can ever ask for.
+    shared.empty_cache()
+    with shared.empty(
+        4096, dtype=torch.float32, device=NPU, share=[HIP, HIP]
+    ) as duplicated:
+        check("duplicate secondaries collapse", len(duplicated.devices) == 2)
+    was = hits()
+    with shared.empty(4096, dtype=torch.float32, device=NPU, share=HIP):
+        check("...and pool as the canonical request", hits() == was + 1)
+
+    # A BO is a live object whatever it is passed to keeps -- NPUChain caches a
+    # whole bound set across dispatches -- so handing one out has to stop these
+    # pages going to anyone else. Only XRT has one to hand out; the HSA runtime
+    # is given an address, and an address is inert.
+    if RUNTIME == "xrt":
+        shared.empty_cache()
+        with buffer(4096) as bound:
+            _ = bound.bo
+        check("taking .bo stops the pages being pooled", pooled() == 0)
+    else:
+        skip("taking .bo", "only XRT names a buffer by a BO")
 
     # Two buffers alive at once are two buffers, whatever the pool holds.
     with shared.zeros(32, 32, dtype=torch.float32, device=NPU, share=HIP) as live_a:
