@@ -555,8 +555,7 @@ def _check_rocr_binding(rocr: _RocrInstall) -> None:
         "agent. A ROCm build of PyTorch bundles its own copy and loads it at "
         "import, so this is what you get by importing torch first.\n"
         f"Preload the right one to settle it before anything else does:\n"
-        f"  LD_PRELOAD={rocr.lib_path} python ...\n"
-        "(scripts/hsa-env.sh does this for the heterogeneous examples.)"
+        f"  LD_PRELOAD={rocr.lib_path} python ..."
     )
 
 
