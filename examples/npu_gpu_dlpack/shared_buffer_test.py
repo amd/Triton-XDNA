@@ -32,7 +32,7 @@ pages. So this file runs against whichever one is selected --
 ``AMD_TRITON_NPU_RUNTIME``, defaulting to ``xrt`` -- and reports the other
 runtime's sections as SKIP. Run it twice to cover both::
 
-    source scripts/dev-env.sh
+    source scripts/hsa-env.sh
     python examples/npu_gpu_dlpack/shared_buffer_test.py
     AMD_TRITON_NPU_RUNTIME=hsa python examples/npu_gpu_dlpack/shared_buffer_test.py
 

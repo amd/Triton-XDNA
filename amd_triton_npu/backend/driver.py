@@ -556,7 +556,7 @@ def _check_rocr_binding(rocr: _RocrInstall) -> None:
         "import, so this is what you get by importing torch first.\n"
         f"Preload the right one to settle it before anything else does:\n"
         f"  LD_PRELOAD={rocr.lib_path} python ...\n"
-        "(scripts/dev-env.sh does this for the heterogeneous examples.)"
+        "(scripts/hsa-env.sh does this for the heterogeneous examples.)"
     )
 
 

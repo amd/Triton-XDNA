@@ -28,7 +28,7 @@ columns say the same thing without depending on timing at all.
 
 Run it::
 
-    source scripts/dev-env.sh
+    source scripts/hsa-env.sh
     python examples/npu_gpu_dlpack/zero_copy_benchmark.py
 """
 

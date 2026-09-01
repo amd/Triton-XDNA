@@ -189,7 +189,7 @@ LD_PRELOAD=$(python -c "from triton.backends.amd_triton_npu.driver import \
 ```
 
 HIP then uses that ROCR too, so one runtime serves both devices.
-`scripts/dev-env.sh` sets this for the heterogeneous examples, and the backend
+`scripts/hsa-env.sh` sets this for the heterogeneous examples, and the backend
 reports the problem with this instruction when the preload is missing.
 
 #### Shared buffers
