@@ -121,6 +121,15 @@ void *triton_npu_hsa_shared_import(void *ptr, uint64_t size, char *errbuf,
 // Register `alias` as another address for the region reachable at `va`, which
 // must already be registered and at least `size` bytes long. Returns 0 on
 // success, or a negative value on error (with a message written to errbuf).
+//
+// `size` is the extent of the alias, not just a check against the region's:
+// only the first `size` bytes resolve through this address. An alias shorter
+// than the region it names therefore does not grant a dispatch access to the
+// rest of it.
+//
+// Registering an address that already names a live region is an error, rather
+// than silently replacing it -- the displaced registration would leave its
+// region with one fewer name to be found or freed by.
 int triton_npu_hsa_shared_alias(void *alias, void *va, uint64_t size,
                                 char *errbuf, size_t errbuf_len);
 
