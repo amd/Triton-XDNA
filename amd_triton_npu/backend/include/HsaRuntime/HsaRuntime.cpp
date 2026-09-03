@@ -772,8 +772,7 @@ private:
       throw std::runtime_error(
           "tensor at offset " + std::to_string(hit.offset) + " spanning " +
           std::to_string(size) + " bytes runs past the end of the " +
-          std::to_string(hit.extent) +
-          "-byte shared region it starts in");
+          std::to_string(hit.extent) + "-byte shared region it starts in");
     return static_cast<std::byte *>(hit.region->aie_va) + hit.offset;
   }
 
