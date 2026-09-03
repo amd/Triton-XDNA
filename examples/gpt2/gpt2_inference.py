@@ -418,6 +418,15 @@ def main():
 
     args.config = GPT2_CONFIGS[args.model]
 
+    if args.backend in ("npu", "hetero", "hetero-fast"):
+        # On some platforms, a HIP/ROCm context created anywhere in the process
+        # permanently blocks new NPU device opens. Acquire the NPU device now,
+        # before HuggingFace/transformers below can trigger CUDA init.
+        import pyxrt
+
+        global _npu_device_handle
+        _npu_device_handle = pyxrt.device(0)
+
     # Load HuggingFace model
     hf_model, tokenizer = load_hf_model(args.config["hf_name"])
 
