@@ -20,7 +20,7 @@ jobs:
        large-packages: true
        swap-storage: false
    - name: Get repo
-     uses: actions/checkout@v3
+     uses: actions/checkout@v4
      with:
       fetch-depth: 2
       submodules: recursive
