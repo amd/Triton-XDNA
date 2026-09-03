@@ -20,8 +20,12 @@ all kernel signatures. That is what allows multiple signatures in one process on
 an AIE agent that permits only one queue (``QUEUES_MAX == 1``).
 
 Used by ``NPULauncher`` in ``driver.py`` when the driver's runtime is "hsa"
-(``NPUDriver("hsa")`` or ``AMD_TRITON_NPU_RUNTIME=hsa``). See
-docs/hsa-zero-copy-notes.md for the deferred zero-copy data path.
+(``NPUDriver("hsa")`` or ``AMD_TRITON_NPU_RUNTIME=hsa``).
+
+Nothing here knows about shared buffers, deliberately: the launcher passes each
+tensor's own address, and the runtime recognises the ones that name memory the
+AIE agent can already reach and dispatches on them in place. So a buffer from
+``shared.py`` needs no special call site -- it is passed like any other tensor.
 """
 
 from .codegen import extracted_type, format_of

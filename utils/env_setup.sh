@@ -5,6 +5,13 @@
 
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 
+# This file does two jobs: install the MLIR-AIE/AIR stack, and export the paths
+# to it. Set TRITON_XDNA_ENV_INSTALL=0 to ask for the second alone -- a shell
+# that only needs the paths does not want two wheel sets re-resolved over the
+# network, nor llvm-aie upgraded to whatever nightly is current, which is what
+# installing does every time. Left unset, both halves run, as CI expects.
+if [[ "${TRITON_XDNA_ENV_INSTALL:-1}" != "0" ]]; then
+
 # Install mlir-air with the [aie] extra. The mlir-air wheel pins the matching
 # mlir-aie commit and requires llvm-aie, so a single pip install resolves the
 # whole MLIR-AIE/AIR/LLVM-AIE stack with a guaranteed-compatible mlir-aie.
@@ -26,6 +33,8 @@ python3 -m pip install "mlir_air[aie]==$MLIR_AIR_VERSION.$MLIR_AIR_TIMESTAMP+$SH
 # llvm-aie explicitly so an existing installation doesn't silently satisfy
 # the unpinned requirement.
 python3 -m pip install --upgrade llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+
+fi  # TRITON_XDNA_ENV_INSTALL
 
 if [[ "$MLIR_AIE_INSTALL_DIR" == "" ]]; then
     # The [aie] extra installs the no-RTTI wheel (dist name: mlir_aie_no_rtti),

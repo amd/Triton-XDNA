@@ -505,6 +505,60 @@ def _get_rocr_install() -> _RocrInstall:
     )
 
 
+def _mapped_rocr_paths() -> "set[str]":
+    """Every ``libhsa-runtime64`` currently mapped into this process.
+
+    Read from ``/proc/self/maps`` rather than asked of the dynamic linker,
+    which has no portable way to enumerate what is loaded. Returns an empty set
+    where that file does not exist; the HSA path is Linux-only, so a missing
+    ``/proc`` means there is nothing to check.
+    """
+    paths = set()
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                # A loaded process has thousands of mappings and a handful of
+                # candidates, so reject on the raw line before splitting it.
+                if "libhsa-runtime64" not in line:
+                    continue
+                # "address perms offset dev inode  /path/to/lib.so"
+                fields = line.split(maxsplit=5)
+                if len(fields) < 6:
+                    continue  # an anonymous mapping has no path
+                path = fields[5].strip()
+                if path.startswith("/"):
+                    paths.add(os.path.realpath(path))
+    except OSError:
+        return set()
+    return paths
+
+
+def _check_rocr_binding(rocr: _RocrInstall) -> None:
+    """Fail if some *other* ROCR has claimed the SONAME we need.
+
+    See README, "Sharing a process with PyTorch", for why this happens; the
+    error below carries the fix. Checked here rather than left to fail on its
+    own because the failure is not catchable: the mismatch surfaces inside
+    ``hsa_init`` as a fatal log from ROCR's profiler layer, which aborts the
+    process. So this must run *before* the first call into the runtime library
+    -- loading it is harmless, calling into it is not.
+    """
+    mapped = _mapped_rocr_paths()
+    ours = os.path.realpath(rocr.lib_path)
+    if not mapped or ours in mapped:
+        return
+    raise RuntimeError(
+        "another ROCR is already loaded in this process:\n  "
+        + "\n  ".join(sorted(mapped))
+        + f"\nThe NPU's HSA runtime was built against {ours} and will bind to "
+        "the loaded one instead, which aborts if it does not support the AIE "
+        "agent. A ROCm build of PyTorch bundles its own copy and loads it at "
+        "import, so this is what you get by importing torch first.\n"
+        f"Preload the right one to settle it before anything else does:\n"
+        f"  LD_PRELOAD={rocr.lib_path} python ..."
+    )
+
+
 def _run_compile(cmd, env=None):
     """Run a compiler/build subprocess, echoing its output to stderr on failure.
 
@@ -548,7 +602,16 @@ def _build_hsa_runtime_lib(include_dir: str, rocr: _RocrInstall) -> str:
     solving ROCR-less builds.
 
     Returns the directory containing the ``.so`` (for the launcher's -L / -rpath).
+
+    Checks which ROCR this process will actually bind before handing the
+    library out. Here rather than at the point of use because *every* route to
+    the HSA runtime passes through this function -- the driver's own agent
+    query, the shared-buffer module, and the generated launcher, which links
+    the result -- and because by the point of use it is too late: the mismatch
+    aborts inside ``hsa_init`` rather than raising. Cheap enough to repeat: it
+    reads one procfs file, and the answer can change as libraries load.
     """
+    _check_rocr_binding(rocr)
     lib_name = "libtriton_npu_hsa.so"
     src_path = os.path.join(include_dir, "HsaRuntime", "HsaRuntime.cpp")
     with open(src_path, "rb") as f:
@@ -884,20 +947,31 @@ def _detect_npu_version_pyxrt() -> str:
 
 
 @functools.lru_cache(maxsize=1)
-def _hsa_agent_name() -> str:
-    """Device name reported by the HSA AIE agent, e.g. ``"aie2p"``.
+def load_hsa_runtime():
+    """The shared HSA runtime library, built if needed and checked before use.
 
-    Loads the shared HSA runtime (building it if needed) and calls its
-    ``triton_npu_hsa_agent_name``. Deliberately reuses that library rather than
-    dlopen-ing ROCR separately from Python: the launcher loads the very same
-    ``.so``, so the process keeps a single ``hsa_init`` and a single HsaRuntime
-    singleton, which the AIE agent requires (``QUEUES_MAX == 1``).
+    Every caller goes through here -- the driver, and the shared-buffer module
+    in ``shared.py`` -- so the process keeps a single ``hsa_init`` and a single
+    HsaRuntime singleton, which the AIE agent requires (``QUEUES_MAX == 1``).
+    The generated launchers link the very same ``.so``, so they join it too.
     """
     import ctypes
 
     include_dir = os.path.join(Path(__file__).resolve().parent, "include")
     lib_dir = _build_hsa_runtime_lib(include_dir, _get_rocr_install())
-    lib = ctypes.CDLL(os.path.join(lib_dir, "libtriton_npu_hsa.so"))
+    return ctypes.CDLL(os.path.join(lib_dir, "libtriton_npu_hsa.so"))
+
+
+@functools.lru_cache(maxsize=1)
+def _hsa_agent_name() -> str:
+    """Device name reported by the HSA AIE agent, e.g. ``"aie2p"``.
+
+    Calls ``triton_npu_hsa_agent_name`` in the shared runtime library, rather
+    than dlopen-ing ROCR separately from Python -- see ``load_hsa_runtime``.
+    """
+    import ctypes
+
+    lib = load_hsa_runtime()
 
     fn = lib.triton_npu_hsa_agent_name
     fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
@@ -2307,6 +2381,14 @@ def compile_module(
             + f"_link_{link_profile}"
             + f"_npu_{npu_version}"
             + f"_bf16emu_{effective_bf16}"
+            # Which build of the shared HSA runtime this launcher links. That
+            # directory is content-addressed, so naming it here rebuilds the
+            # launcher whenever the runtime changes -- and a launcher must not
+            # outlive the build it was linked against: its rpath would load a
+            # second copy of the library beside the one everything else uses,
+            # and the "process-global" HsaRuntime singleton would be two
+            # runtimes that share neither queue nor shared regions.
+            + f"_hsart_{hsa_rt_dir or ''}"
         )
         key = hashlib.md5(key_data.encode("utf-8")).hexdigest()
 

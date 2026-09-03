@@ -154,12 +154,21 @@ silently installs a runtime too old to work.
 
 The backend searches, in order: `AMD_NPU_ROCR_PATH`, `ROCM_PATH`, a pip-installed ROCm (TheRock's `rocm-sdk` wheels), then `/opt/rocm`. A candidate is accepted only if it provides *all* the headers the runtime includes — including `hsa/hsa_ext_amd_aie.h` — plus `libhsa-runtime64`, so an installation without AIE support is reported at startup rather than failing later in the compile. If nothing qualifies, the error lists every candidate and what each was missing. Set `AMD_NPU_ROCR_PATH` to override the search with a specific prefix — a locally built rocr-runtime, for instance.
 
+The runtime is a property of the environment, not of a particular example, so
+any example that selects the NPU backend with a bare `NPUDriver()` runs under
+either one:
+
 ```bash
-cd examples/hsa_matmul
-python hsa_matmul.py
+cd examples/matmul_bf16_m64_n64_k64
+AMD_TRITON_NPU_RUNTIME=hsa AIR_TRANSFORM_TILING_SCRIPT=transform_aie2p.mlir \
+  python matmul_bf16_m64_n64_k64.py
 ```
 
-Or activate it programmatically:
+An example that imports torch — most of them do — also needs the ROCR preload
+described in [Sharing a process with PyTorch](#sharing-a-process-with-pytorch)
+below, or it will abort inside ROCR before reaching the kernel.
+
+Or pin the runtime in the code, ignoring the environment:
 
 ```python
 import triton
@@ -173,6 +182,55 @@ HSA runtime (`libtriton_npu_hsa.so`) against; that path is baked in as an rpath,
 the matching `libhsa-runtime64` is loaded without setting `LD_LIBRARY_PATH`. Set
 `LD_LIBRARY_PATH` only to force a different one ahead of it — for example when a
 system ROCR without AIE support would otherwise be picked up first.
+
+#### Sharing a process with PyTorch
+
+An rpath decides where a library is *found*, not whether it is looked for at
+all: a `libhsa-runtime64.so.1` already loaded satisfies the dependency first. A
+ROCm build of PyTorch bundles its own copy and loads it at import, so in a
+process that uses both the iGPU and the NPU, `import torch` hands the AIE agent
+to a ROCR that was never built for it — and that aborts inside ROCR rather than
+raising. Preload the right one to settle it first:
+
+```bash
+LD_PRELOAD=$(python -c "from triton.backends.amd_triton_npu.driver import \
+  _get_rocr_install; print(_get_rocr_install().lib_path)") python your_script.py
+```
+
+HIP then uses that ROCR too, so one runtime serves both devices.
+`scripts/hsa-env.sh` sets this for the heterogeneous examples, and the backend
+reports the problem with this instruction when the preload is missing.
+
+#### Shared buffers
+
+Under HSA a buffer from `triton.backends.amd_triton_npu.shared` is dispatched on
+where it lives — the runtime recognises it and skips the staging copies it makes
+for an ordinary tensor. It works in both directions: the NPU can allocate pages
+the iGPU maps (`device="hsa:0", share="hip:0"`), and the iGPU can allocate pages
+the NPU maps (`device="hip:0", share="hsa:0"`). A buffer names one NPU runtime
+or the other; XRT and HSA cannot map each other's pages, and asking for both is
+refused. `shared.hsa_dispatch_counts()` reports how many tensor arguments were
+dispatched in place and how many were staged, which is the way to confirm a
+buffer is doing what it was allocated for.
+
+A buffer goes wherever a tensor goes — operators, methods, `out=`,
+`np.asarray` — and adds the per-device handles a dispatch needs:
+
+```python
+from triton.backends.amd_triton_npu import shared
+
+with shared.empty(128, 768, dtype=torch.float32,
+                  device="hsa:0", share="hip:0") as c:
+    torch.matmul(a, b, out=c)     # the iGPU writes where the NPU reads
+    kernel[grid](c, ...)          # dispatched on those same pages
+```
+
+`device=` also takes a `torch.device`, so `device=t.device` works on a tensor
+you already have. Closing a buffer returns its pages to a pool rather than
+unmapping them, because mapping costs about 11 ms regardless of size and a
+whole zero-copy dispatch costs under 1 ms — so allocating per iteration, as
+torch code does, is cheap after the first. `shared.empty_cache()` and
+`shared.set_cache_enabled(False)` are there for when it should not be.
 
 ## Windows Support
 

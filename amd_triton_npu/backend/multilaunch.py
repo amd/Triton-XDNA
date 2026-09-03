@@ -236,8 +236,8 @@ class MultiLaunchRunner:
       - persist {device, elf, hw_context, kernel} for this ELF (one ctx);
       - cache the xrt.bo set per ``bo_key`` and reuse across calls;
       - ``static_indices``  : args written to device on first call only (weights);
-      - ``intermediate_indices`` : args the kernel overwrites (DDR hand-off
-        scratch) -> never written from host;
+      - ``intermediate_indices`` : args carrying no host data (DDR hand-off
+        scratch) -> zeroed once, then never written from host;
       - ``output_indices``  : args synced device->host after the run (default:
         last arg).
 
@@ -253,7 +253,11 @@ class MultiLaunchRunner:
         self.elf = xrt.elf(elf_path)
         self.context = xrt.hw_context(self.device, self.elf)
         self.kernel = xrt.ext.kernel(self.context, kernel_name)
-        self._bos = {}  # bo_key -> list[xrt.ext.bo]
+        # bo_key -> (operand sizes the BOs were made for, list[xrt.ext.bo]).
+        # One dict rather than two: the sizes only mean anything alongside
+        # the BOs they describe, and separate dicts have to be invalidated
+        # in lockstep.
+        self._bos = {}
 
     def run(
         self,
@@ -263,6 +267,7 @@ class MultiLaunchRunner:
         static_indices=(),
         intermediate_indices=(),
         output_indices=None,
+        bound_buffers=None,
     ):
         """Execute the chain.
 
@@ -271,11 +276,26 @@ class MultiLaunchRunner:
                 For ELF args the data_ptr/size come from these arrays. Static
                 inputs (weights) and the final outputs are real arrays;
                 intermediates can be zero-filled placeholders of the right size.
+            bound_buffers: optional {idx: xrt.bo} of caller-owned buffers to use
+                instead of allocating one. The caller's array for that index
+                must alias the BO's own memory (see
+                ``shared.SharedBuffer``), so the host->device staging
+                copy is skipped entirely -- the data is already there. Only the
+                cache-maintenance sync is still issued. Bound indices are never
+                zero-filled: their contents belong to the caller.
             bo_key: cache key for the BO set (e.g. f"{name}_L{layer}").
             static_indices: indices written host->device on first call only.
-            intermediate_indices: indices never written from host.
+            intermediate_indices: indices carrying no host data. Zeroed on
+                the first call for a bo_key, skipped thereafter. Outputs are
+                not implied: they are staged from the host every call unless
+                also named here.
             output_indices: indices synced device->host and returned (default:
-                {len(inputs)-1}).
+                {len(inputs)-1}). This says only "read this back"; it makes no
+                claim about whether the kernel fully writes the operand, so an
+                output is still staged from the host on every dispatch. A kernel
+                that overwrites its output entirely can skip that by naming the
+                index in intermediate_indices as well -- but only if it really
+                does, since intermediates are zeroed on the first call.
 
         Returns:
             dict {idx: numpy array view} for each output index.
@@ -284,28 +304,84 @@ class MultiLaunchRunner:
         import numpy as np
         from ml_dtypes import bfloat16
 
+        bound = bound_buffers or {}
+        # Two different declarations, deliberately not merged. `readback` is
+        # only "sync this back after the run" -- it says nothing about whether
+        # the kernel fully writes the operand, so an output is still staged from
+        # the host every call. `scratch` is the caller promising the operand
+        # carries no host data, which is what licenses zeroing it once and
+        # skipping it thereafter.
+        readback = {len(inputs) - 1} if output_indices is None else set(output_indices)
+        scratch = set(intermediate_indices)
         static_set = set(static_indices)
-        inter_set = set(intermediate_indices)
-        if output_indices is None:
-            readback = {len(inputs) - 1}
-        else:
-            readback = set(output_indices)
-
         sizes = [a.size * a.itemsize for a in inputs]
         first_call = bo_key not in self._bos
         if first_call:
-            self._bos[bo_key] = [xrt.ext.bo(self.device, s) for s in sizes]
-        bos = self._bos[bo_key]
+            # Both checks are invariant for a bo_key, so they run once with the
+            # allocation rather than on every dispatch. bo.size() in particular
+            # crosses into C++; the sizes are recorded so later calls can catch
+            # a caller reusing a bo_key with different operands cheaply.
+            for i, bo in bound.items():
+                if not 0 <= i < len(inputs):
+                    raise ValueError(
+                        f"bound buffer index {i} is out of range for "
+                        f"{len(inputs)} args"
+                    )
+                if bo.size() < sizes[i]:
+                    raise ValueError(
+                        f"bound buffer for arg {i} is {bo.size()} bytes, needs "
+                        f"{sizes[i]}"
+                    )
+            self._bos[bo_key] = (
+                sizes,
+                [
+                    bound[i] if i in bound else xrt.ext.bo(self.device, s)
+                    for i, s in enumerate(sizes)
+                ],
+            )
+        cached_sizes, bos = self._bos[bo_key]
+        if not first_call:
+            # Repeated from the first-call block: indexing bos[i] below would
+            # otherwise raise a bare IndexError instead of this message.
+            for i in bound:
+                if not 0 <= i < len(inputs):
+                    raise ValueError(
+                        f"bound buffer index {i} is out of range for "
+                        f"{len(inputs)} args"
+                    )
+            if sizes != cached_sizes:
+                raise ValueError(
+                    f"bo_key '{bo_key}' was sized {cached_sizes} but this "
+                    f"call needs {sizes}; use a distinct bo_key per operand set"
+                )
+            # Rebinding a different buffer under an existing key would silently
+            # dispatch against the previously cached one.
+            for i, bo in bound.items():
+                if bos[i] is not bo:
+                    raise ValueError(
+                        f"bo_key '{bo_key}' is already bound to a different "
+                        f"buffer for arg {i}; use a distinct bo_key per buffer set"
+                    )
 
-        # Write inputs (skip static-after-first and intermediates).
+        # Write inputs. Bound buffers are never staged: the caller's array is
+        # the BO's memory, so a copy would be from a buffer to itself.
         for i, a in enumerate(inputs):
-            if i in static_set and not first_call:
+            if i in bound:
+                # Nothing to copy -- the caller's array is the BO's memory -- but
+                # still sync, which is a cache operation rather than a transfer.
+                # Skipping it for operands the device overwrites would assume no
+                # host write landed since the last dispatch, which is the
+                # caller's business, not ours.
+                if first_call or i not in scratch:
+                    bos[i].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
                 continue
-            if i in inter_set and not first_call:
+            if not first_call and (i in static_set or i in scratch):
                 continue
-            if i in inter_set and first_call:
-                # still allocate-clean on first call but no meaningful host data;
-                # write zeros so device memory is defined.
+            if i in scratch and i not in static_set:
+                # First call only, by construction: the caller declared this
+                # carries no host data, so zero it to leave device memory
+                # defined. Only scratch -- zeroing an output would destroy
+                # whatever the caller had put in its own array.
                 a.fill(0)
             buf = a.view(np.int16) if a.dtype == bfloat16 else a
             mv = bos[i].map()
@@ -324,6 +400,11 @@ class MultiLaunchRunner:
         for idx in readback:
             bos[idx].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
             a = inputs[idx]
+            if idx in bound:
+                # Already aliases the BO; re-wrapping it would hand back a view
+                # of the same bytes for no reason.
+                results[idx] = a
+                continue
             results[idx] = np.frombuffer(
                 bos[idx].map(), dtype=a.dtype, count=a.size
             ).reshape(a.shape)
@@ -382,6 +463,15 @@ class NPUChain:
     ``args``/``constexprs`` are only used to drive warmup compilation (shapes +
     grid determine the lowered IR); the actual data is passed to ``run`` as numpy
     arrays in combined-arg order.
+
+    Known defect -- do not build a chain of exactly one op if you intend to
+    dispatch it more than once. A single-op chain returns correct data on its
+    first dispatch and corrupt data on every dispatch after that. It reproduces
+    on an unmodified checkout with plain host staging and no shared buffers, so
+    it is in the lowering or the ELF stitching rather than anything above.
+    Chains of two or more ops are unaffected. Until this is fixed, pad a
+    one-op chain with a second, trivial op -- see
+    ``examples/zero_copy/common/add_chain.py``, which does exactly that.
     """
 
     def __init__(self, name, air_project_path=None):
@@ -485,6 +575,7 @@ class NPUChain:
         static_indices=(),
         intermediate_indices=(),
         output_indices=None,
+        bound_buffers=None,
     ):
         """Build (first call) + dispatch the chain. Returns {idx: ndarray}."""
         if self._runner is None:
@@ -495,6 +586,7 @@ class NPUChain:
             static_indices=static_indices,
             intermediate_indices=intermediate_indices,
             output_indices=output_indices,
+            bound_buffers=bound_buffers,
         )
 
     def close(self):

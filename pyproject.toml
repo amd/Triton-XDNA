@@ -1,8 +1,13 @@
 [build-system]
-# nanobind is needed because setup.py builds third_party/triton with
+# nanobind is needed for two reasons. setup.py builds third_party/triton with
 # --no-build-isolation from inside this package's isolated build env, and
-# triton's own setup.py imports nanobind at module scope.
-requires = ["setuptools>=70.1", "wheel", "pip", "build", "pybind11", "nanobind", "cmake>=3.20", "ninja"]
+# triton's own setup.py imports nanobind at module scope. It is also what the
+# amd_triton_npu plugin uses to describe shared buffers to DLPack consumers
+# (amd_triton_npu.cc).
+#
+# 3.0 is the first release whose ndarray raises BufferError for copy=True and
+# for a mismatched dl_device instead of accepting and ignoring them.
+requires = ["setuptools>=70.1", "wheel", "pip", "build", "pybind11", "nanobind>=3.0", "cmake>=3.20", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]

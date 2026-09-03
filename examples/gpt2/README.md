@@ -69,24 +69,24 @@ Four backends route operators across devices differently:
 |---------|-------------|
 | `gpu` | All ops on iGPU via ROCm/Triton |
 | `npu` | All ops on NPU via MLIR-AIR/AIE, except the LM head (GPU) |
-| `hetero` | Attention on GPU, LN/MLP/add on NPU |
+| `hetero` | MLP on NPU; everything else (embeddings, LN, attention, LM head) on GPU |
 | `hetero-fast` | Same as hetero for prefill; all-GPU decode |
 
 ### Per-Op Device Routing
 
 | Op | `gpu` | `npu` | `hetero` | `hetero-fast` prefill | `hetero-fast` decode |
 |----|-------|-------|----------|----------------------|---------------------|
-| LayerNorm (ln1) | GPU | NPU | NPU | NPU | **GPU** |
+| LayerNorm (ln1) | GPU | NPU | **GPU** | **GPU** | GPU |
 | QKV projection | GPU | NPU | GPU | GPU | GPU |
 | Fused attention | GPU | NPU | GPU | GPU | GPU |
 | Output projection | GPU | NPU | GPU | GPU | GPU |
-| Residual add | GPU | NPU | NPU | NPU | **GPU** |
-| LayerNorm (ln2) | GPU | NPU | NPU | NPU | **GPU** |
+| Residual add | GPU | NPU | **GPU** | **GPU** | GPU |
+| LayerNorm (ln2) | GPU | NPU | **GPU** | **GPU** | GPU |
 | MLP up-proj | GPU | NPU | NPU | NPU | **GPU** |
 | GELU | GPU | NPU | NPU | NPU | **GPU** |
 | MLP down-proj | GPU | NPU | NPU | NPU | **GPU** |
 | Residual add | GPU | NPU | NPU | NPU | **GPU** |
-| Final LayerNorm | GPU | NPU | NPU | NPU | **GPU** |
+| Final LayerNorm | GPU | NPU | **GPU** | **GPU** | GPU |
 | LM head | GPU | GPU | GPU | GPU | GPU |
 
 ## Architecture
