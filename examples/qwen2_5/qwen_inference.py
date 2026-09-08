@@ -69,7 +69,13 @@ def run_triton_model(state_dict, input_ids, backend, profile=False, config=None)
 
     import benchmark
 
-    benchmark.select_gpu_backend()
+    # npu mode activates the NPU driver directly. select_gpu_backend() calls
+    # reset_active(), which needs an auto-active GPU driver -- absent on an
+    # iGPU-free host -- so npu mode must not take that path.
+    if backend == "npu":
+        benchmark.select_npu_backend()
+    else:
+        benchmark.select_gpu_backend()
 
     model = Qwen2Model(state_dict, backend=backend, config=config)
     model.timer.enabled = profile
@@ -142,7 +148,12 @@ def run_generation(hf_model, tokenizer, input_ids, args):
 
     import benchmark
 
-    benchmark.select_gpu_backend()
+    # See run_triton_model: npu mode activates the NPU driver rather than
+    # reset_active()-ing to a GPU default that an iGPU-free host does not have.
+    if args.backend == "npu":
+        benchmark.select_npu_backend()
+    else:
+        benchmark.select_gpu_backend()
 
     state_dict = hf_model.state_dict()
     model = Qwen2Model(
@@ -218,7 +229,12 @@ def run_interactive(hf_model, tokenizer, args):
 
     import benchmark
 
-    benchmark.select_gpu_backend()
+    # See run_triton_model: npu mode activates the NPU driver rather than
+    # reset_active()-ing to a GPU default that an iGPU-free host does not have.
+    if backend == "npu":
+        benchmark.select_npu_backend()
+    else:
+        benchmark.select_gpu_backend()
 
     state_dict = hf_model.state_dict()
     model = Qwen2Model(

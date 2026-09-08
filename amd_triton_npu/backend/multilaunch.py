@@ -531,17 +531,23 @@ class NPUChain:
         Forces the NPU driver active for the warmup so the kernel lowers through
         the NPU backend (whose binary_ext is ``ttsharedir``). Without this, in a
         hetero model the GPU driver may be active and ``asm`` would lack
-        ``ttsharedir`` (KeyError). The previously-active driver is restored.
+        ``ttsharedir`` (KeyError).
+
+        Restores the driver active on entry rather than ``reset_active()``, which
+        resolves the auto-detected default and fails with "0 active drivers" on
+        an iGPU-free host (no auto-active GPU driver; NPUDriver is set explicitly,
+        not detected).
         """
         import triton
         from .driver import NPUDriver
 
+        prev = triton.runtime.driver.active
         triton.runtime.driver.set_active(NPUDriver())
         try:
             with config_context(compile_only=True):
                 compiled = kernel.warmup(*args, grid=grid, **constexprs)
         finally:
-            triton.runtime.driver.reset_active()
+            triton.runtime.driver.set_active(prev)
         return compiled.asm["ttsharedir"]
 
     def _build(self):
