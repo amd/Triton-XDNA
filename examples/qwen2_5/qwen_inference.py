@@ -343,6 +343,14 @@ def main():
     )
 
     args.config = QWEN_CONFIGS[args.model]
+
+    if args.backend in ("npu", "hetero", "hetero-fast"):
+        # Grab the NPU before transformers can init HIP (see #103).
+        import pyxrt
+
+        global _npu_device_handle
+        _npu_device_handle = pyxrt.device(0)
+
     hf_model, tokenizer = load_hf_model(args.config["hf_name"])
 
     if args.interactive:
