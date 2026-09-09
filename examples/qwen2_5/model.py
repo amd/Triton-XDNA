@@ -1131,24 +1131,15 @@ class Qwen2Model:
                     x.to(device="cuda", dtype=torch.float32) @ self._lm_head.t()
                 ).cpu()
             elif self.backend == "npu":
-                # LM head on the NPU keeps the forward iGPU-free. embed_tokens
-                # (vocab, n_embd) is the weight shape triton_linear expects. CPU
-                # fallback (never cuda) if the vocab-sized matmul won't lower.
+                # LM head on CPU keeps npu mode iGPU-free without paying the NPU
+                # cost of the vocab-151936 matmul: a single [M,896]@[896,151936]
+                # runs ~29s/token on the AIE (73% of decode) but ~20ms on the
+                # CPU. gpt2's smaller vocab makes the NPU LM head worthwhile; this
+                # one does not.
                 x2d = x.reshape(-1, self.n_embd).to(torch.float32)
-                try:
-                    logits = triton_linear(
-                        x2d,
-                        self.embed_tokens,
-                        backend="npu",
-                        transform_script=self.matmul_script,
-                    ).reshape(x.shape[:-1] + (VOCAB_SIZE,))
-                except Exception as e:
-                    logger.warning(
-                        f"NPU LM head unavailable ({e}); using a CPU matmul"
-                    )
-                    logits = (x2d @ self.embed_tokens.to(torch.float32).t()).reshape(
-                        x.shape[:-1] + (VOCAB_SIZE,)
-                    )
+                logits = (x2d @ self.embed_tokens.to(torch.float32).t()).reshape(
+                    x.shape[:-1] + (VOCAB_SIZE,)
+                )
             else:
                 logits = x.to(torch.float32) @ self.embed_tokens.to(torch.float32).t()
                 if logits.device.type == "cuda":
