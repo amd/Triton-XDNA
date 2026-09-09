@@ -166,13 +166,22 @@ class _FusedMLP:
     """
 
     def __init__(
-        self, n_embd, mlp_dim, matmul_script, gelu_f32in_script, add_f32_script
+        self,
+        n_embd,
+        mlp_dim,
+        matmul_script,
+        gelu_f32in_script,
+        add_f32_script,
+        share="hip:0",
     ):
         self.D = n_embd
         self.H = mlp_dim
         self.matmul_script = matmul_script
         self.gelu_script = gelu_f32in_script
         self.add_script = add_f32_script
+        # Secondary device the operand buffers map into: "hip:0" for hetero's
+        # zero-copy iGPU hand-off, () for npu mode (XRT-only, no ROCm dependency).
+        self._share = share
         self.BM = 128
         self.BN = 256
         self.K0_pad = _next_pow2(self.D + 1)  # +1 bias row
@@ -224,12 +233,13 @@ class _FusedMLP:
         """
         from triton.backends.amd_triton_npu import shared
 
-        # Allocated by XRT so the NPU can name the BO directly, then mapped into
-        # the iGPU. The BOs and the chain's dispatch end up on different
-        # pyxrt.device handles -- each opens its own -- which is fine: handles to
-        # the same device are interchangeable, and shared_buffer_test.py pins
-        # that down by dispatching cross-handle on every run.
-        on = dict(device="xrt:0", share=_IGPU)
+        # Allocated by XRT so the NPU can name the BO directly, and mapped into
+        # self._share when set (hetero's iGPU). The BOs and the chain's dispatch
+        # end up on different pyxrt.device handles -- fine, handles to the same
+        # device are interchangeable.
+        on = dict(device="xrt:0")
+        if self._share:
+            on["share"] = self._share
         # The augmented-K bias fold requires the padding columns past D+1 to be
         # zero, and column D to be 1.0. Both are invariant across every dispatch
         # and every layer, so they are written once here rather than per launch.
@@ -237,14 +247,20 @@ class _FusedMLP:
         self._sb_R = shared.zeros(self.BM, self.D, dtype=torch.float32, **on)
         self._sb_OUT = shared.zeros_like(self._sb_R)
         self._sb_A[:, self.D] = 1.0
-        torch.cuda.synchronize()
+        # Fence the iGPU fill before the NPU reads it. An XRT-only buffer's fill
+        # is host-side and needs no fence.
+        if self._share:
+            torch.cuda.synchronize()
         # Hold the torch views. SharedBuffer keeps them weakly, so that a
         # consumer's tensor can own its buffer without forming a cycle the
         # collector cannot see -- which means an unheld view is re-derived on
         # every access (~4 us against ~0.04 cached). run() touches all three
         # per layer, so holding them here is worth ~140 us per token.
         self._views = (self._sb_A.torch(), self._sb_R.torch(), self._sb_OUT.torch())
-        logger.info("zero-copy NPU/iGPU buffers enabled for the fused MLP")
+        logger.info(
+            "shared fused-MLP buffers enabled (%s)",
+            "zero-copy NPU/iGPU" if self._share else "XRT-only",
+        )
 
     def _build_kernels(self):
         import triton
@@ -444,9 +460,9 @@ class _FusedMLP:
         if layer_idx not in self._weights:
             B0, B2 = self._prep_weights(w_fc, b_fc, w_proj, b_proj)
             b_proj_np = b_proj.to(torch.float32).cpu().numpy()
-            # The iGPU copy rides in the same cache rather than a parallel one,
-            # so it is created and released with everything else for the layer.
-            b_proj_dev = torch.from_numpy(b_proj_np).to("cuda")
+            # Only the on-GPU output path uses this; skip it (no cuda) when the
+            # buffers are XRT-only.
+            b_proj_dev = torch.from_numpy(b_proj_np).to("cuda") if self._share else None
             self._weights[layer_idx] = (B0, B2, b_proj_np, b_proj_dev)
         return self._weights[layer_idx]
 
@@ -587,8 +603,9 @@ class GPT2Model:
             self._place_weights()
 
         # Cache wte on GPU for the LM head matmul (768x50257).
-        # On CPU this takes ~20ms; on GPU <1ms.
-        if backend in ("npu", "hetero", "hetero-fast"):
+        # On CPU this takes ~20ms; on GPU <1ms. hetero only -- npu mode runs the
+        # LM head on the NPU instead (see forward()), so it never touches cuda.
+        if backend in ("hetero", "hetero-fast"):
             self._wte_lm_head = self.wte.to(device="cuda", dtype=torch.float32)
         else:
             self._wte_lm_head = None
@@ -632,6 +649,8 @@ class GPT2Model:
                     self.matmul_script,
                     self.gelu_f32in_script,
                     self.add_f32_script,
+                    # iGPU-shared only in hetero; npu mode stays XRT-only (no ROCm).
+                    share="hip:0" if self._is_hetero else (),
                 )
             except (SharedBufferError, ImportError) as e:
                 # The fused chain needs buffers both devices can address. Where
@@ -1267,10 +1286,28 @@ class GPT2Model:
         # genuinely need host logits should say so explicitly.
         with self.timer.track("lm_head"):
             if self._wte_lm_head is not None:
-                # NPU/hetero: run on GPU (~0.5ms vs ~20ms on CPU)
+                # hetero: run on the iGPU (~0.5ms vs ~20ms on CPU), where x is.
                 logits = (
                     x.to(device="cuda", dtype=torch.float32) @ self._wte_lm_head.t()
                 )
+            elif self.backend == "npu":
+                # LM head on the NPU keeps the forward iGPU-free. triton_linear
+                # transposes internally, so pass wte (vocab, n_embd) directly --
+                # not via self._linear, which would transpose a second time. CPU
+                # fallback (never cuda) if the vocab-sized matmul won't lower.
+                x2d = x.reshape(-1, self.n_embd).to(torch.float32)
+                try:
+                    logits = triton_linear(
+                        x2d,
+                        self.wte,
+                        backend="npu",
+                        transform_script=self.matmul_script,
+                    ).reshape(x.shape[:-1] + (VOCAB_SIZE,))
+                except Exception as e:
+                    logger.warning(f"NPU LM head unavailable ({e}); using a CPU matmul")
+                    logits = (x2d @ self.wte.to(torch.float32).t()).reshape(
+                        x.shape[:-1] + (VOCAB_SIZE,)
+                    )
             else:
                 # GPU: x and wte already on CUDA
                 logits = x.to(torch.float32) @ self.wte.to(torch.float32).t()

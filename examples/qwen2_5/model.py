@@ -17,8 +17,8 @@ model sizes (0.5B, 1.5B); select one with the --model CLI flag.
 
 Four backends route operators across iGPU and NPU:
   "gpu":         all ops on iGPU via ROCm/Triton
-  "npu":         all ops on NPU via MLIR-AIR/AIE (attention falls back to GPU
-                 fused kernel, matching the gpt2 example)
+  "npu":         all ops on NPU via MLIR-AIR/AIE; no iGPU. Attention's
+                 scaled-dot-product core runs on CPU (no NPU kernel yet)
   "hetero":      attention on iGPU; RMSNorm/MLP/add on NPU (prefill & decode)
   "hetero-fast": same as hetero for prefill; all-GPU decode (lower TPOT)
 
@@ -606,8 +606,10 @@ class Qwen2Model:
         elif backend == "hetero":
             self._place_weights()
 
-        # LM head matmul (tied to embeddings). Cache on GPU for speed.
-        if backend in ("npu", "hetero", "hetero-fast"):
+        # LM head matmul (tied to embeddings). Cache on GPU for speed in hetero;
+        # npu mode runs it on the NPU instead (see forward()) so it never touches
+        # cuda.
+        if backend in ("hetero", "hetero-fast"):
             self._lm_head = self.embed_tokens.to(device="cuda", dtype=torch.float32)
         else:
             self._lm_head = None
@@ -824,14 +826,21 @@ class Qwen2Model:
     def _attention(self, x, layer, kv_cache=None, pos_offset=0):
         """Multi-head GQA self-attention with RoPE and optional KV cache.
 
-        x arrives on CUDA in every backend; all attention ops run on GPU.
+        In gpu/hetero modes attention runs on the iGPU via the fused kernel. In
+        npu mode there is no NPU attention kernel yet, so qkv/o_proj run on the
+        NPU and the scaled-dot-product core (RoPE, scores, softmax, attn@V) runs
+        on CPU float32, keeping npu mode off the iGPU.
         """
         B, S, D = x.shape
 
-        # Attention runs on GPU in every backend (the fused kernel is GPU-only and
-        # there is no NPU attention path), so the qkv/o_proj matmuls must too
-        attn_be = self.op_backend["qkv_linear"] if self.op_backend else "gpu"
-        proj_be = self.op_backend["attn_proj"] if self.op_backend else "gpu"
+        npu = self.backend == "npu"
+        # qkv/o_proj on the NPU in npu mode, else the iGPU (the fused kernel is
+        # GPU-only). op_backend, set only in hetero, overrides both.
+        if self.op_backend:
+            attn_be = self.op_backend["qkv_linear"]
+            proj_be = self.op_backend["attn_proj"]
+        else:
+            attn_be = proj_be = "npu" if npu else "gpu"
 
         # Fused QKV projection: q/k/v share input x, so concat their weights and
         # biases into one (n_head+2*n_kv_head)*hd linear -> one GPU launch instead
@@ -882,18 +891,35 @@ class Qwen2Model:
             v_exp = v_full
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        q_3d = q.reshape(B * self.n_head, S, self.head_dim).contiguous()
-        k_3d = k_exp.reshape(B * self.n_head, total_len, self.head_dim).contiguous()
-        v_3d = v_exp.reshape(B * self.n_head, total_len, self.head_dim).contiguous()
-        is_causal = S > 1
-        attn_output = triton_fused_attention(
-            q_3d,
-            k_3d,
-            v_3d,
-            scale=scale,
-            causal=is_causal,
-            pos_offset=pos_offset,
-        ).reshape(B, self.n_head, S, self.head_dim)
+        if npu:
+            # CPU scaled-dot-product attention in float32 (no NPU attention
+            # kernel yet). q/k/v are already CPU tensors from the NPU qkv linear.
+            q_f = q.to(torch.float32)
+            k_f = k_exp.to(torch.float32)
+            v_f = v_exp.to(torch.float32)
+            scores = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale
+            if S > 1:
+                # Causal mask over the current block against all past positions.
+                rows = torch.arange(S).unsqueeze(1) + pos_offset
+                cols = torch.arange(total_len).unsqueeze(0)
+                scores = scores.masked_fill(
+                    (cols > rows).unsqueeze(0).unsqueeze(0), float("-inf")
+                )
+            attn_weights = torch.softmax(scores, dim=-1)
+            attn_output = torch.matmul(attn_weights, v_f)
+        else:
+            q_3d = q.reshape(B * self.n_head, S, self.head_dim).contiguous()
+            k_3d = k_exp.reshape(B * self.n_head, total_len, self.head_dim).contiguous()
+            v_3d = v_exp.reshape(B * self.n_head, total_len, self.head_dim).contiguous()
+            is_causal = S > 1
+            attn_output = triton_fused_attention(
+                q_3d,
+                k_3d,
+                v_3d,
+                scale=scale,
+                causal=is_causal,
+                pos_offset=pos_offset,
+            ).reshape(B, self.n_head, S, self.head_dim)
 
         attn_output = attn_output.transpose(1, 2).reshape(B, S, self.n_embd)
 
@@ -1100,6 +1126,16 @@ class Qwen2Model:
                 logits = (
                     x.to(device="cuda", dtype=torch.float32) @ self._lm_head.t()
                 ).cpu()
+            elif self.backend == "npu":
+                # LM head on CPU keeps npu mode iGPU-free without paying the NPU
+                # cost of the vocab-151936 matmul: a single [M,896]@[896,151936]
+                # runs ~29s/token on the AIE (73% of decode) but ~20ms on the
+                # CPU. gpt2's smaller vocab makes the NPU LM head worthwhile; this
+                # one does not.
+                x2d = x.reshape(-1, self.n_embd).to(torch.float32)
+                logits = (x2d @ self.embed_tokens.to(torch.float32).t()).reshape(
+                    x.shape[:-1] + (VOCAB_SIZE,)
+                )
             else:
                 logits = x.to(torch.float32) @ self.embed_tokens.to(torch.float32).t()
                 if logits.device.type == "cuda":

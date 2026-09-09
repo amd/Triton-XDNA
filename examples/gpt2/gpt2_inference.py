@@ -50,14 +50,35 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 logger = logging.getLogger(__name__)
 
+# run_tests.py grades this exit code as a skip, not a failure -- the autotools
+# convention. Used when the environment cannot run the example (no transformers,
+# or the HuggingFace hub is unreachable) rather than when it has found a defect.
+SKIP_EXIT_CODE = 77
+
+
+class ExampleUnavailable(Exception):
+    """The example cannot run here (missing dependency or model download)."""
+
 
 def load_hf_model(hf_name="gpt2"):
-    """Load HuggingFace GPT-2 model and tokenizer."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    """Load HuggingFace GPT-2 model and tokenizer.
+
+    Raises ExampleUnavailable when transformers is not installed or the model
+    cannot be fetched, so a runner without them (CI without network / the HF
+    stack) skips rather than fails.
+    """
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as e:
+        raise ExampleUnavailable(f"transformers not installed: {e}") from e
 
     logger.info(f"Loading HuggingFace model: {hf_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(hf_name)
-    hf_model = AutoModelForCausalLM.from_pretrained(hf_name)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(hf_name)
+        hf_model = AutoModelForCausalLM.from_pretrained(hf_name)
+    except (OSError, ValueError) as e:
+        # HuggingFace raises OSError for an unreachable hub / missing cache.
+        raise ExampleUnavailable(f"could not load '{hf_name}': {e}") from e
     hf_model.eval()
     logger.info("HuggingFace model loaded.")
     return hf_model, tokenizer
@@ -156,7 +177,7 @@ def compare_logits(ref_logits, triton_logits, tokenizer, input_ids):
     print(f"  Top-5 overlap: {top5_overlap}/5")
     print("=" * 60)
 
-    return max_diff, mean_diff, top1_match
+    return max_diff, mean_diff, top1_match, cos_sim
 
 
 def print_generation(logits, tokenizer, input_ids, prompt):
@@ -378,9 +399,12 @@ def main():
     parser.add_argument(
         "--backend",
         type=str,
-        default="gpu",
+        # Defaults to npu: this is the NPU backend's example, and run_tests.py
+        # invokes it with no args to exercise the iGPU-free path. Pass --backend
+        # gpu/hetero explicitly for the other modes.
+        default="npu",
         choices=["gpu", "npu", "hetero", "hetero-fast", "reference"],
-        help="Backend: gpu, npu, hetero (consistent NPU/GPU split), hetero-fast (GPU-only decode), reference (HF only)",
+        help="Backend: npu (default), gpu, hetero (NPU/GPU split), hetero-fast (GPU-only decode), reference (HF only)",
     )
     parser.add_argument(
         "--prompt",
@@ -391,6 +415,9 @@ def main():
     parser.add_argument(
         "--max-tokens",
         type=int,
+        # Defaults to 0: the single-forward path asserts the logits match the
+        # HuggingFace reference (the correctness gate run_tests relies on); the
+        # generation path (>0) only prints text and cannot fail on wrong output.
         default=0,
         help="Number of tokens to generate (0 = single forward pass only)",
     )
@@ -472,11 +499,36 @@ def main():
         print_generation(triton_logits, tokenizer, input_ids, args.prompt)
 
         # Compare
-        compare_logits(ref_logits, triton_logits, tokenizer, input_ids)
+        _, _, top1_match, cos_sim = compare_logits(
+            ref_logits, triton_logits, tokenizer, input_ids
+        )
+        # Assert on what greedy decode depends on -- the top-1 token -- plus a
+        # cosine floor for gross corruption. bf16 rounding shifts exact logits
+        # but not these. A non-zero exit makes run_tests grade it FAIL.
+        COS_MIN = 0.99
+        if not top1_match or cos_sim < COS_MIN:
+            print(
+                f"CORRECTNESS FAILURE: top1_match={top1_match}, "
+                f"cosine={cos_sim:.6f} (min {COS_MIN})"
+            )
+            sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    # Exit code chosen here, then os._exit to skip interpreter finalization --
+    # see the teardown note below. Default 0; a SKIP or correctness failure
+    # overrides it.
+    _exit_code = 0
+    try:
+        main()
+    except ExampleUnavailable as e:
+        print(f"SKIP: {e}")
+        _exit_code = SKIP_EXIT_CODE
+    except SystemExit as e:
+        # main() calls sys.exit(1) on a correctness failure; carry the code out
+        # through the same os._exit path rather than letting the teardown fault
+        # (below) turn a clean FAIL into a crash.
+        _exit_code = e.code if isinstance(e.code, int) else 1
     # Backstop for the XRT/ROCm process-global teardown fault: results are fully
     # computed and printed by now, so skip interpreter finalization (C++ static
     # destructors) entirely. Flush first since os._exit does not. NPU resources
@@ -484,4 +536,4 @@ if __name__ == "__main__":
     # only guards the residual global-teardown crash GC ordering cannot reach.
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(0)
+    os._exit(_exit_code)

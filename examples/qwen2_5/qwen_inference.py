@@ -33,14 +33,35 @@ from model import QWEN_CONFIGS
 
 logger = logging.getLogger(__name__)
 
+# run_tests.py grades this exit code as a skip, not a failure -- the autotools
+# convention. Used when the environment cannot run the example (no transformers,
+# or the HuggingFace hub is unreachable) rather than when it has found a defect.
+SKIP_EXIT_CODE = 77
+
+
+class ExampleUnavailable(Exception):
+    """The example cannot run here (missing dependency or model download)."""
+
 
 def load_hf_model(hf_name="Qwen/Qwen2.5-0.5B-Instruct"):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    """Load a HuggingFace Qwen model and tokenizer.
+
+    Raises ExampleUnavailable when transformers is not installed or the model
+    cannot be fetched, so a runner without them (CI without network / the HF
+    stack) skips rather than fails.
+    """
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as e:
+        raise ExampleUnavailable(f"transformers not installed: {e}") from e
 
     name = hf_name
     logger.info(f"Loading HuggingFace model {name}...")
-    tokenizer = AutoTokenizer.from_pretrained(name)
-    hf_model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(name)
+        hf_model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32)
+    except (OSError, ValueError) as e:
+        raise ExampleUnavailable(f"could not load '{name}': {e}") from e
     hf_model.eval()
     logger.info("HuggingFace model loaded.")
     return hf_model, tokenizer
@@ -69,7 +90,13 @@ def run_triton_model(state_dict, input_ids, backend, profile=False, config=None)
 
     import benchmark
 
-    benchmark.select_gpu_backend()
+    # npu mode activates the NPU driver directly. select_gpu_backend() calls
+    # reset_active(), which needs an auto-active GPU driver -- absent on an
+    # iGPU-free host -- so npu mode must not take that path.
+    if backend == "npu":
+        benchmark.select_npu_backend()
+    else:
+        benchmark.select_gpu_backend()
 
     model = Qwen2Model(state_dict, backend=backend, config=config)
     model.timer.enabled = profile
@@ -126,7 +153,7 @@ def compare_logits(ref_logits, triton_logits, tokenizer):
     print(f"\n  Top-1 match: {'YES' if top1_match else 'NO'}")
     print(f"  Top-5 overlap: {top5_overlap}/5")
     print("=" * 60)
-    return max_diff, mean_diff, top1_match
+    return max_diff, mean_diff, top1_match, cos_sim
 
 
 def print_generation(logits, tokenizer, prompt):
@@ -142,7 +169,12 @@ def run_generation(hf_model, tokenizer, input_ids, args):
 
     import benchmark
 
-    benchmark.select_gpu_backend()
+    # See run_triton_model: npu mode activates the NPU driver rather than
+    # reset_active()-ing to a GPU default that an iGPU-free host does not have.
+    if args.backend == "npu":
+        benchmark.select_npu_backend()
+    else:
+        benchmark.select_gpu_backend()
 
     state_dict = hf_model.state_dict()
     model = Qwen2Model(
@@ -218,7 +250,12 @@ def run_interactive(hf_model, tokenizer, args):
 
     import benchmark
 
-    benchmark.select_gpu_backend()
+    # See run_triton_model: npu mode activates the NPU driver rather than
+    # reset_active()-ing to a GPU default that an iGPU-free host does not have.
+    if backend == "npu":
+        benchmark.select_npu_backend()
+    else:
+        benchmark.select_gpu_backend()
 
     state_dict = hf_model.state_dict()
     model = Qwen2Model(
@@ -320,7 +357,10 @@ def main():
     parser.add_argument(
         "--backend",
         type=str,
-        default="gpu",
+        # Defaults to npu: this is the NPU backend's example, and run_tests.py
+        # invokes it with no args to exercise the iGPU-free path. Pass --backend
+        # gpu/hetero explicitly for the other modes.
+        default="npu",
         choices=["gpu", "npu", "hetero", "hetero-fast", "reference"],
     )
     parser.add_argument(
@@ -328,7 +368,14 @@ def main():
         type=str,
         default="Give me a short introduction to large language models.",
     )
-    parser.add_argument("--max-tokens", type=int, default=0)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        # Defaults to 0: the single-forward path asserts the logits match the
+        # HuggingFace reference (the correctness gate run_tests relies on); the
+        # generation path (>0) only prints text and cannot fail on wrong output.
+        default=0,
+    )
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
@@ -382,14 +429,36 @@ def main():
         )
         print(f"\n--- Triton ({args.backend.upper()}) ---")
         print_generation(triton_logits, tokenizer, args.prompt)
-        compare_logits(ref_logits, triton_logits, tokenizer)
+        _, _, top1_match, cos_sim = compare_logits(ref_logits, triton_logits, tokenizer)
+        # Cosine floor only, no top-1: qwen's all-NPU forward has a known ~0.97
+        # accuracy gap vs the fp32 reference (rmsnorm bf16 numerics, see
+        # OPTIMIZATIONS.md) that legitimately flips the top-1 token, so a top-1
+        # assert would fail on a known limitation, not a regression. Raise the
+        # floor and re-add top-1 once the rmsnorm-numerics lever lands.
+        COS_MIN = 0.95
+        if cos_sim < COS_MIN:
+            print(f"CORRECTNESS FAILURE: cosine={cos_sim:.6f} (min {COS_MIN})")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    # Exit code chosen here, then os._exit to skip interpreter finalization --
+    # see the teardown note below. Default 0; a SKIP or correctness failure
+    # overrides it.
+    _exit_code = 0
+    try:
+        main()
+    except ExampleUnavailable as e:
+        print(f"SKIP: {e}")
+        _exit_code = SKIP_EXIT_CODE
+    except SystemExit as e:
+        # main() calls sys.exit(1) on a correctness failure; carry the code out
+        # through the same os._exit path rather than letting the teardown fault
+        # (below) turn a clean FAIL into a crash.
+        _exit_code = e.code if isinstance(e.code, int) else 1
     # Backstop for the XRT/ROCm process-global teardown fault: results are fully
     # computed and printed by now, so skip interpreter finalization (C++ static
     # destructors) entirely. Flush first since os._exit does not.
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(0)
+    os._exit(_exit_code)

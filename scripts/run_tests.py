@@ -22,6 +22,11 @@ DEFAULT_SKIPPED_EXAMPLES = {
     "layernorm",
     "load_2d_block",
     "multi_drivers",
+    # LLM end-to-end examples: heavy (HuggingFace download + long compiles). CI
+    # runs them explicitly (-t gpt2 -t qwen2_5) in a dedicated step, so keep them
+    # out of the default sweep.
+    "gpt2",
+    "qwen2_5",
 }
 
 # Examples that cannot run without a transform script on a given device, keyed
@@ -76,9 +81,17 @@ def discover_example_dirs(examples_dir: Path, selected: list[str]) -> list[Path]
 
 def discover_python_files(example_dir: Path) -> list[Path]:
     """
-    Return a list of .py files directly under example_dir (non-recursive).
+    Return the .py files to run directly under example_dir (non-recursive).
+
+    When a directory ships an ``*_inference.py`` entry point, run only those:
+    the LLM examples (gpt2, qwen2_5) also contain a ``model.py`` library with no
+    ``__main__``, which would otherwise be "run" as a no-op that passes without
+    testing anything -- and double-count the directory. Directories without an
+    inference entry point keep the original behavior (every .py runs).
     """
-    return sorted([p for p in example_dir.glob("*.py") if p.is_file()])
+    py_files = sorted([p for p in example_dir.glob("*.py") if p.is_file()])
+    inference = [p for p in py_files if p.name.endswith("_inference.py")]
+    return inference or py_files
 
 
 def run_python_file(
