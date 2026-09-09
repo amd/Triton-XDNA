@@ -28,11 +28,10 @@ python3 -m pip install "mlir_air[aie]==$MLIR_AIR_VERSION.$MLIR_AIR_TIMESTAMP+$SH
     -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
     -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 
-# The [aie] extra requires llvm-aie without a version pin. To track the
-# nightly wheel (matching the prior env_setup.sh behavior), force-upgrade
-# llvm-aie explicitly so an existing installation doesn't silently satisfy
-# the unpinned requirement.
-python3 -m pip install --upgrade llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+# The [aie] extra requires llvm-aie without a version pin, so an existing
+# installation would silently satisfy it. Force the pinned one; see
+# utils/peano-requirements.txt for which version and why.
+python3 -m pip install --upgrade --force-reinstall -r "$(dirname "${SCRIPT_PATH}")/peano-requirements.txt"
 
 fi  # TRITON_XDNA_ENV_INSTALL
 

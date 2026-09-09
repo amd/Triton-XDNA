@@ -1,0 +1,12 @@
+# Pinned llvm-aie (Peano) nightly, installed at every CI and env-setup site via
+# `pip install -r`. The [aie] extra requires llvm-aie without a version, so
+# without this the resolver takes whatever nightly is newest that day.
+#
+# Keep this in step with the llvm-aie that the pinned mlir-aie itself pins --
+# its own utils/peano-requirements.txt at the commit mlir-air's [aie] extra
+# selects (see utils/mlir-air-hash.txt). A mismatch there is not tested
+# upstream, and the LLVM 21 -> 22 transition showed what that costs: the newer
+# Peano grew the AIE core stack frame past the device default, which presented
+# as NaN rather than as an error (mlir-air #1980).
+-f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+llvm-aie==22.0.0.2026090201+a36c62b9

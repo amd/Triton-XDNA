@@ -243,13 +243,27 @@ def _make_version_spec(pkg_name, version, timestamp, short_commit, suffix=""):
     return f"{pkg_name}=={full}"
 
 
+def parse_peano_pin(path: Path) -> str:
+    """The pinned llvm-aie requirement from utils/peano-requirements.txt.
+
+    The file is also fed to `pip install -r` by CI and env_setup, so it is the
+    one place the version lives.
+    """
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("llvm-aie=="):
+            return line
+    raise RuntimeError(f"no pinned llvm-aie requirement in {path}")
+
+
 def get_install_requires():
     """Build install_requires list from hash files.
 
-    Only mlir-air is pinned here. The mlir-air wheel exposes an [aie] extra
-    that pins the matching mlir-aie commit and requires llvm-aie, so we get a
-    guaranteed-compatible mlir-aie transitively without having to pin it
-    ourselves.
+    mlir-air is pinned here, and its [aie] extra pins the matching mlir-aie
+    commit -- so that one comes transitively. llvm-aie does NOT: the extra
+    requires it without a version, so an install would otherwise take whatever
+    nightly is newest that day rather than the one the pinned mlir-aie was
+    built and tested against. Pin it explicitly, from the same file CI uses.
     """
     mlir_air_hash_file = BASE_DIR / "utils" / "mlir-air-hash.txt"
 
@@ -263,6 +277,7 @@ def get_install_requires():
 
     return [
         f"mlir-air[aie]=={mlir_air_full_version}",
+        parse_peano_pin(BASE_DIR / "utils" / "peano-requirements.txt"),
     ]
 
 

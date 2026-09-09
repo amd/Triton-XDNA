@@ -92,7 +92,7 @@ This will automatically install all required dependencies:
 - llvm-aie
 - mlir-air
 
-The mlir-air version is pinned in `utils/mlir-air-hash.txt`. The matching mlir-aie commit is pinned by the mlir-air wheel's `[aie]` extra, so it's resolved transitively. llvm-aie uses the latest nightly release.
+The mlir-air version is pinned in `utils/mlir-air-hash.txt`. The matching mlir-aie commit is pinned by the mlir-air wheel's `[aie]` extra, so it's resolved transitively. llvm-aie is pinned in `utils/peano-requirements.txt`, to the nightly that the pinned mlir-aie was itself built against -- the `[aie]` extra requires it without a version, so otherwise an install would take whatever nightly happened to be newest that day.
 
 #### Option 3: Build from Source (Using Cmake)
 
