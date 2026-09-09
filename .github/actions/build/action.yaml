@@ -60,9 +60,10 @@ runs:
           -f https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti \
           -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
           -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
-      # The [aie] extra requires llvm-aie without a version pin. Force an
-      # upgrade so we always test against the latest nightly wheel.
-      python3 -m pip install --no-cache-dir --upgrade --force-reinstall llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+      # The [aie] extra requires llvm-aie without a version pin, so a cached
+      # or transitively-installed one would silently satisfy it. Force the
+      # pinned one; see utils/peano-requirements.txt for which and why.
+      python3 -m pip install --no-cache-dir --upgrade --force-reinstall -r utils/peano-requirements.txt
       python3 -m pip show llvm-aie
       python3 -m pip show mlir_aie_no_rtti
       # Set environmental variable "MLIR_AIE_INSTALL_DIR"

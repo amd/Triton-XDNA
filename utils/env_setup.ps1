@@ -55,11 +55,11 @@ python -m pip install "mlir_air[aie]==$MLIR_AIR_VERSION.$MLIR_AIR_TIMESTAMP+$SHO
     -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 `
     -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 
-# The [aie] extra requires llvm-aie without a version pin. To track the
-# nightly wheel, force-upgrade llvm-aie explicitly so an existing installation
-# doesn't silently satisfy the unpinned requirement.
-python -m pip install --upgrade llvm-aie `
-    -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+# The [aie] extra requires llvm-aie without a version pin, so an existing
+# installation would silently satisfy it. Force the pinned one; see
+# utils/peano-requirements.txt for which version and why.
+python -m pip install --upgrade --force-reinstall `
+    -r (Join-Path $ScriptDir "peano-requirements.txt")
 
 if (-not $env:MLIR_AIE_INSTALL_DIR) {
     $MLIR_AIE_INSTALL_DIR = (python -c "import importlib.util; spec = importlib.util.find_spec('mlir_aie'); print(spec.submodule_search_locations[0])")
