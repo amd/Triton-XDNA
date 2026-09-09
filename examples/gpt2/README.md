@@ -19,16 +19,18 @@ every size with no changes.
 
 ## Setup
 
-**Prerequisite: a ROCm torch device is required for all backends except
-`reference`.** Every mode — including `--backend npu` — runs the LM head on
-the iGPU (see the routing table below), so a working ROCm/Triton GPU with a
-ROCm build of PyTorch must be installed.
+**`--backend npu` runs on the NPU and CPU only — no iGPU, so it needs neither a
+ROCm GPU nor a ROCm build of PyTorch.** The `gpu`, `hetero`, and `hetero-fast`
+modes do require a ROCm torch device; `reference` needs neither. See the routing
+table below.
 
 ```bash
 # Prerequisites
 pip install transformers
-# ROCm PyTorch (adjust the ROCm version to match your install)
-pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+# torch: a CPU build is enough for `npu` and `reference`; use a ROCm build for
+# the gpu/hetero modes (adjust the ROCm version to match your install).
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+# pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
 
 # Environment setup (required for NPU/hetero modes)
 source /opt/xilinx/xrt/setup.sh
@@ -68,17 +70,23 @@ Four backends route operators across devices differently:
 | Backend | Description |
 |---------|-------------|
 | `gpu` | All ops on iGPU via ROCm/Triton |
-| `npu` | All ops on NPU via MLIR-AIR/AIE, except the LM head (GPU) |
+| `npu` | NPU + CPU only, no iGPU: matmuls/LN/MLP/LM head on the NPU, the attention scores/softmax/attn·V core on CPU (no NPU attention kernel yet) |
 | `hetero` | MLP on NPU; everything else (embeddings, LN, attention, LM head) on GPU |
 | `hetero-fast` | Same as hetero for prefill; all-GPU decode |
 
 ### Per-Op Device Routing
 
+In `gpu`/`hetero`/`hetero-fast`, attention is one fused GPU kernel. In `npu` it
+is split: the projections run on the NPU and the scores/softmax/attn·V core on
+CPU (there is no NPU attention kernel yet), so those rows are broken out below.
+
 | Op | `gpu` | `npu` | `hetero` | `hetero-fast` prefill | `hetero-fast` decode |
 |----|-------|-------|----------|----------------------|---------------------|
 | LayerNorm (ln1) | GPU | NPU | **GPU** | **GPU** | GPU |
 | QKV projection | GPU | NPU | GPU | GPU | GPU |
-| Fused attention | GPU | NPU | GPU | GPU | GPU |
+| Attention scores (Q·Kᵀ) | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
+| Softmax | GPU (fused) | NPU | GPU (fused) | GPU (fused) | GPU (fused) |
+| Attention · V | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
 | Output projection | GPU | NPU | GPU | GPU | GPU |
 | Residual add | GPU | NPU | **GPU** | **GPU** | GPU |
 | LayerNorm (ln2) | GPU | NPU | **GPU** | **GPU** | GPU |
@@ -87,7 +95,7 @@ Four backends route operators across devices differently:
 | MLP down-proj | GPU | NPU | NPU | NPU | **GPU** |
 | Residual add | GPU | NPU | NPU | NPU | **GPU** |
 | Final LayerNorm | GPU | NPU | **GPU** | **GPU** | GPU |
-| LM head | GPU | GPU | GPU | GPU | GPU |
+| LM head | GPU | NPU | GPU | GPU | GPU |
 
 ## Architecture
 

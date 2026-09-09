@@ -15,17 +15,18 @@ scripts serve every size:
 
 ## Setup
 
-**Prerequisite: a ROCm torch device is required for all backends except
-`reference`.** Every mode — including `--backend npu` — runs attention (Q/K/V/O
-projections, RoPE, the fused grouped-query attention kernel) and the LM head on
-the iGPU (see the routing table below), so a working ROCm/Triton GPU with a
-ROCm build of PyTorch must be installed.
+**`--backend npu` runs on the NPU and CPU only — no iGPU, so it needs neither a
+ROCm GPU nor a ROCm build of PyTorch.** The `gpu`, `hetero`, and `hetero-fast`
+modes do require a ROCm torch device; `reference` needs neither. See the routing
+table below.
 
 ```bash
 # Prerequisites
 pip install transformers
-# ROCm PyTorch (adjust the ROCm version to match your install)
-pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+# torch: a CPU build is enough for `npu` and `reference`; use a ROCm build for
+# the gpu/hetero modes (adjust the ROCm version to match your install).
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+# pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
 
 # Environment setup (required for NPU/hetero modes)
 source /opt/xilinx/xrt/setup.sh
@@ -67,19 +68,27 @@ Four backends route operators across devices differently:
 | Backend | Description |
 |---------|-------------|
 | `gpu` | All ops on iGPU via ROCm/Triton |
-| `npu` | RMSNorm/MLP/add on NPU; attention and LM head on iGPU |
+| `npu` | NPU + CPU only, no iGPU: RMSNorm/MLP/add and the Q/K/V/O projections on the NPU, the attention core (RoPE, scores, softmax, attn·V) and the LM head on CPU |
 | `hetero` | Attention on GPU, RMSNorm/MLP/add on NPU |
 | `hetero-fast` | Same as hetero for prefill; all-GPU decode |
 
 ### Per-Op Device Routing
 
+In `gpu`/`hetero`/`hetero-fast`, attention is one fused GPU kernel. In `npu` it
+is split: the Q/K/V/O projections run on the NPU and the RoPE/scores/softmax/
+attn·V core on CPU (there is no NPU attention kernel yet), so those rows are
+broken out below. Qwen's larger vocab makes its LM head run on CPU (gpt2's runs
+on the NPU) — a vocab-sized NPU matmul is far slower there than on the CPU.
+
 | Op | `gpu` | `npu` | `hetero` | `hetero-fast` prefill | `hetero-fast` decode |
 |----|-------|-------|----------|----------------------|---------------------|
 | RMSNorm (input) | GPU | NPU | NPU | NPU | **GPU** |
-| Q/K/V projection | GPU | GPU | GPU | GPU | GPU |
-| RoPE | GPU | GPU | GPU | GPU | GPU |
-| Fused attention (GQA) | GPU | GPU | GPU | GPU | GPU |
-| Output projection | GPU | GPU | GPU | GPU | GPU |
+| Q/K/V projection | GPU | NPU | GPU | GPU | GPU |
+| RoPE | GPU | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
+| Attention scores (Q·Kᵀ) | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
+| Softmax | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
+| Attention · V | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
+| Output projection | GPU | NPU | GPU | GPU | GPU |
 | Residual add | GPU | NPU | NPU | NPU | **GPU** |
 | RMSNorm (post-attn) | GPU | NPU | NPU | NPU | **GPU** |
 | MLP gate/up proj | GPU | NPU | NPU | NPU | **GPU** |
@@ -87,7 +96,7 @@ Four backends route operators across devices differently:
 | MLP down proj | GPU | NPU | NPU | NPU | **GPU** |
 | Residual add | GPU | NPU | NPU | NPU | **GPU** |
 | Final RMSNorm | GPU | NPU | NPU | NPU | **GPU** |
-| LM head | GPU | GPU | GPU | GPU | GPU |
+| LM head | GPU | CPU | GPU | GPU | GPU |
 
 Attention (Q/K/V/O, RoPE, the fused attention kernel) always runs on the iGPU:
 the fused FlashAttention-style kernel is GPU-only, and Qwen's grouped-query
