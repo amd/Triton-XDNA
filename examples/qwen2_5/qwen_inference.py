@@ -59,9 +59,7 @@ def load_hf_model(hf_name="Qwen/Qwen2.5-0.5B-Instruct"):
     logger.info(f"Loading HuggingFace model {name}...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(name)
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            name, torch_dtype=torch.float32
-        )
+        hf_model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32)
     except (OSError, ValueError) as e:
         raise ExampleUnavailable(f"could not load '{name}': {e}") from e
     hf_model.eval()
@@ -431,9 +429,7 @@ def main():
         )
         print(f"\n--- Triton ({args.backend.upper()}) ---")
         print_generation(triton_logits, tokenizer, args.prompt)
-        _, _, top1_match, cos_sim = compare_logits(
-            ref_logits, triton_logits, tokenizer
-        )
+        _, _, top1_match, cos_sim = compare_logits(ref_logits, triton_logits, tokenizer)
         # Cosine floor only, no top-1: qwen's all-NPU forward has a known ~0.97
         # accuracy gap vs the fp32 reference (rmsnorm bf16 numerics, see
         # OPTIMIZATIONS.md) that legitimately flips the top-1 token, so a top-1

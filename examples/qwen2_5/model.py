@@ -909,12 +909,8 @@ class Qwen2Model:
             attn_output = torch.matmul(attn_weights, v_f)
         else:
             q_3d = q.reshape(B * self.n_head, S, self.head_dim).contiguous()
-            k_3d = k_exp.reshape(
-                B * self.n_head, total_len, self.head_dim
-            ).contiguous()
-            v_3d = v_exp.reshape(
-                B * self.n_head, total_len, self.head_dim
-            ).contiguous()
+            k_3d = k_exp.reshape(B * self.n_head, total_len, self.head_dim).contiguous()
+            v_3d = v_exp.reshape(B * self.n_head, total_len, self.head_dim).contiguous()
             is_causal = S > 1
             attn_output = triton_fused_attention(
                 q_3d,

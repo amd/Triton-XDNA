@@ -462,9 +462,7 @@ class _FusedMLP:
             b_proj_np = b_proj.to(torch.float32).cpu().numpy()
             # Only the on-GPU output path uses this; skip it (no cuda) when the
             # buffers are XRT-only.
-            b_proj_dev = (
-                torch.from_numpy(b_proj_np).to("cuda") if self._share else None
-            )
+            b_proj_dev = torch.from_numpy(b_proj_np).to("cuda") if self._share else None
             self._weights[layer_idx] = (B0, B2, b_proj_np, b_proj_dev)
         return self._weights[layer_idx]
 
@@ -1306,9 +1304,7 @@ class GPT2Model:
                         transform_script=self.matmul_script,
                     ).reshape(x.shape[:-1] + (VOCAB_SIZE,))
                 except Exception as e:
-                    logger.warning(
-                        f"NPU LM head unavailable ({e}); using a CPU matmul"
-                    )
+                    logger.warning(f"NPU LM head unavailable ({e}); using a CPU matmul")
                     logits = (x2d @ self.wte.to(torch.float32).t()).reshape(
                         x.shape[:-1] + (VOCAB_SIZE,)
                     )
