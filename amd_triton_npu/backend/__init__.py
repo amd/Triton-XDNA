@@ -1,14 +1,20 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-# Force mlir-air's statically-linked LLVM to load before any ROCm SDK LLVM.
-# A ROCm PyTorch install (e.g. TheRock/gfx1151) transitively pulls in its own
-# libLLVM.so.23 via libamdhip64 -> libhipblaslt. Under ELF first-loaded-wins
-# symbol resolution, whichever LLVM loads first wins the global namespace; if
-# ROCm's wins, mlir-air's libAirAggregateCAPI.so constructor binds the wrong
-# LLVM globals and segfaults (issue #102). Importing air's own LLVM-linked
-# bindings here makes mlir-air's symbols win before triton_shared is loaded.
+# air statically links LLVM; a ROCm PyTorch install pulls in its own
+# libLLVM.so.23. When a script imports torch before triton (as every example
+# does), ROCm's LLVM wins the global namespace and air's constructor binds the
+# wrong globals and segfaults (issue #102). Load air's bindings with
+# RTLD_DEEPBIND so air resolves its own LLVM regardless of torch.
 try:
-    import air._mlir_libs._mlir  # noqa: F401
+    import os
+    import sys
+
+    _prev_flags = sys.getdlopenflags()
+    sys.setdlopenflags(os.RTLD_NOW | os.RTLD_GLOBAL | os.RTLD_DEEPBIND)
+    try:
+        import air._mlir_libs._mlir  # noqa: F401
+    finally:
+        sys.setdlopenflags(_prev_flags)
 except Exception:
     pass

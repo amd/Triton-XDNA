@@ -156,30 +156,6 @@ runs:
 
         echo ""
         echo "=========================================="
-        echo "STEP 7b: ROCm torch diagnostic probe"
-        echo "=========================================="
-        # Every example segfaults (exit -11) at import with no traceback; narrow
-        # down where ROCm torch dies. Each probe is non-fatal (|| echo) so we see
-        # all of them in one run. Order matters: the examples import torch before
-        # triton, so replicate that too.
-        echo "--- probe 1: bare torch import ---"
-        python -c "import torch; print('torch import ok', torch.__version__)" \
-          || echo "PROBE FAIL: bare torch import rc=$?"
-        echo "--- probe 2: torch then triton (example import order) ---"
-        python -c "import torch; import triton; from triton.backends.amd_triton_npu.driver import NPUDriver; print('torch+triton import ok')" \
-          || echo "PROBE FAIL: torch+triton import rc=$?"
-        echo "--- probe 3: HIP device query ---"
-        python -c "import torch; print('hip avail:', torch.cuda.is_available(), (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none'))" \
-          || echo "PROBE FAIL: hip device query rc=$?"
-        echo "--- probe 4: HIP compute, no override ---"
-        python -c "import torch; print('compute ok', torch.randn(4, device='cuda').sum().item())" \
-          || echo "PROBE FAIL: hip compute (no override) rc=$?"
-        echo "--- probe 5: HIP compute, HSA_OVERRIDE_GFX_VERSION=11.5.1 ---"
-        HSA_OVERRIDE_GFX_VERSION=11.5.1 python -c "import torch; print('compute ok', torch.randn(4, device='cuda').sum().item())" \
-          || echo "PROBE FAIL: hip compute (override 11.5.1) rc=$?"
-
-        echo ""
-        echo "=========================================="
         echo "STEP 8: Run Tests"
         echo "=========================================="
         # Pick the tiling scripts that match the NPU this runner actually has.
@@ -205,7 +181,8 @@ runs:
           echo "Auto-detected device architecture: $DEVICE"
         fi
         echo "Target device: $DEVICE"
-        python scripts/run_tests.py --device "$DEVICE" --verbose --timeout 1200
+        CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+          python scripts/run_tests.py --device "$DEVICE" --verbose --timeout 1200
 
         echo ""
         echo "=========================================="
@@ -222,10 +199,8 @@ runs:
         echo "=========================================="
         echo "STEP 10: LLM examples in hetero mode (iGPU + NPU)"
         echo "=========================================="
-        # Same gpt2/qwen examples, now in --backend hetero
-        # HSA_OVERRIDE_GFX_VERSION=11.5.1
-        # is required before any iGPU run so the rocm7.14 torch wheel targets
-        # gfx1151 (Strix Halo). 
+        # Same gpt2/qwen examples in --backend hetero (non-NPU ops on the iGPU).
+        # HSA_OVERRIDE_GFX_VERSION=11.5.1 is required for iGPU compute
         if [ "$DEVICE" = "aie2p" ]; then
           export HSA_OVERRIDE_GFX_VERSION=11.5.1
           hetero_rc=0
