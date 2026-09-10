@@ -38,6 +38,7 @@ runs:
       pip install --no-cache-dir --upgrade pip setuptools wheel
       pip install --no-cache-dir lit cmake joblib pybind11 nanobind
       pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.14
+      pip3 uninstall -y triton-rocm pytorch-triton-rocm
 
    - name: Install MLIR-AIR (with mlir-aie + llvm-aie via [aie] extra)
      env:
