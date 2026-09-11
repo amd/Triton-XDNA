@@ -181,18 +181,42 @@ runs:
           echo "Auto-detected device architecture: $DEVICE"
         fi
         echo "Target device: $DEVICE"
-        python scripts/run_tests.py --device "$DEVICE" --verbose --timeout 1200
+        CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+          python scripts/run_tests.py --device "$DEVICE" --verbose --timeout 1200
 
         echo ""
         echo "=========================================="
         echo "STEP 9: LLM examples in NPU-only mode"
         echo "=========================================="
-        # gpt2/qwen are the end-to-end iGPU-free gate. They default to --backend
-        # npu, so run_tests invokes them in npu mode; the iGPU is hidden here so a
-        # stray cuda/HIP touch fails the job rather than silently using the iGPU.
-        # transformers/numpy/ml_dtypes are their runtime deps (CPU-only, no ROCm);
+        # gpt2/qwen are the end-to-end iGPU-free gate. They default to --backend npu
         # if the HuggingFace hub is unreachable the examples exit 77 = SKIP.
         pip install --no-cache-dir transformers numpy ml_dtypes
         CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
           python scripts/run_tests.py --device "$DEVICE" --verbose --timeout 1200 \
             -t gpt2 -t qwen2_5
+
+        echo ""
+        echo "=========================================="
+        echo "STEP 10: LLM examples in hetero mode (iGPU + NPU)"
+        echo "=========================================="
+        # Same gpt2/qwen examples in --backend hetero (non-NPU ops on the iGPU).
+        # HSA_OVERRIDE_GFX_VERSION=11.5.1 is required for iGPU compute
+        if [ "$DEVICE" = "aie2p" ]; then
+          export HSA_OVERRIDE_GFX_VERSION=11.5.1
+          hetero_rc=0
+          for ex in gpt2 qwen2_5; do
+            echo "--- hetero: $ex ---"
+            entry=$(ls examples/$ex/*_inference.py | head -1)
+            ( cd "examples/$ex" && python "$(basename "$entry")" --backend hetero --max-tokens 0 --verbose )
+            rc=$?
+            if [ "$rc" -eq 77 ]; then
+              echo "SKIP: $ex (exit 77)"
+            elif [ "$rc" -ne 0 ]; then
+              echo "FAIL: $ex (exit $rc)"
+              hetero_rc=1
+            fi
+          done
+          exit $hetero_rc
+        else
+          echo "Skipping hetero run: gpt2/qwen are npu2-only (device=$DEVICE)."
+        fi
