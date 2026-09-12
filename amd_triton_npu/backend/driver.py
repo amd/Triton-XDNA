@@ -77,6 +77,37 @@ autotune_time = False
 # -------------------- Launcher ----------------------------
 
 
+def find_peano_root():
+    """The llvm-aie install root, or "" if none is usable.
+
+    Peano is the only LLVM here with an AIE backend, so anything that shells to
+    clang++/opt/llc for the device needs this. aircc takes it as --peano;
+    without one, aiecc falls back to whatever opt/llc is on PATH -- typically
+    /usr/bin -- and fails with "unrecognized architecture 'aie2p'".
+    """
+    # 1) LLVM_BINARY_DIR points at bin/, peano wants the parent. Only trust it
+    #    if that parent is an AIE-capable LLVM: compiler.py uses the same
+    #    variable for Triton's own LLVM, which is not.
+    peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
+    if peano_dir:
+        candidate = Path(peano_dir).parent
+        if _is_peano_root(str(candidate)):
+            return str(candidate)
+    # 2) The pip-installed llvm-aie package, which is what the pin resolves to.
+    try:
+        dist = importlib.metadata.distribution("llvm-aie")
+        candidate = Path(dist.locate_file("")) / "llvm-aie"
+        if _is_peano_root(str(candidate)):
+            return str(candidate)
+    except Exception:
+        pass
+    # 3) An explicit override.
+    peano_env = os.environ.get("PEANO_INSTALL_DIR", "")
+    if _is_peano_root(peano_env):
+        return peano_env
+    return ""
+
+
 @functools.lru_cache(maxsize=8)
 def _is_peano_root(root: str) -> bool:
     """True only for an LLVM install that can actually target AIE.
@@ -1901,29 +1932,43 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
 
     int verbosity = {1 if npu_config.debug else 0};
 
-    // Get a device handle
-    unsigned int device_index = 0;
-    if (verbosity >= 1)
-        std::cout << "Opening device " << device_index << "..." << std::endl;
-    auto device = xrt::device(device_index);
+    // Persistent XRT session. Opening the device, reading the ELF off disk,
+    // building the hw_context and allocating the buffers cost ~12 ms and do
+    // not depend on the arguments, so they happen once per process rather
+    // than once per dispatch. A module hosts exactly one kernel with
+    // compile-time constant shapes, so the buffer sizes never change either;
+    // the grow-only check below is what makes that safe to assume.
+    static bool session_ready = false;
+    static xrt::device device;
+    static xrt::hw_context context;
+    static xrt::kernel kernel;
+    {' '.join(f'static xrt::bo bo_{i}; static long cap{i} = -1;' for i, ty in ptr_args)}
 
-    // Load the ELF
-    if (verbosity >= 1)
-        std::cout << "Loading ELF: " << elf_path << std::endl;
-    xrt::elf ctx_elf{{elf_path}};
+    if (!session_ready) {{
+        unsigned int device_index = 0;
+        if (verbosity >= 1)
+            std::cout << "Opening device " << device_index << "..." << std::endl;
+        device = xrt::device(device_index);
 
-    if (verbosity >= 1)
-        std::cout << "Creating hw_context..." << std::endl;
-    xrt::hw_context context = xrt::hw_context(device, ctx_elf);
+        if (verbosity >= 1)
+            std::cout << "Loading ELF: " << elf_path << std::endl;
+        xrt::elf ctx_elf{{elf_path}};
 
-    // Kernel name from ELF config (e.g., "main:vecadd")
-    std::string kernelName = elf_kernel_name;
-    if (verbosity >= 1)
-        std::cout << "Kernel name: " << kernelName << std::endl;
-    auto kernel = xrt::ext::kernel(context, kernelName);
+        if (verbosity >= 1)
+            std::cout << "Creating hw_context..." << std::endl;
+        context = xrt::hw_context(device, ctx_elf);
 
-    // Create buffer objects using xrt::ext::bo (no group_id needed)
-    {' '.join(f'xrt::bo bo_{i} = xrt::ext::bo{{device, (size_t)size{i}}};' for i, ty in ptr_args)}
+        // Kernel name from ELF config (e.g., "main:vecadd")
+        std::string kernelName = elf_kernel_name;
+        if (verbosity >= 1)
+            std::cout << "Kernel name: " << kernelName << std::endl;
+        kernel = xrt::ext::kernel(context, kernelName);
+        session_ready = true;
+    }}
+
+    // Grow-only buffers. Equal sizes are the expected case; a larger request
+    // reallocates rather than silently overflowing.
+    {' '.join(f'if (cap{i} < size{i}) {{{{ bo_{i} = xrt::ext::bo{{device, (size_t)size{i}}}; cap{i} = size{i}; }}}}' for i, ty in ptr_args)}
 
     if (verbosity >= 1)
         std::cout << "Writing data into buffer objects." << std::endl;
@@ -2060,29 +2105,8 @@ def _aircc_compile(
     # aircc. Without --peano, aiecc falls back to whichever opt/llc is on PATH
     # (e.g. a system /usr/bin/opt) which lacks the aie2p/aie2 target and fails
     # with "unrecognized architecture 'aie2p'".
-    peano_flag = "--peano="
-    # 1) LLVM_BINARY_DIR points to bin/, peano wants the parent. Only trust it
-    #    if that parent is an AIE-capable LLVM, otherwise fall through so a
-    #    misconfigured LLVM_BINARY_DIR doesn't feed aircc a bogus --peano.
-    peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
-    if peano_dir:
-        candidate = Path(peano_dir).parent
-        if _is_peano_root(str(candidate)):
-            peano_flag = f"--peano={candidate}"
-    # 2) Auto-detect from the pip-installed llvm-aie package.
-    if peano_flag == "--peano=":
-        try:
-            dist = importlib.metadata.distribution("llvm-aie")
-            candidate = Path(dist.locate_file("")) / "llvm-aie"
-            if _is_peano_root(str(candidate)):
-                peano_flag = f"--peano={candidate}"
-        except Exception:
-            pass
-    # 3) Fall back to the PEANO_INSTALL_DIR env var.
-    if peano_flag == "--peano=":
-        peano_env = os.environ.get("PEANO_INSTALL_DIR", "")
-        if _is_peano_root(peano_env):
-            peano_flag = f"--peano={peano_env}"
+    peano_root = find_peano_root()
+    peano_flag = f"--peano={peano_root}" if peano_root else "--peano="
 
     # On Windows, add mlir_aie/bin to PATH so aircc can find aiecc.exe
     if IS_WINDOWS:
