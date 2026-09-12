@@ -82,45 +82,6 @@ static bool verify_writeback() {
   return on;
 }
 
-// Where a dispatch's wall clock goes, accumulated over the process and printed
-// at exit. Off unless TRITON_NPU_HSA_PROFILE is set.
-//
-// Bytes as well as milliseconds, deliberately: on a machine sharing the NPU
-// with anything else the times swing, but "how much did we copy" does not, and
-// most of what this exists to find is traffic that should not happen at all.
-// It reports the submit split by whether the dispatch changed program, because
-// the runtime reconfigures the array on a change and that dwarfs everything
-// else in a workload that cycles through kernels.
-static bool prof_on() {
-  static const bool on = std::getenv("TRITON_NPU_HSA_PROFILE") != nullptr;
-  return on;
-}
-static double prof_now() {
-  return std::chrono::duration<double, std::milli>(
-             std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-struct ProfTotals {
-  double copy_in{}, submit{}, copy_out{};
-  double submit_same{}, submit_switch{};
-  std::uint64_t n_same{}, n_switch{};
-  const void *last_program{};
-  std::uint64_t bytes_in{}, bytes_out{}, declared{}, n{};
-  ~ProfTotals() {
-    if (!prof_on()) return;
-    std::fprintf(stderr,
-        "[hsa-prof] %llu dispatches | copy_in %.1f ms (%.1f MB) | "
-        "submit %.1f ms (declared %.1f MB) | copy_out %.1f ms (%.1f MB)\n",
-        (unsigned long long)n, copy_in, bytes_in / 1048576.0, submit,
-        declared / 1048576.0, copy_out, bytes_out / 1048576.0);
-    std::fprintf(stderr,
-        "[hsa-prof] submit split: same program %llu x %.2f ms | "
-        "switched program %llu x %.2f ms\n",
-        (unsigned long long)n_same, n_same ? submit_same / n_same : 0.0,
-        (unsigned long long)n_switch, n_switch ? submit_switch / n_switch : 0.0);
-  }
-};
-static ProfTotals g_prof;
-
 // What a dispatch declares for a resident region, in bytes.
 //
 // The size in the kernargs is what ROCR walks with CLFLUSH before and after the
@@ -508,19 +469,14 @@ public:
         bool resident = false;
         if (void *shared = resolve_shared(host_ptrs[i], nbytes, &resident)) {
           dev_addr[i] = shared;
-          decl[i] = resident ? std::min<std::uint64_t>(
-                                   sizes[i], RESIDENT_DECLARED_BYTES)
+          decl[i] = resident ? std::min<std::uint64_t>(sizes[i],
+                                                       RESIDENT_DECLARED_BYTES)
                              : sizes[i];
           ++g_in_place;
           continue;
         }
         bufs[i] = acquire(nbytes);
-        const double t_ci = prof_on() ? prof_now() : 0.0;
         std::memcpy(bufs[i].va, host_ptrs[i], nbytes);
-        if (prof_on()) {
-          g_prof.copy_in += prof_now() - t_ci;
-          g_prof.bytes_in += nbytes;
-        }
         dev_addr[i] = bufs[i].va;
         decl[i] = sizes[i];
         ++g_staged;
@@ -575,22 +531,7 @@ public:
 
       // Publish the slot, then ring the doorbell.
       hsa_queue_store_write_index_screlease(q, wr_idx + 1);
-      const double t_sub = prof_on() ? prof_now() : 0.0;
       hsa_signal_store_screlease(q->doorbell_signal, wr_idx);
-      if (prof_on()) {
-        const double dt = prof_now() - t_sub;
-        g_prof.submit += dt;
-        if (g_prof.last_program == program) {
-          g_prof.submit_same += dt;
-          ++g_prof.n_same;
-        } else {
-          g_prof.submit_switch += dt;
-          ++g_prof.n_switch;
-        }
-        g_prof.last_program = program;
-        ++g_prof.n;
-        for (std::uint32_t k = 0; k < num_tensors; ++k) g_prof.declared += decl[k];
-      }
 
       const hsa_signal_value_t sig_val = wait_for_completion();
       if (sig_val != 0)
@@ -603,14 +544,13 @@ public:
       // regardless of output position (unmodified inputs just copy identical
       // bytes). A shared tensor has no staging buffer and needs no copy: the
       // device wrote where the caller reads.
-      const double t_co = prof_on() ? prof_now() : 0.0;
       for (std::uint32_t i = 0; i < num_tensors; ++i) {
         if (!bufs[i].va)
-          continue; // dispatched in place; the device wrote where the caller reads
+          continue; // dispatched in place; the device wrote where the caller
+                    // reads
         const auto nbytes = static_cast<std::size_t>(sizes[i]);
         if (writeback == nullptr || writeback[i] != 0) {
           std::memcpy(host_ptrs[i], bufs[i].va, nbytes);
-          if (prof_on()) g_prof.bytes_out += nbytes;
         } else if (verify_writeback()) {
           // The caller said the kernel does not write this one. Check it, so a
           // wrong mask fails here rather than as a wrong answer somewhere else.
@@ -621,7 +561,6 @@ public:
                 "it; the launcher's write-back mask is wrong for this kernel");
         }
       }
-      if (prof_on()) g_prof.copy_out += prof_now() - t_co;
 
       for (std::uint32_t i = 0; i < num_tensors; ++i)
         release(bufs[i]);
@@ -951,7 +890,6 @@ private:
     *resident = hit.region->resident;
     return static_cast<std::byte *>(hit.region->aie_va) + hit.offset;
   }
-
 
   // Release everything init() may have acquired, in reverse order, and close
   // the HSA session. Shared by the destructor and the constructor's unwind, so

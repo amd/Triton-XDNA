@@ -96,9 +96,8 @@ int triton_npu_hsa_dispatch(triton_npu_hsa_program_t program,
 // production.
 int triton_npu_hsa_dispatch_ex(triton_npu_hsa_program_t program,
                                uint32_t num_tensors, void *const *host_ptrs,
-                               const uint64_t *sizes,
-                               const uint8_t *writeback, char *errbuf,
-                               size_t errbuf_len);
+                               const uint64_t *sizes, const uint8_t *writeback,
+                               char *errbuf, size_t errbuf_len);
 
 // ---------------------------------------------------------------------------
 // Shared regions
