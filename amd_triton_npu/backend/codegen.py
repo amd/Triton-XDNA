@@ -9,6 +9,8 @@ drivers depend on a common surface instead of reaching into each other's
 internals.
 """
 
+import textwrap
+
 
 def ty_to_cpp(ty: str) -> str:
     """Map a Triton signature type to the C++ type used in the launcher."""
@@ -110,3 +112,73 @@ def extract_actual_sizes(src) -> "str | None":
         if needs_padding:
             return f"{m_val},{n_val},1"
     return None
+
+
+def written_pointer_args(src) -> "set[int] | None":
+    """Positional indices of the pointer arguments a kernel stores to.
+
+    Returns ``None`` when that cannot be established, which callers must read
+    as "assume every argument is written". Everything here fails in that
+    direction: the cost of a false positive is one copy, and the cost of a
+    false negative is a silently discarded result.
+
+    Derived from the kernel's own source rather than from argument order.
+    There is no rule in Triton that the output comes last -- ``add_kernel(x, y,
+    out, n)`` and ``kernel(out, x, n)`` are both ordinary -- and a kernel may
+    have several outputs.
+
+    Recognised: a store whose pointer expression names exactly one parameter,
+    as in ``tl.store(C + offs, v)`` or ``tl.atomic_add(Acc + i, v)``. Anything
+    else gives up for the whole kernel: a store through a local
+    (``p = C + offs; tl.store(p, v)``), a store inside a called
+    ``@triton.jit`` helper, or a pointer chosen by control flow. Resolving
+    those needs dataflow, and guessing at them is how outputs go missing.
+    """
+    import ast
+
+    fn = getattr(src, "fn", None)
+    source = getattr(fn, "src", None)
+    names = getattr(fn, "arg_names", None)
+    if not source or not names:
+        return None
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return None
+
+    index = {name: i for i, name in enumerate(names)}
+    written: set[int] = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = node.func
+        attr = callee.attr if isinstance(callee, ast.Attribute) else None
+        plain = callee.id if isinstance(callee, ast.Name) else None
+        name = attr or plain
+        if name is None:
+            continue
+
+        if name == "store" or name.startswith("atomic_"):
+            if not node.args:
+                return None
+            referenced = {
+                index[n.id]
+                for n in ast.walk(node.args[0])
+                if isinstance(n, ast.Name) and n.id in index
+            }
+            if len(referenced) != 1:
+                return None  # unresolvable, or ambiguous between two arguments
+            written |= referenced
+        elif name not in _TL_PURE_CALLS and plain is not None:
+            # A call to something we cannot see into -- a @triton.jit helper,
+            # typically -- which may store to anything it was handed.
+            return None
+
+    return written
+
+
+# Calls that cannot store, so they do not defeat the analysis above. Attribute
+# calls (``tl.*``) are covered by the store/atomic check; this list is only for
+# bare names, which is what a call to a helper function looks like.
+_TL_PURE_CALLS = frozenset({"range", "len", "min", "max", "abs", "float", "int"})

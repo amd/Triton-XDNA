@@ -31,7 +31,7 @@ AIE agent can already reach and dispatches on them in place. So a buffer from
 from .codegen import extracted_type, format_of
 
 
-def _generate_hsa_launcher(constants, signature, _kernel_name) -> str:
+def _generate_hsa_launcher(constants, signature, _kernel_name, written=None) -> str:
     """Generate the thin C++ CPython launcher that dispatches via HSA/ROCR.
 
     The generated module exposes ``set_paths(pdi_path, insts_path)`` (which calls
@@ -39,6 +39,9 @@ def _generate_hsa_launcher(constants, signature, _kernel_name) -> str:
     (which marshals the tensor pointers/sizes and calls
     ``triton_npu_hsa_dispatch`` with the GIL released). All HSA state lives in
     the shared runtime library, not in this per-signature module.
+
+    ``written`` is the set of positional argument indices the kernel stores to
+    (``codegen.written_pointer_args``), or None when that is not known.
 
     ``_kernel_name`` is accepted for signature parity with the XRT launcher
     generators but is unused: the HSA path selects work by PDI/insts address,
@@ -87,20 +90,17 @@ def _generate_hsa_launcher(constants, signature, _kernel_name) -> str:
     )
 
     # Which arguments the kernel writes, and so which have to be copied back
-    # out of their staging buffer. Everything else is read-only to the device
+    # out of their staging buffer. Everything else is read-only to the device,
     # and copying it back moves its size in bytes, per launch, for nothing --
     # measured at 260 ms of a 756 ms prefill, against 63 ms for the same work
     # through XRT, which copies back one argument.
     #
-    # The convention is Triton's own and the XRT launcher already relies on it
-    # (see the TODO next to its FROM_DEVICE sync): the output is the last
-    # pointer argument. It is a convention, not a guarantee, so
-    # AMD_TRITON_NPU_HSA_VERIFY_WRITEBACK=1 checks every argument this marks
-    # read-only against what the device actually wrote.
+    # `written` comes from the kernel's own stores and is None when that cannot
+    # be established. None means "every argument", which is what the runtime
+    # did before this existed. Deliberately not argument order: nothing in
+    # Triton says the output comes last, and a kernel may have several.
     writeback_init = (
-        ", ".join(
-            "1" if pos + 1 == num_ptr_args else "0" for pos in range(num_ptr_args)
-        )
+        ", ".join("1" if written is None or i in written else "0" for i, _ in ptr_args)
         or "0"
     )
 

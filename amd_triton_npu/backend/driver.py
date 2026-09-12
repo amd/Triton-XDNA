@@ -29,6 +29,7 @@ import air.passmanager
 
 from .config import npu_config, _VALID_RUNTIMES
 from .codegen import (
+    written_pointer_args,
     extract_actual_sizes,
     extract_signature_and_constants,
     extracted_type,
@@ -2602,7 +2603,10 @@ class NPULauncher(object):
 
             self.output_format = "pdi"
             launcher_src = _generate_hsa_launcher(
-                constants, signature, self.kernel_placeholder_name
+                constants,
+                signature,
+                self.kernel_placeholder_name,
+                written=written_pointer_args(src),
             )
             link_profile = "hsa"
         else:
