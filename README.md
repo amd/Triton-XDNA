@@ -178,10 +178,15 @@ triton.runtime.driver.set_active(NPUDriver("hsa"))
 ```
 
 `AMD_NPU_ROCR_PATH` selects which ROCR the backend compiles and links the shared
-HSA runtime (`libtriton_npu_hsa.so`) against; that path is baked in as an rpath, so
-the matching `libhsa-runtime64` is loaded without setting `LD_LIBRARY_PATH`. Set
-`LD_LIBRARY_PATH` only to force a different one ahead of it — for example when a
-system ROCR without AIE support would otherwise be picked up first.
+HSA runtime (`libtriton_npu_hsa.so`) against; that path is baked in as a
+`DT_RPATH`, so the matching `libhsa-runtime64` is loaded without setting
+`LD_LIBRARY_PATH`, **and is not displaced by one**. `DT_RPATH` rather than the
+linker's modern `DT_RUNPATH` default is deliberate: `LD_LIBRARY_PATH` overrides
+RUNPATH, and any machine with ROCm installed has `/opt/rocm/lib` on it, so with
+RUNPATH the library silently binds to the system ROCR instead of the one it was
+built against. A system ROCR without AIE support then reports the agent as
+`aie2` on a Strix and fails `hsa_amd_vmem_map` with
+`HSA_STATUS_ERROR_INVALID_AGENT`.
 
 #### Sharing a process with PyTorch
 

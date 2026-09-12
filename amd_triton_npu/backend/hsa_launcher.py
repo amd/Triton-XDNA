@@ -31,7 +31,7 @@ AIE agent can already reach and dispatches on them in place. So a buffer from
 from .codegen import extracted_type, format_of
 
 
-def _generate_hsa_launcher(constants, signature, _kernel_name) -> str:
+def _generate_hsa_launcher(constants, signature, _kernel_name, written=None) -> str:
     """Generate the thin C++ CPython launcher that dispatches via HSA/ROCR.
 
     The generated module exposes ``set_paths(pdi_path, insts_path)`` (which calls
@@ -39,6 +39,9 @@ def _generate_hsa_launcher(constants, signature, _kernel_name) -> str:
     (which marshals the tensor pointers/sizes and calls
     ``triton_npu_hsa_dispatch`` with the GIL released). All HSA state lives in
     the shared runtime library, not in this per-signature module.
+
+    ``written`` is the set of positional argument indices the kernel stores to
+    (``codegen.written_pointer_args``), or None when that is not known.
 
     ``_kernel_name`` is accepted for signature parity with the XRT launcher
     generators but is unused: the HSA path selects work by PDI/insts address,
@@ -84,6 +87,21 @@ def _generate_hsa_launcher(constants, signature, _kernel_name) -> str:
         f"host_ptrs[{pos}] = ptr_info{i}.dev_ptr; "
         f"sizes[{pos}] = (std::uint64_t)tensor_volume{i};"
         for pos, (i, _) in enumerate(ptr_args)
+    )
+
+    # Which arguments the kernel writes, and so which have to be copied back
+    # out of their staging buffer. Everything else is read-only to the device,
+    # and copying it back moves its size in bytes, per launch, for nothing --
+    # measured at 260 ms of a 756 ms prefill, against 63 ms for the same work
+    # through XRT, which copies back one argument.
+    #
+    # `written` comes from the kernel's own stores and is None when that cannot
+    # be established. None means "every argument", which is what the runtime
+    # did before this existed. Deliberately not argument order: nothing in
+    # Triton says the output comes last, and a kernel may have several.
+    writeback_init = (
+        ", ".join("1" if written is None or i in written else "0" for i, _ in ptr_args)
+        or "0"
     )
 
     return f"""
@@ -148,12 +166,13 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   if (gridX * gridY * gridZ > 0) {{
     void* host_ptrs[{arr_len}];
     std::uint64_t sizes[{arr_len}];
+    static const std::uint8_t writeback[{arr_len}] = {{{writeback_init}}};
     {fill_arrays}
     char err[512];
     int rc;
     Py_BEGIN_ALLOW_THREADS
-    rc = triton_npu_hsa_dispatch(g_program, NUM_KERNARGS, host_ptrs, sizes,
-                                 err, sizeof(err));
+    rc = triton_npu_hsa_dispatch_ex(g_program, NUM_KERNARGS, host_ptrs, sizes,
+                                    writeback, err, sizeof(err));
     Py_END_ALLOW_THREADS
     if (rc != 0) {{
       PyErr_SetString(PyExc_RuntimeError, err);
