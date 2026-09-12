@@ -23,6 +23,7 @@
 
 #include "HsaRuntime/HsaRuntime.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -109,8 +110,15 @@ inline void sync_cpu_cache(void *ptr, std::size_t size) {
     const long l = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
     return l > 0 ? static_cast<std::size_t>(l) : std::size_t{64};
   }();
-  auto *p = static_cast<char *>(ptr);
-  char *const end = p + size;
+  if (size == 0)
+    return;
+  // Start at the line the range starts in, not at the range. CLFLUSH takes an
+  // address and evicts the line containing it, so an unaligned start walked in
+  // line-sized steps ends short: at a 64-byte line, 62 bytes from offset 3
+  // touch two lines but the second step lands past the end and is never made.
+  char *p = reinterpret_cast<char *>(reinterpret_cast<std::uintptr_t>(ptr) &
+                                     ~static_cast<std::uintptr_t>(line - 1));
+  char *const end = static_cast<char *>(ptr) + size;
   _mm_mfence();
   for (; p < end; p += line)
     _mm_clflush(p);
