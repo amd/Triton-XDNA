@@ -26,6 +26,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <unistd.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -68,6 +72,97 @@ static_assert(TRITON_NPU_HSA_MAX_KERNARGS <= UINT16_MAX,
 // unparseable, or <= 0 means wait forever, which is the default -- see the
 // note on triton_npu_hsa_dispatch() in the header for why.
 constexpr const char *TIMEOUT_ENV = "AMD_TRITON_NPU_HSA_TIMEOUT";
+
+// Check every argument the caller declared read-only against what came back.
+// Opt-in: it costs a comparison over the argument, which is the same order as
+// the copy it exists to avoid.
+static bool verify_writeback() {
+  static const bool on =
+      std::getenv("AMD_TRITON_NPU_HSA_VERIFY_WRITEBACK") != nullptr;
+  return on;
+}
+
+// Where a dispatch's wall clock goes, accumulated over the process and printed
+// at exit. Off unless TRITON_NPU_HSA_PROFILE is set.
+//
+// Bytes as well as milliseconds, deliberately: on a machine sharing the NPU
+// with anything else the times swing, but "how much did we copy" does not, and
+// most of what this exists to find is traffic that should not happen at all.
+// It reports the submit split by whether the dispatch changed program, because
+// the runtime reconfigures the array on a change and that dwarfs everything
+// else in a workload that cycles through kernels.
+static bool prof_on() {
+  static const bool on = std::getenv("TRITON_NPU_HSA_PROFILE") != nullptr;
+  return on;
+}
+static double prof_now() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+struct ProfTotals {
+  double copy_in{}, submit{}, copy_out{};
+  double submit_same{}, submit_switch{};
+  std::uint64_t n_same{}, n_switch{};
+  const void *last_program{};
+  std::uint64_t bytes_in{}, bytes_out{}, declared{}, n{};
+  ~ProfTotals() {
+    if (!prof_on()) return;
+    std::fprintf(stderr,
+        "[hsa-prof] %llu dispatches | copy_in %.1f ms (%.1f MB) | "
+        "submit %.1f ms (declared %.1f MB) | copy_out %.1f ms (%.1f MB)\n",
+        (unsigned long long)n, copy_in, bytes_in / 1048576.0, submit,
+        declared / 1048576.0, copy_out, bytes_out / 1048576.0);
+    std::fprintf(stderr,
+        "[hsa-prof] submit split: same program %llu x %.2f ms | "
+        "switched program %llu x %.2f ms\n",
+        (unsigned long long)n_same, n_same ? submit_same / n_same : 0.0,
+        (unsigned long long)n_switch, n_switch ? submit_switch / n_switch : 0.0);
+  }
+};
+static ProfTotals g_prof;
+
+// What a dispatch declares for a resident region, in bytes.
+//
+// The size in the kernargs is what ROCR walks with CLFLUSH before and after the
+// submit (rocr::FlushCpuCache, inlined into XdnaDriver::SubmitCmdChain), at
+// about 18 us per declared MB. That is the right default -- it is what makes a
+// host write visible to the device -- but it is pure waste for a region the CPU
+// wrote once and only the device touches afterwards, and it is paid on every
+// dispatch. Declaring zero keeps the operand's *address*, which is all the
+// device needs, while flushing essentially nothing.
+//
+// Zero rather than one line because ROCR's flush loop is a do-while: a declared
+// zero walks exactly one cache line, the least it can be asked to do. The size
+// reaches nothing else -- the command buffer carries only each argument's
+// address -- so shrinking it costs the device nothing.
+constexpr std::uint64_t RESIDENT_DECLARED_BYTES = 0;
+
+// Write back and invalidate the CPU's cached copy of [ptr, ptr+size), so that a
+// device read afterwards sees host writes and a host read afterwards sees
+// device writes. This is what a resident region's owner calls instead of having
+// it done on every dispatch; it is the same operation ROCR performs, over the
+// same range, just at a time the caller chooses.
+inline void sync_cpu_cache(void *ptr, std::size_t size) {
+#if defined(__x86_64__) || defined(__i386__)
+  static const std::size_t line = [] {
+    const long l = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+    return l > 0 ? static_cast<std::size_t>(l) : std::size_t{64};
+  }();
+  auto *p = static_cast<char *>(ptr);
+  char *const end = p + size;
+  _mm_mfence();
+  for (; p < end; p += line)
+    _mm_clflush(p);
+  _mm_mfence();
+#else
+  (void)ptr;
+  (void)size;
+  throw std::runtime_error(
+      "explicit cache sync is implemented with CLFLUSH and so only on x86; "
+      "on this architecture do not mark regions resident, and let every "
+      "dispatch flush them");
+#endif
+}
 
 // Thrown when a dispatch exceeds the watchdog timeout. A distinct type because
 // the recovery differs from an ordinary failure: the device may still be
@@ -283,6 +378,9 @@ struct SharedRegion {
                          // both how it was granted and how it is released
   bool abandoned{false}; // given to a dispatch that then timed out, so the
                          // mapping has to outlive its owner (abandon_shared)
+  bool resident{false};  // the caller manages this region's cache state itself,
+                         // so a dispatch declares only a token span for it (see
+                         // shared_set_resident)
 };
 
 } // namespace
@@ -366,7 +464,8 @@ public:
   // Run one dispatch of `program` over num_tensors (host_ptr, size) pairs.
   // Serialized against every other dispatch (single shared queue).
   void dispatch(triton_npu_hsa_program *program, std::uint32_t num_tensors,
-                void *const *host_ptrs, const std::uint64_t *sizes) {
+                void *const *host_ptrs, const std::uint64_t *sizes,
+                const std::uint8_t *writeback) {
     if (program == nullptr)
       throw std::runtime_error(
           "dispatch called with a null program handle (was set_paths / prepare "
@@ -384,6 +483,10 @@ public:
     // What the device is given for tensor i: its own address when it is
     // already in a shared region, otherwise the staging buffer's.
     std::array<void *, TRITON_NPU_HSA_MAX_KERNARGS> dev_addr{};
+    // The size declared for tensor i in the kernargs. Equal to sizes[i] except
+    // for a resident region, which declares RESIDENT_DECLARED_BYTES -- see
+    // shared_set_resident() and the note on the constant.
+    std::array<std::uint64_t, TRITON_NPU_HSA_MAX_KERNARGS> decl{};
     try {
       // A shared tensor is already memory the AIE agent can reach: dispatch on
       // it in place. Every other one gets a pooled I/O buffer and a copy in.
@@ -402,14 +505,24 @@ public:
                                    " claims " + std::to_string(sizes[i]) +
                                    " bytes at a null address");
         const auto nbytes = static_cast<std::size_t>(sizes[i]);
-        if (void *shared = resolve_shared(host_ptrs[i], nbytes)) {
+        bool resident = false;
+        if (void *shared = resolve_shared(host_ptrs[i], nbytes, &resident)) {
           dev_addr[i] = shared;
+          decl[i] = resident ? std::min<std::uint64_t>(
+                                   sizes[i], RESIDENT_DECLARED_BYTES)
+                             : sizes[i];
           ++g_in_place;
           continue;
         }
         bufs[i] = acquire(nbytes);
+        const double t_ci = prof_on() ? prof_now() : 0.0;
         std::memcpy(bufs[i].va, host_ptrs[i], nbytes);
+        if (prof_on()) {
+          g_prof.copy_in += prof_now() - t_ci;
+          g_prof.bytes_in += nbytes;
+        }
         dev_addr[i] = bufs[i].va;
+        decl[i] = sizes[i];
         ++g_staged;
       }
 
@@ -429,7 +542,7 @@ public:
           kernarg_slot(static_cast<std::uint32_t>(pkt_idx)));
       for (std::uint32_t i = 0; i < num_tensors; ++i) {
         kernargs[i] = reinterpret_cast<std::uint64_t>(dev_addr[i]);
-        kernargs[num_tensors + i] = sizes[i];
+        kernargs[num_tensors + i] = decl[i];
       }
 
       // Build the AIE dispatch packet.
@@ -462,7 +575,22 @@ public:
 
       // Publish the slot, then ring the doorbell.
       hsa_queue_store_write_index_screlease(q, wr_idx + 1);
+      const double t_sub = prof_on() ? prof_now() : 0.0;
       hsa_signal_store_screlease(q->doorbell_signal, wr_idx);
+      if (prof_on()) {
+        const double dt = prof_now() - t_sub;
+        g_prof.submit += dt;
+        if (g_prof.last_program == program) {
+          g_prof.submit_same += dt;
+          ++g_prof.n_same;
+        } else {
+          g_prof.submit_switch += dt;
+          ++g_prof.n_switch;
+        }
+        g_prof.last_program = program;
+        ++g_prof.n;
+        for (std::uint32_t k = 0; k < num_tensors; ++k) g_prof.declared += decl[k];
+      }
 
       const hsa_signal_value_t sig_val = wait_for_completion();
       if (sig_val != 0)
@@ -475,10 +603,25 @@ public:
       // regardless of output position (unmodified inputs just copy identical
       // bytes). A shared tensor has no staging buffer and needs no copy: the
       // device wrote where the caller reads.
-      for (std::uint32_t i = 0; i < num_tensors; ++i)
-        if (bufs[i].va)
-          std::memcpy(host_ptrs[i], bufs[i].va,
-                      static_cast<std::size_t>(sizes[i]));
+      const double t_co = prof_on() ? prof_now() : 0.0;
+      for (std::uint32_t i = 0; i < num_tensors; ++i) {
+        if (!bufs[i].va)
+          continue; // dispatched in place; the device wrote where the caller reads
+        const auto nbytes = static_cast<std::size_t>(sizes[i]);
+        if (writeback == nullptr || writeback[i] != 0) {
+          std::memcpy(host_ptrs[i], bufs[i].va, nbytes);
+          if (prof_on()) g_prof.bytes_out += nbytes;
+        } else if (verify_writeback()) {
+          // The caller said the kernel does not write this one. Check it, so a
+          // wrong mask fails here rather than as a wrong answer somewhere else.
+          if (std::memcmp(host_ptrs[i], bufs[i].va, nbytes) != 0)
+            throw std::runtime_error(
+                "tensor argument " + std::to_string(i) +
+                " was declared read-only by the caller, but the device changed "
+                "it; the launcher's write-back mask is wrong for this kernel");
+        }
+      }
+      if (prof_on()) g_prof.copy_out += prof_now() - t_co;
 
       for (std::uint32_t i = 0; i < num_tensors; ++i)
         release(bufs[i]);
@@ -618,6 +761,38 @@ public:
     if (region->abandoned)
       return;
     vmem_free(region->buf, region->imported);
+  }
+
+  // Write back and invalidate the CPU's cached copy of a registered region's
+  // first `size` bytes, addressed by any of its names. Bounds-checked against
+  // that name's extent for the same reason resolve_shared is: an address may
+  // point into a region, and an alias may be shorter than the region behind it.
+  void shared_sync(void *va, std::size_t size) {
+    void *host = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(regions_mtx_);
+      const RegionHit hit = find_region(va);
+      if (!hit.region)
+        throw std::runtime_error("address names no registered shared region");
+      if (hit.offset + size > hit.extent)
+        throw std::runtime_error(
+            "sync of " + std::to_string(size) + " bytes at offset " +
+            std::to_string(hit.offset) + " runs past the end of the " +
+            std::to_string(hit.extent) + "-byte shared region it starts in");
+      host = va;
+    }
+    // Outside the lock: flushing a gigabyte takes milliseconds, and it touches
+    // only the caller's own pages, which it owns for the duration.
+    sync_cpu_cache(host, size);
+  }
+
+  // Mark (or unmark) a region as one whose cache state the caller maintains.
+  void shared_set_resident(void *va, bool resident) {
+    std::lock_guard<std::mutex> lock(regions_mtx_);
+    const RegionHit hit = find_region(va);
+    if (!hit.region)
+      throw std::runtime_error("address names no registered shared region");
+    hit.region->resident = resident;
   }
 
 private:
@@ -763,7 +938,7 @@ private:
   // The span is taken as ptr + size because that is what the dispatch ABI says
   // a tensor occupies. A strided view does not occupy that span, but no more so
   // here than in the staging path, which copies exactly those bytes.
-  void *resolve_shared(void *ptr, std::size_t size) {
+  void *resolve_shared(void *ptr, std::size_t size, bool *resident) {
     std::lock_guard<std::mutex> lock(regions_mtx_);
     const RegionHit hit = find_region(ptr);
     if (!hit.region)
@@ -773,8 +948,10 @@ private:
           "tensor at offset " + std::to_string(hit.offset) + " spanning " +
           std::to_string(size) + " bytes runs past the end of the " +
           std::to_string(hit.extent) + "-byte shared region it starts in");
+    *resident = hit.region->resident;
     return static_cast<std::byte *>(hit.region->aie_va) + hit.offset;
   }
+
 
   // Release everything init() may have acquired, in reverse order, and close
   // the HSA session. Shared by the destructor and the constructor's unwind, so
@@ -1318,14 +1495,54 @@ extern "C" int triton_npu_hsa_dispatch(triton_npu_hsa_program_t program,
                                        void *const *host_ptrs,
                                        const uint64_t *sizes, char *errbuf,
                                        size_t errbuf_len) {
+  return triton_npu_hsa_dispatch_ex(program, num_tensors, host_ptrs, sizes,
+                                    nullptr, errbuf, errbuf_len);
+}
+
+extern "C" int triton_npu_hsa_dispatch_ex(triton_npu_hsa_program_t program,
+                                          uint32_t num_tensors,
+                                          void *const *host_ptrs,
+                                          const uint64_t *sizes,
+                                          const uint8_t *writeback,
+                                          char *errbuf, size_t errbuf_len) {
   try {
-    runtime().dispatch(program, num_tensors, host_ptrs, sizes);
+    runtime().dispatch(program, num_tensors, host_ptrs, sizes, writeback);
     return 0;
   } catch (const std::exception &e) {
     write_err(errbuf, errbuf_len, "HSA dispatch failed", e.what());
     return -1;
   } catch (...) {
     write_err(errbuf, errbuf_len, "HSA dispatch failed", "unknown error");
+    return -1;
+  }
+}
+
+extern "C" int triton_npu_hsa_shared_set_resident(void *va, int resident,
+                                                  char *errbuf,
+                                                  size_t errbuf_len) {
+  try {
+    runtime().shared_set_resident(va, resident != 0);
+    return 0;
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len, "HSA shared set-resident failed", e.what());
+    return -1;
+  } catch (...) {
+    write_err(errbuf, errbuf_len, "HSA shared set-resident failed",
+              "unknown error");
+    return -1;
+  }
+}
+
+extern "C" int triton_npu_hsa_shared_sync(void *va, uint64_t nbytes,
+                                          char *errbuf, size_t errbuf_len) {
+  try {
+    runtime().shared_sync(va, static_cast<std::size_t>(nbytes));
+    return 0;
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len, "HSA shared sync failed", e.what());
+    return -1;
+  } catch (...) {
+    write_err(errbuf, errbuf_len, "HSA shared sync failed", "unknown error");
     return -1;
   }
 }

@@ -86,6 +86,24 @@ def _generate_hsa_launcher(constants, signature, _kernel_name) -> str:
         for pos, (i, _) in enumerate(ptr_args)
     )
 
+    # Which arguments the kernel writes, and so which have to be copied back
+    # out of their staging buffer. Everything else is read-only to the device
+    # and copying it back moves its size in bytes, per launch, for nothing --
+    # measured at 260 ms of a 756 ms prefill, against 63 ms for the same work
+    # through XRT, which copies back one argument.
+    #
+    # The convention is Triton's own and the XRT launcher already relies on it
+    # (see the TODO next to its FROM_DEVICE sync): the output is the last
+    # pointer argument. It is a convention, not a guarantee, so
+    # AMD_TRITON_NPU_HSA_VERIFY_WRITEBACK=1 checks every argument this marks
+    # read-only against what the device actually wrote.
+    writeback_init = (
+        ", ".join(
+            "1" if pos + 1 == num_ptr_args else "0" for pos in range(num_ptr_args)
+        )
+        or "0"
+    )
+
     return f"""
 #include <Python.h>
 #include <cstdint>
@@ -148,12 +166,13 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   if (gridX * gridY * gridZ > 0) {{
     void* host_ptrs[{arr_len}];
     std::uint64_t sizes[{arr_len}];
+    static const std::uint8_t writeback[{arr_len}] = {{{writeback_init}}};
     {fill_arrays}
     char err[512];
     int rc;
     Py_BEGIN_ALLOW_THREADS
-    rc = triton_npu_hsa_dispatch(g_program, NUM_KERNARGS, host_ptrs, sizes,
-                                 err, sizeof(err));
+    rc = triton_npu_hsa_dispatch_ex(g_program, NUM_KERNARGS, host_ptrs, sizes,
+                                    writeback, err, sizeof(err));
     Py_END_ALLOW_THREADS
     if (rc != 0) {{
       PyErr_SetString(PyExc_RuntimeError, err);

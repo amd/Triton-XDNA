@@ -79,6 +79,27 @@ int triton_npu_hsa_dispatch(triton_npu_hsa_program_t program,
                             const uint64_t *sizes, char *errbuf,
                             size_t errbuf_len);
 
+// Dispatch, copying back only the arguments the kernel writes.
+//
+// `writeback[i]` non-zero means argument i may have been written by the kernel
+// and its staging buffer has to be copied back to the caller. A zero says the
+// kernel only reads it, so the copy is skipped -- worth roughly the argument's
+// size in memory bandwidth, on every launch. Arguments dispatched in place (a
+// shared region) are unaffected either way; they are never copied.
+//
+// A null `writeback` means "every argument", which is what
+// triton_npu_hsa_dispatch does and what a caller that does not know should
+// pass. Getting a 1 wrong costs only the copy; getting a 0 wrong loses the
+// kernel's output silently, so set AMD_TRITON_NPU_HSA_VERIFY_WRITEBACK=1 to
+// have every zero checked against what the device actually wrote. That check
+// costs a comparison per byte, so it is for tests and bring-up, not for
+// production.
+int triton_npu_hsa_dispatch_ex(triton_npu_hsa_program_t program,
+                               uint32_t num_tensors, void *const *host_ptrs,
+                               const uint64_t *sizes,
+                               const uint8_t *writeback, char *errbuf,
+                               size_t errbuf_len);
+
 // ---------------------------------------------------------------------------
 // Shared regions
 // ---------------------------------------------------------------------------
@@ -143,6 +164,45 @@ int triton_npu_hsa_shared_unalias(void *alias, char *errbuf, size_t errbuf_len);
 // forget every address that named it. Unregistered addresses are ignored, so
 // this is idempotent. Returns 0 on success, or a negative value on error.
 int triton_npu_hsa_shared_free(void *va, char *errbuf, size_t errbuf_len);
+
+// Declare that the caller, not the runtime, maintains the CPU-cache state of
+// the region reachable at `va` (any of its registered addresses). Returns 0, or
+// a negative value on error (with a message written to errbuf).
+//
+// What a dispatch declares as an operand's size is what ROCR walks with CLFLUSH
+// on the way in and on the way out -- about 18 us per declared MB, on every
+// dispatch. For a weight set the host writes once and the device only reads,
+// that is the same gigabyte flushed for every launch, and it is the whole of
+// the difference between this runtime and XRT on a decode: XRT uploads a buffer
+// once and passes a handle.
+//
+// A resident region is declared as one cache line instead, so the operand keeps
+// its address -- all the device needs -- and the flush costs nothing. In
+// exchange the region's owner takes on the coherency:
+//
+// * after the CPU writes to it, call triton_npu_hsa_shared_sync before the next
+//   dispatch, or the device may read a stale line;
+// * after the device writes to it, call triton_npu_hsa_shared_sync before the
+//   CPU reads, or the CPU may see one.
+//
+// So it fits a region that is written once and then belongs to the device (a
+// weight set; a KV cache the host seeds and never reads), and not one that is
+// exchanged every dispatch. Small operands are not worth marking: the flush
+// they pay for is proportional to their size.
+int triton_npu_hsa_shared_set_resident(void *va, int resident, char *errbuf,
+                                       size_t errbuf_len);
+
+// Write back and invalidate the CPU's cached copy of the first `nbytes` of the
+// region reachable at `va`, so a device read afterwards sees host writes and a
+// host read afterwards sees device writes. Returns 0, or a negative value on
+// error (with a message written to errbuf).
+//
+// This is the operation a dispatch performs implicitly over every operand it
+// declares; calling it explicitly is how the owner of a resident region keeps
+// its side of the bargain above. Implemented with CLFLUSH, so it is x86-only
+// and fails on other architectures rather than silently doing nothing.
+int triton_npu_hsa_shared_sync(void *va, uint64_t nbytes, char *errbuf,
+                               size_t errbuf_len);
 
 // Tensor arguments dispatched since the process started, split by how they got
 // to the device: `in_place` were in a shared region, `staged` were copied
