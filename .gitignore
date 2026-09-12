@@ -45,3 +45,6 @@ xrt-dev/
 
 # llvm windows prebuilt images
 third_party/llvm-*
+
+# mlir-air sources, fetched at the pinned commit by utils/fetch_mlir_air_src.py
+third_party/mlir-air-src/

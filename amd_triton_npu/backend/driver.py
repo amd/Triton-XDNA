@@ -2121,7 +2121,14 @@ PyMODINIT_FUNC PyInit___npu_dispatch(void) {{
 
 
 def _aircc_compile(
-    air_mlir_path, output_format, npu_version, air_proj_path, bf16_emulation=None
+    air_mlir_path,
+    output_format,
+    npu_version,
+    air_proj_path,
+    bf16_emulation=None,
+    stack_size=2048,
+    extra_args=None,
+    runtime_loop_tiling_sizes=(4, 4),
 ):
     """Run aircc on an AIR-dialect MLIR file to produce an NPU binary.
 
@@ -2135,6 +2142,11 @@ def _aircc_compile(
         output_format: "elf", "xclbin", or "pdi".
         npu_version: target device string ("npu1"/"npu2") for ``--device``.
         air_proj_path: directory aircc writes artifacts into.
+        stack_size: AIE core stack size in bytes.
+        extra_args: further aircc flags, appended verbatim.
+        runtime_loop_tiling_sizes: shim-DMA BD tiling factors. Defaults to
+            (4, 4) for the compiler path; pass () to leave aircc's own default
+            in place, which is what an externally-authored module wants.
 
     Returns:
         elf:           {"elf_path": str, "elf_kernel_name": str}
@@ -2255,13 +2267,23 @@ def _aircc_compile(
     if bf16_emulation:
         aircc_cmd.insert(-1, "--bf16-emulation")
     # Explicitly set runtime loop tiling sizes to [4,4] (aircc
-    # default changed from [4,4] to [] in mlir-air #1470).
-    aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
-    aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
-    # Increase core stack size to 2048 bytes to accommodate
-    # deeper call chains in register-intensive kernels.
+    # default changed from [4,4] to [] in mlir-air #1470). This restores the
+    # behaviour the compiler path's kernels were tuned against; a module
+    # authored elsewhere was tuned against aircc's *current* default, so it
+    # passes an empty tuple to leave the flag off. See the note on
+    # FusedDecodeOp.runtime_loop_tiling_sizes.
+    for size in runtime_loop_tiling_sizes or ():
+        aircc_cmd.insert(-1, f"--air-runtime-loop-tiling-sizes={size}")
+    # Increase core stack size to accommodate deeper call chains in
+    # register-intensive kernels. Externally-authored AIR modules may need
+    # more than the compiler path's default (the fused decode wants 10240).
     aircc_cmd.insert(-1, "--stack-size")
-    aircc_cmd.insert(-1, "2048")
+    aircc_cmd.insert(-1, str(stack_size))
+    # Options an externally-built module requires that the compiler path never
+    # emits -- e.g. --use-lock-race-condition-fix-v2, without which the fused
+    # decode's shared-L2 fan-in deadlocks on a counting lock.
+    for arg in extra_args or ():
+        aircc_cmd.insert(-1, arg)
     _run_compile(aircc_cmd)
 
     if output_format == "elf":
