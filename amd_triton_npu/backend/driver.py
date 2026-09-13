@@ -1,6 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
+import collections
 import functools
 import hashlib
 import json
@@ -1882,7 +1883,7 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 
     # Build set_arg lines for kernel invocation
     set_arg_lines = "\n    ".join(
-        f"run.set_arg({idx}, bo_{i});" for idx, (i, ty) in enumerate(ptr_args)
+        f"run.set_arg({idx}, g_bo_{i});" for idx, (i, ty) in enumerate(ptr_args)
     )
 
     return f"""
@@ -1909,6 +1910,40 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 static char elf_path[1024] = {{0}};
 static char elf_kernel_name[256] = {{0}};
 
+// The device handle, shared by every launch in this module. Opening it costs
+// ~11 ms and it is not a rationed resource, so unlike the session below it is
+// never given back. Function-local so it is opened on first use rather than
+// at load time: importing a module is not a reason to touch the device.
+static xrt::device& shared_device() {{
+    static xrt::device device(0u);
+    return device;
+}}
+
+// This module's XRT session, held across launches. A hw_context is the
+// expensive part to build (~35 ms) and also a rationed one: the driver caps
+// how many can exist at once -- 32 on a Strix, fewer where the device is
+// shared -- and exceeding it fails the next CREATE_HWCTX with EINVAL, in
+// whichever process asks last. Since every kernel signature is its own
+// module with its own copy of these statics, nothing here can see how many
+// are already alive. So the ownership is inverted: the module builds a
+// session when it needs one and releases it when asked, and driver.py, which
+// is the only place that can see all the modules, decides who holds one.
+static bool g_session_ready = false;
+static xrt::hw_context g_context;
+static xrt::kernel g_kernel;
+{' '.join(f'static xrt::bo g_bo_{i}; static long g_cap{i} = -1;' for i, ty in ptr_args)}
+
+// Give the session back: drop the buffers, the kernel and the context, in
+// that order, so nothing outlives the context it was created from. The next
+// launch rebuilds what it needs. The device handle deliberately survives.
+static PyObject* py_release_session(PyObject* self, PyObject* args) {{
+    {' '.join(f'g_bo_{i} = xrt::bo(); g_cap{i} = -1;' for i, ty in ptr_args)}
+    g_kernel = xrt::kernel();
+    g_context = xrt::hw_context();
+    g_session_ready = false;
+    Py_RETURN_NONE;
+}}
+
 static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
     const char* elf;
     const char* kname;
@@ -1932,54 +1967,42 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
 
     int verbosity = {1 if npu_config.debug else 0};
 
-    // Persistent XRT session. Opening the device, reading the ELF off disk,
-    // building the hw_context and allocating the buffers cost ~12 ms and do
-    // not depend on the arguments, so they happen once per process rather
-    // than once per dispatch. A module hosts exactly one kernel with
-    // compile-time constant shapes, so the buffer sizes never change either;
-    // the grow-only check below is what makes that safe to assume.
-    static bool session_ready = false;
-    static xrt::device device;
-    static xrt::hw_context context;
-    static xrt::kernel kernel;
-    {' '.join(f'static xrt::bo bo_{i}; static long cap{i} = -1;' for i, ty in ptr_args)}
-
-    if (!session_ready) {{
-        unsigned int device_index = 0;
-        if (verbosity >= 1)
-            std::cout << "Opening device " << device_index << "..." << std::endl;
-        device = xrt::device(device_index);
-
+    // Build the session if this module does not currently hold one. What each
+    // step costs, measured on Strix: device 11 ms, ELF 0.1 ms, hw_context
+    // 35 ms, kernel 0.04 ms, a 4 MB buffer 1 ms. None of it depends on the
+    // arguments, so none of it belongs in a dispatch.
+    xrt::device& device = shared_device();
+    if (!g_session_ready) {{
         if (verbosity >= 1)
             std::cout << "Loading ELF: " << elf_path << std::endl;
         xrt::elf ctx_elf{{elf_path}};
 
         if (verbosity >= 1)
             std::cout << "Creating hw_context..." << std::endl;
-        context = xrt::hw_context(device, ctx_elf);
+        g_context = xrt::hw_context(device, ctx_elf);
 
         // Kernel name from ELF config (e.g., "main:vecadd")
         std::string kernelName = elf_kernel_name;
         if (verbosity >= 1)
             std::cout << "Kernel name: " << kernelName << std::endl;
-        kernel = xrt::ext::kernel(context, kernelName);
-        session_ready = true;
+        g_kernel = xrt::ext::kernel(g_context, kernelName);
+        g_session_ready = true;
     }}
 
     // Grow-only buffers. Equal sizes are the expected case; a larger request
     // reallocates rather than silently overflowing.
-    {' '.join(f'if (cap{i} < size{i}) {{{{ bo_{i} = xrt::ext::bo{{device, (size_t)size{i}}}; cap{i} = size{i}; }}}}' for i, ty in ptr_args)}
+    {' '.join(f'if (g_cap{i} < size{i}) {{{{ g_bo_{i} = xrt::ext::bo{{device, (size_t)size{i}}}; g_cap{i} = size{i}; }}}}' for i, ty in ptr_args)}
 
     if (verbosity >= 1)
         std::cout << "Writing data into buffer objects." << std::endl;
-    {' '.join(f'void *buf{i} = bo_{i}.map<void *>(); memcpy(buf{i}, arg{i}, size{i});' for i, ty in ptr_args)}
+    {' '.join(f'void *buf{i} = g_bo_{i}.map<void *>(); memcpy(buf{i}, arg{i}, size{i});' for i, ty in ptr_args)}
 
-    {' '.join(f'bo_{i}.sync(XCL_BO_SYNC_BO_TO_DEVICE);' for i, ty in ptr_args)}
+    {' '.join(f'g_bo_{i}.sync(XCL_BO_SYNC_BO_TO_DEVICE);' for i, ty in ptr_args)}
 
     if (verbosity >= 1)
         std::cout << "Running Kernel." << std::endl;
     {'auto start = std::chrono::high_resolution_clock::now();' if autotune_time else ''}
-    auto run = xrt::run(kernel);
+    auto run = xrt::run(g_kernel);
     {set_arg_lines}
     run.start();
     run.wait2();
@@ -1990,7 +2013,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
     if (verbosity >= 1)
         std::cout << "Copying results." << std::endl;
     // TODO: Assuming the last tensor is the only output tensor.
-    bo_{last_ptr_idx}.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    g_bo_{last_ptr_idx}.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     memcpy(arg{last_ptr_idx}, buf{last_ptr_idx}, size{last_ptr_idx});
 
     if (verbosity >= 1)
@@ -2051,6 +2074,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 static PyMethodDef ModuleMethods[] = {{
   {{"launch", launch, METH_VARARGS, "Entry point for all kernels with this signature"}},
   {{"set_paths", py_set_paths, METH_VARARGS, "Set path to ELF binary and kernel name"}},
+  {{"release_session", py_release_session, METH_NOARGS, "Release this module's hw_context, kernel and buffers"}},
   {{NULL, NULL, 0, NULL}} // sentinel
 }};
 
@@ -2242,6 +2266,76 @@ _global_module_cache = {}
 # for direct fast-path calls (bypassing Triton JIT entirely).
 _last_dispatched_module = None
 
+# Modules currently holding an XRT session, least recently used first.
+#
+# The ELF launcher keeps its hw_context across launches because building one
+# costs ~35 ms. They are rationed, though -- 32 at once on a Strix, fewer when
+# the device is shared -- and each module is a separate .so that cannot see the
+# others, so the bookkeeping has to live here, the one place that sees them
+# all. A kernel swept over many shapes is many modules: examples/matmul_i8_*
+# alone builds 18 in one process, and matmul_bf16_* builds 27.
+_live_sessions = collections.OrderedDict()
+
+# How many may hold one at once. Well under any device's limit, and above the
+# working set of a model that cycles through a handful of kernels per layer,
+# which is the case the session exists for.
+_MAX_LIVE_SESSIONS = int(os.environ.get("AMD_TRITON_NPU_XRT_MAX_SESSIONS", "8"))
+
+
+def _note_session(key, mod):
+    """Record that ``mod`` is about to hold a session, evicting if needed.
+
+    Called before every launch, so the order tracks actual use rather than
+    creation order.
+    """
+    if not hasattr(mod, "release_session"):
+        return  # xclbin and HSA launchers hold no session
+    _live_sessions.pop(key, None)
+    while len(_live_sessions) >= _MAX_LIVE_SESSIONS:
+        _, evicted = _live_sessions.popitem(last=False)
+        evicted.release_session()
+    _live_sessions[key] = mod
+
+
+def _release_all_sessions(keep=None):
+    """Hand every session back, optionally sparing one.
+
+    The fallback for a device with less room than ``_MAX_LIVE_SESSIONS``
+    assumes -- contexts held by other processes count against the same limit,
+    so no cap chosen here can be right everywhere.
+    """
+    for key, mod in list(_live_sessions.items()):
+        if key == keep:
+            continue
+        mod.release_session()
+        del _live_sessions[key]
+
+
+# What the driver reports when no hw_context is available. Matched on text
+# because XRT raises a plain std::runtime_error here, with no error code to
+# test; a miss only costs the retry, since the exception is re-raised either
+# way.
+_NO_HWCTX = "CREATE_HWCTX"
+
+
+def _launch_with_session(key, mod, *launch_args):
+    """Launch ``mod``, keeping the number of live XRT sessions bounded."""
+    _note_session(key, mod)
+    try:
+        return mod.launch(*launch_args)
+    except RuntimeError as e:
+        if _NO_HWCTX not in str(e) or not hasattr(mod, "release_session"):
+            raise
+        # The device had less room than _MAX_LIVE_SESSIONS assumed -- most
+        # likely because something else on the machine holds contexts too.
+        # Give back everything this process is sitting on and try once more;
+        # if it still fails, the device is genuinely full and the caller
+        # should hear about it.
+        logger.debug("no hw_context available; releasing %d", len(_live_sessions))
+        _release_all_sessions(keep=key)
+        mod.release_session()
+        return mod.launch(*launch_args)
+
 
 def _get_cached_aircc_artifacts(cache, output_format):
     """Return cached aircc artifacts (elf/xclbin/pdi) or None if the set is incomplete.
@@ -2384,7 +2478,9 @@ def compile_module(
         if input_key in _global_module_cache:
             mod = _global_module_cache[input_key]
             _last_dispatched_module = mod
-            return mod.launch(
+            return _launch_with_session(
+                input_key,
+                mod,
                 gridX,
                 gridY,
                 gridZ,
@@ -2602,7 +2698,9 @@ def compile_module(
         _global_module_cache[input_key] = mod
         _last_dispatched_module = mod
 
-        return mod.launch(
+        return _launch_with_session(
+            input_key,
+            mod,
             gridX,
             gridY,
             gridZ,
