@@ -455,7 +455,7 @@ public:
     // The size declared for tensor i in the kernargs. Equal to sizes[i] except
     // for a resident region, which declares RESIDENT_DECLARED_BYTES -- see
     // shared_set_resident() and the note on the constant.
-    std::array<std::uint64_t, TRITON_NPU_HSA_MAX_KERNARGS> decl{};
+    std::array<std::uint64_t, TRITON_NPU_HSA_MAX_KERNARGS> declared_sizes{};
     try {
       // A shared tensor is already memory the AIE agent can reach: dispatch on
       // it in place. Every other one gets a pooled I/O buffer and a copy in.
@@ -477,16 +477,17 @@ public:
         bool resident = false;
         if (void *shared = resolve_shared(host_ptrs[i], nbytes, &resident)) {
           dev_addr[i] = shared;
-          decl[i] = resident ? std::min<std::uint64_t>(sizes[i],
-                                                       RESIDENT_DECLARED_BYTES)
-                             : sizes[i];
+          declared_sizes[i] =
+              resident
+                  ? std::min<std::uint64_t>(sizes[i], RESIDENT_DECLARED_BYTES)
+                  : sizes[i];
           ++g_in_place;
           continue;
         }
         bufs[i] = acquire(nbytes);
         std::memcpy(bufs[i].va, host_ptrs[i], nbytes);
         dev_addr[i] = bufs[i].va;
-        decl[i] = sizes[i];
+        declared_sizes[i] = sizes[i];
         ++g_staged;
       }
 
@@ -506,7 +507,7 @@ public:
           kernarg_slot(static_cast<std::uint32_t>(pkt_idx)));
       for (std::uint32_t i = 0; i < num_tensors; ++i) {
         kernargs[i] = reinterpret_cast<std::uint64_t>(dev_addr[i]);
-        kernargs[num_tensors + i] = decl[i];
+        kernargs[num_tensors + i] = declared_sizes[i];
       }
 
       // Build the AIE dispatch packet.
