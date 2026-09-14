@@ -23,14 +23,9 @@
 
 #include "HsaRuntime/HsaRuntime.h"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <unistd.h>
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#endif
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -98,40 +93,6 @@ static bool verify_writeback() {
 // reaches nothing else -- the command buffer carries only each argument's
 // address -- so shrinking it costs the device nothing.
 constexpr std::uint64_t RESIDENT_DECLARED_BYTES = 0;
-
-// Write back and invalidate the CPU's cached copy of [ptr, ptr+size), so that a
-// device read afterwards sees host writes and a host read afterwards sees
-// device writes. This is what a resident region's owner calls instead of having
-// it done on every dispatch; it is the same operation ROCR performs, over the
-// same range, just at a time the caller chooses.
-inline void sync_cpu_cache(void *ptr, std::size_t size) {
-#if defined(__x86_64__) || defined(__i386__)
-  static const std::size_t line = [] {
-    const long l = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
-    return l > 0 ? static_cast<std::size_t>(l) : std::size_t{64};
-  }();
-  if (size == 0)
-    return;
-  // Start at the line the range starts in, not at the range. CLFLUSH takes an
-  // address and evicts the line containing it, so an unaligned start walked in
-  // line-sized steps ends short: at a 64-byte line, 62 bytes from offset 3
-  // touch two lines but the second step lands past the end and is never made.
-  char *p = reinterpret_cast<char *>(reinterpret_cast<std::uintptr_t>(ptr) &
-                                     ~static_cast<std::uintptr_t>(line - 1));
-  char *const end = static_cast<char *>(ptr) + size;
-  _mm_mfence();
-  for (; p < end; p += line)
-    _mm_clflush(p);
-  _mm_mfence();
-#else
-  (void)ptr;
-  (void)size;
-  throw std::runtime_error(
-      "explicit cache sync is implemented with CLFLUSH and so only on x86; "
-      "on this architecture do not mark regions resident, and let every "
-      "dispatch flush them");
-#endif
-}
 
 // Thrown when a dispatch exceeds the watchdog timeout. A distinct type because
 // the recovery differs from an ordinary failure: the device may still be
@@ -350,6 +311,9 @@ struct SharedRegion {
   bool resident{false};  // the caller manages this region's cache state itself,
                          // so a dispatch declares only a token span for it (see
                          // shared_set_resident)
+  bool dirty{true};      // the host has written this region since the device
+                         // last saw it, so the next dispatch has to declare it
+  // in full and let ROCR flush it (see shared_mark_dirty)
 };
 
 } // namespace
@@ -456,6 +420,10 @@ public:
     // for a resident region, which declares RESIDENT_DECLARED_BYTES -- see
     // shared_set_resident() and the note on the constant.
     std::array<std::uint64_t, TRITON_NPU_HSA_MAX_KERNARGS> declared_sizes{};
+    // Resident regions this dispatch declares in full, and so has ROCR flush.
+    // Their dirty flag is cleared once the dispatch completes, not here: a
+    // dispatch that fails before submitting has flushed nothing.
+    std::vector<std::shared_ptr<SharedRegion>> flushed;
     try {
       // A shared tensor is already memory the AIE agent can reach: dispatch on
       // it in place. Every other one gets a pooled I/O buffer and a copy in.
@@ -474,13 +442,17 @@ public:
                                    " claims " + std::to_string(sizes[i]) +
                                    " bytes at a null address");
         const auto nbytes = static_cast<std::size_t>(sizes[i]);
-        bool resident = false;
-        if (void *shared = resolve_shared(host_ptrs[i], nbytes, &resident)) {
+        bool declare_full = true;
+        std::shared_ptr<SharedRegion> region;
+        if (void *shared =
+                resolve_shared(host_ptrs[i], nbytes, &declare_full, &region)) {
           dev_addr[i] = shared;
-          declared_sizes[i] =
-              resident
-                  ? std::min<std::uint64_t>(sizes[i], RESIDENT_DECLARED_BYTES)
-                  : sizes[i];
+          declared_sizes[i] = declare_full ? sizes[i] : RESIDENT_DECLARED_BYTES;
+          // Declaring it in full is what makes ROCR flush it. Remember which
+          // regions that covered, so the debt can be cleared once the dispatch
+          // that discharges it has actually run.
+          if (declare_full && region->resident)
+            flushed.push_back(std::move(region));
           ++g_in_place;
           continue;
         }
@@ -569,6 +541,15 @@ public:
                 " was declared read-only by the caller, but the device changed "
                 "it; the launcher's write-back mask is wrong for this kernel");
         }
+      }
+
+      // The dispatch ran, so the flush its declared sizes asked for has
+      // happened. Until the host writes them again, these regions can go back
+      // to declaring a token span.
+      if (!flushed.empty()) {
+        std::lock_guard<std::mutex> lock(regions_mtx_);
+        for (const auto &region : flushed)
+          region->dirty = false;
       }
 
       for (std::uint32_t i = 0; i < num_tensors; ++i)
@@ -711,36 +692,34 @@ public:
     vmem_free(region->buf, region->imported);
   }
 
-  // Write back and invalidate the CPU's cached copy of a registered region's
-  // first `size` bytes, addressed by any of its names. Bounds-checked against
-  // that name's extent for the same reason resolve_shared is: an address may
-  // point into a region, and an alias may be shorter than the region behind it.
-  void shared_sync(void *va, std::size_t size) {
-    void *host = nullptr;
-    {
-      std::lock_guard<std::mutex> lock(regions_mtx_);
-      const RegionHit hit = find_region(va);
-      if (!hit.region)
-        throw std::runtime_error("address names no registered shared region");
-      if (hit.offset + size > hit.extent)
-        throw std::runtime_error(
-            "sync of " + std::to_string(size) + " bytes at offset " +
-            std::to_string(hit.offset) + " runs past the end of the " +
-            std::to_string(hit.extent) + "-byte shared region it starts in");
-      host = va;
-    }
-    // Outside the lock: flushing a gigabyte takes milliseconds, and it touches
-    // only the caller's own pages, which it owns for the duration.
-    sync_cpu_cache(host, size);
+  // Record that the host has written a registered region, so that the next
+  // dispatch to use it declares it in full and ROCR flushes it. Addressed by
+  // any of the region's names.
+  //
+  // The flush itself is nobody's business here. Declaring a size is the only
+  // handle this runtime has on ROCR's cache maintenance -- there is no API to
+  // ask for it directly -- and reaching for CLFLUSH instead would put a second,
+  // private implementation of the same operation in a layer that has no
+  // business knowing what a cache line is.
+  void shared_mark_dirty(void *va) {
+    std::lock_guard<std::mutex> lock(regions_mtx_);
+    const RegionHit hit = find_region(va);
+    if (!hit.region)
+      throw std::runtime_error("address names no registered shared region");
+    hit.region->dirty = true;
   }
 
-  // Mark (or unmark) a region as one whose cache state the caller maintains.
+  // Mark (or unmark) a region as one the device keeps, so that dispatches stop
+  // declaring it in full. Marking it also marks it dirty: whatever the host
+  // wrote before handing the region over still has to reach the device, and the
+  // next dispatch is what makes that happen.
   void shared_set_resident(void *va, bool resident) {
     std::lock_guard<std::mutex> lock(regions_mtx_);
     const RegionHit hit = find_region(va);
     if (!hit.region)
       throw std::runtime_error("address names no registered shared region");
     hit.region->resident = resident;
+    hit.region->dirty = true;
   }
 
 private:
@@ -886,7 +865,8 @@ private:
   // The span is taken as ptr + size because that is what the dispatch ABI says
   // a tensor occupies. A strided view does not occupy that span, but no more so
   // here than in the staging path, which copies exactly those bytes.
-  void *resolve_shared(void *ptr, std::size_t size, bool *resident) {
+  void *resolve_shared(void *ptr, std::size_t size, bool *declare_full,
+                       std::shared_ptr<SharedRegion> *region_out) {
     std::lock_guard<std::mutex> lock(regions_mtx_);
     const RegionHit hit = find_region(ptr);
     if (!hit.region)
@@ -896,7 +876,11 @@ private:
           "tensor at offset " + std::to_string(hit.offset) + " spanning " +
           std::to_string(size) + " bytes runs past the end of the " +
           std::to_string(hit.extent) + "-byte shared region it starts in");
-    *resident = hit.region->resident;
+    // A resident region is declared in full exactly once after the host writes
+    // it -- that declaration is what asks ROCR to flush it -- and as a token
+    // span on every dispatch after that.
+    *declare_full = !hit.region->resident || hit.region->dirty;
+    *region_out = hit.region;
     return static_cast<std::byte *>(hit.region->aie_va) + hit.offset;
   }
 
@@ -1480,16 +1464,17 @@ extern "C" int triton_npu_hsa_shared_set_resident(void *va, int resident,
   }
 }
 
-extern "C" int triton_npu_hsa_shared_sync(void *va, uint64_t nbytes,
-                                          char *errbuf, size_t errbuf_len) {
+extern "C" int triton_npu_hsa_shared_mark_dirty(void *va, char *errbuf,
+                                                size_t errbuf_len) {
   try {
-    runtime().shared_sync(va, static_cast<std::size_t>(nbytes));
+    runtime().shared_mark_dirty(va);
     return 0;
   } catch (const std::exception &e) {
-    write_err(errbuf, errbuf_len, "HSA shared sync failed", e.what());
+    write_err(errbuf, errbuf_len, "HSA shared mark dirty failed", e.what());
     return -1;
   } catch (...) {
-    write_err(errbuf, errbuf_len, "HSA shared sync failed", "unknown error");
+    write_err(errbuf, errbuf_len, "HSA shared mark dirty failed",
+              "unknown error");
     return -1;
   }
 }

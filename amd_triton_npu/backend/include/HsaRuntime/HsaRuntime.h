@@ -175,33 +175,43 @@ int triton_npu_hsa_shared_free(void *va, char *errbuf, size_t errbuf_len);
 // the difference between this runtime and XRT on a decode: XRT uploads a buffer
 // once and passes a handle.
 //
-// A resident region is declared as one cache line instead, so the operand keeps
-// its address -- all the device needs -- and the flush costs nothing. In
-// exchange the region's owner takes on the coherency:
+// A resident region declares a token span instead, so the operand keeps its
+// address -- all the device needs -- and the flush costs nothing. In exchange
+// the region's owner has to say when the host has written it: call
+// triton_npu_hsa_shared_mark_dirty, and the next dispatch declares the region
+// in full again, which is what asks ROCR to flush it.
 //
-// * after the CPU writes to it, call triton_npu_hsa_shared_sync before the next
-//   dispatch, or the device may read a stale line;
-// * after the device writes to it, call triton_npu_hsa_shared_sync before the
-//   CPU reads, or the CPU may see one.
+// Coherency is all-or-nothing per dispatch, not per direction. ROCR walks a
+// declared range both before and after the submit, so a dispatch that declares
+// a region in full covers both directions -- the CPU's writes reach the device,
+// and the device's writes become visible to a later CPU read -- and a dispatch
+// that declares a token span covers neither. There is no way to ask for one
+// walk and not the other; the size is the only knob, which is why marking a
+// region dirty costs two walks of it rather than the one it needs.
 //
-// So it fits a region that is written once and then belongs to the device (a
-// weight set; a KV cache the host seeds and never reads), and not one that is
-// exchanged every dispatch. Small operands are not worth marking: the flush
+// So this fits a region the host writes and the device thereafter owns (a
+// weight set; a KV cache the host seeds and never reads back), and not one that
+// is exchanged every dispatch. Small operands are not worth marking: the flush
 // they pay for is proportional to their size.
 int triton_npu_hsa_shared_set_resident(void *va, int resident, char *errbuf,
                                        size_t errbuf_len);
 
-// Write back and invalidate the CPU's cached copy of the first `nbytes` of the
-// region reachable at `va`, so a device read afterwards sees host writes and a
-// host read afterwards sees device writes. Returns 0, or a negative value on
-// error (with a message written to errbuf).
+// Record that the host has written the resident region reachable at `va`, so
+// that the next dispatch to use it declares it in full and ROCR flushes it.
+// Returns 0, or a negative value on error (with a message written to errbuf).
 //
-// This is the operation a dispatch performs implicitly over every operand it
-// declares; calling it explicitly is how the owner of a resident region keeps
-// its side of the bargain above. Implemented with CLFLUSH, so it is x86-only
-// and fails on other architectures rather than silently doing nothing.
-int triton_npu_hsa_shared_sync(void *va, uint64_t nbytes, char *errbuf,
-                               size_t errbuf_len);
+// No cache instruction is issued here, or anywhere in this runtime. The
+// declared size is the only handle it has on ROCR's cache maintenance, and
+// using it means there is exactly one implementation of that operation, in the
+// layer that owns the device.
+//
+// The price of going through ROCR is that the flush cannot be asked for in one
+// direction: the dispatch that discharges the mark walks the region before the
+// submit, which is what was wanted, and again after it, which was not. So a
+// mark costs about twice what the equivalent CLFLUSH would. That is a bargain
+// at the rate regions are actually handed over -- once when a weight set is
+// loaded, once per prompt for a KV cache -- and it is not paid per dispatch.
+int triton_npu_hsa_shared_mark_dirty(void *va, char *errbuf, size_t errbuf_len);
 
 // Tensor arguments dispatched since the process started, split by how they got
 // to the device: `in_place` were in a shared region, `staged` were copied
