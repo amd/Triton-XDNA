@@ -9,6 +9,8 @@ drivers depend on a common surface instead of reaching into each other's
 internals.
 """
 
+import textwrap
+
 
 def ty_to_cpp(ty: str) -> str:
     """Map a Triton signature type to the C++ type used in the launcher."""
@@ -110,3 +112,107 @@ def extract_actual_sizes(src) -> "str | None":
         if needs_padding:
             return f"{m_val},{n_val},1"
     return None
+
+
+def written_pointer_args(src) -> "set[int] | None":
+    """Positional indices of the pointer arguments a kernel stores to.
+
+    Returns ``None`` when that cannot be established, which callers must read
+    as "assume every argument is written". Everything here fails in that
+    direction: the cost of a false positive is one copy, and the cost of a
+    false negative is a silently discarded result.
+
+    Derived from the kernel's own source rather than from argument order.
+    There is no rule in Triton that the output comes last -- ``add_kernel(x, y,
+    out, n)`` and ``kernel(out, x, n)`` are both ordinary -- and a kernel may
+    have several outputs.
+
+    Recognised: a call to ``tl.store`` or ``tl.atomic_*``, through whatever
+    name the kernel imported ``triton.language`` under, whose pointer
+    expression names exactly one parameter. Anything else gives up for the
+    whole kernel -- a store through a local (``p = C + offs; tl.store(p, v)``),
+    a call to another ``@triton.jit`` function, a pointer chosen by control
+    flow. Resolving those needs dataflow, and guessing at them is how outputs
+    go missing.
+    """
+    import ast
+
+    fn = getattr(src, "fn", None)
+    inner = getattr(fn, "fn", None)
+    source = getattr(fn, "src", None)
+    names = getattr(fn, "arg_names", None)
+    if not source or not names:
+        return None
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return None
+
+    # The names this kernel can reach triton.language by. A store is only an
+    # intrinsic if it is qualified by one of them: a @triton.jit helper the
+    # user happens to have called `store` is a call into code we cannot see,
+    # and treating it as an intrinsic would read its *first* argument as the
+    # output when the helper may write through any of them.
+    tl_aliases = {"tl", "triton.language"}
+    for name, value in getattr(inner, "__globals__", {}).items():
+        if getattr(value, "__name__", None) == "triton.language":
+            tl_aliases.add(name)
+
+    def qualifier(node):
+        """Dotted name of a call's qualifier, or None if it is not a name."""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = qualifier(node.value)
+            return f"{base}.{node.attr}" if base else None
+        return None
+
+    # Only pointer arguments, because only they can be the target of a store.
+    # A scalar's name turning up in the pointer expression -- `C + tl.arange(0,
+    # N)` -- would otherwise read as a second candidate and make every such
+    # store look ambiguous.
+    _, signature = extract_signature_and_constants(src)
+    index = {
+        name: i
+        for i, name in enumerate(names)
+        if isinstance(signature.get(i), str) and signature[i].startswith("*")
+    }
+    written: set[int] = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        if isinstance(node.func, ast.Attribute):
+            attr, base = node.func.attr, qualifier(node.func.value)
+            is_store = (attr == "store" or attr.startswith("atomic_")) and (
+                base in tl_aliases
+            )
+            opaque = base not in tl_aliases
+        else:
+            # A bare name: a helper, or an intrinsic imported directly. Either
+            # way it is not something this can read, so it is only safe if it
+            # cannot store at all.
+            is_store = False
+            opaque = qualifier(node.func) not in _CANNOT_STORE
+
+        if is_store:
+            if not node.args:
+                return None
+            referenced = {
+                index[n.id]
+                for n in ast.walk(node.args[0])
+                if isinstance(n, ast.Name) and n.id in index
+            }
+            if len(referenced) != 1:
+                return None  # unresolvable, or ambiguous between two arguments
+            written |= referenced
+        elif opaque:
+            return None
+
+    return written
+
+
+# Bare-name calls that cannot store, so they do not defeat the analysis above.
+# Anything else called by bare name is assumed to be able to write anything.
+_CANNOT_STORE = frozenset({"range", "len", "min", "max", "abs", "float", "int"})

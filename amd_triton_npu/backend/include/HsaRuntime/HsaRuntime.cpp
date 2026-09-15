@@ -69,6 +69,31 @@ static_assert(TRITON_NPU_HSA_MAX_KERNARGS <= UINT16_MAX,
 // note on triton_npu_hsa_dispatch() in the header for why.
 constexpr const char *TIMEOUT_ENV = "AMD_TRITON_NPU_HSA_TIMEOUT";
 
+// Check every argument the caller declared read-only against what came back.
+// Opt-in: it costs a comparison over the argument, which is the same order as
+// the copy it exists to avoid.
+static bool verify_writeback() {
+  static const bool on =
+      std::getenv("AMD_TRITON_NPU_HSA_VERIFY_WRITEBACK") != nullptr;
+  return on;
+}
+
+// What a dispatch declares for a resident region, in bytes.
+//
+// The size in the kernargs is what ROCR walks with CLFLUSH before and after the
+// submit (rocr::FlushCpuCache, inlined into XdnaDriver::SubmitCmdChain), at
+// about 18 us per declared MB. That is the right default -- it is what makes a
+// host write visible to the device -- but it is pure waste for a region the CPU
+// wrote once and only the device touches afterwards, and it is paid on every
+// dispatch. Declaring zero keeps the operand's *address*, which is all the
+// device needs, while flushing essentially nothing.
+//
+// Zero rather than one line because ROCR's flush loop is a do-while: a declared
+// zero walks exactly one cache line, the least it can be asked to do. The size
+// reaches nothing else -- the command buffer carries only each argument's
+// address -- so shrinking it costs the device nothing.
+constexpr std::uint64_t RESIDENT_DECLARED_BYTES = 0;
+
 // Thrown when a dispatch exceeds the watchdog timeout. A distinct type because
 // the recovery differs from an ordinary failure: the device may still be
 // executing, so every device-visible resource the dispatch handed it must be
@@ -283,6 +308,12 @@ struct SharedRegion {
                          // both how it was granted and how it is released
   bool abandoned{false}; // given to a dispatch that then timed out, so the
                          // mapping has to outlive its owner (abandon_shared)
+  bool resident{false};  // the caller manages this region's cache state itself,
+                         // so a dispatch declares only a token span for it (see
+                         // shared_set_resident)
+  bool dirty{true};      // the host has written this region since the device
+                         // last saw it, so the next dispatch has to declare it
+  // in full and let ROCR flush it (see shared_mark_dirty)
 };
 
 } // namespace
@@ -366,7 +397,8 @@ public:
   // Run one dispatch of `program` over num_tensors (host_ptr, size) pairs.
   // Serialized against every other dispatch (single shared queue).
   void dispatch(triton_npu_hsa_program *program, std::uint32_t num_tensors,
-                void *const *host_ptrs, const std::uint64_t *sizes) {
+                void *const *host_ptrs, const std::uint64_t *sizes,
+                const std::uint8_t *writeback) {
     if (program == nullptr)
       throw std::runtime_error(
           "dispatch called with a null program handle (was set_paths / prepare "
@@ -384,6 +416,14 @@ public:
     // What the device is given for tensor i: its own address when it is
     // already in a shared region, otherwise the staging buffer's.
     std::array<void *, TRITON_NPU_HSA_MAX_KERNARGS> dev_addr{};
+    // The size declared for tensor i in the kernargs. Equal to sizes[i] except
+    // for a resident region, which declares RESIDENT_DECLARED_BYTES -- see
+    // shared_set_resident() and the note on the constant.
+    std::array<std::uint64_t, TRITON_NPU_HSA_MAX_KERNARGS> declared_sizes{};
+    // Resident regions this dispatch declares in full, and so has ROCR flush.
+    // Their dirty flag is cleared once the dispatch completes, not here: a
+    // dispatch that fails before submitting has flushed nothing.
+    std::vector<std::shared_ptr<SharedRegion>> flushed;
     try {
       // A shared tensor is already memory the AIE agent can reach: dispatch on
       // it in place. Every other one gets a pooled I/O buffer and a copy in.
@@ -402,14 +442,24 @@ public:
                                    " claims " + std::to_string(sizes[i]) +
                                    " bytes at a null address");
         const auto nbytes = static_cast<std::size_t>(sizes[i]);
-        if (void *shared = resolve_shared(host_ptrs[i], nbytes)) {
+        bool declare_full = true;
+        std::shared_ptr<SharedRegion> region;
+        if (void *shared =
+                resolve_shared(host_ptrs[i], nbytes, &declare_full, &region)) {
           dev_addr[i] = shared;
+          declared_sizes[i] = declare_full ? sizes[i] : RESIDENT_DECLARED_BYTES;
+          // Declaring it in full is what makes ROCR flush it. Remember which
+          // regions that covered, so the debt can be cleared once the dispatch
+          // that discharges it has actually run.
+          if (declare_full && region->resident)
+            flushed.push_back(std::move(region));
           ++g_in_place;
           continue;
         }
         bufs[i] = acquire(nbytes);
         std::memcpy(bufs[i].va, host_ptrs[i], nbytes);
         dev_addr[i] = bufs[i].va;
+        declared_sizes[i] = sizes[i];
         ++g_staged;
       }
 
@@ -429,7 +479,7 @@ public:
           kernarg_slot(static_cast<std::uint32_t>(pkt_idx)));
       for (std::uint32_t i = 0; i < num_tensors; ++i) {
         kernargs[i] = reinterpret_cast<std::uint64_t>(dev_addr[i]);
-        kernargs[num_tensors + i] = sizes[i];
+        kernargs[num_tensors + i] = declared_sizes[i];
       }
 
       // Build the AIE dispatch packet.
@@ -475,10 +525,32 @@ public:
       // regardless of output position (unmodified inputs just copy identical
       // bytes). A shared tensor has no staging buffer and needs no copy: the
       // device wrote where the caller reads.
-      for (std::uint32_t i = 0; i < num_tensors; ++i)
-        if (bufs[i].va)
-          std::memcpy(host_ptrs[i], bufs[i].va,
-                      static_cast<std::size_t>(sizes[i]));
+      for (std::uint32_t i = 0; i < num_tensors; ++i) {
+        if (!bufs[i].va)
+          continue; // dispatched in place; the device wrote where the caller
+                    // reads
+        const auto nbytes = static_cast<std::size_t>(sizes[i]);
+        if (writeback == nullptr || writeback[i] != 0) {
+          std::memcpy(host_ptrs[i], bufs[i].va, nbytes);
+        } else if (verify_writeback()) {
+          // The caller said the kernel does not write this one. Check it, so a
+          // wrong mask fails here rather than as a wrong answer somewhere else.
+          if (std::memcmp(host_ptrs[i], bufs[i].va, nbytes) != 0)
+            throw std::runtime_error(
+                "tensor argument " + std::to_string(i) +
+                " was declared read-only by the caller, but the device changed "
+                "it; the launcher's write-back mask is wrong for this kernel");
+        }
+      }
+
+      // The dispatch ran, so the flush its declared sizes asked for has
+      // happened. Until the host writes them again, these regions can go back
+      // to declaring a token span.
+      if (!flushed.empty()) {
+        std::lock_guard<std::mutex> lock(regions_mtx_);
+        for (const auto &region : flushed)
+          region->dirty = false;
+      }
 
       for (std::uint32_t i = 0; i < num_tensors; ++i)
         release(bufs[i]);
@@ -618,6 +690,36 @@ public:
     if (region->abandoned)
       return;
     vmem_free(region->buf, region->imported);
+  }
+
+  // Record that the host has written a registered region, so that the next
+  // dispatch to use it declares it in full and ROCR flushes it. Addressed by
+  // any of the region's names.
+  //
+  // The flush itself is nobody's business here. Declaring a size is the only
+  // handle this runtime has on ROCR's cache maintenance -- there is no API to
+  // ask for it directly -- and reaching for CLFLUSH instead would put a second,
+  // private implementation of the same operation in a layer that has no
+  // business knowing what a cache line is.
+  void shared_mark_dirty(void *va) {
+    std::lock_guard<std::mutex> lock(regions_mtx_);
+    const RegionHit hit = find_region(va);
+    if (!hit.region)
+      throw std::runtime_error("address names no registered shared region");
+    hit.region->dirty = true;
+  }
+
+  // Mark (or unmark) a region as one the device keeps, so that dispatches stop
+  // declaring it in full. Marking it also marks it dirty: whatever the host
+  // wrote before handing the region over still has to reach the device, and the
+  // next dispatch is what makes that happen.
+  void shared_set_resident(void *va, bool resident) {
+    std::lock_guard<std::mutex> lock(regions_mtx_);
+    const RegionHit hit = find_region(va);
+    if (!hit.region)
+      throw std::runtime_error("address names no registered shared region");
+    hit.region->resident = resident;
+    hit.region->dirty = true;
   }
 
 private:
@@ -763,7 +865,8 @@ private:
   // The span is taken as ptr + size because that is what the dispatch ABI says
   // a tensor occupies. A strided view does not occupy that span, but no more so
   // here than in the staging path, which copies exactly those bytes.
-  void *resolve_shared(void *ptr, std::size_t size) {
+  void *resolve_shared(void *ptr, std::size_t size, bool *declare_full,
+                       std::shared_ptr<SharedRegion> *region_out) {
     std::lock_guard<std::mutex> lock(regions_mtx_);
     const RegionHit hit = find_region(ptr);
     if (!hit.region)
@@ -773,6 +876,11 @@ private:
           "tensor at offset " + std::to_string(hit.offset) + " spanning " +
           std::to_string(size) + " bytes runs past the end of the " +
           std::to_string(hit.extent) + "-byte shared region it starts in");
+    // A resident region is declared in full exactly once after the host writes
+    // it -- that declaration is what asks ROCR to flush it -- and as a token
+    // span on every dispatch after that.
+    *declare_full = !hit.region->resident || hit.region->dirty;
+    *region_out = hit.region;
     return static_cast<std::byte *>(hit.region->aie_va) + hit.offset;
   }
 
@@ -1318,14 +1426,55 @@ extern "C" int triton_npu_hsa_dispatch(triton_npu_hsa_program_t program,
                                        void *const *host_ptrs,
                                        const uint64_t *sizes, char *errbuf,
                                        size_t errbuf_len) {
+  return triton_npu_hsa_dispatch_ex(program, num_tensors, host_ptrs, sizes,
+                                    nullptr, errbuf, errbuf_len);
+}
+
+extern "C" int triton_npu_hsa_dispatch_ex(triton_npu_hsa_program_t program,
+                                          uint32_t num_tensors,
+                                          void *const *host_ptrs,
+                                          const uint64_t *sizes,
+                                          const uint8_t *writeback,
+                                          char *errbuf, size_t errbuf_len) {
   try {
-    runtime().dispatch(program, num_tensors, host_ptrs, sizes);
+    runtime().dispatch(program, num_tensors, host_ptrs, sizes, writeback);
     return 0;
   } catch (const std::exception &e) {
     write_err(errbuf, errbuf_len, "HSA dispatch failed", e.what());
     return -1;
   } catch (...) {
     write_err(errbuf, errbuf_len, "HSA dispatch failed", "unknown error");
+    return -1;
+  }
+}
+
+extern "C" int triton_npu_hsa_shared_set_resident(void *va, int resident,
+                                                  char *errbuf,
+                                                  size_t errbuf_len) {
+  try {
+    runtime().shared_set_resident(va, resident != 0);
+    return 0;
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len, "HSA shared set-resident failed", e.what());
+    return -1;
+  } catch (...) {
+    write_err(errbuf, errbuf_len, "HSA shared set-resident failed",
+              "unknown error");
+    return -1;
+  }
+}
+
+extern "C" int triton_npu_hsa_shared_mark_dirty(void *va, char *errbuf,
+                                                size_t errbuf_len) {
+  try {
+    runtime().shared_mark_dirty(va);
+    return 0;
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len, "HSA shared mark dirty failed", e.what());
+    return -1;
+  } catch (...) {
+    write_err(errbuf, errbuf_len, "HSA shared mark dirty failed",
+              "unknown error");
     return -1;
   }
 }

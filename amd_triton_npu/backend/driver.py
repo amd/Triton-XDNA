@@ -29,6 +29,7 @@ import air.passmanager
 
 from .config import npu_config, _VALID_RUNTIMES
 from .codegen import (
+    written_pointer_args,
     extract_actual_sizes,
     extract_signature_and_constants,
     extracted_type,
@@ -637,6 +638,19 @@ def _build_hsa_runtime_lib(include_dir: str, rocr: _RocrInstall) -> str:
             f"-I{rocr.include_dir}",
             f"-L{rocr.lib_dir}",
             f"-Wl,-rpath,{rocr.lib_dir}",
+            # DT_RPATH, not DT_RUNPATH. The two differ in exactly the way that
+            # matters here: LD_LIBRARY_PATH overrides RUNPATH but not RPATH.
+            # A machine with ROCm installed has /opt/rocm/lib on
+            # LD_LIBRARY_PATH, so with the linker's modern default this library
+            # binds to the SYSTEM libhsa-runtime64 rather than the AIE-capable
+            # one it was compiled against -- and a ROCR too old for AIE reports
+            # the agent as "aie2" on a Strix and then fails
+            # hsa_amd_vmem_map with HSA_STATUS_ERROR_INVALID_AGENT.
+            #
+            # _check_rocr_binding cannot catch that: it looks for a ROCR
+            # already mapped, and here the wrong one is loaded later, by this
+            # library's own dlopen.
+            "-Wl,--disable-new-dtags",
             # Link the resolved file rather than -lhsa-runtime64: a ROCm wheel
             # ships only libhsa-runtime64.so.1, and without the unversioned
             # symlink the linker's -l lookup fails.
@@ -2602,7 +2616,10 @@ class NPULauncher(object):
 
             self.output_format = "pdi"
             launcher_src = _generate_hsa_launcher(
-                constants, signature, self.kernel_placeholder_name
+                constants,
+                signature,
+                self.kernel_placeholder_name,
+                written=written_pointer_args(src),
             )
             link_profile = "hsa"
         else:

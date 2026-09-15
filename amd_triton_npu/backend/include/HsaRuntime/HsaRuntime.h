@@ -79,6 +79,26 @@ int triton_npu_hsa_dispatch(triton_npu_hsa_program_t program,
                             const uint64_t *sizes, char *errbuf,
                             size_t errbuf_len);
 
+// Dispatch, copying back only the arguments the kernel writes.
+//
+// `writeback[i]` non-zero means argument i may have been written by the kernel
+// and its staging buffer has to be copied back to the caller. A zero says the
+// kernel only reads it, so the copy is skipped -- worth roughly the argument's
+// size in memory bandwidth, on every launch. Arguments dispatched in place (a
+// shared region) are unaffected either way; they are never copied.
+//
+// A null `writeback` means "every argument", which is what
+// triton_npu_hsa_dispatch does and what a caller that does not know should
+// pass. Getting a 1 wrong costs only the copy; getting a 0 wrong loses the
+// kernel's output silently, so set AMD_TRITON_NPU_HSA_VERIFY_WRITEBACK=1 to
+// have every zero checked against what the device actually wrote. That check
+// costs a comparison per byte, so it is for tests and bring-up, not for
+// production.
+int triton_npu_hsa_dispatch_ex(triton_npu_hsa_program_t program,
+                               uint32_t num_tensors, void *const *host_ptrs,
+                               const uint64_t *sizes, const uint8_t *writeback,
+                               char *errbuf, size_t errbuf_len);
+
 // ---------------------------------------------------------------------------
 // Shared regions
 // ---------------------------------------------------------------------------
@@ -143,6 +163,55 @@ int triton_npu_hsa_shared_unalias(void *alias, char *errbuf, size_t errbuf_len);
 // forget every address that named it. Unregistered addresses are ignored, so
 // this is idempotent. Returns 0 on success, or a negative value on error.
 int triton_npu_hsa_shared_free(void *va, char *errbuf, size_t errbuf_len);
+
+// Declare that the caller, not the runtime, maintains the CPU-cache state of
+// the region reachable at `va` (any of its registered addresses). Returns 0, or
+// a negative value on error (with a message written to errbuf).
+//
+// What a dispatch declares as an operand's size is what ROCR walks with CLFLUSH
+// on the way in and on the way out -- about 18 us per declared MB, on every
+// dispatch. For a weight set the host writes once and the device only reads,
+// that is the same gigabyte flushed for every launch, and it is the whole of
+// the difference between this runtime and XRT on a decode: XRT uploads a buffer
+// once and passes a handle.
+//
+// A resident region declares a token span instead, so the operand keeps its
+// address -- all the device needs -- and the flush costs nothing. In exchange
+// the region's owner has to say when the host has written it: call
+// triton_npu_hsa_shared_mark_dirty, and the next dispatch declares the region
+// in full again, which is what asks ROCR to flush it.
+//
+// Coherency is all-or-nothing per dispatch, not per direction. ROCR walks a
+// declared range both before and after the submit, so a dispatch that declares
+// a region in full covers both directions -- the CPU's writes reach the device,
+// and the device's writes become visible to a later CPU read -- and a dispatch
+// that declares a token span covers neither. There is no way to ask for one
+// walk and not the other; the size is the only knob, which is why marking a
+// region dirty costs two walks of it rather than the one it needs.
+//
+// So this fits a region the host writes and the device thereafter owns (a
+// weight set; a KV cache the host seeds and never reads back), and not one that
+// is exchanged every dispatch. Small operands are not worth marking: the flush
+// they pay for is proportional to their size.
+int triton_npu_hsa_shared_set_resident(void *va, int resident, char *errbuf,
+                                       size_t errbuf_len);
+
+// Record that the host has written the resident region reachable at `va`, so
+// that the next dispatch to use it declares it in full and ROCR flushes it.
+// Returns 0, or a negative value on error (with a message written to errbuf).
+//
+// No cache instruction is issued here, or anywhere in this runtime. The
+// declared size is the only handle it has on ROCR's cache maintenance, and
+// using it means there is exactly one implementation of that operation, in the
+// layer that owns the device.
+//
+// The price of going through ROCR is that the flush cannot be asked for in one
+// direction: the dispatch that discharges the mark walks the region before the
+// submit, which is what was wanted, and again after it, which was not. So a
+// mark costs about twice what the equivalent CLFLUSH would. That is a bargain
+// at the rate regions are actually handed over -- once when a weight set is
+// loaded, once per prompt for a KV cache -- and it is not paid per dispatch.
+int triton_npu_hsa_shared_mark_dirty(void *va, char *errbuf, size_t errbuf_len);
 
 // Tensor arguments dispatched since the process started, split by how they got
 // to the device: `in_place` were in a shared region, `staged` were copied
