@@ -54,6 +54,7 @@ SCRIPTLESS_UNSUPPORTED = {
         # transform_<device>.mlir convention does not apply to them either.
         "gpt2": "npu2-only example",
         "qwen2_5": "npu2-only example",
+        "llama32_1b_q4nx": "npu2-only example",
     },
     "aie2p": {},
 }

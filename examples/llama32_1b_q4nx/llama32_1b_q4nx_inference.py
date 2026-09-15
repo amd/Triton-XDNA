@@ -280,12 +280,19 @@ def main(argv=None):
             profile=args.profile,
         )
         if ids == list(config.PROMPT):
-            verdict = "PASS" if first == config.EXPECT_FIRST else "FAIL"
+            ok = first == config.EXPECT_FIRST
             print(
                 f"[triton-prefill] first token {first} "
-                f"(expect {config.EXPECT_FIRST}) -- {verdict}",
+                f"(expect {config.EXPECT_FIRST}) -- {'PASS' if ok else 'FAIL'}",
                 flush=True,
             )
+            # Stop here rather than decode from a prefill already known to be
+            # wrong. Generation would still produce fluent text -- the decode
+            # is fed a KV cache, not a verdict -- so a caller reading the exit
+            # status would be told the run succeeded. --prefill-only gates the
+            # same way.
+            if not ok:
+                return 1
 
         # The npz is already written, so the decode's own prefill step has
         # nothing left to do. Everything after it -- seed_kv, the dispatch
