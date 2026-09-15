@@ -55,65 +55,37 @@ def _tokenizer_dir(air):
     )
 
 
-class _TimedOps:
-    """Wrap an ops backend so each operator's wall time is accumulated."""
-
-    def __init__(self, inner):
-        self._inner, self.t = inner, {}
-        self.enabled = getattr(inner, "enabled", "-")
-
-    def __getattr__(self, name):
-        fn = getattr(self._inner, name)
-        if not callable(fn):
-            return fn
-
-        def timed(*a, **k):
-            t0 = time.perf_counter()
-            try:
-                return fn(*a, **k)
-            finally:
-                self.t[name] = self.t.get(name, 0.0) + time.perf_counter() - t0
-
-        return timed
-
-    def report(self, total):
-        for k, v in sorted(self.t.items(), key=lambda kv: -kv[1]):
-            print(f"[profile] {k:10s} {v * 1000:8.1f} ms  {100 * v / total:5.1f}%")
-        print(f"[profile] {'TOTAL':10s} {total * 1000:8.1f} ms")
-
-
 def run_prefill(ids, backend, ops, max_seq, model, kv_path, profile=False):
     """Our prefill -> the handoff npz. Returns (first_token, P)."""
     import torch
 
     from model import LlamaPrefill
-    from prefill import build_ops
 
     m = LlamaPrefill(
-        ops=build_ops(backend, ops),
+        backend=backend,
+        ops=ops,
         n_layers=config.N_LAYERS,
         max_seq=max_seq,
         model=model,
     )
-    if profile:
-        m.ops = _TimedOps(m.ops)
+    m.timer.enabled = profile
     t0 = time.time()
     m.load_weights()
     t_load = time.time() - t0
     if profile:  # one warm pass so timings exclude compilation
         m.prefill(ids)
         m.clear_context()
-        m.ops.t.clear()
+        m.timer.reset()
     t0 = time.time()
     logits = m.prefill(ids)
     t_run = time.time() - t0
     if profile:
-        m.ops.report(t_run)
+        m.timer.report(t_run)
     first = int(torch.argmax(logits))
     if kv_path is not None:
         m.save_kv_npz(kv_path, first, ids)
     print(
-        f"[triton-prefill] backend={backend} ops={getattr(m.ops, 'enabled', '-')} "
+        f"[triton-prefill] backend={backend} ops={sorted(m.enabled)} "
         f"P={len(ids)} load {t_load:.1f}s prefill {t_run:.2f}s first={first}",
         flush=True,
     )
@@ -129,7 +101,6 @@ def make_session_class(air, backend, ops, model, n_layers):
     stays exactly as mlir-air builds it.
     """
     from model import LlamaPrefill
-    from prefill import build_ops
 
     class TritonSession(air.Session):
         def __init__(self, seq_len=2048):
@@ -142,7 +113,8 @@ def make_session_class(air, backend, ops, model, n_layers):
             t0 = time.perf_counter()
             print("[session] loading prefill weights (once)...", flush=True)
             self.prefiller = LlamaPrefill(
-                ops=build_ops(backend, ops),
+                backend=backend,
+                ops=ops,
                 n_layers=n_layers,
                 max_seq=seq_len,
                 model=model,
@@ -181,7 +153,9 @@ def make_session_class(air, backend, ops, model, n_layers):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backend", choices=("cpu", "npu"), default="npu")
-    ap.add_argument("--ops", default="all", help="NPU ops (see prefill.py)")
+    ap.add_argument(
+        "--ops", default="all", help="NPU ops: all, or a comma-separated subset"
+    )
     ap.add_argument("--prompt", default=None, help="token ids, comma separated")
     ap.add_argument("--text", default=None, help="prompt text (needs transformers)")
     ap.add_argument("--max-tokens", type=int, default=20)

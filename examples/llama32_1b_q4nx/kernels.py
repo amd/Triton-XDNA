@@ -259,7 +259,7 @@ def _padded_weight(w, Kp, Np):
     return b
 
 
-def matmul(x, w, block_m=BLOCK_M, block_n=BLOCK_N):
+def triton_matmul(x, w, block_m=BLOCK_M, block_n=BLOCK_N):
     """x: [M, K] float32/bf16, w: [K, N] bf16 -> [M, N] float32, on the NPU."""
     M, K = x.shape
     Kw, N = w.shape
@@ -317,7 +317,7 @@ def _swiglu_kernel(G, U, Y, BLOCK: tl.constexpr):
 SWIGLU_BLOCK = 1024
 
 
-def swiglu(gate, up, block=SWIGLU_BLOCK):
+def triton_swiglu(gate, up, block=SWIGLU_BLOCK):
     """silu(gate) * up over matching [M, N] tensors -> [M, N] float32."""
     shape = gate.shape
     # Fixed-size chunks, so the grid never tracks the prompt length (ROW_TILE).
@@ -381,7 +381,7 @@ def _rms_norm_kernel(
 RMS_BLOCK_M = 2
 
 
-def rms_norm(x, weight, eps, block_m=RMS_BLOCK_M):
+def triton_rms_norm(x, weight, eps, block_m=RMS_BLOCK_M):
     """x: [M, D] -> RMS-normalized and scaled by `weight` [D]."""
     M, dim = x.shape
     Mp = math.ceil(M / ROW_TILE) * ROW_TILE

@@ -25,16 +25,6 @@ import config  # noqa: E402
 from model import LlamaPrefill  # noqa: E402
 
 
-def build_ops(backend, ops_spec):
-    if backend == "cpu":
-        from ops import TorchOps
-
-        return TorchOps()
-    from ops_npu import NpuOps
-
-    return NpuOps(ops_spec)
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backend", choices=("cpu", "npu"), default="npu")
@@ -61,7 +51,8 @@ def main(argv=None):
     )
 
     m = LlamaPrefill(
-        ops=build_ops(args.backend, args.ops),
+        backend=args.backend,
+        ops=args.ops,
         n_layers=args.n_layers,
         max_seq=args.max_seq,
         model=args.model,
@@ -80,7 +71,7 @@ def main(argv=None):
     top = torch.topk(logits, 5)
     first = int(top.indices[0])
     print(
-        f"[prefill] backend={args.backend} ops={getattr(m.ops, 'enabled', '-')} "
+        f"[prefill] backend={args.backend} ops={sorted(m.enabled)} "
         f"P={len(ids)} in {t_run:.2f}s"
     )
     print(
@@ -98,9 +89,7 @@ def main(argv=None):
         verdict = "PASS"
 
     if args.compare_cpu and args.backend != "cpu":
-        from ops import TorchOps
-
-        ref = LlamaPrefill(ops=TorchOps(), n_layers=args.n_layers, max_seq=args.max_seq)
+        ref = LlamaPrefill(backend="cpu", n_layers=args.n_layers, max_seq=args.max_seq)
         ref._w, ref.embed, ref.final_norm = m._w, m.embed, m.final_norm
         ref.lm_head, ref._lut, ref.fingerprint = m.lm_head, m._lut, m.fingerprint
         ref.prefill(ids)

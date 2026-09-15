@@ -74,9 +74,9 @@ producing the same token ids.
 
 | Op | Device | Kernel |
 |---|---|---|
-| all 7 projections per layer (112 GEMMs) | **NPU** | `kernels.matmul` |
-| RMSNorm (33) | **NPU** | `kernels.rms_norm` |
-| SwiGLU (16) | **NPU** | `kernels.swiglu` |
+| all 7 projections per layer (112 GEMMs) | **NPU** | `kernels.triton_matmul` |
+| RMSNorm (33) | **NPU** | `kernels.triton_rms_norm` |
+| SwiGLU (16) | **NPU** | `kernels.triton_swiglu` |
 | RoPE | CPU | no transform script — see below |
 | causal GQA attention | CPU | no transform script |
 | LM head | CPU | one GEMV, off the hot path |
@@ -226,9 +226,7 @@ reference.
 ```
 llama32_1b_q4nx_inference.py  # end to end: our prefill -> mlir-air's decode
 prefill.py                    # prefill alone, with the Paris gate
-model.py                      # the 16-layer forward pass
-ops.py                        # CPU reference backend (the correctness baseline)
-ops_npu.py                    # per-op NPU routing
+model.py                      # the 16-layer forward pass and its operators
 kernels.py                    # the Triton kernels + NPU dispatch plumbing
 config.py                     # dims; re-exports mlir-air's loader and RoPE table
 transform_rms_norm_aie2p.mlir # f32 row reduction (see above)
