@@ -1883,7 +1883,7 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 
     # Build set_arg lines for kernel invocation
     set_arg_lines = "\n    ".join(
-        f"run.set_arg({idx}, g_bo_{i});" for idx, (i, ty) in enumerate(ptr_args)
+        f"run.set_arg({idx}, s.bo_{i});" for idx, (i, ty) in enumerate(ptr_args)
     )
 
     return f"""
@@ -1910,37 +1910,53 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 static char elf_path[1024] = {{0}};
 static char elf_kernel_name[256] = {{0}};
 
-// The device handle, shared by every launch in this module. Opening it costs
-// ~11 ms and it is not a rationed resource, so unlike the session below it is
-// never given back. Function-local so it is opened on first use rather than
-// at load time: importing a module is not a reason to touch the device.
-static xrt::device& shared_device() {{
-    static xrt::device device(0u);
-    return device;
-}}
-
 // This module's XRT session, held across launches. A hw_context is the
 // expensive part to build (~35 ms) and also a rationed one: the driver caps
 // how many can exist at once -- 32 on a Strix, fewer where the device is
 // shared -- and exceeding it fails the next CREATE_HWCTX with EINVAL, in
 // whichever process asks last. Since every kernel signature is its own
-// module with its own copy of these statics, nothing here can see how many
-// are already alive. So the ownership is inverted: the module builds a
-// session when it needs one and releases it when asked, and driver.py, which
-// is the only place that can see all the modules, decides who holds one.
-static bool g_session_ready = false;
-static xrt::hw_context g_context;
-static xrt::kernel g_kernel;
-{' '.join(f'static xrt::bo g_bo_{i}; static long g_cap{i} = -1;' for i, ty in ptr_args)}
+// module with its own copy of this, nothing here can see how many are
+// already alive. So the ownership is inverted: the module builds a session
+// when it needs one and releases it when asked, and driver.py, which is the
+// only place that can see all the modules, decides who holds one.
+//
+// One object rather than separate statics, because the member order is the
+// teardown order: members are destroyed in reverse of declaration, giving
+// buffers, kernel, context, ELF, device. XRT faults if a handle outlives what
+// it was built from, and separate statics would not guarantee that -- a
+// function-local static device would be constructed last and so destroyed
+// first, before the context that depends on it.
+//
+// The ELF is held for the same reason. A hw_context does keep the ELF alive
+// on its own (hw_context_impl stores a copy in its m_elf_map, and xrt::elf is
+// a shared_ptr-backed handle), so this is about destruction order, not
+// lifetime.
+struct Session {{
+    xrt::device device;
+    xrt::elf elf;
+    xrt::hw_context context;
+    xrt::kernel kernel;
+    {' '.join(f'xrt::bo bo_{i}; long cap{i} = -1;' for i, ty in ptr_args)}
+    bool ready = false;
+}};
 
-// Give the session back: drop the buffers, the kernel and the context, in
-// that order, so nothing outlives the context it was created from. The next
-// launch rebuilds what it needs. The device handle deliberately survives.
+// Built on first use, not at load time: importing a module is not a reason to
+// touch the device.
+static Session& session() {{
+    static Session s;
+    return s;
+}}
+
+// Give the session back. The device is kept: opening it costs ~11 ms and it is
+// not rationed, so there is nothing to gain by releasing it. Everything built
+// from it goes, innermost first, and the next launch rebuilds what it needs.
 static PyObject* py_release_session(PyObject* self, PyObject* args) {{
-    {' '.join(f'g_bo_{i} = xrt::bo(); g_cap{i} = -1;' for i, ty in ptr_args)}
-    g_kernel = xrt::kernel();
-    g_context = xrt::hw_context();
-    g_session_ready = false;
+    Session& s = session();
+    {' '.join(f's.bo_{i} = xrt::bo(); s.cap{i} = -1;' for i, ty in ptr_args)}
+    s.kernel = xrt::kernel();
+    s.context = xrt::hw_context();
+    s.elf = xrt::elf();
+    s.ready = false;
     Py_RETURN_NONE;
 }}
 
@@ -1971,38 +1987,45 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
     // step costs, measured on Strix: device 11 ms, ELF 0.1 ms, hw_context
     // 35 ms, kernel 0.04 ms, a 4 MB buffer 1 ms. None of it depends on the
     // arguments, so none of it belongs in a dispatch.
-    xrt::device& device = shared_device();
-    if (!g_session_ready) {{
+    Session& s = session();
+    if (!s.ready) {{
+        if (!s.device) {{
+            unsigned int device_index = 0;
+            if (verbosity >= 1)
+                std::cout << "Opening device " << device_index << "..." << std::endl;
+            s.device = xrt::device(device_index);
+        }}
+
         if (verbosity >= 1)
             std::cout << "Loading ELF: " << elf_path << std::endl;
-        xrt::elf ctx_elf{{elf_path}};
+        s.elf = xrt::elf{{elf_path}};
 
         if (verbosity >= 1)
             std::cout << "Creating hw_context..." << std::endl;
-        g_context = xrt::hw_context(device, ctx_elf);
+        s.context = xrt::hw_context(s.device, s.elf);
 
         // Kernel name from ELF config (e.g., "main:vecadd")
         std::string kernelName = elf_kernel_name;
         if (verbosity >= 1)
             std::cout << "Kernel name: " << kernelName << std::endl;
-        g_kernel = xrt::ext::kernel(g_context, kernelName);
-        g_session_ready = true;
+        s.kernel = xrt::ext::kernel(s.context, kernelName);
+        s.ready = true;
     }}
 
     // Grow-only buffers. Equal sizes are the expected case; a larger request
     // reallocates rather than silently overflowing.
-    {' '.join(f'if (g_cap{i} < size{i}) {{{{ g_bo_{i} = xrt::ext::bo{{device, (size_t)size{i}}}; g_cap{i} = size{i}; }}}}' for i, ty in ptr_args)}
+    {' '.join(f'if (s.cap{i} < size{i}) {{{{ s.bo_{i} = xrt::ext::bo{{s.device, (size_t)size{i}}}; s.cap{i} = size{i}; }}}}' for i, ty in ptr_args)}
 
     if (verbosity >= 1)
         std::cout << "Writing data into buffer objects." << std::endl;
-    {' '.join(f'void *buf{i} = g_bo_{i}.map<void *>(); memcpy(buf{i}, arg{i}, size{i});' for i, ty in ptr_args)}
+    {' '.join(f'void *buf{i} = s.bo_{i}.map<void *>(); memcpy(buf{i}, arg{i}, size{i});' for i, ty in ptr_args)}
 
-    {' '.join(f'g_bo_{i}.sync(XCL_BO_SYNC_BO_TO_DEVICE);' for i, ty in ptr_args)}
+    {' '.join(f's.bo_{i}.sync(XCL_BO_SYNC_BO_TO_DEVICE);' for i, ty in ptr_args)}
 
     if (verbosity >= 1)
         std::cout << "Running Kernel." << std::endl;
     {'auto start = std::chrono::high_resolution_clock::now();' if autotune_time else ''}
-    auto run = xrt::run(g_kernel);
+    auto run = xrt::run(s.kernel);
     {set_arg_lines}
     run.start();
     run.wait2();
@@ -2013,7 +2036,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
     if (verbosity >= 1)
         std::cout << "Copying results." << std::endl;
     // TODO: Assuming the last tensor is the only output tensor.
-    g_bo_{last_ptr_idx}.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    s.bo_{last_ptr_idx}.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     memcpy(arg{last_ptr_idx}, buf{last_ptr_idx}, size{last_ptr_idx});
 
     if (verbosity >= 1)
