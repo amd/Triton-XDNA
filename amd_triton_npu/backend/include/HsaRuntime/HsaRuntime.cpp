@@ -394,6 +394,36 @@ public:
     return raw;
   }
 
+  // Overwrite `nbytes` of a prepared program's instruction stream at
+  // `byte_offset`.
+  //
+  // The AIE dispatch packet carries insts_addr and insts_size per enqueue, so
+  // the stream is an input to each dispatch rather than a property of the
+  // program -- prepare() only fixes where it lives. A decode needs that: its
+  // context length L is encoded in a handful of stream words, and mlir-air's
+  // xclbin path rewrites exactly those words per token. This is the same edit
+  // against the buffer the packet already points at.
+  //
+  // Takes dispatch_mtx_, the same lock a dispatch holds. The GIL does not
+  // serialise this: the dispatch path releases it for the duration of the
+  // device work, and this is reached through ctypes, which releases it too.
+  // Without the lock another thread could memcpy into the stream while the
+  // queue is consuming it, and the dispatch would run a mix of two contexts.
+  void patch_insts(triton_npu_hsa_program *program, std::uint64_t byte_offset,
+                   const void *src, std::uint64_t nbytes) {
+    if (program == nullptr)
+      throw std::runtime_error("patch_insts called with a null program handle");
+    if (byte_offset + nbytes < byte_offset ||
+        byte_offset + nbytes > program->insts.size())
+      throw std::runtime_error(
+          "patch_insts range [" + std::to_string(byte_offset) + ", +" +
+          std::to_string(nbytes) + ") is outside the " +
+          std::to_string(program->insts.size()) + "-byte instruction stream");
+    std::lock_guard<std::mutex> lock(dispatch_mtx_);
+    std::memcpy(static_cast<char *>(program->insts.va()) + byte_offset, src,
+                static_cast<std::size_t>(nbytes));
+  }
+
   // Run one dispatch of `program` over num_tensors (host_ptr, size) pairs.
   // Serialized against every other dispatch (single shared queue).
   void dispatch(triton_npu_hsa_program *program, std::uint32_t num_tensors,
@@ -1475,6 +1505,22 @@ extern "C" int triton_npu_hsa_shared_mark_dirty(void *va, char *errbuf,
   } catch (...) {
     write_err(errbuf, errbuf_len, "HSA shared mark dirty failed",
               "unknown error");
+    return -1;
+  }
+}
+
+extern "C" int triton_npu_hsa_patch_insts(triton_npu_hsa_program_t program,
+                                          uint64_t byte_offset, const void *src,
+                                          uint64_t nbytes, char *errbuf,
+                                          size_t errbuf_len) {
+  try {
+    runtime().patch_insts(program, byte_offset, src, nbytes);
+    return 0;
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len, "HSA patch insts failed", e.what());
+    return -1;
+  } catch (...) {
+    write_err(errbuf, errbuf_len, "HSA patch insts failed", "unknown error");
     return -1;
   }
 }
