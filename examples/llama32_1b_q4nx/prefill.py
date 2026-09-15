@@ -1,0 +1,120 @@
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+"""Run the Llama-3.2-1B Q4NX prefill and write the decode's KV handoff.
+
+    python prefill.py --backend cpu
+    python prefill.py --backend npu --ops all
+    python prefill.py --backend npu --kv-out /tmp/prefill_kv.npz
+
+The gate is the first generated token: 12366 (" Paris") for the canonical
+prompt. The npz is what mlir-air's fused decode consumes; `model.save_kv_npz`
+states that layout.
+"""
+
+import argparse
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import config  # noqa: E402
+from model import LlamaPrefill  # noqa: E402
+
+
+def build_ops(backend, ops_spec):
+    if backend == "cpu":
+        from ops import TorchOps
+
+        return TorchOps()
+    from ops_npu import NpuOps
+
+    return NpuOps(ops_spec)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--backend", choices=("cpu", "npu"), default="npu")
+    ap.add_argument(
+        "--ops",
+        default=None,
+        help="NPU ops to enable: 'all', or a comma list of "
+        "matmul,rms_norm,swiglu (default: all)",
+    )
+    ap.add_argument("--prompt", default=None, help="token ids, comma separated")
+    ap.add_argument("--n-layers", type=int, default=config.N_LAYERS)
+    ap.add_argument("--max-seq", type=int, default=256)
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--kv-out", default=None, help="write the decode handoff npz here")
+    ap.add_argument(
+        "--compare-cpu",
+        action="store_true",
+        help="also run the CPU reference and report per-layer KV divergence",
+    )
+    args = ap.parse_args(argv)
+
+    ids = (
+        [int(t) for t in args.prompt.split(",")] if args.prompt else list(config.PROMPT)
+    )
+
+    m = LlamaPrefill(
+        ops=build_ops(args.backend, args.ops),
+        n_layers=args.n_layers,
+        max_seq=args.max_seq,
+        model=args.model,
+    )
+    t0 = time.time()
+    m.load_weights()
+    t_load = time.time() - t0
+    print(
+        f"[prefill] weights {config.MODEL_DEFAULT} ({m.fingerprint}) in {t_load:.1f}s"
+    )
+
+    t0 = time.time()
+    logits = m.prefill(ids)
+    t_run = time.time() - t0
+
+    top = torch.topk(logits, 5)
+    first = int(top.indices[0])
+    print(
+        f"[prefill] backend={args.backend} ops={getattr(m.ops, 'enabled', '-')} "
+        f"P={len(ids)} in {t_run:.2f}s"
+    )
+    print(
+        f"[prefill] top5 {top.indices.tolist()} {[round(float(v),2) for v in top.values]}"
+    )
+
+    ok = args.n_layers == config.N_LAYERS and ids == list(config.PROMPT)
+    if ok:
+        verdict = "PASS" if first == config.EXPECT_FIRST else "FAIL"
+        print(
+            f"[prefill] first token {first} (expect {config.EXPECT_FIRST}) -- {verdict}"
+        )
+    else:
+        print(f"[prefill] first token {first} (gate not applicable)")
+        verdict = "PASS"
+
+    if args.compare_cpu and args.backend != "cpu":
+        from ops import TorchOps
+
+        ref = LlamaPrefill(ops=TorchOps(), n_layers=args.n_layers, max_seq=args.max_seq)
+        ref._w, ref.embed, ref.final_norm = m._w, m.embed, m.final_norm
+        ref.lm_head, ref._lut, ref.fingerprint = m.lm_head, m._lut, m.fingerprint
+        ref.prefill(ids)
+        for L in range(args.n_layers):
+            dk = np.abs(m.kv_k[L] - ref.kv_k[L]).max()
+            dv = np.abs(m.kv_v[L] - ref.kv_v[L]).max()
+            print(f"[compare] layer {L:2d}  dK {dk:.4f}  dV {dv:.4f}")
+
+    if args.kv_out:
+        K, V = m.save_kv_npz(args.kv_out, first, ids)
+        print(f"[prefill] wrote {args.kv_out}  k{K.shape} v{V.shape} first={first}")
+
+    return 0 if verdict == "PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

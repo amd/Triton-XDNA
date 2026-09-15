@@ -27,6 +27,10 @@ DEFAULT_SKIPPED_EXAMPLES = {
     # out of the default sweep.
     "gpt2",
     "qwen2_5",
+    # Needs the 1.3 GB model.q4nx bundle and, for generation, a one-time
+    # `make compile-decode` in the example. `--prefill-only` runs without the
+    # decode build but still wants the weights.
+    "llama32_1b_q4nx",
 }
 
 # Examples that cannot run without a transform script on a given device, keyed
