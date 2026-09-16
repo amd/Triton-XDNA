@@ -42,6 +42,7 @@
 #include <utility>
 #include <vector>
 
+#include <dlfcn.h>    // dlsym(), to probe for an optional ROCR extension
 #include <sys/stat.h> // fstat(), to size the object a dma-buf names
 #include <unistd.h>   // close(), for the dma-buf an import is reached through
 
@@ -393,6 +394,9 @@ struct triton_npu_hsa_program {
   // one uint32 per parameter here; the device reads them in its dispatch
   // preamble.
   PoolBuffer scratchpad;
+  // The address the control code is patched with: what the NPU sees, which is
+  // not the host address the allocation is known by.
+  std::uint64_t scratchpad_dev_addr = 0;
 
   // Argument addresses the control code was last patched with. Re-patching
   // means rewriting the whole control code (354 KiB for the fused decode, over
@@ -513,39 +517,12 @@ public:
           "kernel '" + std::string(kernel_name) + "' in '" + elf_path +
           "' has no PDI patch site, so it cannot be dispatched as a full ELF");
 
-    // Two shapes this cannot dispatch, refused here rather than hung on the
-    // device. Both come from the same hole in the ABI, measured on aie2p
-    // against ROCm/rocm-systems#11668:
-    //
-    // ROCR patches exactly two addresses into the control code -- the control
-    // code's own and the PDI's -- and for each it resolves the buffer's
-    // *device* address through an ioctl and adds the buffer to the command's
-    // residency list (BuildFullElfCommand). Userspace can do neither: a pool
-    // allocation's host address is not its device address, and a buffer the
-    // command does not list is not held down for the dispatch.
-    //
-    // So any other address the control code needs is unreachable from here.
-    // Writing the host address instead does not fault; the design simply waits
-    // on data that never arrives, and the dispatch hangs until the queue is
-    // torn down. On a shared NPU that is the worst available outcome, so these
-    // are rejected at prepare time, where the caller still has a stack.
-    //
-    // Both are real: the fused Q4NX decode's q4nx_decode has two PDI patch
-    // sites and a scratchpad. Lifting either needs ROCR to resolve and list
-    // application-named buffers -- there is nothing to work around here.
-    if (k.pdi_patches.size() > 1)
-      throw std::runtime_error(
-          "kernel '" + std::string(kernel_name) + "' switches configuration " +
-          std::to_string(k.pdi_patches.size()) +
-          " times, but the dispatch packet carries one pdi_addr and only ROCR "
-          "can resolve a PDI's device address; dispatching it would hang");
-    if (k.has_scratchpad)
-      throw std::runtime_error(
-          "kernel '" + std::string(kernel_name) +
-          "' declares a control scratchpad, which needs ROCR to patch the "
-          "buffer's device address into the control code and keep it resident; "
-          "the dispatch ABI has no way to ask for that, and dispatching it "
-          "would hang");
+    // Any address the control code needs beyond ROCR's one PDI -- a second
+    // configuration to switch to, a control scratchpad -- has to be written
+    // here, and it has to be the *device* address. A pool allocation's host
+    // address is not it, and writing that does not fault: the design waits on
+    // data that never arrives and the dispatch hangs. Ask ROCR, which is the
+    // only thing that can answer (hsa_amd_aie_agent_device_address).
 
     // Every PDI, not just the patched one: the control code switches to the
     // others by address, and an unmapped one faults the array.
@@ -554,8 +531,7 @@ public:
     for (const aie_full_elf::Pdi &pdi : prog->image->pdis) {
       prog->pdi_bufs.push_back(alloc_dev(pdi.data.size()));
       std::memcpy(prog->pdi_bufs.back().va(), pdi.data.data(), pdi.data.size());
-      prog->pdi_addrs.push_back(
-          reinterpret_cast<std::uint64_t>(prog->pdi_bufs.back().va()));
+      prog->pdi_addrs.push_back(device_address(prog->pdi_bufs.back().va()));
     }
 
     prog->ctrl =
@@ -568,7 +544,16 @@ public:
       // every slot, so an unwritten one has to be a zero rather than whatever
       // the pool last held.
       std::memset(prog->scratchpad.va(), 0, k.scratchpad_size);
+      prog->scratchpad_dev_addr = device_address(prog->scratchpad.va());
     }
+
+    // Patch once here rather than on the first dispatch: everything these
+    // sites name -- the other PDIs, the scratchpad -- is fixed for the life of
+    // the program. Only the arguments move, and dispatch re-patches for those.
+    aie_full_elf::write_control_code(
+        k, prog->ctrl_va, prog->ctrl_size,
+        std::vector<std::uint64_t>(k.num_args(), 0), prog->scratchpad_dev_addr,
+        prog->pdi_addrs);
 
     triton_npu_hsa_program *raw = prog.get();
     programs_.emplace(std::move(key), std::move(prog));
@@ -726,8 +711,7 @@ public:
         if (!program->ctrl_patched || program->patched_args != args) {
           aie_full_elf::write_control_code(
               *program->kernel, program->ctrl_va, program->ctrl_size, args,
-              reinterpret_cast<std::uint64_t>(program->scratchpad.va()),
-              program->pdi_addrs);
+              program->scratchpad_dev_addr, program->pdi_addrs);
           program->patched_args = std::move(args);
           program->ctrl_patched = true;
         }
@@ -745,11 +729,40 @@ public:
 
       // Each ring slot owns a fixed kernarg slot of the same index; no
       // allocation on the hot path. Layout: [addr0..addrN-1, size0..sizeN-1].
+      // A full-ELF design's scratchpad is reached only through the address
+      // patched into its control code, so nothing else in the packet mentions
+      // it -- and a buffer the command does not list is not kept resident for
+      // the dispatch. Listing it as a trailing kernarg is what holds it down.
+      //
+      // It is declared at its real size, not at the token span a resident
+      // region uses, because the declared size is also what ROCR walks with
+      // CLFLUSH -- and the host has just written these bytes. Declaring 0
+      // keeps the buffer resident but flushes nothing, and the parameters then
+      // sit in CPU cache: a dispatch sees them only if they happen to have
+      // been evicted, which shows up as a stale answer on some runs and the
+      // right one on others. The scratchpad is 4 bytes per parameter, so the
+      // flush it costs is nothing.
+      const std::uint32_t extra_kernargs =
+          (program->full_elf && program->scratchpad.va() != nullptr) ? 1u : 0u;
+      const std::uint32_t total_kernargs = num_tensors + extra_kernargs;
+      if (total_kernargs > TRITON_NPU_HSA_MAX_KERNARGS)
+        throw std::runtime_error(
+            "dispatch needs " + std::to_string(total_kernargs) +
+            " kernarg slots (including the scratchpad) but the runtime "
+            "supports at most " +
+            std::to_string(TRITON_NPU_HSA_MAX_KERNARGS) +
+            "; raise TRITON_NPU_HSA_MAX_KERNARGS in HsaRuntime.h and rebuild");
+
       auto *kernargs = static_cast<std::uint64_t *>(
           kernarg_slot(static_cast<std::uint32_t>(pkt_idx)));
       for (std::uint32_t i = 0; i < num_tensors; ++i) {
         kernargs[i] = reinterpret_cast<std::uint64_t>(dev_addr[i]);
-        kernargs[num_tensors + i] = declared_sizes[i];
+        kernargs[total_kernargs + i] = declared_sizes[i];
+      }
+      if (extra_kernargs) {
+        kernargs[num_tensors] =
+            reinterpret_cast<std::uint64_t>(program->scratchpad.va());
+        kernargs[total_kernargs + num_tensors] = program->scratchpad.size();
       }
 
       // Build the AIE dispatch packet.
@@ -772,9 +785,9 @@ public:
       pkt.insts_addr_low = static_cast<std::uint32_t>(insts_addr & 0xFFFFFFFFu);
       pkt.insts_addr_high = static_cast<std::uint32_t>(insts_addr >> 32);
       // Narrowing checked by the static_assert on TRITON_NPU_HSA_MAX_KERNARGS.
-      pkt.num_kernargs = static_cast<std::uint16_t>(num_tensors);
+      pkt.num_kernargs = static_cast<std::uint16_t>(total_kernargs);
       // The ABI requires kernarg_address to be NULL when num_kernargs is 0.
-      pkt.kernarg_address = (num_tensors > 0) ? kernargs : nullptr;
+      pkt.kernarg_address = (total_kernargs > 0) ? kernargs : nullptr;
       if (program->full_elf) {
         pkt.insts_size = program->ctrl_size;
         pkt.pdi_addr =
@@ -1450,6 +1463,37 @@ private:
   // API requires; data_granule_ is normalized non-zero in init()).
   std::size_t round_up(std::size_t n) const {
     return ((n + data_granule_ - 1) / data_granule_) * data_granule_;
+  }
+
+  // The address the NPU sees for `ptr`, which is not the host address the
+  // allocation is known by.
+  //
+  // Only ROCR can answer: the mapping comes from the driver, per buffer object.
+  // Everything a full-ELF control code reaches is named by this address, and a
+  // host address written into a patch site does not fault -- the design waits
+  // on data that never arrives -- so a buffer with no device address is refused
+  // here rather than dispatched.
+  std::uint64_t device_address(void *ptr) {
+    // Looked up rather than called directly: this is an extension, and the
+    // header a given ROCm ships may not even declare it. A build against one
+    // ROCR and a run against another is the normal case here (the launcher
+    // binds its ROCR by DT_RPATH), so the question is what is loaded now.
+    using AieDeviceAddressFn =
+        hsa_status_t (*)(hsa_agent_t, void *, std::uint64_t *, std::size_t *);
+    static auto *fn = reinterpret_cast<AieDeviceAddressFn>(
+        dlsym(RTLD_DEFAULT, "hsa_amd_aie_agent_device_address"));
+    if (fn == nullptr)
+      throw std::runtime_error(
+          "this ROCR has no hsa_amd_aie_agent_device_address, so the device "
+          "address of a full-ELF design's scratchpad or of a configuration it "
+          "switches to cannot be resolved; dispatching it would hang");
+
+    std::uint64_t dev = 0;
+    HSA_CHECK(fn(aie_agent_, ptr, &dev, nullptr));
+    if (dev == 0)
+      throw std::runtime_error(
+          "allocation has no device address, so the NPU cannot fetch from it");
+    return dev;
   }
 
   // A fresh dev-pool allocation of `size` bytes.
