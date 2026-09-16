@@ -206,15 +206,28 @@ runs:
         # prompt's first token, so a wrong kernel fails here rather than being
         # absorbed into fluent-looking output. npu2-only, like gpt2/qwen.
         if [ "$DEVICE" = "aie2p" ]; then
-          ( cd examples/llama32_1b_q4nx \
-            && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
-               python llama32_1b_q4nx_inference.py --prefill-only )
-          rc=$?
-          if [ "$rc" -eq 77 ]; then
-            echo "SKIP: llama32_1b_q4nx (exit 77)"
-          elif [ "$rc" -ne 0 ]; then
-            echo "FAIL: llama32_1b_q4nx (exit $rc)"
-            exit "$rc"
+          # The weight loader lives in mlir-air's sources, which the wheel does
+          # not ship, so fetch them at the pinned commit first. Sparse and
+          # blobless: ~1.7 MB of two directories. Without this the example
+          # declines the test and the gate never actually runs.
+          air_rc=0
+          python3 utils/fetch_mlir_air_src.py || air_rc=$?
+          if [ "$air_rc" -ne 0 ]; then
+            echo "SKIP: llama32_1b_q4nx (mlir-air sources unavailable)"
+          else
+            # `|| rc=$?` rather than a bare call: this step runs under `bash -e`,
+            # so a non-zero exit -- including the 77 that means SKIP -- would
+            # otherwise abort the step before the check below could grade it.
+            rc=0
+            ( cd examples/llama32_1b_q4nx \
+              && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+                 python llama32_1b_q4nx_inference.py --prefill-only ) || rc=$?
+            if [ "$rc" -eq 77 ]; then
+              echo "SKIP: llama32_1b_q4nx (exit 77)"
+            elif [ "$rc" -ne 0 ]; then
+              echo "FAIL: llama32_1b_q4nx (exit $rc)"
+              exit "$rc"
+            fi
           fi
         else
           echo "Skipping llama32_1b_q4nx: npu2-only (device=$DEVICE)."
@@ -232,8 +245,8 @@ runs:
           for ex in gpt2 qwen2_5; do
             echo "--- hetero: $ex ---"
             entry=$(ls examples/$ex/*_inference.py | head -1)
-            ( cd "examples/$ex" && python "$(basename "$entry")" --backend hetero --max-tokens 0 --verbose )
-            rc=$?
+            rc=0
+            ( cd "examples/$ex" && python "$(basename "$entry")" --backend hetero --max-tokens 0 --verbose ) || rc=$?
             if [ "$rc" -eq 77 ]; then
               echo "SKIP: $ex (exit 77)"
             elif [ "$rc" -ne 0 ]; then
