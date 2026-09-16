@@ -20,12 +20,13 @@ srcdir  := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 DRIVER  := $(srcdir)/llama32_1b_q4nx_inference.py
 
 # Operators to run on the NPU: 'all', or a comma list of matmul,rms_norm,swiglu.
-# xrt (default) or hsa. HSA runs both halves on Yiannis' HsaRuntime: the
-# prefill's kernels as PDI, and the decode with its instruction stream patched
-# per token (hsa_decode.py). Correct, and currently ~22 tok/s against XRT's
+# xrt (default) or hsa. HSA runs both halves on HsaRuntime: the prefill's
+# kernels as PDI, and the decode as one full ELF whose context length arrives
+# as scratchpad parameters rather than as an edit to its instruction stream
+# (hsa_decode.py).
 RUNTIME  ?= xrt
 export AMD_TRITON_NPU_RUNTIME = $(RUNTIME)
-DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),pdi,xclbin)
+DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),elf,xclbin)
 
 OPS      ?= all
 BACKEND  ?= npu

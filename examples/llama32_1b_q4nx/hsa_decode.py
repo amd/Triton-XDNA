@@ -6,26 +6,26 @@ mlir-air's decoder dispatches through pyxrt. This runs the same design on
 HsaRuntime instead, which is what makes a fully-HSA chatbot possible.
 
 The whole problem is the context length. It changes every token, and an AIE
-dispatch has only two ways to hear about it:
+dispatch has two ways to hear about it:
 
 * the instruction stream, which encodes L in a handful of words. mlir-air's
   xclbin path rewrites exactly those words per token and passes the stream as a
-  kernel argument.
-* mlir-aie scratchpad parameters, which is what the full-ELF path uses --
-  `xrt::run::get_ctrl_scratchpad_bo`, an XRT API with no HSA counterpart
-  (`grep -ic scratch hsa_ext_amd_aie.h` is 0).
+  kernel argument. This file used to do the same, calibrating the L-dependent
+  words from two builds at adjacent L and patching 248 of them per token.
+* mlir-aie scratchpad parameters: two scalars in device memory that the design
+  reads in its dispatch preamble. This is what it does now.
 
-So on HSA it has to be the first, and the AIE dispatch packet does carry
-`insts_addr_low/high` and `insts_size` per enqueue -- the stream is an input to
-each dispatch, not a property of the program. What blocked it was only that
-`triton_npu_hsa_prepare` read the stream from a file once. `patch_insts` (added
-to HsaRuntime for this) writes into the very buffer the packet already points
-at, so the 248 L-dependent words are rewritten per token exactly as the xclbin
-path rewrites them.
+The second is better in every way that matters. There is no template pair to
+build, no slope to calibrate, and nothing per-L to get wrong -- one ELF serves
+every context length. It also removes the only reason HsaRuntime ever had an
+entry point that writes arbitrary bytes into executable device memory.
 
-The design itself is L-independent: the L=2048 and L=2047 builds produce a
-BYTE-IDENTICAL PDI and differ only in those insts words. One PDI serves every
-context length.
+It needs a ROCR that can resolve the device address of an application's buffer
+(`hsa_amd_aie_agent_device_address`): a full-ELF design reaches its scratchpad
+through an address patched into its control code, and that address is the one
+the NPU sees, not the host address the allocation is known by. Without it the
+dispatch does not fault -- the design waits on data that never arrives -- so
+HsaRuntime refuses to prepare such a design and says so.
 
 Weights and the KV cache live in shared regions, so they are dispatched on in
 place. Copying 0.7 GB of weights per token would cap throughput near 23 tok/s
@@ -34,6 +34,7 @@ before any compute.
 
 import ctypes
 import os
+import re
 import sys
 import weakref
 
@@ -42,6 +43,10 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config  # noqa: E402
+
+# aiecc names a full-ELF kernel "<device>:<sequence>". The decode's builder
+# names both, so this is the same for every model sharing the fused engine.
+ELF_KERNEL_NAME = "main:q4nx_decode"
 
 
 class HsaDecodeError(RuntimeError):
@@ -128,36 +133,50 @@ def mark_resident(lib, arr):
         raise HsaDecodeError(buf.value.decode())
 
 
-class HsaProgram:
-    """A prepared PDI + instruction stream, with the stream patchable per token."""
+class HsaElfProgram:
+    """A full-ELF kernel, with a scratchpad the host writes per dispatch.
 
-    def __init__(self, pdi_path, insts_path):
+    The other shape, above, puts the context length in the instruction stream
+    and rewrites it every token. This one does not touch the stream at all: L
+    is two scalars in device memory that the design reads in its dispatch
+    preamble, so one artifact serves every context length.
+    """
+
+    def __init__(self, elf_path, kernel_name):
         from triton.backends.amd_triton_npu.driver import load_hsa_runtime
 
         self.lib = load_hsa_runtime()
         buf, n = _errbuf()
-        self.lib.triton_npu_hsa_prepare.restype = ctypes.c_void_p
-        self.handle = self.lib.triton_npu_hsa_prepare(
-            pdi_path.encode(), insts_path.encode(), buf, n
+        self.lib.triton_npu_hsa_prepare_elf.restype = ctypes.c_void_p
+        self.handle = self.lib.triton_npu_hsa_prepare_elf(
+            str(elf_path).encode(), kernel_name.encode(), buf, n
         )
         if not self.handle:
             raise HsaDecodeError(buf.value.decode())
-        self.insts_words = os.path.getsize(insts_path) // 4
 
-    def patch_insts(self, word_offset, words):
-        """Overwrite `words` (uint32) at `word_offset` in the live stream."""
-        a = np.ascontiguousarray(words, dtype=np.uint32)
+        addr = ctypes.c_void_p()
+        size = ctypes.c_uint64()
         buf, n = _errbuf()
-        rc = self.lib.triton_npu_hsa_patch_insts(
+        rc = self.lib.triton_npu_hsa_scratchpad(
             ctypes.c_void_p(self.handle),
-            ctypes.c_uint64(word_offset * 4),
-            a.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_uint64(a.nbytes),
+            ctypes.byref(addr),
+            ctypes.byref(size),
             buf,
             n,
         )
         if rc != 0:
             raise HsaDecodeError(buf.value.decode())
+        if not addr.value or not size.value:
+            raise HsaDecodeError(
+                f"'{kernel_name}' declares no scratchpad parameters, so there "
+                "is no way to give it a context length"
+            )
+        # A view, not a copy: writing an element writes device memory. The
+        # runtime declares this buffer at its real size on every dispatch, so
+        # what is written here is flushed before the device reads it.
+        self.params = np.ctypeslib.as_array(
+            ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint32)), (size.value // 4,)
+        )
 
     def dispatch(self, arrays):
         """One enqueue over `arrays` in kernel-argument order."""
@@ -175,34 +194,59 @@ class HsaProgram:
             raise HsaDecodeError(buf.value.decode())
 
 
-class InstsForL:
-    """The L-dependent words of the decode's instruction stream.
+def parse_params(path):
+    """Read params.txt into (append_name, scale, addend, mask_name).
 
-    Calibrated exactly as mlir-air's DecodeInstsGen does: two builds at the
-    same ATTN_MAXL and adjacent L differ only in the words that encode L, and
-    those move linearly, so a diff of the two gives base and slope.
+    The names are not fixed across models. AIR names a BD-offset parameter
+    after the sequence argument it is affine in and puts the coefficients in
+    the suffix, so llama's REGION_W=256 gives `..._x256_m256` (L*256 - 256)
+    while gemma's 512 gives `..._x512_m512`. Hardcoding either writes the wrong
+    KV address for the other, silently. Classify by the kind column instead --
+    `addr` is the BD offset, `core` the herd RTP -- and take the arithmetic
+    from the suffix rather than assuming it.
+
+    Mirrors mlir-air's own reader in fused_decode/decode_elf.py.
     """
+    lines = [ln.split() for ln in open(path).read().split("\n") if ln.strip()]
+    entries = [ln for ln in lines[1:] if len(ln) >= 4]
+    slot = {ln[0]: int(ln[1]) for ln in entries}
+    kind = {ln[0]: ln[3] for ln in entries}
+    addr = [n for n in slot if kind[n] == "addr"]
+    core = [n for n in slot if kind[n] == "core"]
+    if len(addr) != 1 or len(core) != 1:
+        raise HsaDecodeError(
+            f"{path}: expected exactly one 'addr' and one 'core' parameter, "
+            f"got addr={addr} core={core}"
+        )
+    m = re.search(r"_argoff_(\d+)_x(-?\d+)_([mp])(\d+)$", addr[0])
+    if not m:
+        raise HsaDecodeError(f"{path}: cannot read affine coefficients from {addr[0]}")
+    scale = int(m.group(2))
+    addend = int(m.group(4)) * (-1 if m.group(3) == "m" else 1)
+    return Params(slot[addr[0]], scale, addend, slot[core[0]])
 
-    def __init__(self, insts_lo, insts_hi, l_lo, l_hi):
-        i1 = np.fromfile(insts_lo, dtype=np.uint32)
-        i2 = np.fromfile(insts_hi, dtype=np.uint32)
-        if i1.size != i2.size:
-            raise HsaDecodeError("calibration streams differ in length")
-        self.ld = np.where(i1 != i2)[0]
-        if self.ld.size == 0:
-            raise HsaDecodeError("the two calibration builds are identical")
-        self.lo, self.hi = int(self.ld.min()), int(self.ld.max()) + 1
-        self.base = i1[self.ld].astype(np.int64)
-        self.slope = (i2[self.ld].astype(np.int64) - self.base) // (l_hi - l_lo)
-        self.base_L = l_lo
-        self.full = i1.copy()
 
-    def slice_for(self, L):
-        """The [lo:hi] window of the stream at context length L."""
-        out = self.full[self.lo : self.hi].copy()
-        vals = self.base + (L - self.base_L) * self.slope
-        out[self.ld - self.lo] = vals.astype(np.uint32)
-        return out
+class Params:
+    """Where each parameter lives in the scratchpad, and what to write there."""
+
+    def __init__(self, append_slot, scale, addend, mask_slot):
+        self.append_slot = append_slot
+        self.scale = scale
+        self.addend = addend
+        self.mask_slot = mask_slot
+
+    def write(self, params, L):
+        """Write context length L into the scratchpad `params`."""
+        # The KV append slot: a byte offset, written raw because it is an
+        # `addr`-kind parameter.
+        params[self.append_slot] = np.uint32(
+            (L * self.scale + self.addend) & 0xFFFFFFFF
+        )
+        # The attention mask threshold. A `core`-kind parameter is shifted left
+        # by 2: the firmware's UPDATE_REG masks the low bits and the core
+        # shifts back after reading. Values that fit in 30 bits survive, which
+        # every context length does.
+        params[self.mask_slot] = np.uint32((L << 2) & 0xFFFFFFFF)
 
 
 def make_hsa_decoder_class(air, artifact_dir):
@@ -210,28 +254,49 @@ def make_hsa_decoder_class(air, artifact_dir):
 
     Everything host-side stays theirs -- weight load, the region-major KV
     layout, `seed_kv`, sampling. Only `dispatch` changes: instead of handing
-    XRT an instruction-stream BO as a kernel argument, it patches the stream
-    the HSA program already owns and enqueues the five tensors.
+    XRT an instruction-stream BO as a kernel argument, it writes the context
+    length to a scratchpad and enqueues the five tensors.
 
     Their `__init__` still runs, so the XRT BOs it builds exist and go unused.
     That costs the weight allocation twice. Worth fixing before this is more
     than a demonstration; not worth forking their setup to avoid today.
     """
+    # ...but their __init__ has to be kept off *their* full-ELF path. It is
+    # their default now, and it builds an XRT hw_context and imports mlir-aie's
+    # ParameterScratchpad, which loads a second LLVM into a process that
+    # already has Triton's:
+    #
+    #     Option 'print-inst-addrs' registered more than once!
+    #     LLVM ERROR: inconsistency in registered CommandLine options
+    #
+    # which aborts the process rather than raising. Their xclbin path allocates
+    # BOs we ignore, as it always has. We are doing the ELF ourselves; this only
+    # says not to do it twice.
+    os.environ.setdefault("DECODE_ELF", "0")
 
     class HsaFusedDecoder(air.FusedDecoder):
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
-            pdi = os.path.join(artifact_dir, f"decode_L{self.ATTN_MAXL}.pdi")
-            lo = os.path.join(artifact_dir, f"decode_L{self.ATTN_MAXL - 1}.insts.bin")
-            hi = os.path.join(artifact_dir, f"decode_L{self.ATTN_MAXL}.insts.bin")
-            for f in (pdi, lo, hi):
+            elf = os.path.join(artifact_dir, "decode_scratchpad.elf")
+            params_txt = os.path.join(artifact_dir, "decode_scratchpad.params.txt")
+            for f in (elf, params_txt):
                 if not os.path.exists(f):
                     raise HsaDecodeError(
-                        f"{f} is missing; build the PDI templates with\n"
-                        "    python decode_build.py --format pdi"
+                        f"{f} is missing; build the decode with\n"
+                        "    python decode_build.py --format elf"
                     )
-            self._gen = InstsForL(lo, hi, self.ATTN_MAXL - 1, self.ATTN_MAXL)
-            self._prog = HsaProgram(pdi, hi)
+            self._params = parse_params(params_txt)
+            # The scale IS the model's region width. If they disagree, the ELF
+            # and this driver were built from different geometries and every KV
+            # append would land in the wrong place -- which reads as bad
+            # numerics, not as a mismatch, so check it here.
+            if self._params.scale != self.REGION_W:
+                raise HsaDecodeError(
+                    f"{os.path.basename(params_txt)} encodes scale "
+                    f"{self._params.scale} but the decoder's REGION_W is "
+                    f"{self.REGION_W}; the ELF and the driver disagree"
+                )
+            self._prog = HsaElfProgram(elf, ELF_KERNEL_NAME)
             # Host mirrors of the five kernel tensors. The XRT path keeps these
             # in BOs; HSA takes plain pointers and stages them itself.
             lib = self._prog.lib
@@ -258,8 +323,8 @@ def make_hsa_decoder_class(air, artifact_dir):
             mark_resident(lib, self._w)
             mark_resident(lib, self._kv)
             print(
-                f"[hsa-decode] ONE PDI + patched insts: ATTN_MAXL={self.ATTN_MAXL}, "
-                f"{self._gen.ld.size} L-dependent words",
+                f"[hsa-decode] ONE full ELF: ATTN_MAXL={self.ATTN_MAXL}, "
+                f"L via {self._prog.params.size} scratchpad parameters",
                 flush=True,
             )
 
@@ -274,8 +339,10 @@ def make_hsa_decoder_class(air, artifact_dir):
 
         def dispatch(self, tok, p):
             L = p + 1
-            # The context length, into the stream the packet already points at.
-            self._prog.patch_insts(self._gen.lo, self._gen.slice_for(L))
+            # The context length, as two scalars in device memory. The design
+            # reads them in its dispatch preamble; nothing rewrites the
+            # instruction stream.
+            self._params.write(self._prog.params, L)
             self._x[:] = np.asarray(self.embed[tok], self.bf16)
             self._r[self._rms_lut_off : self._rms_lut_off + 32] = self.rope_cos[p][
                 :32

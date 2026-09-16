@@ -191,7 +191,7 @@ python prefill.py --backend cpu --kv-out /tmp/kv.npz
 ### Running on the HSA runtime
 
 ```bash
-make compile-decode RUNTIME=hsa   # the decode as PDI, not xclbin
+make compile-decode RUNTIME=hsa   # the decode as one full ELF, not xclbin
 make chat RUNTIME=hsa
 ```
 
@@ -202,20 +202,30 @@ It is not as fast. Measured on Strix, 60 tokens, runtimes alternated:
 
 | | tok/s |
 |---|---|
-| XRT | 54.5 – 54.8 |
-| HSA | 49.1 – 51.5 |
+| XRT | 54.5 |
+| HSA | 46.9 – 47.3 |
 
-a stable gap of about 9%, reproducible across runs rather than noise. It is
-not the per-dispatch cache flush -- that is what resident regions removed, and
-without them the gap is roughly three times larger. What remains has not been
-attributed, so treat the HSA path as correct and close, not as a replacement.
+The token ids are identical between the two, so this is a throughput gap and
+not a correctness one.
 
-The interesting part is how the context length gets to the device. HSA has no
-scratchpad parameters, so the full-ELF mechanism is unavailable; but the AIE
-dispatch packet carries the instruction stream's address per enqueue, so
-`hsa_decode.py` patches the 248 L-dependent words per token — the same words
-mlir-air's xclbin path rewrites. One PDI serves every context length; the
-L=2048 and L=2047 builds are byte-identical.
+The interesting part is how the context length gets to the device. It is a
+**scratchpad parameter**: two scalars in device memory that the design reads in
+its dispatch preamble, so one full ELF serves every context length and nothing
+rewrites the instruction stream per token. That replaced a calibration — two
+builds at adjacent L, a diff to find the 248 L-dependent words, and a linear
+extrapolation patched in on every dispatch.
+
+It needs a ROCR that can resolve the device address of an application's buffer
+(`hsa_amd_aie_agent_device_address`). A full-ELF design reaches its scratchpad
+through an address patched into its control code, and that address is the one
+the NPU sees, not the host address the allocation is known by. Without it
+`triton_npu_hsa_prepare_elf` refuses the design rather than hanging on it.
+
+About 3 ms/token of the gap to XRT is unattributed. One measured candidate: the
+full-ELF control code is 354764 bytes against the older path's 158032-byte
+instruction stream, and ROCR walks `insts_size` with CLFLUSH on every dispatch
+even though the control code only changes when an argument address does — which,
+for a decode, is never after the first token.
 
 `--ops` takes `all` or a comma list of `matmul,rms_norm,swiglu`, so a
 numerical regression can be bisected to a single kernel against the same CPU
