@@ -513,6 +513,40 @@ public:
           "kernel '" + std::string(kernel_name) + "' in '" + elf_path +
           "' has no PDI patch site, so it cannot be dispatched as a full ELF");
 
+    // Two shapes this cannot dispatch, refused here rather than hung on the
+    // device. Both come from the same hole in the ABI, measured on aie2p
+    // against ROCm/rocm-systems#11668:
+    //
+    // ROCR patches exactly two addresses into the control code -- the control
+    // code's own and the PDI's -- and for each it resolves the buffer's
+    // *device* address through an ioctl and adds the buffer to the command's
+    // residency list (BuildFullElfCommand). Userspace can do neither: a pool
+    // allocation's host address is not its device address, and a buffer the
+    // command does not list is not held down for the dispatch.
+    //
+    // So any other address the control code needs is unreachable from here.
+    // Writing the host address instead does not fault; the design simply waits
+    // on data that never arrives, and the dispatch hangs until the queue is
+    // torn down. On a shared NPU that is the worst available outcome, so these
+    // are rejected at prepare time, where the caller still has a stack.
+    //
+    // Both are real: the fused Q4NX decode's q4nx_decode has two PDI patch
+    // sites and a scratchpad. Lifting either needs ROCR to resolve and list
+    // application-named buffers -- there is nothing to work around here.
+    if (k.pdi_patches.size() > 1)
+      throw std::runtime_error(
+          "kernel '" + std::string(kernel_name) + "' switches configuration " +
+          std::to_string(k.pdi_patches.size()) +
+          " times, but the dispatch packet carries one pdi_addr and only ROCR "
+          "can resolve a PDI's device address; dispatching it would hang");
+    if (k.has_scratchpad)
+      throw std::runtime_error(
+          "kernel '" + std::string(kernel_name) +
+          "' declares a control scratchpad, which needs ROCR to patch the "
+          "buffer's device address into the control code and keep it resident; "
+          "the dispatch ABI has no way to ask for that, and dispatching it "
+          "would hang");
+
     // Every PDI, not just the patched one: the control code switches to the
     // others by address, and an unmapped one faults the array.
     prog->pdi_bufs.reserve(prog->image->pdis.size());
