@@ -26,7 +26,15 @@ DRIVER  := $(srcdir)/llama32_1b_q4nx_inference.py
 # (hsa_decode.py).
 RUNTIME  ?= xrt
 export AMD_TRITON_NPU_RUNTIME = $(RUNTIME)
-DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),elf,xclbin)
+# Which decode artifact to build. On HSA that is a capability question, not a
+# preference: the scratchpad ELF needs a ROCR exporting
+# hsa_amd_aie_agent_device_address, and no released one does yet, so a machine
+# without it builds the template pair and patches L into the instruction stream
+# instead. hsa_decode.py asks the same question at run time and has to get the
+# same answer, so both go through one place.
+HSA_DECODE_FORMAT := $(shell $(PYTHON) -c "import sys; sys.path.insert(0, '$(srcdir)'); \
+  from hsa_decode import use_scratchpad; print('elf' if use_scratchpad() else 'pdi')" 2>/dev/null || echo pdi)
+DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),$(HSA_DECODE_FORMAT),xclbin)
 
 OPS      ?= all
 BACKEND  ?= npu

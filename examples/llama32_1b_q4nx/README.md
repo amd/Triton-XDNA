@@ -212,18 +212,27 @@ Take any single reading here with salt: this NPU is shared, and the same build
 measured 47.3 and 50.1 tok/s an hour apart. Only numbers from runs interleaved
 in one session are worth comparing.
 
-The interesting part is how the context length gets to the device. It is a
-**scratchpad parameter**: two scalars in device memory that the design reads in
-its dispatch preamble, so one full ELF serves every context length and nothing
-rewrites the instruction stream per token. That replaced a calibration — two
-builds at adjacent L, a diff to find the 248 L-dependent words, and a linear
-extrapolation patched in on every dispatch.
+The interesting part is how the context length gets to the device. There are
+two ways, and which one runs is decided by what the loaded ROCR can do:
 
-It needs a ROCR that can resolve the device address of an application's buffer
-(`hsa_amd_aie_agent_device_address`). A full-ELF design reaches its scratchpad
-through an address patched into its control code, and that address is the one
-the NPU sees, not the host address the allocation is known by. Without it
-`triton_npu_hsa_prepare_elf` refuses the design rather than hanging on it.
+**A scratchpad parameter** — two scalars in device memory that the design reads
+in its dispatch preamble, so one full ELF serves every context length and
+nothing rewrites the instruction stream per token. This needs a ROCR exporting
+`hsa_amd_aie_agent_device_address`: a full-ELF design reaches its scratchpad
+through an address patched into its control code, and that is the address the
+NPU sees, not the host address the allocation is known by. No released ROCR
+exports it yet.
+
+**A patched instruction stream** — the fallback, and what every released ROCR
+gets. Two builds at adjacent L differ only in the words encoding it, so a diff
+gives base and slope, and 248 words are patched in per token. One PDI serves
+every context length; the L=2048 and L=2047 builds are byte-identical.
+
+`hsa_decode.use_scratchpad()` asks the question and the Makefile builds
+whichever artifact the answer calls for. `AMD_TRITON_NPU_HSA_DECODE=elf|insts`
+forces one, which is how the two are compared on a machine that could run
+either. Alternated on this one they are the same speed: 49.65 tok/s for the
+ELF, 50.36 for the patched stream.
 
 The scratchpad costs nothing against the patched-stream path it replaced.
 Alternated in one session, three runs each: patched stream 50.09 / 48.87 / 50.40

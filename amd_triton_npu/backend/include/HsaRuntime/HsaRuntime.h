@@ -98,6 +98,23 @@ triton_npu_hsa_program_t triton_npu_hsa_prepare_elf(const char *elf_path,
 int triton_npu_hsa_scratchpad(triton_npu_hsa_program_t program, void **addr,
                               uint64_t *size, char *errbuf, size_t errbuf_len);
 
+// Whether this ROCR can dispatch a full ELF whose design needs an address
+// resolved for it -- a control scratchpad, or a configuration it switches to.
+// Returns 1 if it can, 0 if it cannot. Never fails and never initializes the
+// runtime.
+//
+// The question is whether the loaded ROCR exports
+// hsa_amd_aie_agent_device_address. A full-ELF design reaches those buffers
+// through addresses patched into its control code, and those are device
+// addresses; only ROCR can resolve one, and nothing standard exports it yet.
+//
+// Ask before choosing which artifact to build or load, rather than preparing
+// one and handling the failure: the two shapes are different files, and a
+// caller that has to pick between them wants the answer first. A design needing
+// no such address -- no scratchpad, a single configuration -- dispatches as a
+// full ELF on any ROCR with the AIE packet, and does not need this.
+int triton_npu_hsa_full_elf_supported(void);
+
 // Dispatch a prepared program: acquire vmem I/O buffers, copy inputs in, fill
 // kernargs, enqueue the AIE packet, wait for completion, copy outputs back, and
 // return the buffers to the pool. host_ptrs[i]/sizes[i] describe tensor i (i in
@@ -149,6 +166,21 @@ int triton_npu_hsa_dispatch_ex(triton_npu_hsa_program_t program,
                                uint32_t num_tensors, void *const *host_ptrs,
                                const uint64_t *sizes, const uint8_t *writeback,
                                char *errbuf, size_t errbuf_len);
+
+// Overwrite nbytes of a prepared program's instruction stream at byte_offset.
+// Returns 0 on success, or a negative value (with a message in errbuf).
+//
+// The dispatch packet carries the stream's address and size per enqueue, so the
+// stream is an input to each dispatch and not a property of the program. A
+// decode needs that: its context length is encoded in a few stream words and
+// changes every token.
+//
+// Serialised against dispatch internally. The GIL does not do it: the dispatch
+// path releases the GIL, and so does the ctypes call that reaches this.
+int triton_npu_hsa_patch_insts(triton_npu_hsa_program_t program,
+                               uint64_t byte_offset, const void *src,
+                               uint64_t nbytes, char *errbuf,
+                               size_t errbuf_len);
 
 // ---------------------------------------------------------------------------
 // Shared regions
