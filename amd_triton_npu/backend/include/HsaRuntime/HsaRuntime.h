@@ -47,6 +47,52 @@ triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *pdi_path,
                                                 char *errbuf,
                                                 size_t errbuf_len);
 
+// Initialize the runtime (idempotent) and load one kernel out of a full ELF --
+// what `aiecc --get-full-elf` emits. Returns an opaque program handle, or NULL
+// on error (with a message written to errbuf).
+//
+// `kernel_name` is "<device>:<sequence>" as aiecc names it, e.g.
+// "main:q4nx_decode"; the error lists what the file actually holds if the name
+// does not match.
+//
+// A full ELF differs from the (pdi, insts) pair above in where the arguments
+// go. There, the hardware patches them into the instruction stream as it runs.
+// Here the ELF *is* the stream, it loads its own configuration, and this
+// runtime patches the argument addresses into it before each enqueue. What that
+// buys is the scratchpad below: a design can then take a runtime value without
+// anything rewriting its instruction stream per dispatch.
+//
+// Only aie2p (npu2/Strix) supports this shape.
+triton_npu_hsa_program_t triton_npu_hsa_prepare_elf(const char *elf_path,
+                                                    const char *kernel_name,
+                                                    char *errbuf,
+                                                    size_t errbuf_len);
+
+// Where a full-ELF program's control scratchpad lives, and how many bytes of it
+// the ELF declared. Either pointer may be NULL. Returns 0 on success, or a
+// negative value on error (with a message written to errbuf); asking a program
+// that was not prepared from an ELF is an error.
+//
+// The scratchpad is plain device-visible memory: the host writes it, and the
+// device reads it in its dispatch preamble, so a value written here reaches the
+// next dispatch without touching the instruction stream. It is `4 *
+// parameter_count` bytes, one uint32 per parameter, indexed by the parameter's
+// `state_table_idx`.
+//
+// This deliberately returns the address rather than taking a parameter name.
+// The mapping from name to index, and the rule that a `core`-kind parameter is
+// stored shifted left by 2 while an `addr`-kind one is stored raw, live in the
+// build's params.txt -- a build artifact that this runtime has no business
+// parsing. The caller owns that encoding; this only says where to put the
+// result. Both are zero for a program whose design declares no parameters.
+//
+// No flush is issued, and none is needed: the scratchpad is device memory
+// reached through the same coherent mapping as every other operand, and the
+// dispatch that reads it is ordered after the write by the packet's acquire
+// fence.
+int triton_npu_hsa_scratchpad(triton_npu_hsa_program_t program, void **addr,
+                              uint64_t *size, char *errbuf, size_t errbuf_len);
+
 // Dispatch a prepared program: acquire vmem I/O buffers, copy inputs in, fill
 // kernargs, enqueue the AIE packet, wait for completion, copy outputs back, and
 // return the buffers to the pool. host_ptrs[i]/sizes[i] describe tensor i (i in

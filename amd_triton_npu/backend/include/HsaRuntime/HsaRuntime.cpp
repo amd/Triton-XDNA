@@ -37,6 +37,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -48,12 +49,45 @@
 #include "hsa/hsa_ext_amd.h"
 #include "hsa/hsa_ext_amd_aie.h"
 
+#include "AieFullElf.h"
+
 namespace {
 
 // Queue depth cap. Also bounds the kernarg slot pool (one slot per ring slot).
 constexpr std::uint32_t QUEUE_SIZE = 32;
 
 // Bytes in the AIE dispatch packet after completion_signal up to
+// Alignment a full ELF's control code must have in device memory, from
+// hsa_amd_aie_kernel_dispatch_packet_t::pdi_patch_offset's contract.
+inline constexpr std::size_t kCtrlCodeAlign = 16 * 1024;
+
+// The dispatch packet's trailing 64-bit field, under either of its names.
+//
+// ROCm/rocm-systems#11668 gives that field a meaning and renames it from
+// `reserved4` to `pdi_patch_offset`: zero still means "PDI plus instruction
+// sequence", and non-zero selects a full-ELF dispatch and says where in the
+// control code ROCR writes pdi_addr. Same offset and same width either way, so
+// accept both spellings and let this build against a ROCR from before or after
+// that change -- the header the backend compiles against is whichever ROCR the
+// link profile points at, and today's default still says `reserved4`.
+//
+// Writing a non-zero value to a *runtime* without #11668 is a different matter:
+// it still requires the field to be 0 and rejects the packet. That surfaces as
+// ROCR's own error on the first full-ELF dispatch, which is the right place for
+// it -- there is nothing to feature-detect against at prepare time.
+template <typename P, typename = void> struct PdiPatchField {
+  static std::uint64_t &get(P &p) { return p.reserved4; }
+};
+template <typename P>
+struct PdiPatchField<
+    P, std::void_t<decltype(std::declval<P &>().pdi_patch_offset)>> {
+  static std::uint64_t &get(P &p) { return p.pdi_patch_offset; }
+};
+
+inline std::uint64_t &pdi_patch_field(hsa_amd_aie_kernel_dispatch_packet_t &p) {
+  return PdiPatchField<hsa_amd_aie_kernel_dispatch_packet_t>::get(p);
+}
+
 // kernarg_address; the ABI requires this to be exactly 24.
 constexpr std::uint16_t AIE_PACKET_COUNT = 24;
 
@@ -318,13 +352,54 @@ struct SharedRegion {
 
 } // namespace
 
-// A prepared program is just its two pool allocations; the opaque handle in the
-// C ABI points at one of these, owned by the runtime's program cache. Both
-// members free themselves, so a prepare() that loads the PDI and then fails on
-// the instructions releases the PDI on the way out.
+// A prepared program: the device allocations one kernel dispatches from. The
+// opaque handle in the C ABI points at one of these, owned by the runtime's
+// program cache. Every member frees itself, so a prepare() that loads the PDI
+// and then fails on the instructions releases the PDI on the way out.
+//
+// Two shapes, distinguished by `full_elf`:
+//
+//   * PDI plus instruction sequence -- `pdi` and `insts`, the only shape until
+//     now. The hardware patches the arguments into the stream as it runs.
+//   * full ELF -- everything below it. The control code is the stream, it
+//     loads its own configuration, and the *application* patches the argument
+//     addresses into it before enqueuing. In exchange the design can carry a
+//     scratchpad, which is how a runtime value reaches the device without
+//     rewriting the stream per dispatch.
 struct triton_npu_hsa_program {
   PoolBuffer pdi;
   PoolBuffer insts;
+
+  bool full_elf = false;
+
+  // Parsed once and kept: `kernel` points into `image`, and the patch sites it
+  // holds are walked on every dispatch that changes an argument.
+  std::unique_ptr<aie_full_elf::Image> image;
+  const aie_full_elf::Kernel *kernel = nullptr;
+
+  // One per aie_full_elf::Image::pdis entry, same order, so a patch site's
+  // pdi_index indexes both.
+  std::vector<PoolBuffer> pdi_bufs;
+  std::vector<std::uint64_t> pdi_addrs;
+
+  // The control code. `ctrl` owns an over-allocation; `ctrl_va` is the 16
+  // KiB-aligned address inside it that the packet names, which the ABI
+  // requires and ROCR rejects the dispatch without.
+  PoolBuffer ctrl;
+  void *ctrl_va = nullptr;
+  std::size_t ctrl_size = 0;
+
+  // The control scratchpad, if the design declares parameters. The host writes
+  // one uint32 per parameter here; the device reads them in its dispatch
+  // preamble.
+  PoolBuffer scratchpad;
+
+  // Argument addresses the control code was last patched with. Re-patching
+  // means rewriting the whole control code (354 KiB for the fused decode, over
+  // 772 patch sites), and a decode dispatches the same buffers every token, so
+  // the common case is to skip it entirely.
+  std::vector<std::uint64_t> patched_args;
+  bool ctrl_patched = false;
 };
 
 namespace {
@@ -392,6 +467,101 @@ public:
     triton_npu_hsa_program *raw = prog.get();
     programs_.emplace(std::move(key), std::move(prog));
     return raw;
+  }
+
+  // Load one kernel out of a full ELF and return its program handle. Keyed by
+  // (elf_path, kernel_name), so two signatures naming the same kernel share the
+  // allocation. Thread-safe.
+  //
+  // Everything the dispatch needs is resolved here, once: the control code into
+  // a 16 KiB-aligned allocation, every PDI the file carries, the scratchpad at
+  // the size the ELF declares, and the addresses of all of those written into
+  // the control code -- except the one ROCR writes per dispatch.
+  triton_npu_hsa_program *prepare_elf(const char *elf_path,
+                                      const char *kernel_name) {
+    std::string key = std::string(elf_path) + '\0' + kernel_name;
+    std::lock_guard<std::mutex> lock(programs_mtx_);
+    auto it = programs_.find(key);
+    if (it != programs_.end())
+      return it->second.get();
+
+    auto prog = std::make_unique<triton_npu_hsa_program>();
+    prog->full_elf = true;
+    prog->image = std::make_unique<aie_full_elf::Image>(
+        aie_full_elf::parse_file(elf_path));
+
+    auto k_it = prog->image->kernels.find(kernel_name);
+    if (k_it == prog->image->kernels.end()) {
+      std::string have;
+      for (const auto &[name, _] : prog->image->kernels)
+        have += (have.empty() ? "" : ", ") + name;
+      throw std::runtime_error("'" + std::string(elf_path) +
+                               "' has no kernel '" + kernel_name +
+                               "'; it has: " + have);
+    }
+    prog->kernel = &k_it->second;
+    const aie_full_elf::Kernel &k = *prog->kernel;
+
+    // Without a PDI patch site pdi_patch_offset would be 0, which is how the
+    // packet spells "PDI plus instruction sequence" -- the dispatch would
+    // silently take the other shape and run a control code that nothing
+    // configured the array for. That is a hang, not an error, so refuse here.
+    // (The fused decode's seg:seg_sequence is such a kernel; q4nx_decode, the
+    // one that is actually dispatched, is not.)
+    if (!k.has_pdi_patch())
+      throw std::runtime_error(
+          "kernel '" + std::string(kernel_name) + "' in '" + elf_path +
+          "' has no PDI patch site, so it cannot be dispatched as a full ELF");
+
+    // Every PDI, not just the patched one: the control code switches to the
+    // others by address, and an unmapped one faults the array.
+    prog->pdi_bufs.reserve(prog->image->pdis.size());
+    prog->pdi_addrs.reserve(prog->image->pdis.size());
+    for (const aie_full_elf::Pdi &pdi : prog->image->pdis) {
+      prog->pdi_bufs.push_back(alloc_dev(pdi.data.size()));
+      std::memcpy(prog->pdi_bufs.back().va(), pdi.data.data(), pdi.data.size());
+      prog->pdi_addrs.push_back(
+          reinterpret_cast<std::uint64_t>(prog->pdi_bufs.back().va()));
+    }
+
+    prog->ctrl =
+        alloc_dev_aligned(k.ctrl_code.size(), kCtrlCodeAlign, &prog->ctrl_va);
+    prog->ctrl_size = k.ctrl_code.size();
+
+    if (k.has_scratchpad) {
+      prog->scratchpad = alloc_dev(k.scratchpad_size);
+      // The host writes parameters into this by index and the device reads
+      // every slot, so an unwritten one has to be a zero rather than whatever
+      // the pool last held.
+      std::memset(prog->scratchpad.va(), 0, k.scratchpad_size);
+    }
+
+    triton_npu_hsa_program *raw = prog.get();
+    programs_.emplace(std::move(key), std::move(prog));
+    return raw;
+  }
+
+  // The control scratchpad of a full-ELF program: where it lives and how big
+  // the ELF declared it. Both null/zero for a program that declares none.
+  //
+  // Handing back the address rather than a write entry point is deliberate.
+  // The scratchpad is plain device-visible memory that the host writes and the
+  // device reads in its dispatch preamble; the encoding on top of it -- which
+  // index a parameter has, and that a `core` parameter is stored shifted left
+  // by 2 -- lives in params.txt, which is a build artifact this runtime has no
+  // business parsing. So the caller writes uint32s and this only says where.
+  void scratchpad(triton_npu_hsa_program *program, void **addr,
+                  std::uint64_t *size) {
+    if (program == nullptr)
+      throw std::runtime_error("scratchpad called with a null program handle");
+    if (!program->full_elf)
+      throw std::runtime_error(
+          "scratchpad is only available on a full-ELF program; this one was "
+          "prepared as a PDI plus instruction sequence");
+    if (addr)
+      *addr = program->scratchpad.va();
+    if (size)
+      *size = program->scratchpad.size();
   }
 
   // Overwrite `nbytes` of a prepared program's instruction stream at
@@ -493,6 +663,42 @@ public:
         ++g_staged;
       }
 
+      // In full-ELF mode the hardware is not given the arguments: the control
+      // code carries them, so they have to be patched in before the packet is
+      // enqueued. kernarg_address still lists them (the ABI requires it, and it
+      // is what ROCR resolves and keeps resident), but it is not what the
+      // design reads.
+      //
+      // Rewriting the control code is not cheap -- 354 KiB and 772 patch sites
+      // for the fused decode -- and the shim DMA scheme is additive, so it has
+      // to start from the pristine bytes every time rather than patch over the
+      // last result. A decode dispatches the same buffers every token, so skip
+      // it when nothing moved.
+      if (program->full_elf) {
+        // Short of the control code's argument count, the missing ones would be
+        // patched as address zero and the design would DMA from the bottom of
+        // the address space -- so say so instead. Extra tensors are fine: they
+        // are listed in kernarg_address and kept resident, they simply have no
+        // patch site.
+        if (num_tensors < program->kernel->num_args())
+          throw std::runtime_error(
+              "kernel '" + program->kernel->name + "' patches " +
+              std::to_string(program->kernel->num_args()) +
+              " arguments into its control code but the dispatch supplied " +
+              std::to_string(num_tensors));
+        std::vector<std::uint64_t> args(program->kernel->num_args(), 0);
+        for (std::uint32_t i = 0; i < args.size(); ++i)
+          args[i] = reinterpret_cast<std::uint64_t>(dev_addr[i]);
+        if (!program->ctrl_patched || program->patched_args != args) {
+          aie_full_elf::write_control_code(
+              *program->kernel, program->ctrl_va, program->ctrl_size, args,
+              reinterpret_cast<std::uint64_t>(program->scratchpad.va()),
+              program->pdi_addrs);
+          program->patched_args = std::move(args);
+          program->ctrl_patched = true;
+        }
+      }
+
       // Claim a ring slot. Only *peek* at the write index here; the advance is
       // published further down, once the packet is fully written. Reserving up
       // front instead would, on any failure in between, leave the read index
@@ -521,16 +727,29 @@ public:
       pkt.opcode = HSA_AMD_AIE_PACKET_OPCODE_KMQ;
       pkt.count = AIE_PACKET_COUNT;
       pkt.completion_signal = signal_;
+      // The stream is the instruction sequence in one mode and the ELF's
+      // control code in the other; pdi_patch_offset is what tells them apart.
+      // Zero means PDI plus instruction sequence, and non-zero means full ELF,
+      // naming the byte offset in the control code where ROCR writes pdi_addr.
       const auto insts_addr =
-          reinterpret_cast<std::uintptr_t>(program->insts.va());
+          program->full_elf
+              ? reinterpret_cast<std::uintptr_t>(program->ctrl_va)
+              : reinterpret_cast<std::uintptr_t>(program->insts.va());
       pkt.insts_addr_low = static_cast<std::uint32_t>(insts_addr & 0xFFFFFFFFu);
       pkt.insts_addr_high = static_cast<std::uint32_t>(insts_addr >> 32);
       // Narrowing checked by the static_assert on TRITON_NPU_HSA_MAX_KERNARGS.
       pkt.num_kernargs = static_cast<std::uint16_t>(num_tensors);
       // The ABI requires kernarg_address to be NULL when num_kernargs is 0.
       pkt.kernarg_address = (num_tensors > 0) ? kernargs : nullptr;
-      pkt.insts_size = program->insts.size();
-      pkt.pdi_addr = program->pdi.va();
+      if (program->full_elf) {
+        pkt.insts_size = program->ctrl_size;
+        pkt.pdi_addr =
+            program->pdi_bufs[program->kernel->rocr_pdi_index()].va();
+        pdi_patch_field(pkt) = program->kernel->pdi_patch_offset();
+      } else {
+        pkt.insts_size = program->insts.size();
+        pkt.pdi_addr = program->pdi.va();
+      }
 
       // Arm the signal to 1 (device decrements to 0 on success, or sets a
       // negative error code) and write the packet into the slot. Nothing from
@@ -1199,6 +1418,31 @@ private:
     return ((n + data_granule_ - 1) / data_granule_) * data_granule_;
   }
 
+  // A fresh dev-pool allocation of `size` bytes.
+  PoolBuffer alloc_dev(std::size_t size) {
+    if (size == 0)
+      throw std::runtime_error("refusing a zero-byte device allocation");
+    void *raw = nullptr;
+    HSA_CHECK(hsa_amd_memory_pool_allocate(dev_pool_, size, 0, &raw));
+    return PoolBuffer(raw, size);
+  }
+
+  // A dev-pool allocation with `align`-aligned room for `size` bytes, with the
+  // aligned address written to *aligned_va.
+  //
+  // hsa_amd_memory_pool_allocate takes no alignment, so this over-allocates and
+  // picks the aligned address inside. The ABI explicitly allows it: the control
+  // code "does not have to sit at the start of its allocation", only be 16 KiB
+  // aligned. Getting this wrong is not subtle -- ROCR rejects the dispatch with
+  // "full-ELF control code must be 16 KiB aligned in device memory".
+  PoolBuffer alloc_dev_aligned(std::size_t size, std::size_t align,
+                               void **aligned_va) {
+    PoolBuffer b = alloc_dev(size + align - 1);
+    const auto base = reinterpret_cast<std::uintptr_t>(b.va());
+    *aligned_va = reinterpret_cast<void *>((base + align - 1) & ~(align - 1));
+    return b;
+  }
+
   // Read a file into a fresh dev-pool allocation.
   PoolBuffer load_binary(const std::string &path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -1448,6 +1692,39 @@ triton_npu_hsa_prepare(const char *pdi_path, const char *insts_path,
   } catch (...) {
     write_err(errbuf, errbuf_len, "HSA prepare failed", "unknown error");
     return nullptr;
+  }
+}
+
+extern "C" triton_npu_hsa_program_t
+triton_npu_hsa_prepare_elf(const char *elf_path, const char *kernel_name,
+                           char *errbuf, size_t errbuf_len) {
+  try {
+    if (!elf_path || !kernel_name)
+      throw std::runtime_error("null elf_path or kernel_name");
+    return runtime().prepare_elf(elf_path, kernel_name);
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len, "HSA full-ELF prepare failed", e.what());
+    return nullptr;
+  } catch (...) {
+    write_err(errbuf, errbuf_len, "HSA full-ELF prepare failed",
+              "unknown error");
+    return nullptr;
+  }
+}
+
+extern "C" int triton_npu_hsa_scratchpad(triton_npu_hsa_program_t program,
+                                         void **addr, uint64_t *size,
+                                         char *errbuf, size_t errbuf_len) {
+  try {
+    runtime().scratchpad(program, addr, size);
+    return 0;
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len, "HSA scratchpad query failed", e.what());
+    return -1;
+  } catch (...) {
+    write_err(errbuf, errbuf_len, "HSA scratchpad query failed",
+              "unknown error");
+    return -1;
   }
 }
 
