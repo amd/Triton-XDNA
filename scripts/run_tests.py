@@ -27,6 +27,10 @@ DEFAULT_SKIPPED_EXAMPLES = {
     # out of the default sweep.
     "gpt2",
     "qwen2_5",
+    # Same as above, and additionally: the no-argument run generates, which
+    # needs a one-time `make compile-decode`. CI gates it on --prefill-only
+    # instead, in its own step, which needs no decode build.
+    "llama32_1b_q4nx",
 }
 
 # Examples that cannot run without a transform script on a given device, keyed
@@ -50,6 +54,7 @@ SCRIPTLESS_UNSUPPORTED = {
         # transform_<device>.mlir convention does not apply to them either.
         "gpt2": "npu2-only example",
         "qwen2_5": "npu2-only example",
+        "llama32_1b_q4nx": "npu2-only example",
     },
     "aie2p": {},
 }

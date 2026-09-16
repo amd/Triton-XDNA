@@ -99,6 +99,21 @@ int triton_npu_hsa_dispatch_ex(triton_npu_hsa_program_t program,
                                const uint64_t *sizes, const uint8_t *writeback,
                                char *errbuf, size_t errbuf_len);
 
+// Overwrite nbytes of a prepared program's instruction stream at byte_offset.
+// Returns 0 on success, or a negative value (with a message in errbuf).
+//
+// The dispatch packet carries the stream's address and size per enqueue, so the
+// stream is an input to each dispatch and not a property of the program. A
+// decode needs that: its context length is encoded in a few stream words and
+// changes every token.
+//
+// Serialised against dispatch internally. The GIL does not do it: the dispatch
+// path releases the GIL, and so does the ctypes call that reaches this.
+int triton_npu_hsa_patch_insts(triton_npu_hsa_program_t program,
+                               uint64_t byte_offset, const void *src,
+                               uint64_t nbytes, char *errbuf,
+                               size_t errbuf_len);
+
 // ---------------------------------------------------------------------------
 // Shared regions
 // ---------------------------------------------------------------------------
