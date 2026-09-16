@@ -76,6 +76,13 @@ def lower_template(L, out_dir=None, output_format="xclbin"):
     fd_dir = fused_decode_dir()
     out_dir = out_dir or fd_dir
     os.environ.update(DECODE_ENV, DECODE_GOLDEN_L=str(L))
+    if output_format == "elf":
+        # What makes L a runtime value rather than a constant folded into the
+        # design. Without it the build is an ordinary fixed-L one: it succeeds,
+        # emits no scratchpad parameters, and the host has no way to say what
+        # the context length is -- so it is set here rather than left to the
+        # caller, and the missing params.txt is caught below either way.
+        os.environ["DECODE_DYNSEQ"] = "1"
 
     sys.path.insert(0, fd_dir)
     spec = importlib.util.spec_from_file_location(
