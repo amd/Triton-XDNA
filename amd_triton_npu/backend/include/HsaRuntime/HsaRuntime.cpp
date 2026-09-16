@@ -42,7 +42,6 @@
 #include <utility>
 #include <vector>
 
-#include <dlfcn.h>    // dlsym(), to probe for an optional ROCR extension
 #include <sys/stat.h> // fstat(), to size the object a dma-buf names
 #include <unistd.h>   // close(), for the dma-buf an import is reached through
 
@@ -62,23 +61,36 @@ constexpr std::uint32_t QUEUE_SIZE = 32;
 // hsa_amd_aie_kernel_dispatch_packet_t::pdi_patch_offset's contract.
 inline constexpr std::size_t kCtrlCodeAlign = 16 * 1024;
 
-// ROCR's resolver for the device address of one of our buffers, or null if the
-// loaded ROCR has none.
+// The address the NPU sees for `ptr`, or 0 if this ROCR cannot say.
 //
-// Looked up rather than called directly, for two reasons. It is an extension,
-// so the header a given ROCm ships may not even declare it -- and this file is
-// expected to build against either. And the ROCR a launcher runs against is
-// not the one it was compiled against (it binds by DT_RPATH), so the only
-// question that matters is what is loaded right now.
+// hsa_amd_pointer_info has always existed; what varies is whether the loaded
+// ROCR knows AIE allocations. One that does not reports them as
+// HSA_EXT_POINTER_TYPE_UNKNOWN with every field nil, because it resolves
+// pointers through the KFD thunk, which has never heard of an XDNA buffer
+// object. One that does reports the agent's address in agentBaseAddress, the
+// same field it has always used for a GPU's.
 //
-// Resolved once: dlsym on every dispatch would be a syscall-shaped cost on the
-// hot path, and the answer cannot change within a process.
-using AieDeviceAddressFn = hsa_status_t (*)(hsa_agent_t, void *,
-                                            std::uint64_t *, std::size_t *);
-inline AieDeviceAddressFn aie_device_address_fn() {
-  static auto *fn = reinterpret_cast<AieDeviceAddressFn>(
-      dlsym(RTLD_DEFAULT, "hsa_amd_aie_agent_device_address"));
-  return fn;
+// The ROCR a launcher runs against is not the one it was compiled against (it
+// binds by DT_RPATH), so this is a question only the running process can
+// answer.
+inline std::uint64_t query_device_address(void *ptr) {
+  hsa_amd_pointer_info_t info{};
+  info.size = sizeof(info);
+  if (hsa_amd_pointer_info(ptr, &info, nullptr, nullptr, nullptr) !=
+      HSA_STATUS_SUCCESS)
+    return 0;
+  if (info.type == HSA_EXT_POINTER_TYPE_UNKNOWN ||
+      info.hostBaseAddress == nullptr)
+    return 0;
+
+  // pointer_info reports the allocation, so an interior pointer needs its
+  // offset carried across.
+  const auto offset = static_cast<std::uint8_t *>(ptr) -
+                      static_cast<std::uint8_t *>(info.hostBaseAddress);
+  const auto base = reinterpret_cast<std::uint64_t>(info.agentBaseAddress);
+  if (base == 0 || info.agentBaseAddress == info.hostBaseAddress)
+    return 0; // reachable only at its host address, which is not patchable
+  return base + static_cast<std::uint64_t>(offset);
 }
 
 // The dispatch packet's trailing 64-bit field, under either of its names.
@@ -541,7 +553,7 @@ public:
     // here, and it has to be the *device* address. A pool allocation's host
     // address is not it, and writing that does not fault: the design waits on
     // data that never arrives and the dispatch hangs. Ask ROCR, which is the
-    // only thing that can answer (hsa_amd_aie_agent_device_address).
+    // only thing that can answer (hsa_amd_pointer_info's agentBaseAddress).
 
     // Every PDI, not just the patched one: the control code switches to the
     // others by address, and an unmapped one faults the array.
@@ -1493,18 +1505,13 @@ private:
   // on data that never arrives -- so a buffer with no device address is refused
   // here rather than dispatched.
   std::uint64_t device_address(void *ptr) {
-    auto *fn = aie_device_address_fn();
-    if (fn == nullptr)
-      throw std::runtime_error(
-          "this ROCR has no hsa_amd_aie_agent_device_address, so the device "
-          "address of a full-ELF design's scratchpad or of a configuration it "
-          "switches to cannot be resolved; dispatching it would hang");
-
-    std::uint64_t dev = 0;
-    HSA_CHECK(fn(aie_agent_, ptr, &dev, nullptr));
+    const std::uint64_t dev = query_device_address(ptr);
     if (dev == 0)
       throw std::runtime_error(
-          "allocation has no device address, so the NPU cannot fetch from it");
+          "this ROCR does not report a device address for an AIE allocation, "
+          "so the address of a full-ELF design's scratchpad or of a "
+          "configuration it switches to cannot be resolved; dispatching it "
+          "would hang");
     return dev;
   }
 
@@ -1895,8 +1902,36 @@ extern "C" int triton_npu_hsa_patch_insts(triton_npu_hsa_program_t program,
 extern "C" int triton_npu_hsa_full_elf_supported(void) {
   // No runtime() here, and nothing that can throw: a caller asking which shape
   // to build must not have to claim the device to find out, and may well ask
-  // before any dispatch has happened.
-  return aie_device_address_fn() != nullptr ? 1 : 0;
+  // before any dispatch has happened. So this takes hsa_init (refcounted, and
+  // harmless if the runtime singleton already holds one) and allocates a page
+  // from the dev pool, but creates no queue and dispatches nothing.
+  //
+  // Asking a real allocation is the only honest probe: whether ROCR reports a
+  // device address for AIE memory is not visible in any symbol or version.
+  if (hsa_init() != HSA_STATUS_SUCCESS)
+    return 0;
+
+  int supported = 0;
+  std::vector<hsa_agent_t> aies;
+  AgentSearch as_aie{HSA_DEVICE_TYPE_AIE, &aies};
+  if (hsa_iterate_agents(collect_agents, &as_aie) == HSA_STATUS_SUCCESS &&
+      !aies.empty()) {
+    PoolSearch s{
+        HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED, false, {}, false};
+    const hsa_status_t st =
+        hsa_amd_agent_iterate_memory_pools(aies.front(), find_pool, &s);
+    if ((st == HSA_STATUS_SUCCESS || st == HSA_STATUS_INFO_BREAK) && s.found) {
+      void *probe = nullptr;
+      if (hsa_amd_memory_pool_allocate(s.pool, 4096, 0, &probe) ==
+          HSA_STATUS_SUCCESS) {
+        supported = query_device_address(probe) != 0 ? 1 : 0;
+        hsa_amd_memory_pool_free(probe);
+      }
+    }
+  }
+
+  hsa_shut_down();
+  return supported;
 }
 
 extern "C" void triton_npu_hsa_dispatch_counts(uint64_t *in_place,

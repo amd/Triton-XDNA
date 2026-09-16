@@ -21,9 +21,10 @@ every context length. It also removes the only reason HsaRuntime ever had an
 entry point that writes arbitrary bytes into executable device memory.
 
 It needs a ROCR that can resolve the device address of an application's buffer
-(`hsa_amd_aie_agent_device_address`): a full-ELF design reaches its scratchpad
-through an address patched into its control code, and that address is the one
-the NPU sees, not the host address the allocation is known by. Without it the
+-- one whose `hsa_amd_pointer_info` reports an AIE allocation's device address
+in `agentBaseAddress`: a full-ELF design reaches its scratchpad through an
+address patched into its control code, and that address is the one the NPU
+sees, not the host address the allocation is known by. Without it the
 dispatch does not fault -- the design waits on data that never arrives -- so
 HsaRuntime refuses to prepare such a design and says so.
 
@@ -138,10 +139,11 @@ def use_scratchpad():
 
     The ELF is the better shape -- one artifact for every context length, and
     nothing writing into the instruction stream per token -- but it needs a
-    ROCR that can resolve the device address of one of our buffers
-    (`hsa_amd_aie_agent_device_address`), and no released one exports it yet.
-    So this is a capability question, asked of the ROCR that is actually
-    loaded, not a preference.
+    ROCR that can resolve the device address of one of our buffers -- one whose
+    `hsa_amd_pointer_info` answers for an AIE allocation rather than calling it
+    HSA_EXT_POINTER_TYPE_UNKNOWN -- and no released one does. So this is a
+    capability question, asked of the ROCR that is actually loaded, not a
+    preference.
 
     AMD_TRITON_NPU_HSA_DECODE=elf|insts forces one, which is how the two are
     compared on a machine that could run either.

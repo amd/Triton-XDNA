@@ -100,13 +100,17 @@ int triton_npu_hsa_scratchpad(triton_npu_hsa_program_t program, void **addr,
 
 // Whether this ROCR can dispatch a full ELF whose design needs an address
 // resolved for it -- a control scratchpad, or a configuration it switches to.
-// Returns 1 if it can, 0 if it cannot. Never fails and never initializes the
-// runtime.
+// Returns 1 if it can, 0 if it cannot. Never fails, and creates no queue.
 //
-// The question is whether the loaded ROCR exports
-// hsa_amd_aie_agent_device_address. A full-ELF design reaches those buffers
-// through addresses patched into its control code, and those are device
-// addresses; only ROCR can resolve one, and nothing standard exports it yet.
+// The question is whether the loaded ROCR's hsa_amd_pointer_info reports a
+// device address for an AIE allocation. A full-ELF design reaches those
+// buffers through addresses patched into its control code, and those are
+// device addresses; only ROCR can resolve one. A ROCR that resolves pointers
+// through the KFD thunk alone cannot: the thunk has never heard of an XDNA
+// buffer object, so it answers HSA_EXT_POINTER_TYPE_UNKNOWN.
+//
+// Answering means allocating a page and asking about it, so this does take
+// hsa_init -- refcounted, and harmless if the runtime singleton holds one.
 //
 // Ask before choosing which artifact to build or load, rather than preparing
 // one and handling the failure: the two shapes are different files, and a

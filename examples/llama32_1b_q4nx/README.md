@@ -217,11 +217,13 @@ two ways, and which one runs is decided by what the loaded ROCR can do:
 
 **A scratchpad parameter** — two scalars in device memory that the design reads
 in its dispatch preamble, so one full ELF serves every context length and
-nothing rewrites the instruction stream per token. This needs a ROCR exporting
-`hsa_amd_aie_agent_device_address`: a full-ELF design reaches its scratchpad
-through an address patched into its control code, and that is the address the
-NPU sees, not the host address the allocation is known by. No released ROCR
-exports it yet.
+nothing rewrites the instruction stream per token. This needs a ROCR whose
+`hsa_amd_pointer_info` reports a device address for an AIE allocation: a
+full-ELF design reaches its scratchpad through an address patched into its
+control code, and that is the address the NPU sees, not the host address the
+allocation is known by. Released ROCRs resolve pointers through the KFD thunk,
+which has never heard of an XDNA buffer object, so they report an AIE pointer
+as `HSA_EXT_POINTER_TYPE_UNKNOWN` with every field nil.
 
 **A patched instruction stream** — the fallback, and what every released ROCR
 gets. Two builds at adjacent L differ only in the words encoding it, so a diff
@@ -231,15 +233,19 @@ every context length; the L=2048 and L=2047 builds are byte-identical.
 `hsa_decode.use_scratchpad()` asks the question and the Makefile builds
 whichever artifact the answer calls for. `AMD_TRITON_NPU_HSA_DECODE=elf|insts`
 forces one, which is how the two are compared on a machine that could run
-either. Alternated on this one they are the same speed: 49.65 tok/s for the
-ELF, 50.36 for the patched stream.
+either.
 
-The scratchpad costs nothing against the patched-stream path it replaced.
-Alternated in one session, three runs each: patched stream 50.09 / 48.87 / 50.40
-tok/s, scratchpad 50.13 / 50.23 / 49.60. The dispatch shape is if anything
-cheaper — dispatching the same `vector_scalar_add` design both ways, full ELF
-is about 10 µs/dispatch faster than PDI plus instruction stream, measured over
-400 dispatches.
+The scratchpad is slightly slower, by about 1.5%. Ten pairs alternated in one
+session, patched stream first or ELF first, the patched stream won all ten: at
+60 tokens 49.7 – 50.5 tok/s for the ELF against 50.1 – 50.9, and at 120 tokens
+51.3 – 51.9 against 52.1 – 52.7. That is roughly 0.3 ms on a 20 ms token.
+
+The likely cause is that there is simply more control code to fetch. aiecc
+builds the full ELF with `--expand-load-pdis`, which replaces each `load_pdi`
+with the configuration writes inlined, so the decode ELF's `.ctrltext.1` is
+354 KiB against the 158 KiB instruction stream it replaces — 2.24x. Nothing
+about resolving the scratchpad's address is on the hot path: that happens once,
+at load.
 
 The remaining gap to XRT is the same one the HSA path has always had, and it is
 still unattributed. Of a 20.2 ms token, 18.3 ms is inside the dispatch.
