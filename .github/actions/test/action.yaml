@@ -197,6 +197,31 @@ runs:
 
         echo ""
         echo "=========================================="
+        echo "STEP 9b: Llama-3.2-1B prefill gate"
+        echo "=========================================="
+        # Invoked directly rather than through run_tests.py, which would run the
+        # entry point with no arguments and so try to generate -- and generation
+        # needs a one-time `make compile-decode`. --prefill-only needs no decode
+        # build and is the stronger signal anyway: it gates on the canonical
+        # prompt's first token, so a wrong kernel fails here rather than being
+        # absorbed into fluent-looking output. npu2-only, like gpt2/qwen.
+        if [ "$DEVICE" = "aie2p" ]; then
+          ( cd examples/llama32_1b_q4nx \
+            && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+               python llama32_1b_q4nx_inference.py --prefill-only )
+          rc=$?
+          if [ "$rc" -eq 77 ]; then
+            echo "SKIP: llama32_1b_q4nx (exit 77)"
+          elif [ "$rc" -ne 0 ]; then
+            echo "FAIL: llama32_1b_q4nx (exit $rc)"
+            exit "$rc"
+          fi
+        else
+          echo "Skipping llama32_1b_q4nx: npu2-only (device=$DEVICE)."
+        fi
+
+        echo ""
+        echo "=========================================="
         echo "STEP 10: LLM examples in hetero mode (iGPU + NPU)"
         echo "=========================================="
         # Same gpt2/qwen examples in --backend hetero (non-NPU ops on the iGPU).

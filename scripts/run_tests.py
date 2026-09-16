@@ -27,9 +27,9 @@ DEFAULT_SKIPPED_EXAMPLES = {
     # out of the default sweep.
     "gpt2",
     "qwen2_5",
-    # Needs the 1.3 GB model.q4nx bundle and, for generation, a one-time
-    # `make compile-decode` in the example. `--prefill-only` runs without the
-    # decode build but still wants the weights.
+    # Same as above, and additionally: the no-argument run generates, which
+    # needs a one-time `make compile-decode`. CI gates it on --prefill-only
+    # instead, in its own step, which needs no decode build.
     "llama32_1b_q4nx",
 }
 
