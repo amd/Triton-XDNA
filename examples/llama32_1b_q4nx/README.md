@@ -203,10 +203,14 @@ It is not as fast. Measured on Strix, 60 tokens, runtimes alternated:
 | | tok/s |
 |---|---|
 | XRT | 54.5 |
-| HSA | 46.9 – 47.3 |
+| HSA | 48.9 – 50.4 |
 
 The token ids are identical between the two, so this is a throughput gap and
 not a correctness one.
+
+Take any single reading here with salt: this NPU is shared, and the same build
+measured 47.3 and 50.1 tok/s an hour apart. Only numbers from runs interleaved
+in one session are worth comparing.
 
 The interesting part is how the context length gets to the device. It is a
 **scratchpad parameter**: two scalars in device memory that the design reads in
@@ -221,11 +225,15 @@ through an address patched into its control code, and that address is the one
 the NPU sees, not the host address the allocation is known by. Without it
 `triton_npu_hsa_prepare_elf` refuses the design rather than hanging on it.
 
-About 3 ms/token of the gap to XRT is unattributed. One measured candidate: the
-full-ELF control code is 354764 bytes against the older path's 158032-byte
-instruction stream, and ROCR walks `insts_size` with CLFLUSH on every dispatch
-even though the control code only changes when an argument address does — which,
-for a decode, is never after the first token.
+The scratchpad costs nothing against the patched-stream path it replaced.
+Alternated in one session, three runs each: patched stream 50.09 / 48.87 / 50.40
+tok/s, scratchpad 50.13 / 50.23 / 49.60. The dispatch shape is if anything
+cheaper — dispatching the same `vector_scalar_add` design both ways, full ELF
+is about 10 µs/dispatch faster than PDI plus instruction stream, measured over
+400 dispatches.
+
+The remaining gap to XRT is the same one the HSA path has always had, and it is
+still unattributed. Of a 20.2 ms token, 18.3 ms is inside the dispatch.
 
 `--ops` takes `all` or a comma list of `matmul,rms_norm,swiglu`, so a
 numerical regression can be bisected to a single kernel against the same CPU
