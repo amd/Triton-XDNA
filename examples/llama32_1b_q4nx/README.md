@@ -66,9 +66,9 @@ From there it is an ordinary AIR design.
     make recompile-decode    # just relower the xclbins, ~9 s
     make decode-kernels      # just rebuild the AIE kernels, ~13 s
 
-Verified against mlir-air's own Makefile build: `insts.bin` byte-identical,
-the xclbin differing in 83 header bytes (UUID and timestamps), and generation
-producing the same token ids.
+Verified against mlir-air's own Makefile build: `insts.bin` byte-identical, the
+xclbin differing only in its UUID and timestamps, and generation producing the
+same token ids.
 
 ## What runs where
 

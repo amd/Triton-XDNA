@@ -69,6 +69,46 @@ def _air_llms_root():
     )
 
 
+class DecodeArtifactError(RuntimeError):
+    """Raised when the decode shape asked for is not one this example builds."""
+
+
+def select_decode_artifact(env=None):
+    """Tell mlir-air's decoder which decode artifact to load.
+
+    mlir-air's ``FusedDecoder`` picks between a full ELF and the xclbin
+    templates by reading ``DECODE_ELF`` (``fused_decode/decode_elf.py``), and
+    that is the only channel it offers -- ``FusedDecoder.__init__`` takes no
+    such argument. So this writes the variable, but decides here rather than
+    letting the default decide, because the two shapes are not interchangeable
+    for us:
+
+    * The ELF route dispatches through pyxrt, which in this process aborts:
+      mlir-air's ELF path brings up a second LLVM and re-registers an option
+      Triton has already registered ("Option 'print-inst-addrs' registered more
+      than once!"). That is a bug to fix, not a shape we have rejected.
+    * ``decode_build.py`` builds the xclbin (and PDI) templates, so the ELF the
+      other route wants is not an artifact this example produces at all.
+
+    Asking for the ELF therefore cannot work today, and saying so here is worth
+    more than letting it fail later inside mlir-air on a missing ``.maxl``.
+
+    Returns the value written, so a caller (and a test) can check it.
+    """
+    env = os.environ if env is None else env
+    asked = env.get("DECODE_ELF")
+    if asked is not None and asked != "0":
+        raise DecodeArtifactError(
+            f"DECODE_ELF={asked!r} selects mlir-air's full-ELF decode. This "
+            "example builds the xclbin templates (decode_build.py --format "
+            "xclbin|pdi) and does not produce that ELF, and mlir-air's ELF "
+            "dispatch aborts in-process on a duplicate LLVM option "
+            "registration. Unset DECODE_ELF to use the templates."
+        )
+    env["DECODE_ELF"] = "0"
+    return env["DECODE_ELF"]
+
+
 def _add_air_paths():
     llms = _air_llms_root()
     for p in (

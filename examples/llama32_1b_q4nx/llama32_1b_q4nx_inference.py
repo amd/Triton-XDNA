@@ -42,13 +42,11 @@ def _air_inference_module():
     """mlir-air's llama32_1b_q4nx_inference, importable and unmodified."""
     import importlib.util
 
-    # mlir-air's decoder now defaults to its own full-ELF artifact, built by its
-    # `make compile-decode-elf`. This example builds the xclbin templates
-    # instead -- `decode_build.py` lowers them through `FusedDecodeOp`, which is
-    # the point of the example -- so ask for the shape we actually produce.
-    # setdefault, not a plain set: someone who has built the ELF and wants it
-    # can still say so.
-    os.environ.setdefault("DECODE_ELF", "0")
+    # Before the import: mlir-air's module reads its decode-shape selection at
+    # import time, so a later choice would not be seen. See
+    # config.select_decode_artifact for why this example fixes it rather than
+    # taking mlir-air's default.
+    config.select_decode_artifact()
 
     config._add_air_paths()
     path = os.path.join(
