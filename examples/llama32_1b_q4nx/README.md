@@ -42,8 +42,8 @@ np.savez(path, k=K, v=V, first=first, prompt=prompt)   # K, V: [16, P, 512] f32
 ```
 
 No shared weight format, no buffer plumbing, no ELF coupling. Any prefill that
-emits that npz drops into mlir-air's `generate()`. `save_kv_npz` in `model.py`
-states the layout — head order, the half-split RoPE convention, and the llama3
+emits that npz drops into mlir-air's `generate()`. `save_kv_npz` in
+`../llm_q4nx/llama_prefill.py` states the layout — head order, the half-split RoPE convention, and the llama3
 frequency scaling that a reimplementation silently gets wrong.
 
 `llama32_1b_q4nx_inference.py` writes the npz and then neutralizes the one
@@ -228,8 +228,9 @@ Llama-3.2-1B-specific, and that is all this directory holds:
 ```
 llama32_1b_q4nx_inference.py  # entry point: spec + prefill class -> the harness
 prefill.py                    # prefill alone, with the Paris gate
-model.py                      # the 16-layer forward pass and its operators
 config.py                     # dims; re-exports mlir-air's loader and RoPE table
+
+(the 16-layer forward itself is ../llm_q4nx/llama_prefill.py, shared with the 3B)
 ```
 
 Shared with the other Q4NX model families, in `../llm_q4nx/`:

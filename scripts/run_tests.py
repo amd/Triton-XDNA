@@ -31,6 +31,7 @@ DEFAULT_SKIPPED_EXAMPLES = {
     # needs a one-time `make compile-decode`. CI gates it on --prefill-only
     # instead, in its own step, which needs no decode build.
     "llama32_1b_q4nx",
+    "llama32_3b_q4nx",
     # Not an example: the harness the *_q4nx examples share. Its files are
     # libraries, and the two with a __main__ are build steps -- running
     # decode_build.py as a "test" lowers the whole decode.
@@ -59,6 +60,7 @@ SCRIPTLESS_UNSUPPORTED = {
         "gpt2": "npu2-only example",
         "qwen2_5": "npu2-only example",
         "llama32_1b_q4nx": "npu2-only example",
+        "llama32_3b_q4nx": "npu2-only example",
     },
     "aie2p": {},
 }

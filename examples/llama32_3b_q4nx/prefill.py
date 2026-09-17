@@ -1,6 +1,6 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
-"""Run the Llama-3.2-1B Q4NX prefill and write the decode's KV handoff.
+"""Run the Llama-3.2-3B Q4NX prefill and write the decode's KV handoff.
 
     python prefill.py --backend cpu
     python prefill.py --backend npu --ops all

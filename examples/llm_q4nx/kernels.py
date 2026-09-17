@@ -353,6 +353,7 @@ def _rms_norm_kernel(
     eps: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    DIM: tl.constexpr,
 ):
     """y = x * rsqrt(mean(x^2) + eps) * w, per row.
 
@@ -361,6 +362,12 @@ def _rms_norm_kernel(
     That example rounds the squares to bf16 before summing and is only tested
     at N=256; at our N=2048 a bf16 sum of 2048 terms carries ~9% relative
     error, which is visible in the model output.
+
+    `N` is the row stride and `DIM` the model dimension. They are equal for a
+    power-of-two model dim and differ when the caller has zero-padded the rows
+    up to one -- Llama-3.2-3B's 3072 is not a power of two, and `tl.arange`
+    requires that the reduction width is. The padding contributes nothing to
+    the sum of squares, so only the divisor has to know the difference.
     """
     pid = tl.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -372,7 +379,7 @@ def _rms_norm_kernel(
     x_f32 = x.to(tl.float32)
     x_sq = x_f32 * x_f32
     sum_sq = tl.sum(x_sq, axis=1)
-    rstd = tl.math.rsqrt(sum_sq / N + eps)
+    rstd = tl.math.rsqrt(sum_sq / DIM + eps)
 
     y = x_f32 * rstd[:, None] * w.to(tl.float32)[None, :]
     tl.store(Y + offsets, y.to(x.dtype))
@@ -385,9 +392,18 @@ def triton_rms_norm(x, weight, eps, block_m=RMS_BLOCK_M):
     """x: [M, D] -> RMS-normalized and scaled by `weight` [D]."""
     M, dim = x.shape
     Mp = math.ceil(M / ROW_TILE) * ROW_TILE
-    wb = weight.to(torch.bfloat16).contiguous()
+    # The reduction width must be a power of two (tl.arange). Llama-3.2-1B's
+    # 2048 already is, so it pads by nothing and its generated code is
+    # unchanged; Llama-3.2-3B's 3072 is not. Zero columns add zero to the sum
+    # of squares, and a zero weight leaves their output zero, so the padding is
+    # invisible to the result -- only the mean's divisor has to ignore it.
+    dim_p = 1 << (dim - 1).bit_length()
+    wb = torch.nn.functional.pad(weight.to(torch.bfloat16), (0, dim_p - dim))
+    wb = wb.contiguous()
     # Pad once; each dispatch gets a contiguous row slice, no copy back.
-    xb = torch.nn.functional.pad(x.to(torch.bfloat16), (0, 0, 0, Mp - M)).contiguous()
+    xb = torch.nn.functional.pad(
+        x.to(torch.bfloat16), (0, dim_p - dim, 0, Mp - M)
+    ).contiguous()
     y = torch.empty_like(xb)
     # Fixed ROW_TILE-row chunks, so the grid is constant (ROW_TILE).
     for m0 in range(0, Mp, ROW_TILE):
@@ -397,10 +413,11 @@ def triton_rms_norm(x, weight, eps, block_m=RMS_BLOCK_M):
             xb[m0 : m0 + ROW_TILE],
             wb,
             y[m0 : m0 + ROW_TILE],
-            dim,
+            dim_p,
             float(eps),
             transform_script=script("llm_q4nx/transform_rms_norm_aie2p.mlir"),
             BLOCK_M=block_m,
-            BLOCK_N=dim,
+            BLOCK_N=dim_p,
+            DIM=dim,
         )
-    return y[:M].to(torch.float32)
+    return y[:M, :dim].to(torch.float32)

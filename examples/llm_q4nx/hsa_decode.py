@@ -239,13 +239,13 @@ def make_hsa_decoder_class(air, artifact_dir):
             self._w = shared_array(lib, self.Wv16.shape, self.Wv16.dtype)
             self._w[:] = self.Wv16
             _rms = np.concatenate(
-                [self.rms_slabs, np.zeros(64, self.bf16), self.final_norm]
+                [self.rms_slabs, np.zeros(self.DH, self.bf16), self.final_norm]
             )
             self._r = shared_array(lib, _rms.shape, _rms.dtype)
             self._r[:] = _rms
             self._rms_lut_off = int(self.rms_slabs.size)
             self._y = shared_array(lib, (self.ny,), self.bf16)
-            self._kv = shared_array(lib, (16 * self.LREG,), self.bf16)
+            self._kv = shared_array(lib, (self.KV.size,), self.bf16)
             # The two big ones are written here (and, for the KV cache, in
             # seed_kv) and belong to the device afterwards, so they carry their
             # own coherency rather than being flushed per token. The small three
@@ -272,12 +272,12 @@ def make_hsa_decoder_class(air, artifact_dir):
             # The context length, into the stream the packet already points at.
             self._prog.patch_insts(self._gen.lo, self._gen.slice_for(L))
             self._x[:] = np.asarray(self.embed[tok], self.bf16)
-            self._r[self._rms_lut_off : self._rms_lut_off + 32] = self.rope_cos[p][
-                :32
-            ].astype(self.bf16)
-            self._r[self._rms_lut_off + 32 : self._rms_lut_off + 64] = self.rope_sin[p][
-                :32
-            ].astype(self.bf16)
+            half = self.DH // 2
+            off = self._rms_lut_off
+            self._r[off : off + half] = self.rope_cos[p][:half].astype(self.bf16)
+            self._r[off + half : off + self.DH] = self.rope_sin[p][:half].astype(
+                self.bf16
+            )
             self._prog.dispatch([self._x, self._w, self._r, self._y, self._kv])
             voc = self._y[self.decode_y : self.decode_y + self.UNI_LM * self.VP]
             return voc[: self.VOCAB_SIZE].astype(np.float32)

@@ -1,12 +1,25 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
-"""Llama-3.2-1B prefill: the model, with each op routed to a backend.
+"""The Llama prefill: the model, with each op routed to a backend.
+
+Shared by every Llama-architecture Q4NX example -- 3.2-1B, 3.2-3B, 3.1-8B.
+They differ only in the constants below, never in the forward: one norm pair
+per block, fused QKV, half-split RoPE, SwiGLU, no qk-norm. A family that breaks
+any of those (Gemma's norm sandwich, Qwen3's qk-norm) needs its own forward and
+must not be bent into this one.
+
+**Which model this is, is decided by `sys.path`.** The constants come from
+`config`, and each example directory -- which holds its own `config.py` -- is
+put ahead of this one on `sys.path` by its entry point. That keeps the forward
+free of dimension plumbing, at the cost of an import that reads as ambiguous.
+`bound_model()` below makes the binding checkable, and a second model in the
+same process fails loudly rather than silently running on the first one's dims.
 
 Structured like examples/gpt2 and examples/qwen2_5: the model carries a
 `backend`, and each operator is a `_op(..., backend=None)` method that falls
 back to it. The torch body of each method is the reference its NPU kernel is
 checked against, so a wrong answer can be bisected op by op -- the only
-practical way to debug a 16-layer model whose end-to-end signal is one token
+practical way to debug a 28-layer model whose end-to-end signal is one token
 id. `--ops` narrows which operators go to the NPU; `--compare-cpu` builds a
 second model with backend="cpu" and diffs the KV cache layer by layer.
 
@@ -40,6 +53,19 @@ from config import (
     load_q4nx,
     rope_lut,
 )
+
+
+def bound_model():
+    """The model whose constants this forward is running on.
+
+    The names above are resolved once, at first import. A process that later
+    put a different model's directory on `sys.path` would keep using these, and
+    the symptom would be a plausible-looking wrong token rather than an error --
+    so the binding is made checkable, and `LlamaPrefill` asserts it.
+    """
+    import config as _cfg
+
+    return _cfg.MODEL_NAME
 
 
 def _t(a, dtype=torch.float32):
@@ -87,11 +113,14 @@ class OpTimer:
 
 
 class LlamaPrefill:
-    """Q4NX Llama-3.2-1B prefill producing the decode's KV handoff.
+    """Q4NX Llama prefill producing the decode's KV handoff.
 
     backend: "cpu" runs every operator in torch, which is the reference the NPU
     path is checked against; "npu" runs the operators named by `ops` as Triton
     kernels and leaves the rest in torch.
+
+    Which Llama is decided by which example's `config` is on `sys.path` -- see
+    the module docstring and `bound_model`.
     """
 
     #: Operators with an NPU kernel. RoPE and attention are absent because
@@ -100,8 +129,23 @@ class LlamaPrefill:
     NPU_OPS = ("matmul", "rms_norm", "swiglu")
 
     def __init__(
-        self, backend="cpu", ops="all", n_layers=N_LAYERS, max_seq=2048, model=None
+        self,
+        backend="cpu",
+        ops="all",
+        n_layers=N_LAYERS,
+        max_seq=2048,
+        model=None,
+        expect_model=None,
     ):
+        # A mismatch here means this forward resolved one model's dims while
+        # the caller meant another, which produces fluent wrong text rather
+        # than an error. Cheap to check once, expensive to debug later.
+        if expect_model is not None and bound_model() != expect_model:
+            raise RuntimeError(
+                f"this forward is bound to {bound_model()!r} but {expect_model!r} "
+                "was asked for; each model runs in its own process, with its own "
+                "example directory first on sys.path"
+            )
         self.backend = backend
         self.enabled = self._resolve_ops(ops)
         self.timer = OpTimer(enabled=False)
@@ -179,13 +223,16 @@ class LlamaPrefill:
     def _rope(self, x, lut, n_heads, backend=None):
         """Half-split RoPE (HuggingFace Llama convention). CPU only, see NPU_OPS.
 
-        x:   [N, n_heads*64]
-        lut: [N, 64] = [cos_0..cos_31, sin_0..sin_31]
+        x:   [N, n_heads*DH]
+        lut: [N, DH] = [cos_0..cos_{DH/2-1}, sin_0..sin_{DH/2-1}]
 
-            out[i]      = x[i]*cos[i] - x[i+32]*sin[i]
-            out[i+32]   = x[i]*sin[i] + x[i+32]*cos[i]
+        With H = DH // 2:
 
-        Pairs (i, i+32), NOT adjacent (2i, 2i+1).
+            out[i]      = x[i]*cos[i] - x[i+H]*sin[i]
+            out[i+H]    = x[i]*sin[i] + x[i+H]*cos[i]
+
+        Pairs (i, i+H), NOT adjacent (2i, 2i+1). H is 32 for the 1B's 64-wide
+        heads and 64 for the 3B's 128-wide ones.
         """
         with self.timer.track("rope"):
             N = x.shape[0]
@@ -333,15 +380,17 @@ class LlamaPrefill:
         and what its `seed_kv()` assumes -- because getting any of it wrong
         degrades quality without failing:
 
-            k, v : [16, P, 512] float32   (bf16-exact values)
+            k, v : [N_LAYERS, P, DK] float32   (bf16-exact values)
 
-        512 is 8 KV heads x 64, laid out as column `h*64 + d`, position-major,
-        heads contiguous within a position. No permutation and no interleaving
+        DK is N_KV_HEADS x DH, laid out as column `h*DH + d`, position-major,
+        heads contiguous within a position. That is [16, P, 512] for the 1B
+        and [28, P, 1024] for the 3B -- the shape follows the model, so read it
+        from `config` rather than from this line. No permutation and no interleaving
         at this boundary: the region-major scatter the decode wants happens
         inside its own `seed_kv()`.
 
         K is stored already rotated, V raw. The rotation is half-split --
-        `out[i] = x[i]*cos[i] - x[i+32]*sin[i]`, pairing i with i+32 rather
+        `out[i] = x[i]*cos[i] - x[i+DH/2]*sin[i]`, pairing i with i+DH/2 rather
         than adjacent lanes -- and its table carries llama3 frequency scaling
         (factor 32, low 1, high 4, old context 8192, theta 500000), which is
         why `config.rope_lut` re-exports mlir-air's generator instead of

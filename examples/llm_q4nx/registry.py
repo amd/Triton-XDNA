@@ -35,6 +35,18 @@ class ModelSpec:
         air_inference: that driver's module filename.
         tokenizer_fallback: used only when mlir-air's driver is not loaded,
             i.e. `--prefill-only`.
+        driver_api: which shape mlir-air's own driver for this model exposes.
+            They are not uniform, and the difference is in how our prefill is
+            handed to their decode:
+
+            * `"npz"` -- the 1B. `generate(ids, n, seq_len, kv_path, ...)`
+              reads a KV handoff file, so the harness writes one and
+              neutralizes the step that would have produced it.
+            * `"prefiller"` -- the 3B. `generate_stream(dec, tokenizer, ids, n,
+              prefiller=...)` takes the prefill object directly, calling
+              `clear_context()`, `prefill()` and `kv_view()` on it -- which is
+              the interface our prefill already has. No file, nothing to
+              neutralize.
     """
 
     name: str
@@ -43,6 +55,18 @@ class ModelSpec:
     air_package: str
     air_inference: str
     tokenizer_fallback: str
+    driver_api: str = "npz"
+    #: For `driver_api="prefiller"`: the decoder class that driver exposes.
+    #: Named per model (`FusedDecode3B`), so it is recorded
+    #: rather than derived from the model name.
+    decoder_class: str = ""
+    #: Whether `AMD_TRITON_NPU_RUNTIME=hsa` works for this model. The HSA
+    #: adapter subclasses `air.FusedDecoder`, which only the npz-API drivers
+    #: define -- the prefiller ones name theirs `FusedDecode3B` -- so asking
+    #: for HSA elsewhere raises AttributeError from inside hsa_decode.py.
+    #: Generalizing it belongs with the HSA scratchpad work, not with adding
+    #: models.
+    supports_hsa: bool = False
     #: llms packages to put on sys.path, beyond `air_package`.
     extra_packages: tuple = field(default_factory=tuple)
 
@@ -77,10 +101,51 @@ LLAMA_3_2_1B = ModelSpec(
     air_inference="llama32_1b_q4nx_inference.py",
     tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.2-1B",
     extra_packages=("llama32_1b",),
+    supports_hsa=True,
 )
 
 
-SPECS = {s.name: s for s in (LLAMA_3_2_1B,)}
+#: Llama-3.2-3B. Same architecture as the 1B -- SwiGLU, one norm pair per
+#: block, no qk-norm -- at 28 layers of 3072 with 128-wide heads.
+#:
+#: Its environment is assembled from *two* places in
+#: `llms/llama32_3b_q4nx/Makefile`, and reading only the obvious one gets it
+#: wrong: `DECODE_ENV` (line 51) carries most of it, but `W_DUAL_CHAN=1` reaches
+#: the builder through a bare `export` (line 49) instead. That variable picks
+#: the DDR weight layout, so dropping it builds cleanly and decodes to garbage.
+#:
+#: Two differences from the 1B, both deliberate:
+#:
+#: * `UNIFIED=1` is set here and unset for the 1B -- the per-model fact the 1B's
+#:   comment above warns not to carry over in either direction.
+#: * `PROJ_RC_CACHE` is absent, because the 3B's Makefile does not set it. It is
+#:   read by the builder (`fused_decode.py:1114`) *and* by `proj_qmm.cc`, so the
+#:   two must agree -- which they do, both taking the same default. Pinning it
+#:   here would not protect that agreement, it would break step 2 of the
+#:   verification: if upstream moves the default, air's own build moves with it
+#:   and ours would silently stop matching.
+LLAMA_3_2_3B = ModelSpec(
+    name="llama-3.2-3b",
+    decode_env=dict(
+        DECODE_MODEL="llama-3.2-3b",
+        VOCAB_CHUNK_I2="9",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="1",
+        DECODE_GOLDEN="1",
+        W_DUAL_CHAN="1",
+    ),
+    model_type="LLAMA_3_2_3B",
+    air_package="llama32_3b_q4nx",
+    air_inference="llama32_3b_q4nx_inference.py",
+    tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.2-3B",
+    extra_packages=("llama32_3b", "llama32_1b_q4nx"),
+    driver_api="prefiller",
+    decoder_class="FusedDecode3B",
+)
+
+
+SPECS = {s.name: s for s in (LLAMA_3_2_1B, LLAMA_3_2_3B)}
 
 #: What `--model` defaults to where a single model is implied.
 DEFAULT = LLAMA_3_2_1B.name
