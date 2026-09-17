@@ -178,10 +178,33 @@ EXAMPLES = [
             "across iGPU and NPU."
         ),
     },
+    {
+        "kind": "model",
+        "name": "Llama-3.2-1B (Q4NX)",
+        "path": "llama32_1b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "End-to-end Llama-3.2-1B on the NPU: a Triton prefill built from "
+            "this repo's kernels, feeding mlir-air's fused Q4NX decode."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Llama-3.2-3B (Q4NX)",
+        "path": "llama32_3b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "The Llama-3.2-3B configuration of the same Triton-prefill / "
+            "AIR-decode split, sharing the llm_q4nx harness."
+        ),
+    },
 ]
 
-# Directories to ignore when verifying registry completeness
-VERIFY_IGNORE = {"__pycache__"}
+# Directories under examples/ that are not examples. Keep in step with
+# DEFAULT_SKIPPED_EXAMPLES in scripts/run_tests.py, which already excludes
+# llm_q4nx for the same reason: it is the harness the *_q4nx examples share,
+# its files are libraries, and the two with a __main__ are build steps.
+VERIFY_IGNORE = {"__pycache__", "llm_q4nx"}
 
 
 def get_device_support(example_dir):
@@ -368,5 +391,7 @@ if __name__ == "__main__":
 
     content = generate_readme(base_url=args.base_url)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(content)
+    # Explicit encoding: the dashboard is full of status emoji, and the
+    # platform default (cp1252 on Windows) cannot represent them.
+    args.output.write_text(content, encoding="utf-8")
     print(f"Generated {args.output}")
