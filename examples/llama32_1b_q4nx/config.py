@@ -16,6 +16,10 @@ _SHARED = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "llm_q4nx"
 )
 
+#: This example's model, and the key into llm_q4nx/registry.py. The shared
+#: Llama forward asserts against it (llm_q4nx/llama_prefill.py::bound_model).
+MODEL_NAME = "llama-3.2-1b"
+
 # Llama-3.2-1B. Mirrors mlir-air's llama32_1b_q4nx_weights; kept here so the
 # kernels can be read without chasing an import.
 D = 2048  # model dim

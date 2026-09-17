@@ -2,17 +2,18 @@
 # SPDX-License-Identifier: MIT
 """End to end: a Triton prefill feeding mlir-air's Q4NX fused decode.
 
-    python llama32_1b_q4nx_inference.py --backend npu --max-tokens 20
-    python llama32_1b_q4nx_inference.py --prefill-only     # no decode build needed
+    python llama32_3b_q4nx_inference.py --backend npu --max-tokens 20
+    python llama32_3b_q4nx_inference.py --prefill-only     # no decode build needed
 
 The prefill is this repo's -- Triton kernels on XDNA (prefill.py, and
 ../llm_q4nx/kernels.py). The decode is mlir-air's fused Q4NX decode, run
 unmodified: the shared harness writes the KV handoff npz that its `generate()`
 already loads, and neutralizes only the step that would have produced it.
 
-Everything here is Llama-3.2-1B-specific and nothing else is: the driver,
-the decode build and the HSA dispatch all live in ../llm_q4nx/ and are shared
-with the other model families.
+Llama-3.2-3B is architecturally the 1B -- SwiGLU, one norm pair per block, no
+qk-norm -- so it shares the 1B's forward as well as the harness. Everything
+3B-specific is in `config.py`: 28 layers of 3072, 128-wide heads, and its own
+weight bundle.
 
 Prerequisite for generation (not for --prefill-only):
 
@@ -38,7 +39,7 @@ def main(argv=None):
     from llama_prefill import LlamaPrefill
 
     return harness.main(
-        registry.spec("llama-3.2-1b"),
+        registry.spec(config.MODEL_NAME),
         config,
         LlamaPrefill,
         doc=__doc__,
@@ -50,5 +51,5 @@ if __name__ == "__main__":
     from llama_prefill import LlamaPrefill
 
     raise SystemExit(
-        harness.run(registry.spec("llama-3.2-1b"), config, LlamaPrefill, doc=__doc__)
+        harness.run(registry.spec(config.MODEL_NAME), config, LlamaPrefill, doc=__doc__)
     )

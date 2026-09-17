@@ -197,7 +197,7 @@ runs:
 
         echo ""
         echo "=========================================="
-        echo "STEP 9b: Llama-3.2-1B prefill gate"
+        echo "STEP 9b: Q4NX prefill gates"
         echo "=========================================="
         # Invoked directly rather than through run_tests.py, which would run the
         # entry point with no arguments and so try to generate -- and generation
@@ -220,24 +220,32 @@ runs:
           air_rc=0
           python3 utils/fetch_mlir_air_src.py || air_rc=$?
           if [ "$air_rc" -ne 0 ]; then
-            echo "SKIP: llama32_1b_q4nx (mlir-air sources unavailable)"
+            echo "SKIP: Q4NX examples (mlir-air sources unavailable)"
           else
-            # `|| rc=$?` rather than a bare call: this step runs under `bash -e`,
-            # so a non-zero exit -- including the 77 that means SKIP -- would
-            # otherwise abort the step before the check below could grade it.
-            rc=0
-            ( cd examples/llama32_1b_q4nx \
-              && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
-                 python llama32_1b_q4nx_inference.py --prefill-only ) || rc=$?
-            if [ "$rc" -eq 77 ]; then
-              echo "SKIP: llama32_1b_q4nx (exit 77)"
-            elif [ "$rc" -ne 0 ]; then
-              echo "FAIL: llama32_1b_q4nx (exit $rc)"
-              exit "$rc"
-            fi
+            # Every Q4NX example, each gating on its own prompt's first token.
+            # They share the prefill kernels and the harness, so one of them
+            # passing says little about the others: the 3B is the first model
+            # whose dim is not a power of two, which the RMSNorm kernel has to
+            # pad for.
+            for ex in llama32_1b_q4nx llama32_3b_q4nx; do
+              # `|| rc=$?` rather than a bare call: this step runs under
+              # `bash -e`, so a non-zero exit -- including the 77 that means
+              # SKIP -- would otherwise abort the step before the check below
+              # could grade it.
+              rc=0
+              ( cd "examples/$ex" \
+                && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+                   python "${ex}_inference.py" --prefill-only ) || rc=$?
+              if [ "$rc" -eq 77 ]; then
+                echo "SKIP: $ex (exit 77)"
+              elif [ "$rc" -ne 0 ]; then
+                echo "FAIL: $ex (exit $rc)"
+                exit "$rc"
+              fi
+            done
           fi
         else
-          echo "Skipping llama32_1b_q4nx: npu2-only (device=$DEVICE)."
+          echo "Skipping Q4NX examples: npu2-only (device=$DEVICE)."
         fi
 
         echo ""

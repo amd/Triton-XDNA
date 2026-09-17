@@ -57,9 +57,16 @@ def air_inference_module(model):
 
 
 def tokenizer_dir(air, model):
-    """The tokenizer mlir-air's driver uses, or this model's checkpoint."""
-    if air is not None:
-        return air._TOKENIZER
+    """The tokenizer mlir-air's driver uses, or this model's checkpoint.
+
+    The drivers spell it differently -- the 1B exports `_TOKENIZER`, the 3B
+    `TOKENIZER_DEFAULT` -- so try both before falling back. The tokenizer is a
+    convenience for printing text, never the gate, so an unknown spelling
+    degrades to the fallback rather than failing the run.
+    """
+    for attr in ("_TOKENIZER", "TOKENIZER_DEFAULT"):
+        if air is not None and hasattr(air, attr):
+            return getattr(air, attr)
     return os.environ.get(
         "Q4NX_TOKENIZER_DIR", os.path.expanduser(model.tokenizer_fallback)
     )
@@ -68,7 +75,14 @@ def tokenizer_dir(air, model):
 def run_prefill(
     prefill_cls, cfg, ids, backend, ops, max_seq, model, kv_path, profile=False
 ):
-    """Our prefill -> the handoff npz. Returns (first_token, P)."""
+    """Our prefill -> the handoff npz.
+
+    Returns `(first_token, P, prefiller)`. The prefiller is returned because
+    mlir-air's per-model drivers do not agree on how the handoff is made: the
+    1B reads the npz, while the 3B is handed this object and calls
+    `kv_view()` on it. See `ModelSpec.driver_api`. `kv_path=None` skips the
+    npz, which is what the object-handoff models and `--prefill-only` want.
+    """
     import torch
 
     m = prefill_cls(
@@ -102,7 +116,7 @@ def run_prefill(
         f"P={len(ids)} load {t_load:.1f}s prefill {t_run:.2f}s first={first}",
         flush=True,
     )
-    return first, len(ids)
+    return first, len(ids), m
 
 
 def make_session_class(air, prefill_cls, cfg, backend, ops, model):
@@ -160,6 +174,48 @@ def make_session_class(air, prefill_cls, cfg, backend, ops, model):
             )
 
     return TritonSession
+
+
+def generate_via_prefiller(air, spec, cfg, args, ids, prefiller):
+    """Generation for drivers that take the prefill object rather than a file.
+
+    mlir-air's 3B driver hands its `generate_stream` a prefiller and calls
+    `clear_context()`, `prefill()` and `kv_view()` on it -- the interface our
+    prefill already has, so it goes in directly with nothing to neutralize.
+
+    Two details that are easy to get wrong and silent when wrong:
+
+    * `min_prefill=1`. Their default is `PREFILL_MIN_TOKENS` (96), below which
+      the prompt is replayed token-by-token through the decode and the
+      prefiller is never touched. That is the right default for them -- it is
+      faster for short prompts -- but it would mean the six-token gate prompt
+      exercised none of the Triton prefill this example exists to test, and
+      still printed a plausible answer.
+    * `stop_on_eos=False`. The npz path generates a fixed count, so leaving
+      their EOS stop on would make the two paths' token counts differ for
+      reasons that have nothing to do with the kernels.
+    """
+    dec = air.FusedDecode3B(
+        args.model or cfg.MODEL_DEFAULT,
+        airsrc.fused_decode_dir(),
+        model_type=spec.model_type,
+    )
+    gen, t_prompt, t_gen = air.generate_stream(
+        dec,
+        None,  # tokenizer: only used for streaming output, which we do not do
+        ids,
+        args.max_tokens,
+        stream=False,
+        prefiller=prefiller,
+        min_prefill=1,
+        stop_on_eos=False,
+    )
+    print(
+        f"[e2e] prompt {t_prompt:.2f}s, decode {t_gen:.2f}s "
+        f"({len(gen) / t_gen:.2f} tok/s)",
+        flush=True,
+    )
+    return gen
 
 
 def build_parser(doc):
@@ -258,7 +314,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         return ok
 
     if args.prefill_only:
-        first, _ = run_prefill(
+        first, _, _ = run_prefill(
             prefill_cls,
             cfg,
             ids,
@@ -277,7 +333,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     tmp.close()
     kv_path = tmp.name
     try:
-        first, P = run_prefill(
+        first, P, prefiller = run_prefill(
             prefill_cls,
             cfg,
             ids,
@@ -295,15 +351,17 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         if ids == list(cfg.PROMPT) and not gate(first):
             return 1
 
-        # The npz is already written, so the decode's own prefill step has
-        # nothing left to do. Everything after it -- seed_kv, the dispatch
-        # loop, sampling -- is mlir-air's, untouched.
-        air.run_prefill = lambda *a, **k: None
-
         t0 = time.time()
-        out = air.generate(
-            ids, args.max_tokens, args.seq_len, kv_path, greedy=args.greedy
-        )
+        if spec.driver_api == "prefiller":
+            out = generate_via_prefiller(air, spec, cfg, args, ids, prefiller)
+        else:
+            # The npz is already written, so the decode's own prefill step has
+            # nothing left to do. Everything after it -- seed_kv, the dispatch
+            # loop, sampling -- is mlir-air's, untouched.
+            air.run_prefill = lambda *a, **k: None
+            out = air.generate(
+                ids, args.max_tokens, args.seq_len, kv_path, greedy=args.greedy
+            )
         dt = time.time() - t0
         print(f"[e2e] {len(out)} tokens in {dt:.2f}s", flush=True)
         print(f"[e2e] ids {out}", flush=True)
