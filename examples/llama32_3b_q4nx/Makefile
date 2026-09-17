@@ -1,7 +1,6 @@
 # Llama-3.2-3B Q4NX on the NPU: a Triton prefill feeding mlir-air's fused decode.
 #
-#   make chat            Interactive chat REPL  <-- start here
-#   make run             One prompt, N_TOKENS of output
+#   make run             One prompt, N_TOKENS of output  <-- start here
 #   make prefill         Prefill only + the Paris gate (no decode build needed)
 #   make profile         Per-operator prefill timing
 #   make compile-decode  One-time: build the fused decode templates
@@ -23,10 +22,13 @@ shared  := $(srcdir)/../llm_q4nx
 # This example's model family, as ../llm_q4nx/registry.py names it.
 MODEL_NAME := llama-3.2-3b
 
-# Operators to run on the NPU: 'all', or a comma list of matmul,rms_norm,swiglu.
-# xrt (default) or hsa. HSA runs both halves on Yiannis' HsaRuntime: the
-# prefill's kernels as PDI, and the decode with its instruction stream patched
-# per token (../llm_q4nx/hsa_decode.py). Correct, and currently ~22 tok/s against XRT's
+# Dispatch runtime. Only xrt for this model: the HSA decode adapter subclasses
+# mlir-air's `FusedDecoder`, which only its npz-API drivers define -- the 3B's
+# names its decoder `FusedDecode3B` -- so the harness refuses HSA here
+# (registry.py: supports_hsa). Kept as a variable, and still selecting the pdi
+# decode format, so that enabling it is a one-line change once the adapter is
+# generalized; the description that used to be here was the 1B's, and promised
+# a runtime this model cannot use.
 RUNTIME  ?= xrt
 export AMD_TRITON_NPU_RUNTIME = $(RUNTIME)
 DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),pdi,xclbin)
@@ -36,13 +38,11 @@ BACKEND  ?= npu
 N_TOKENS ?= 200
 PROMPT   ?= The capital of France is
 MODEL    ?=
-SYSTEM   ?=
 
 MODEL_ARG  := $(if $(MODEL),--model "$(MODEL)",)
-SYSTEM_ARG := $(if $(SYSTEM),--system "$(SYSTEM)",)
 COMMON     := --backend $(BACKEND) --ops $(OPS) $(MODEL_ARG)
 
-.PHONY: help chat run prefill profile compile-decode \
+.PHONY: help run prefill profile compile-decode \
 	recompile-decode decode-kernels air-src preflight clean
 
 ## Fail early, and say what is actually wrong.
@@ -65,7 +65,6 @@ preflight:
 help:
 	@echo "Llama-3.2-3B Q4NX -- Triton prefill + mlir-air fused decode"
 	@echo ""
-	@echo "  make chat             Interactive REPL (/clear resets, /exit quits)"
 	@echo "  make run              One prompt: PROMPT=\"...\" N_TOKENS=$(N_TOKENS)"
 	@echo "  make prefill          Prefill only + Paris gate (no decode build)"
 	@echo "  make profile          Per-operator prefill timing"
@@ -78,11 +77,12 @@ help:
 	@echo "  RUNTIME=xrt|hsa       Dispatch runtime (default: xrt)"
 	@echo "  BACKEND=npu|cpu       Where the prefill runs (default: npu)"
 	@echo "  OPS=all|matmul,...    Which operators go to the NPU (default: all)"
-	@echo "  SYSTEM=\"...\"          System prompt for chat"
 
-## Interactive chat. Weights load once; every turn is prefill compute only.
-chat: preflight
-	@cd $(srcdir) && $(PYTHON) $(DRIVER) --interactive $(COMMON) $(SYSTEM_ARG)
+# No `chat` target, unlike the 1B's Makefile. mlir-air's Session /
+# interactive_chat pair exists only on its npz-API drivers; the 3B's driver has
+# neither, so the harness refuses --interactive up front (harness.main) and this
+# target could only ever exit 1. A target that cannot work is worse than no
+# target -- it reads as a feature until someone runs it.
 
 ## One prompt, greedy, N_TOKENS of output.
 run: preflight
@@ -97,7 +97,7 @@ prefill: preflight
 profile: preflight
 	@cd $(srcdir) && $(PYTHON) $(DRIVER) --prefill-only --profile $(COMMON)
 
-## Everything the decode needs, from nothing. Run once, before `chat`.
+## Everything the decode needs, from nothing. Run once, before `run`.
 ##
 ## Two steps, both owned here:
 ##
