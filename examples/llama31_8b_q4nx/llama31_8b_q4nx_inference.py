@@ -12,8 +12,9 @@ already loads, and neutralizes only the step that would have produced it.
 
 Llama-3.1-8B is architecturally the 1B -- SwiGLU, one norm pair per block, no
 qk-norm -- so it shares the 1B's forward as well as the harness. Everything
-3B-specific is in `config.py`: 28 layers of 3072, 128-wide heads, and its own
-weight bundle.
+8B-specific is in `config.py`: 32 layers of 4096, 128-wide heads, its own
+weight bundle, and -- unlike both siblings -- an untied LM head and its own
+gate prompt.
 
 Prerequisite for generation (not for --prefill-only):
 

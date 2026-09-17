@@ -93,7 +93,7 @@ def load_q4nx(model=None):
     which loads and then produces fluent nonsense.
 
     Returns a dict with
-        layers: list of 28 dicts, each with
+        layers: list of 32 dicts, each with
             attn_norm, ffn_norm : float32 [D]
             q, k, v, o, gate, up, down : bfloat16 [K, out]  (y = x @ W)
         embed, final_norm, lm_head : float32
@@ -150,8 +150,8 @@ def rope_lut(seq_len, dtype=None):
     reimplementation that drops it produces K rotated on the wrong frequencies
     and long prompts silently degrade.
 
-    The 3B's table is twice the 1B's width, because its heads are: 128 wide, so
-    64 cos and 64 sin.
+    The table is DH wide because the heads are, so 64 cos and 64 sin for this
+    model's 128-wide heads -- the same shape as the 3B's, and twice the 1B's.
     """
     _add_air_paths()
     from llama31_8b_q4nx_weights import generate_rope_lut, llama31_8b_config

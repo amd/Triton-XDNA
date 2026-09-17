@@ -290,14 +290,24 @@ class LlamaPrefill:
         self.fingerprint = raw["fingerprint"]
         self.embed = raw["embed"]  # float32 [VOCAB, D], kept as numpy (1 GB)
         self.final_norm = _t(raw["final_norm"])
-        self.lm_head = _t(raw["lm_head"], torch.bfloat16)  # tied to embed
+        # Tied to `embed` on the 1B and 3B, and its own dequantized tensor on
+        # the 8B -- `config.load_q4nx` decides which, so this line must not
+        # assume either. Getting it wrong is silent: the 8B ran on the tied
+        # assumption and generated 57618 instead of " Paris".
+        self.lm_head = _t(raw["lm_head"], torch.bfloat16)
         self._w = []
         # Pop as we go: `raw` holds every layer's numpy arrays at once, and
         # holding those alongside the torch copies doubles the resident set for
         # the length of the loop. Each layer's source is dead once converted.
+        #
+        # Reversed so the pop comes off the tail. `pop(0)` shifts the whole list
+        # each time, which is O(n^2) for no reason; `pop()` is O(1) and the
+        # reverse restores the order the forward indexes `self._w` by. That
+        # order is load-bearing -- layer k's weights must land at `_w[k]`.
         layers = raw["layers"]
+        layers.reverse()
         while layers:
-            L = layers.pop(0)
+            L = layers.pop()
             w = {
                 "attn_norm": _t(L["attn_norm"]),
                 "ffn_norm": _t(L["ffn_norm"]),
