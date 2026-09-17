@@ -47,6 +47,11 @@ class ModelSpec:
               `clear_context()`, `prefill()` and `kv_view()` on it -- which is
               the interface our prefill already has. No file, nothing to
               neutralize.
+            * `"kv_arrays"` -- Qwen3-4B. Its `generate()` has no handoff
+              parameter at all: it calls its own `_prefill_npu` and passes the
+              `(K, V, first)` straight to the decode loop. So that one function
+              is replaced with ours, which is the same trick the npz path uses
+              on `run_prefill` and keeps us on their public `generate()`.
     """
 
     name: str
@@ -74,6 +79,12 @@ class ModelSpec:
     min_host_gib: float = 0.0
     #: llms packages to put on sys.path, beyond `air_package`.
     extra_packages: tuple = field(default_factory=tuple)
+    #: Environment variable this model's mlir-air driver reads, at import time,
+    #: to find the decode artifacts -- empty when it resolves `fused_decode/`
+    #: itself. `decode_build.py` writes every model's artifacts there, while
+    #: mlir-air's Makefiles leave each model's in its own directory, so a driver
+    #: that defaults to the latter has to be pointed back.
+    decode_dir_env: str = ""
 
 
 #: Two places where this spec deliberately does *not* match mlir-air's
@@ -199,7 +210,60 @@ LLAMA_3_1_8B = ModelSpec(
 )
 
 
-SPECS = {s.name: s for s in (LLAMA_3_2_1B, LLAMA_3_2_3B, LLAMA_3_1_8B)}
+#: Qwen3-4B. The first non-Llama family here, and the first to need its own
+#: forward: between the QKV projection and RoPE each head's 128 lanes are
+#: RMS-normalized by a per-layer weight (`llm_q4nx/qwen3_prefill.py`). Also the
+#: first with DQ != D -- 32 heads of 128 against a 2560 model dim -- so o_proj
+#: contracts 4096 -> 2560 instead of being square.
+#:
+#: Its environment comes from the same two places as the 3B's: `DECODE_ENV`
+#: (llms/qwen3_4b_q4nx/Makefile) for most of it, and a bare `export` for
+#: `W_DUAL_CHAN=1`. `VOCAB_CHUNK_I2=30` is this model's own value -- the
+#: divisibility constraint depends on its NCX/NCY/PAIR_ROWS geometry, and
+#: Qwen3-8B's 8 does not transfer despite the shared reader.
+#:
+#: `DECODE_WGROUP` is absent because its Makefile defaults it to 0 (disabled):
+#: the split exists for models past the 4 GiB one-BO shim-BD-offset limit, and
+#: 4B's ~2.1 GiB of decode weight is under it. The Makefile keeps it as an
+#: override, and a model that needs it must set it here *and* match it on the
+#: host, which is a second reason not to pin a value we do not need.
+QWEN3_4B = ModelSpec(
+    name="qwen3-4b",
+    decode_env=dict(
+        DECODE_MODEL="qwen3-4b",
+        VOCAB_CHUNK_I2="30",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="1",
+        DECODE_GOLDEN="1",
+        W_DUAL_CHAN="1",
+    ),
+    model_type="QWEN3_4B",
+    air_package="qwen3_4b_q4nx",
+    air_inference="qwen3_4b_q4nx_inference.py",
+    # Qwen3's driver detokenizes straight from the weight repo rather than
+    # exporting a tokenizer path, so there is no attribute for `tokenizer_dir`
+    # to find. Qwen3 ships one ungated checkpoint, base and instruct alike.
+    tokenizer_fallback="Qwen/Qwen3-4B",
+    driver_api="kv_arrays",
+    decoder_class="FusedDecoder",
+    decode_dir_env="Q4NX_QWEN3_4B_DECODE_DIR",
+    # Measured on this box, as the 8B's was: peak RSS of `--prefill-only` is
+    # 20.3 GiB. That is high for 4B parameters, and it is the same cost the
+    # 8B's comment describes rather than anything Qwen3 does -- 36 layers of
+    # 2560 dequantize to 3.6G bf16 parameters, and `load_q4nx` materializes all
+    # of them as numpy before the first is converted. Loading per layer is the
+    # fix, and it belongs to every model at once, not here.
+    min_host_gib=22.0,
+    extra_packages=("qwen3_8b_q4nx", "qwen3_4b"),
+    # Its driver *does* name its decoder `FusedDecoder`, so the adapter would
+    # import -- but nothing here has run it on hardware, and the ELF route it
+    # wants is still blocked. False records "untested", not "cannot".
+    supports_hsa=False,
+)
+
+
+SPECS = {s.name: s for s in (LLAMA_3_2_1B, LLAMA_3_2_3B, LLAMA_3_1_8B, QWEN3_4B)}
 
 #: What `--model` defaults to where a single model is implied.
 DEFAULT = LLAMA_3_2_1B.name

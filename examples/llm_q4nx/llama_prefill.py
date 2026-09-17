@@ -5,8 +5,12 @@
 Shared by every Llama-architecture Q4NX example -- 3.2-1B, 3.2-3B, 3.1-8B.
 They differ only in the constants below, never in the forward: one norm pair
 per block, fused QKV, half-split RoPE, SwiGLU, no qk-norm. A family that breaks
-any of those (Gemma's norm sandwich, Qwen3's qk-norm) needs its own forward and
-must not be bent into this one.
+any of those (Gemma's norm sandwich, Qwen3's qk-norm) writes its own `_layer`
+and must not add a branch to this one -- `qwen3_prefill.py` is that, and it
+subclasses `LlamaPrefill` only to reuse what is *not* the forward: the operator
+routing, the timer, the KV handoff and `prefill()`'s padding. The two hooks
+that exist for it, `EXTRA_LAYER_WEIGHTS` and `kv_stack`, are marked below; a
+family needing more than a hook needs its own class, not a third hook.
 
 **Which model this is, is decided by `sys.path`.** The constants come from
 `config`, and each example directory -- which holds its own `config.py` -- is
@@ -137,6 +141,12 @@ class LlamaPrefill:
     #: neither has a transform script yet -- the same position
     #: examples/gpt2 --backend npu takes on attention, not a Triton limit.
     NPU_OPS = ("matmul", "rms_norm", "swiglu")
+
+    #: Per-layer tensors a subclass's forward needs that Llama's does not, as
+    #: `name -> torch dtype`. `load_weights` reads them out of `load_q4nx`'s
+    #: layer dicts; this family needs none. Qwen3's per-head q/k norms are the
+    #: reason it exists -- see qwen3_prefill.py.
+    EXTRA_LAYER_WEIGHTS = {}
 
     def __init__(
         self,
@@ -321,6 +331,8 @@ class LlamaPrefill:
             # their output dimension and issued as one GEMM: Q|K|V (one
             # normalized hidden in) and gate|up. Same arithmetic, 48 fewer
             # launches per prefill.
+            for nm, dt in self.EXTRA_LAYER_WEIGHTS.items():
+                w[nm] = _t(L[nm], dt)
             w["qkv"] = torch.cat([w["q"], w["k"], w["v"]], dim=1).contiguous()
             w["gate_up"] = torch.cat([w["gate"], w["up"]], dim=1).contiguous()
             # The unfused halves are dead once concatenated -- the forward only
@@ -405,6 +417,25 @@ class LlamaPrefill:
             self.kv_k[L][:] = 0
             self.kv_v[L][:] = 0
 
+    def kv_stack(self):
+        """The handoff as a pair of arrays: k, v float32 [N_LAYERS, P, DK].
+
+        The layout is stated in `save_kv_npz` below, which is the same data
+        written to a file. It is split out because mlir-air's drivers do not
+        agree on how the handoff arrives -- the 1B reads the npz, the 3B is
+        handed the prefiller, and Qwen3's takes exactly these two arrays (see
+        `ModelSpec.driver_api`).
+        """
+        c = self.current_context_length
+        return (
+            np.stack([self.kv_k[L][:c] for L in range(self.n_layers)]).astype(
+                np.float32
+            ),
+            np.stack([self.kv_v[L][:c] for L in range(self.n_layers)]).astype(
+                np.float32
+            ),
+        )
+
     def save_kv_npz(self, path, first, prompt):
         """Write the handoff mlir-air's `generate()` loads.
 
@@ -429,14 +460,6 @@ class LlamaPrefill:
         rebuilding one: a reimplementation that drops the scaling rotates K on
         the wrong frequencies and only long prompts show it.
         """
-        c = self.current_context_length
-        K = np.stack([self.kv_k[L][:c] for L in range(self.n_layers)])
-        V = np.stack([self.kv_v[L][:c] for L in range(self.n_layers)])
-        np.savez(
-            path,
-            k=K.astype(np.float32),
-            v=V.astype(np.float32),
-            first=first,
-            prompt=np.array(prompt),
-        )
+        K, V = self.kv_stack()
+        np.savez(path, k=K, v=V, first=first, prompt=np.array(prompt))
         return K, V

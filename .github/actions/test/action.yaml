@@ -294,6 +294,13 @@ runs:
             # than dying at exit 137.
             gate llama31_8b_q4nx --prefill-only
 
+            # Qwen3-4B is prefill-only for the 3B's reason -- its decode needs
+            # a requantized weight cache a fresh runner does not have -- and
+            # carries a min_host_gib of its own. Its prefill gate is still the
+            # first coverage of a non-Llama forward: the per-head qk-norm and
+            # the decoupled q dim are both in it.
+            gate qwen3_4b_q4nx --prefill-only
+
             echo ""
             echo "--------------------------------------------------"
             echo "Q4NX Gate Results:"
