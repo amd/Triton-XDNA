@@ -270,6 +270,19 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     """
     args = build_parser(doc).parse_args(argv)
 
+    if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and not spec.supports_hsa:
+        # Up front, for the same reason --interactive is below: a property of
+        # the model, not of anything on disk. Without this the run loads
+        # weights for minutes and then dies inside hsa_decode.py on
+        # `air.FusedDecoder`, an attribute this model's driver does not define.
+        raise SystemExit(
+            f"AMD_TRITON_NPU_RUNTIME=hsa is not supported for {spec.name}. The "
+            f"HSA decode adapter subclasses mlir-air's `FusedDecoder`, which "
+            f"only its npz-API drivers define; this model's driver names its "
+            f"decoder {spec.decoder_class or 'something else'}. Use the "
+            f"default XRT runtime."
+        )
+
     if args.interactive and spec.driver_api != "npz":
         # Before anything is imported or loaded: mlir-air's
         # Session/interactive_chat pair exists only on the npz drivers. The
