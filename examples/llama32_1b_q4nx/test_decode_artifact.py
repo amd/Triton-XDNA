@@ -30,7 +30,7 @@ def test_leaves_an_explicit_zero_alone():
     assert config.select_decode_artifact(env) == "0"
 
 
-def test_rejects_the_elf_we_do_not_build():
+def test_rejects_mlir_airs_own_elf_dispatch():
     # mlir-air's default. Has to fail here, with a reason, rather than inside
     # mlir-air on a missing decode_scratchpad.maxl -- or, worse, in an abort
     # from a duplicate LLVM option registration.
@@ -39,7 +39,9 @@ def test_rejects_the_elf_we_do_not_build():
         try:
             config.select_decode_artifact(env)
         except config.DecodeArtifactError as e:
-            assert "does not produce that ELF" in str(e)
+            # Point at the knob that does select the HSA decode's shape, since
+            # wanting an ELF is a reasonable thing to have wanted.
+            assert "AMD_TRITON_NPU_HSA_DECODE" in str(e)
         else:
             raise AssertionError(f"DECODE_ELF={asked!r} should have been refused")
 

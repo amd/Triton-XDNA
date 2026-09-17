@@ -76,6 +76,13 @@ def lower_template(L, out_dir=None, output_format="xclbin"):
     fd_dir = fused_decode_dir()
     out_dir = out_dir or fd_dir
     os.environ.update(DECODE_ENV, DECODE_GOLDEN_L=str(L))
+    if output_format == "elf":
+        # What makes L a runtime value rather than a constant folded into the
+        # design. Without it the build is an ordinary fixed-L one: it succeeds,
+        # emits no scratchpad parameters, and the host has no way to say what
+        # the context length is -- so it is set here rather than left to the
+        # caller, and the missing params.txt is caught below either way.
+        os.environ["DECODE_DYNSEQ"] = "1"
 
     sys.path.insert(0, fd_dir)
     spec = importlib.util.spec_from_file_location(
@@ -109,6 +116,33 @@ def lower_template(L, out_dir=None, output_format="xclbin"):
     art = op.lower(output_format=output_format)
     print(f"[decode-build] L={L} lowered in {time.time() - t0:.1f}s", flush=True)
 
+    if output_format == "elf":
+        # One artifact for every context length: L is a scratchpad parameter,
+        # not something baked into an instruction stream, so there is no
+        # template pair and nothing per-L to build. params.txt is half of it --
+        # it maps each parameter to its slot, and the host cannot write one
+        # without it -- so it is copied out beside the ELF rather than left in
+        # the project directory.
+        dst_e = os.path.join(out_dir, "decode_scratchpad.elf")
+        dst_p = os.path.join(out_dir, "decode_scratchpad.params.txt")
+        shutil.copyfile(art["elf_path"], dst_e)
+        params = os.path.join(os.path.dirname(art["elf_path"]), "params.txt")
+        if not os.path.exists(params):
+            raise SystemExit(
+                f"{params} is missing: the build emitted no scratchpad "
+                "parameters, so L has no way to reach the device. It needs an "
+                "mlir-air whose fused_decode routes DYNSEQ through the "
+                "scratchpad, and DECODE_DYNSEQ=1."
+            )
+        shutil.copyfile(params, dst_p)
+        # The build's ATTN_MAXL, recorded rather than defaulted: a driver
+        # guessing 2048 against an ELF built at another L mis-sizes the KV
+        # cache and the mask threshold together, and both read as bad numerics.
+        with open(os.path.join(out_dir, "decode_scratchpad.maxl"), "w") as f:
+            f.write(f"{fd.ATTN_MAXL}\n")
+        print(f"[decode-build] -> {dst_e} + params.txt", flush=True)
+        return dst_e, dst_p
+
     # Name them the way the decode's template loader expects to find them.
     ext = "pdi" if output_format == "pdi" else "xclbin"
     dst_x = os.path.join(out_dir, f"decode_L{L}.{ext}")
@@ -138,13 +172,33 @@ def main(argv=None):
     ap.add_argument(
         "--format",
         default="xclbin",
-        choices=("xclbin", "pdi"),
-        help="pdi is what the HSA runtime consumes; xclbin is XRT's",
+        choices=("xclbin", "pdi", "elf"),
+        help="elf is what the HSA runtime consumes -- one artifact for every "
+        "context length, with L a scratchpad parameter; pdi is the older HSA "
+        "path, which needs a template pair and patches L into the instruction "
+        "stream; xclbin is XRT's",
     )
     args = ap.parse_args(argv)
 
     if args.context_length is not None:
         lower_template(args.context_length, args.out_dir, args.format)
+        return 0
+
+    # One ELF serves every context length, so there is no pair to build and no
+    # slope to calibrate -- that is the point of the scratchpad.
+    if args.format == "elf":
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--context-length",
+            str(args.max_context_length),
+            "--format",
+            "elf",
+        ]
+        if args.out_dir:
+            cmd += ["--out-dir", args.out_dir]
+        subprocess.run(cmd, check=True)
+        print("[decode-build] one full ELF lowered through FusedDecodeOp.", flush=True)
         return 0
 
     # The loader wants the L template and an L-1 slope reference. Separate

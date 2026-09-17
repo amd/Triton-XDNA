@@ -47,6 +47,78 @@ triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *pdi_path,
                                                 char *errbuf,
                                                 size_t errbuf_len);
 
+// Initialize the runtime (idempotent) and load one kernel out of a full ELF --
+// what `aiecc --get-full-elf` emits. Returns an opaque program handle, or NULL
+// on error (with a message written to errbuf).
+//
+// `kernel_name` is "<device>:<sequence>" as aiecc names it, e.g.
+// "main:q4nx_decode"; the error lists what the file actually holds if the name
+// does not match.
+//
+// A full ELF differs from the (pdi, insts) pair above in where the arguments
+// go. There, the hardware patches them into the instruction stream as it runs.
+// Here the ELF *is* the stream, it loads its own configuration, and this
+// runtime patches the argument addresses into it before each enqueue. What that
+// buys is the scratchpad below: a design can then take a runtime value without
+// anything rewriting its instruction stream per dispatch.
+//
+// Only aie2p (npu2/Strix) supports this shape.
+triton_npu_hsa_program_t triton_npu_hsa_prepare_elf(const char *elf_path,
+                                                    const char *kernel_name,
+                                                    char *errbuf,
+                                                    size_t errbuf_len);
+
+// Where a full-ELF program's control scratchpad lives, and how many bytes of it
+// the ELF declared. Either pointer may be NULL. Returns 0 on success, or a
+// negative value on error (with a message written to errbuf); asking a program
+// that was not prepared from an ELF is an error.
+//
+// The scratchpad is plain device-visible memory: the host writes it, and the
+// device reads it in its dispatch preamble, so a value written here reaches the
+// next dispatch without touching the instruction stream. It is `4 *
+// parameter_count` bytes, one uint32 per parameter, indexed by the parameter's
+// `state_table_idx`.
+//
+// This deliberately returns the address rather than taking a parameter name.
+// The mapping from name to index, and the rule that a `core`-kind parameter is
+// stored shifted left by 2 while an `addr`-kind one is stored raw, live in the
+// build's params.txt -- a build artifact that this runtime has no business
+// parsing. The caller owns that encoding; this only says where to put the
+// result. Both are zero for a program whose design declares no parameters.
+//
+// Writes here are flushed by the next dispatch, which names the scratchpad as
+// an operand at its real size -- the size a dispatch declares is what ROCR
+// walks with CLFLUSH. That is not free-standing coherency: a write that no
+// dispatch follows has not reached the device, and the scratchpad is not one
+// of the resident regions below, so it is flushed every time. At 4 bytes per
+// parameter that costs nothing, and the alternative is worse than it sounds --
+// unflushed parameters sit in CPU cache and a dispatch sees them only if they
+// happen to have been evicted, which fails as a stale answer rather than an
+// error.
+int triton_npu_hsa_scratchpad(triton_npu_hsa_program_t program, void **addr,
+                              uint64_t *size, char *errbuf, size_t errbuf_len);
+
+// Whether this ROCR can dispatch a full ELF whose design needs an address
+// resolved for it -- a control scratchpad, or a configuration it switches to.
+// Returns 1 if it can, 0 if it cannot. Never fails, and creates no queue.
+//
+// The question is whether the loaded ROCR's hsa_amd_pointer_info reports a
+// device address for an AIE allocation. A full-ELF design reaches those
+// buffers through addresses patched into its control code, and those are
+// device addresses; only ROCR can resolve one. A ROCR that resolves pointers
+// through the KFD thunk alone cannot: the thunk has never heard of an XDNA
+// buffer object, so it answers HSA_EXT_POINTER_TYPE_UNKNOWN.
+//
+// Answering means allocating a page and asking about it, so this does take
+// hsa_init -- refcounted, and harmless if the runtime singleton holds one.
+//
+// Ask before choosing which artifact to build or load, rather than preparing
+// one and handling the failure: the two shapes are different files, and a
+// caller that has to pick between them wants the answer first. A design needing
+// no such address -- no scratchpad, a single configuration -- dispatches as a
+// full ELF on any ROCR with the AIE packet, and does not need this.
+int triton_npu_hsa_full_elf_supported(void);
+
 // Dispatch a prepared program: acquire vmem I/O buffers, copy inputs in, fill
 // kernargs, enqueue the AIE packet, wait for completion, copy outputs back, and
 // return the buffers to the pool. host_ptrs[i]/sizes[i] describe tensor i (i in

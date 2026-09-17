@@ -191,7 +191,7 @@ python prefill.py --backend cpu --kv-out /tmp/kv.npz
 ### Running on the HSA runtime
 
 ```bash
-make compile-decode RUNTIME=hsa   # the decode as PDI, not xclbin
+make compile-decode RUNTIME=hsa   # the decode as one full ELF, not xclbin
 make chat RUNTIME=hsa
 ```
 
@@ -202,20 +202,53 @@ It is not as fast. Measured on Strix, 60 tokens, runtimes alternated:
 
 | | tok/s |
 |---|---|
-| XRT | 54.5 – 54.8 |
-| HSA | 49.1 – 51.5 |
+| XRT | 54.5 |
+| HSA | 48.9 – 50.4 |
 
-a stable gap of about 9%, reproducible across runs rather than noise. It is
-not the per-dispatch cache flush -- that is what resident regions removed, and
-without them the gap is roughly three times larger. What remains has not been
-attributed, so treat the HSA path as correct and close, not as a replacement.
+The token ids are identical between the two, so this is a throughput gap and
+not a correctness one.
 
-The interesting part is how the context length gets to the device. HSA has no
-scratchpad parameters, so the full-ELF mechanism is unavailable; but the AIE
-dispatch packet carries the instruction stream's address per enqueue, so
-`hsa_decode.py` patches the 248 L-dependent words per token — the same words
-mlir-air's xclbin path rewrites. One PDI serves every context length; the
-L=2048 and L=2047 builds are byte-identical.
+Take any single reading here with salt: this NPU is shared, and the same build
+measured 47.3 and 50.1 tok/s an hour apart. Only numbers from runs interleaved
+in one session are worth comparing.
+
+The interesting part is how the context length gets to the device. There are
+two ways, and which one runs is decided by what the loaded ROCR can do:
+
+**A scratchpad parameter** — two scalars in device memory that the design reads
+in its dispatch preamble, so one full ELF serves every context length and
+nothing rewrites the instruction stream per token. This needs a ROCR whose
+`hsa_amd_pointer_info` reports a device address for an AIE allocation: a
+full-ELF design reaches its scratchpad through an address patched into its
+control code, and that is the address the NPU sees, not the host address the
+allocation is known by. Released ROCRs resolve pointers through the KFD thunk,
+which has never heard of an XDNA buffer object, so they report an AIE pointer
+as `HSA_EXT_POINTER_TYPE_UNKNOWN` with every field nil.
+
+**A patched instruction stream** — the fallback, and what every released ROCR
+gets. Two builds at adjacent L differ only in the words encoding it, so a diff
+gives base and slope, and 248 words are patched in per token. One PDI serves
+every context length; the L=2048 and L=2047 builds are byte-identical.
+
+`hsa_decode.use_scratchpad()` asks the question and the Makefile builds
+whichever artifact the answer calls for. `AMD_TRITON_NPU_HSA_DECODE=elf|insts`
+forces one, which is how the two are compared on a machine that could run
+either.
+
+The scratchpad is slightly slower, by about 1.5%. Ten pairs alternated in one
+session, patched stream first or ELF first, the patched stream won all ten: at
+60 tokens 49.7 – 50.5 tok/s for the ELF against 50.1 – 50.9, and at 120 tokens
+51.3 – 51.9 against 52.1 – 52.7. That is roughly 0.3 ms on a 20 ms token.
+
+The likely cause is that there is simply more control code to fetch. aiecc
+builds the full ELF with `--expand-load-pdis`, which replaces each `load_pdi`
+with the configuration writes inlined, so the decode ELF's `.ctrltext.1` is
+354 KiB against the 158 KiB instruction stream it replaces — 2.24x. Nothing
+about resolving the scratchpad's address is on the hot path: that happens once,
+at load.
+
+The remaining gap to XRT is the same one the HSA path has always had, and it is
+still unattributed. Of a 20.2 ms token, 18.3 ms is inside the dispatch.
 
 `--ops` takes `all` or a comma list of `matmul,rms_norm,swiglu`, so a
 numerical regression can be bisected to a single kernel against the same CPU
