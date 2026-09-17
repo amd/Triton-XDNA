@@ -2555,6 +2555,16 @@ def compile_module(
         npu_version = detect_npu_version(link_profile)
         key_data = (
             str(air_output)
+            # This cache holds the compiled launcher, and the AIR IR above does
+            # not determine it: the launcher is generated from the kernel's
+            # signature and constants, and a constexpr that folds to a value an
+            # existing one already had lowers to byte-identical IR while
+            # changing the launcher's arity. Without this the stale .so is
+            # reused and called with the wrong number of arguments -- surfacing
+            # as "function takes exactly N arguments (N+1 given)" from a module
+            # the caller never built, only for those with a warm cache, so it
+            # reproduces on upgrade and never in CI.
+            + f"_launcher_{hashlib.md5(launcher_src.encode()).hexdigest()}"
             + f"_timing_{autotune_time}"
             + f"_format_{output_format}"
             + f"_link_{link_profile}"
