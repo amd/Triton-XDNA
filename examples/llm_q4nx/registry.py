@@ -47,10 +47,20 @@ class ModelSpec:
     extra_packages: tuple = field(default_factory=tuple)
 
 
-#: The 1B's environment has no DECODE_MODEL because the builder's default is
-#: llama-3.2-1b, and no UNIFIED because its Makefile sets neither. Stated
-#: explicitly all the same: a spec that relies on someone else's default is a
-#: spec that breaks silently when the default moves.
+#: Two places where this spec deliberately does *not* match mlir-air's
+#: Makefiles character for character. Both matter when adding a model.
+#:
+#: `DECODE_MODEL` is pinned here, and upstream does not set it at all: the 1B is
+#: the builder's own default (`MODEL_NAME = os.environ.get("DECODE_MODEL",
+#: "llama-3.2-1b")`), so neither `llms/llama32_1b_q4nx/Makefile` nor
+#: `fused_decode/Makefile` names it. Relying on someone else's default is a
+#: thing that breaks silently when the default moves, so every spec names its
+#: own model even where upstream can get away with not.
+#:
+#: `UNIFIED` is absent here because it is absent upstream, and that absence is a
+#: fact about this model rather than an omission -- the 3B, Qwen3 and Gemma3
+#: Makefiles all set `UNIFIED=1`. Copy each new model's from its Makefile; do
+#: not carry this one's over.
 LLAMA_3_2_1B = ModelSpec(
     name="llama-3.2-1b",
     decode_env=dict(
