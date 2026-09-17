@@ -70,28 +70,36 @@ def _air_llms_root():
 
 
 class DecodeArtifactError(RuntimeError):
-    """Raised when the decode shape asked for is not one this example builds."""
+    """Raised when the decode shape asked for is not one this example drives."""
 
 
 def select_decode_artifact(env=None):
-    """Tell mlir-air's decoder which decode artifact to load.
+    """Keep mlir-air's decoder off *its own* full-ELF dispatch.
 
-    mlir-air's ``FusedDecoder`` picks between a full ELF and the xclbin
-    templates by reading ``DECODE_ELF`` (``fused_decode/decode_elf.py``), and
-    that is the only channel it offers -- ``FusedDecoder.__init__`` takes no
-    such argument. So this writes the variable, but decides here rather than
-    letting the default decide, because the two shapes are not interchangeable
-    for us:
+    ``DECODE_ELF`` (``fused_decode/decode_elf.py``) does not select a decode
+    shape so much as select *who dispatches it*: set, ``FusedDecoder`` loads a
+    full ELF and runs it through pyxrt itself. That is the one thing this
+    example never wants, on either runtime:
 
-    * The ELF route dispatches through pyxrt, which in this process aborts:
-      mlir-air's ELF path brings up a second LLVM and re-registers an option
-      Triton has already registered ("Option 'print-inst-addrs' registered more
-      than once!"). That is a bug to fix, not a shape we have rejected.
-    * ``decode_build.py`` builds the xclbin (and PDI) templates, so the ELF the
-      other route wants is not an artifact this example produces at all.
+    * on XRT, because ``decode_build.py`` builds the xclbin templates and the
+      decode runs from those;
+    * on HSA, because the full ELF **is** what we run -- but we load and
+      dispatch it ourselves, through ``HsaElfProgram`` and a scratchpad (see
+      ``hsa_decode.py``). Letting mlir-air do it too would do it twice.
 
-    Asking for the ELF therefore cannot work today, and saying so here is worth
-    more than letting it fail later inside mlir-air on a missing ``.maxl``.
+    And in both cases it would not get that far: mlir-air's ELF path brings up
+    a second LLVM and re-registers an option Triton has already registered
+    ("Option 'print-inst-addrs' registered more than once!"), which aborts the
+    process rather than raising. That is a bug to fix, not a shape rejected on
+    taste.
+
+    So the variable is written here rather than left to its default -- it is
+    the only channel ``FusedDecoder`` offers, its ``__init__`` taking no such
+    argument -- and an explicit request for it is refused with the reason,
+    which beats aborting later inside mlir-air.
+
+    Note this says nothing about whether *we* use a full ELF. On HSA we
+    normally do; ``AMD_TRITON_NPU_HSA_DECODE`` selects that, not this.
 
     Returns the value written, so a caller (and a test) can check it.
     """
@@ -99,11 +107,12 @@ def select_decode_artifact(env=None):
     asked = env.get("DECODE_ELF")
     if asked is not None and asked != "0":
         raise DecodeArtifactError(
-            f"DECODE_ELF={asked!r} selects mlir-air's full-ELF decode. This "
-            "example builds the xclbin templates (decode_build.py --format "
-            "xclbin|pdi) and does not produce that ELF, and mlir-air's ELF "
-            "dispatch aborts in-process on a duplicate LLVM option "
-            "registration. Unset DECODE_ELF to use the templates."
+            f"DECODE_ELF={asked!r} hands the decode to mlir-air's own full-ELF "
+            "dispatch, which this example never uses: on XRT it runs the "
+            "xclbin templates, and on HSA it loads and dispatches the ELF "
+            "itself. mlir-air's route also aborts in-process on a duplicate "
+            "LLVM option registration. Unset DECODE_ELF; to choose the HSA "
+            "decode's shape use AMD_TRITON_NPU_HSA_DECODE=elf|insts."
         )
     env["DECODE_ELF"] = "0"
     return env["DECODE_ELF"]

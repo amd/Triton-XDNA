@@ -365,18 +365,11 @@ def make_hsa_decoder_class(air, artifact_dir):
     That costs the weight allocation twice. Worth fixing before this is more
     than a demonstration; not worth forking their setup to avoid today.
     """
-    # ...but their __init__ has to be kept off *their* full-ELF path. It is
-    # their default now, and it builds an XRT hw_context and imports mlir-aie's
-    # ParameterScratchpad, which loads a second LLVM into a process that
-    # already has Triton's:
-    #
-    #     Option 'print-inst-addrs' registered more than once!
-    #     LLVM ERROR: inconsistency in registered CommandLine options
-    #
-    # which aborts the process rather than raising. Their xclbin path allocates
-    # BOs we ignore, as it always has. We are doing the ELF ourselves; this only
-    # says not to do it twice.
-    os.environ.setdefault("DECODE_ELF", "0")
+    # ...but their __init__ has to be kept off *their* full-ELF path: we are
+    # doing the ELF ourselves, and theirs would abort the process on a
+    # duplicate LLVM option registration. config.select_decode_artifact()
+    # settles that before their module is imported, which is where it has to
+    # happen -- they read the selection at import time.
 
     class HsaFusedDecoder(air.FusedDecoder):
         def __init__(self, *a, **kw):
