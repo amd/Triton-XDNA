@@ -181,12 +181,17 @@ LLAMA_3_1_8B = ModelSpec(
     air_package="llama31_8b_q4nx",
     air_inference="llama31_8b_q4nx_inference.py",
     tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.1-8B",
-    # Measured, not estimated: peak RSS of `--prefill-only` on this box is
-    # 31.6 GiB, against an arithmetic 16 for the weights themselves. The gap is
-    # torch allocator headroom and the transient while the fused QKV/gate-up
-    # are built, and an estimate would have set this at 20 and let a host
-    # through that still gets killed. The smaller two pass on CI's runner as
-    # they are, so they stay unchecked.
+    # Measured, not estimated: peak RSS of `--prefill-only` is 30.9 GiB, and
+    # the arithmetic for the weights alone is 16. Two separate attempts to
+    # reason this number out landed at 20, which would have let through a host
+    # that still gets killed, so it is set from `ru_maxrss` with a margin.
+    #
+    # Note what it is NOT: a statement that an 8B cannot fit in less. It is
+    # what *this* prefill currently costs, which is more than it needs to --
+    # the weights are all materialized before the first GEMM. Loading them
+    # per-layer would cut it a long way, and is the real fix if the runner
+    # turns out to be the thing in the way. The smaller two are unchecked;
+    # they pass on CI as they are.
     min_host_gib=34.0,
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",

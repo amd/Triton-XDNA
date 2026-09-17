@@ -139,6 +139,12 @@ runs:
         echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
         # Report what XRT sees, so a missing/unavailable NPU is obvious in the
         # log instead of surfacing as a per-test "No NPU devices found".
+        # Host memory, so a model that declines for lack of it leaves the
+        # number it declined against in the log. The Q4NX prefills dequantize
+        # to bf16 on the host and the largest needs tens of GiB; without this
+        # the only evidence of an undersized runner is an exit 137.
+        echo "--- host memory ---"
+        grep -E "^(MemTotal|MemAvailable):" /proc/meminfo || true
         echo "--- xrt version ---"
         xrt-smi --version || echo "WARNING: xrt-smi --version failed"
         echo "--- xrt-smi examine (exit status reported below) ---"

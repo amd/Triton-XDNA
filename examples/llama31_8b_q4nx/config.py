@@ -111,20 +111,28 @@ def load_q4nx(model=None):
     dims = _proj_dims(cfg)
 
     qm = Q4nxModel(model or MODEL_DEFAULT)
+
+    # Llama-3.1-8B does NOT tie its LM head to the embedding, unlike the 1B and
+    # 3B, whose `embed_norm_lmhead()` returns the tied full-precision embedding
+    # as the head. The bundle carries a real quantized `lm_head.weight`, and
+    # using the embedding instead still produces fluent text off a plausible
+    # logit vector -- it cost a gate failure at 57618 to find.
+    #
+    # Order matters here, and only for this model. Dequantizing the untied LM
+    # head peaks at ~11 GiB inside `dequant` to produce a 2 GiB result, so
+    # doing it after the layers -- as the 1B and 3B loaders do, where the head
+    # is tied and free -- pays that transient on top of 13 GiB of resident
+    # layer weights. Taking it first pays it against an empty heap and drops
+    # the load's peak by about that much.
+    embed = qm.bf16("model.embed_tokens.weight")
+    final_norm = qm.bf16("model.norm.weight")
+    lm_head = qm.dequant("lm_head.weight", VOCAB, D)
+
     layers = []
     for k in range(N_LAYERS):
         w = qm.layer_weights(k, dims)
         attn_norm, ffn_norm = qm.layer_rms(k)
         layers.append(dict(attn_norm=attn_norm, ffn_norm=ffn_norm, **w))
-    # Llama-3.1-8B does NOT tie its LM head to the embedding, unlike the 1B and
-    # 3B. `embed_norm_lmhead()` returns the tied full-precision embedding as the
-    # head, which is right for them and wrong here: the bundle carries a real
-    # quantized `lm_head.weight`, and using the embedding instead still produces
-    # fluent text off a plausible-looking logit vector. It cost a gate failure
-    # at 57618 rather than 12366 to find.
-    embed = qm.bf16("model.embed_tokens.weight")
-    final_norm = qm.bf16("model.norm.weight")
-    lm_head = qm.dequant("lm_head.weight", VOCAB, D)
     return dict(
         layers=layers,
         embed=embed,

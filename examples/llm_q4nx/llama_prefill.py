@@ -69,9 +69,19 @@ def bound_model():
 
 
 def _t(a, dtype=torch.float32):
-    """numpy (possibly ml_dtypes bfloat16) -> torch tensor."""
+    """numpy (possibly ml_dtypes bfloat16) -> torch tensor.
+
+    bf16 is reinterpreted rather than converted. torch cannot borrow an
+    ml_dtypes bfloat16 buffer directly, and the obvious workaround -- go via
+    float32 -- doubles every weight in transit, which on an 8B is 13 GiB of
+    transient float32 for a result that ends up bf16 again. The two types are
+    the same two bytes, so view them as `uint16` and relabel: no copy, no
+    intermediate, bit-identical to the float32 route.
+    """
     if a.dtype.kind == "V" or str(a.dtype) == "bfloat16":
-        a = a.astype(np.float32)
+        t = torch.from_numpy(np.ascontiguousarray(a).view(np.uint16))
+        t = t.view(torch.bfloat16)
+        return t if dtype == torch.bfloat16 else t.to(dtype)
     return torch.from_numpy(np.ascontiguousarray(a)).to(dtype)
 
 
@@ -282,7 +292,12 @@ class LlamaPrefill:
         self.final_norm = _t(raw["final_norm"])
         self.lm_head = _t(raw["lm_head"], torch.bfloat16)  # tied to embed
         self._w = []
-        for L in raw["layers"]:
+        # Pop as we go: `raw` holds every layer's numpy arrays at once, and
+        # holding those alongside the torch copies doubles the resident set for
+        # the length of the loop. Each layer's source is dead once converted.
+        layers = raw["layers"]
+        while layers:
+            L = layers.pop(0)
             w = {
                 "attn_norm": _t(L["attn_norm"]),
                 "ffn_norm": _t(L["ffn_norm"]),
