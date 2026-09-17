@@ -18,11 +18,15 @@
 PYTHON  ?= python3
 srcdir  := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 DRIVER  := $(srcdir)/llama32_1b_q4nx_inference.py
+# The harness shared with the other Q4NX model families.
+shared  := $(srcdir)/../llm_q4nx
+# This example's model family, as ../llm_q4nx/registry.py names it.
+MODEL_NAME := llama-3.2-1b
 
 # Operators to run on the NPU: 'all', or a comma list of matmul,rms_norm,swiglu.
 # xrt (default) or hsa. HSA runs both halves on Yiannis' HsaRuntime: the
 # prefill's kernels as PDI, and the decode with its instruction stream patched
-# per token (hsa_decode.py). Correct, and currently ~22 tok/s against XRT's
+# per token (../llm_q4nx/hsa_decode.py). Correct, and currently ~22 tok/s against XRT's
 RUNTIME  ?= xrt
 export AMD_TRITON_NPU_RUNTIME = $(RUNTIME)
 DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),pdi,xclbin)
@@ -97,10 +101,10 @@ profile: preflight
 ##
 ## Two steps, both owned here:
 ##
-##   1. decode_kernels.py -- the six AIE kernels, compiled with Peano (~13 s).
+##   1. ../llm_q4nx/decode_kernels.py -- the six AIE kernels, compiled with Peano (~13 s).
 ##      Byte-identical to what mlir-air's Makefile produces, and cached on the
 ##      source and flags, so a re-run is free.
-##   2. decode_build.py -- the xclbins, lowered through FusedDecodeOp: mlir-air's
+##   2. ../llm_q4nx/decode_build.py -- the xclbins, lowered through FusedDecodeOp: mlir-air's
 ##      build_module() supplies the AIR IR, this backend's _aircc_compile turns
 ##      it into an artifact exactly as for every other AIR design (~9 s).
 ##
@@ -108,18 +112,18 @@ profile: preflight
 ## almost all of it building templates we then relowered anyway. What is needed
 ## from mlir-air now is SOURCE, not its build system.
 compile-decode: preflight air-src
-	@cd $(srcdir) && $(PYTHON) decode_kernels.py
-	@cd $(srcdir) && $(PYTHON) decode_build.py --format $(DECODE_FORMAT)
+	@cd $(shared) && $(PYTHON) decode_kernels.py --model $(MODEL_NAME)
+	@cd $(shared) && $(PYTHON) decode_build.py --model $(MODEL_NAME) --format $(DECODE_FORMAT)
 
 ## Just step 2 -- relower the xclbins from the AIR IR (~9 s), reusing the AIE
 ## kernels already on disk. The one to run while iterating on the builder or
 ## the lowering.
 recompile-decode: preflight air-src
-	@cd $(srcdir) && $(PYTHON) decode_build.py --format $(DECODE_FORMAT)
+	@cd $(shared) && $(PYTHON) decode_build.py --model $(MODEL_NAME) --format $(DECODE_FORMAT)
 
 ## Just step 1 -- rebuild the AIE kernels. Only needed if their C++ changed.
 decode-kernels: preflight air-src
-	@cd $(srcdir) && $(PYTHON) decode_kernels.py --force
+	@cd $(shared) && $(PYTHON) decode_kernels.py --model $(MODEL_NAME) --force
 
 ## mlir-air's sources at the commit utils/mlir-air-hash.txt already pins -- the
 ## same one env_setup.sh builds the wheel version from. Sparse and blobless

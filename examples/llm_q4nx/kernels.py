@@ -399,7 +399,7 @@ def triton_rms_norm(x, weight, eps, block_m=RMS_BLOCK_M):
             y[m0 : m0 + ROW_TILE],
             dim,
             float(eps),
-            transform_script=script("llama32_1b_q4nx/transform_rms_norm_aie2p.mlir"),
+            transform_script=script("llm_q4nx/transform_rms_norm_aie2p.mlir"),
             BLOCK_M=block_m,
             BLOCK_N=dim,
         )
