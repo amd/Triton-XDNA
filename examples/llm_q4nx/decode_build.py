@@ -115,8 +115,17 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
 
     from triton.backends.amd_triton_npu.fused_decode_op import FusedDecodeOp
 
+    # Take the AIE core stack from the builder rather than FusedDecodeOp's
+    # default, exactly as mlir-air's own driver does
+    # (`XRTBackend(stack_size=STACK_SIZE)`). It is per-model: the builder
+    # defaults to 10240, which Llama-3.2-1B and -3B take, while Llama-3.1-8B's
+    # Makefile lowers it to 8064 via DECODE_STACK. Deriving it means a model
+    # whose Makefile moves that value cannot silently keep ours.
     op = FusedDecodeOp.from_builder(
-        fd.build_module, kernel_objects=objs, name=f"fused_decode_{model.name}_L{L}"
+        fd.build_module,
+        kernel_objects=objs,
+        name=f"fused_decode_{model.name}_L{L}",
+        stack_size=fd.STACK_SIZE,
     )
     print(
         f"[decode-build] L={L} model={fd.MODEL_NAME} ATTN_MAXL={fd.ATTN_MAXL} "

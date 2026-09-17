@@ -32,6 +32,7 @@ DEFAULT_SKIPPED_EXAMPLES = {
     # instead, in its own step, which needs no decode build.
     "llama32_1b_q4nx",
     "llama32_3b_q4nx",
+    "llama31_8b_q4nx",
     # Not an example: the harness the *_q4nx examples share. Its files are
     # libraries, and the two with a __main__ are build steps -- running
     # decode_build.py as a "test" lowers the whole decode.
@@ -61,6 +62,7 @@ SCRIPTLESS_UNSUPPORTED = {
         "qwen2_5": "npu2-only example",
         "llama32_1b_q4nx": "npu2-only example",
         "llama32_3b_q4nx": "npu2-only example",
+        "llama31_8b_q4nx": "npu2-only example",
     },
     "aie2p": {},
 }

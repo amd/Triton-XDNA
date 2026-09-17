@@ -280,6 +280,14 @@ runs:
 
             gate llama32_3b_q4nx --prefill-only
 
+            # The 8B is prefill-only for the 3B's reason and skips itself for
+            # one of its own: its dequantized bf16 weights do not fit every
+            # runner, and an undersized host does not raise -- it SIGKILLs the
+            # load, which no `except` can turn into a skip. `min_host_gib` is
+            # checked before anything is allocated, so this reports SKIP rather
+            # than dying at exit 137.
+            gate llama31_8b_q4nx --prefill-only
+
             echo ""
             echo "--------------------------------------------------"
             echo "Q4NX Gate Results:"
