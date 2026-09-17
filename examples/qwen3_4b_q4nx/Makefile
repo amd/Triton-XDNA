@@ -21,6 +21,11 @@ DRIVER  := $(srcdir)/qwen3_4b_q4nx_inference.py
 shared  := $(srcdir)/../llm_q4nx
 # This example's model family, as ../llm_q4nx/registry.py names it.
 MODEL_NAME := qwen3-4b
+# Absolute, so the remediation messages in `preflight` name a path that works
+# from wherever make was invoked. Spelling them relative meant choosing between
+# a path correct from the repo root and one correct from here, and the two
+# messages had silently chosen differently.
+root    := $(realpath $(srcdir)/../..)
 
 # Dispatch runtime. Only xrt here: the HSA decode adapter subclasses mlir-air's
 # `FusedDecoder`, which this driver does name -- but nothing has run it on
@@ -47,18 +52,18 @@ COMMON     := --backend $(BACKEND) --ops $(OPS) $(MODEL_ARG)
 preflight:
 	@$(PYTHON) -c "import triton" 2>/dev/null || { \
 	  echo "ERROR: '$(PYTHON)' cannot import triton."; \
-	  echo "  A virtualenv with triton-xdna installed must be active. From the repo root:"; \
-	  echo "    source sandbox/bin/activate"; \
-	  echo "    source /opt/xilinx/xrt/setup.sh && source ../../utils/env_setup.sh"; \
+	  echo "  A virtualenv with triton-xdna installed must be active:"; \
+	  echo "    source $(root)/sandbox/bin/activate"; \
+	  echo "    source /opt/xilinx/xrt/setup.sh && source $(root)/utils/env_setup.sh"; \
 	  exit 1; }
 	@$(PYTHON) -c "import mlir_air, mlir_aie" 2>/dev/null || { \
 	  echo "ERROR: mlir_air / mlir_aie are not installed in this environment."; \
-	  echo "  With the venv ACTIVE, run:  source ../../utils/env_setup.sh"; \
+	  echo "  With the venv ACTIVE, run:  source $(root)/utils/env_setup.sh"; \
 	  exit 1; }
 	@test -n "$$XILINX_XRT" || { \
 	  echo "ERROR: XRT is not set up.  Run: source /opt/xilinx/xrt/setup.sh"; exit 1; }
 	@test -n "$$MLIR_AIE_INSTALL_DIR" || { \
-	  echo "ERROR: MLIR_AIE_INSTALL_DIR is unset.  Run: source ../../utils/env_setup.sh"; exit 1; }
+	  echo "ERROR: MLIR_AIE_INSTALL_DIR is unset.  Run: source $(root)/utils/env_setup.sh"; exit 1; }
 
 help:
 	@echo "Qwen3-4B Q4NX -- Triton prefill + mlir-air fused decode"
