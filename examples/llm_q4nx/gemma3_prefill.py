@@ -67,6 +67,12 @@ class Gemma3Prefill(LlamaPrefill):
         "k_norm": torch.float32,
     }
 
+    #: The two RoPE tables `load_weights` adds below. Declared so
+    #: `share_weights_from` carries them; without this a second instance built
+    #: for `--compare-cpu` inherits `_lut` alone and dies in `_layer` on the
+    #: first global layer.
+    WEIGHT_ATTRS = LlamaPrefill.WEIGHT_ATTRS + ("_lut_local", "_lut_global")
+
     def load_weights(self, model=None):
         """Llama's loader, plus the second RoPE table.
 

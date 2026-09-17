@@ -7,7 +7,7 @@
 
 The prefill is this repo's -- Triton kernels on XDNA (prefill.py, and
 ../llm_q4nx/kernels.py). The decode is mlir-air's fused Q4NX decode, run
-unmodified: 36 layers plus the tied LM head in one dispatch.
+unmodified: 34 layers plus the tied LM head in one dispatch.
 
 Gemma3-4B is the furthest from the Llama block of anything here
 (`../llm_q4nx/gemma3_prefill.py`): each sublayer is wrapped in a norm sandwich

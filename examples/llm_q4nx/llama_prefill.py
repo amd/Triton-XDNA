@@ -148,6 +148,14 @@ class LlamaPrefill:
     #: reason it exists -- see qwen3_prefill.py.
     EXTRA_LAYER_WEIGHTS = {}
 
+    #: Everything `load_weights` establishes, which is what a second instance
+    #: needs to share rather than reload. Declared here so `share_weights_from`
+    #: can copy it, because the alternative -- each caller listing the
+    #: attributes it remembers -- is a trap: a subclass that adds one gets an
+    #: AttributeError deep in the forward, from every call site that was
+    #: written before it existed. Gemma3's second RoPE table did exactly that.
+    WEIGHT_ATTRS = ("_w", "embed", "final_norm", "lm_head", "_lut", "fingerprint")
+
     def __init__(
         self,
         backend="cpu",
@@ -308,6 +316,19 @@ class LlamaPrefill:
             return torch.matmul(x.to(torch.bfloat16), w.t()).to(torch.float32)
 
     # ---- weights ----
+    def share_weights_from(self, other):
+        """Adopt `other`'s loaded weights instead of loading them again.
+
+        For `--compare-cpu`, which runs the same weights through a second
+        instance on the CPU backend: a reload would cost minutes and, worse,
+        would compare against a different dequantization rather than the same
+        one. `WEIGHT_ATTRS` is read off `other`'s class, so a subclass that adds
+        an attribute is covered by declaring it there and nowhere else.
+        """
+        for attr in type(other).WEIGHT_ATTRS:
+            setattr(self, attr, getattr(other, attr))
+        return self
+
     def load_weights(self, model=None):
         raw = load_q4nx(model or self.model)
         self.fingerprint = raw["fingerprint"]

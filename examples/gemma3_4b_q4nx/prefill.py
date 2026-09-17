@@ -40,7 +40,7 @@ def main(argv=None):
         "--ops",
         default=None,
         help="NPU ops to enable: 'all', or a comma list of "
-        "matmul,rms_norm,swiglu (default: all)",
+        "matmul,rms_norm,geglu (default: all)",
     )
     ap.add_argument("--prompt", default=None, help="token ids, comma separated")
     ap.add_argument("--n-layers", type=int, default=config.N_LAYERS)
@@ -98,8 +98,10 @@ def main(argv=None):
 
     if args.compare_cpu and args.backend != "cpu":
         ref = Gemma3Prefill(backend="cpu", n_layers=args.n_layers, max_seq=args.max_seq)
-        ref._w, ref.embed, ref.final_norm = m._w, m.embed, m.final_norm
-        ref.lm_head, ref._lut, ref.fingerprint = m.lm_head, m._lut, m.fingerprint
+        # Not an attribute-by-attribute copy: Gemma has two RoPE tables, and
+        # listing them here is what the next subclass would forget. The class
+        # declares what it owns (`WEIGHT_ATTRS`) and this asks for all of it.
+        ref.share_weights_from(m)
         ref.prefill(ids)
         for L in range(args.n_layers):
             dk = np.abs(m.kv_k[L] - ref.kv_k[L]).max()
