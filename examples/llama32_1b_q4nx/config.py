@@ -44,6 +44,17 @@ PROMPT = [128000, 791, 6864, 315, 9822, 374]  # "The capital of France is"
 EXPECT_FIRST = 12366  # " Paris"
 BOS = 128000  # <|begin_of_text|>, for the session warmup
 
+#: What `--greedy` must generate from PROMPT, first token included. Recorded
+#: from a verified run; the decode is deterministic given the same artifacts,
+#: so a change here means the decode changed, not that the model drifted.
+#:
+#: This is the only assertion that covers the decode at all -- the first-token
+#: gate above is pure prefill, and every decode-side fact these examples carry
+#: (the builder environment, -DMODEL_TYPE, GLU_SLICE, the core stack, which
+#: driver API is used) is invisible to it. Regenerate with
+#: `--max-tokens 8 --greedy` if the decode legitimately changes.
+EXPECT_IDS = [12366, 13, 578, 6864, 315, 10057, 374, 20437, 13]
+
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Llama-3.2-1B-NPU2")
 
 

@@ -227,12 +227,41 @@ runs:
             # passing says little about the others: the 3B is the first model
             # whose dim is not a power of two, which the RMSNorm kernel has to
             # pad for.
-            for ex in llama32_1b_q4nx llama32_3b_q4nx; do
+            # Full inference where it is affordable, prefill-only otherwise.
+            # A prefill gate cannot see anything the decode carries -- the
+            # builder environment, -DMODEL_TYPE, GLU_SLICE, the core stack,
+            # which driver API is used -- and that is most of what a new model
+            # adds. The 1B pays 10 s to build its decode and 15 s to generate,
+            # so it runs the real thing and compares against recorded ids.
+            #
+            # The 3B stays prefill-only, and the reason is cost rather than
+            # principle: its decode needs a requantized weight cache that a
+            # fresh runner does not have, measured at ~7 min. Worth revisiting
+            # if that can be cached between runs.
+            rc=0
+            echo "--- decode gate: llama32_1b_q4nx ---"
+            ( cd examples/llama32_1b_q4nx && make compile-decode ) || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "FAIL: llama32_1b_q4nx compile-decode (exit $rc)"
+              exit "$rc"
+            fi
+            ( cd examples/llama32_1b_q4nx \
+              && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+                 python llama32_1b_q4nx_inference.py --max-tokens 8 --greedy ) || rc=$?
+            if [ "$rc" -eq 77 ]; then
+              echo "SKIP: llama32_1b_q4nx decode (exit 77)"
+            elif [ "$rc" -ne 0 ]; then
+              echo "FAIL: llama32_1b_q4nx decode (exit $rc)"
+              exit "$rc"
+            fi
+
+            for ex in llama32_3b_q4nx; do
               # `|| rc=$?` rather than a bare call: this step runs under
               # `bash -e`, so a non-zero exit -- including the 77 that means
               # SKIP -- would otherwise abort the step before the check below
               # could grade it.
               rc=0
+              echo "--- gate: $ex ---"
               ( cd "examples/$ex" \
                 && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
                    python "${ex}_inference.py" --prefill-only ) || rc=$?

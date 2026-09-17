@@ -112,9 +112,13 @@ def run_prefill(
     first = int(torch.argmax(logits))
     if kv_path is not None:
         m.save_kv_npz(kv_path, first, ids)
+    # The model is named here, not left to the caller's shell trace. Every
+    # Q4NX gate otherwise prints identical text -- same P, same first token --
+    # so a loop that ran one model twice would read as two passes.
     print(
-        f"[triton-prefill] backend={backend} ops={sorted(m.enabled)} "
-        f"P={len(ids)} load {t_load:.1f}s prefill {t_run:.2f}s first={first}",
+        f"[triton-prefill] model={cfg.MODEL_NAME} backend={backend} "
+        f"ops={sorted(m.enabled)} P={len(ids)} load {t_load:.1f}s "
+        f"prefill {t_run:.2f}s first={first}",
         flush=True,
     )
     return first, len(ids), m
@@ -323,7 +327,8 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         ok = first == cfg.EXPECT_FIRST
         print(
             f"[triton-prefill] first token {first} "
-            f"(expect {cfg.EXPECT_FIRST}) -- {'PASS' if ok else 'FAIL'}",
+            f"(expect {cfg.EXPECT_FIRST}) for {cfg.MODEL_NAME} "
+            f"-- {'PASS' if ok else 'FAIL'}",
             flush=True,
         )
         return ok
@@ -385,6 +390,27 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         dt = time.time() - t0
         print(f"[e2e] {len(out)} tokens in {dt:.2f}s", flush=True)
         print(f"[e2e] ids {out}", flush=True)
+
+        # The decode gate. Everything above this line is prefill: the
+        # first-token check cannot see the builder environment, -DMODEL_TYPE,
+        # GLU_SLICE, the core stack, or which driver API was used, because all
+        # of those live in the artifact this generation just ran.
+        golden = getattr(cfg, "EXPECT_IDS", None)
+        if golden and args.greedy and ids == list(cfg.PROMPT):
+            got = list(out)[: len(golden)]
+            if got != list(golden):
+                print(
+                    f"[e2e] decode MISMATCH for {cfg.MODEL_NAME}\n"
+                    f"  expected {list(golden)}\n"
+                    f"  got      {got}",
+                    flush=True,
+                )
+                return 1
+            print(
+                f"[e2e] decode ids match the recorded {len(golden)} for "
+                f"{cfg.MODEL_NAME} -- PASS",
+                flush=True,
+            )
         try:
             from transformers import AutoTokenizer
 
