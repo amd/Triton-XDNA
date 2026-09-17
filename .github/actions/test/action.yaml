@@ -211,7 +211,7 @@ runs:
           # unconditionally: --prefill-only below never reaches that code, and
           # a decode run is too heavy for this gate, which would otherwise
           # leave the selection with no coverage at all.
-          ( cd examples/llama32_1b_q4nx && python3 test_decode_artifact.py )
+          ( cd examples/llm_q4nx && python3 test_decode_artifact.py )
 
           # The weight loader lives in mlir-air's sources, which the wheel does
           # not ship, so fetch them at the pinned commit first. Sparse and

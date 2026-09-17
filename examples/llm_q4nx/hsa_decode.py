@@ -34,14 +34,9 @@ before any compute.
 
 import ctypes
 import os
-import sys
 import weakref
 
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import config  # noqa: E402
 
 
 class HsaDecodeError(RuntimeError):

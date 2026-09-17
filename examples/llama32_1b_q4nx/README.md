@@ -55,7 +55,7 @@ that — `seed_kv`, the dispatch loop, sampling — is mlir-air's code untouched
 The decode superkernel does not fit the Triton compiler path: one dispatch
 spans every decoder layer, weights are resident across tokens, and the
 per-token work is an instruction patch rather than a launch. So it enters from
-the other end. `decode_build.py` takes mlir-air's `fused_decode.build_module()`
+the other end. `../llm_q4nx/decode_build.py` takes mlir-air's `fused_decode.build_module()`
 for the AIR IR and hands it to `FusedDecodeOp`
 (`amd_triton_npu/backend/fused_decode_op.py`), which calls the same
 `_aircc_compile` every other kernel in this backend uses — same aircc
@@ -147,7 +147,7 @@ make compile-decode      # ~22 s; the decode's AIE kernels, then its xclbins
 Iterating on the AIR builder or the lowering afterwards only needs
 `make recompile-decode` (~9 s) — the AIE kernels are C++ and rarely change.
 
-Both steps are owned here. `decode_kernels.py` compiles the six AIE kernels
+Both steps are owned here. `../llm_q4nx/decode_kernels.py` compiles the six AIE kernels
 with Peano, byte-identically to mlir-air's Makefile and cached on the source
 and flags; `decode_build.py` lowers the xclbins through `FusedDecodeOp`. What
 is needed from mlir-air is now *source* — `fused_decode.py` and `kernels/` —
@@ -213,7 +213,7 @@ attributed, so treat the HSA path as correct and close, not as a replacement.
 The interesting part is how the context length gets to the device. HSA has no
 scratchpad parameters, so the full-ELF mechanism is unavailable; but the AIE
 dispatch packet carries the instruction stream's address per enqueue, so
-`hsa_decode.py` patches the 248 L-dependent words per token — the same words
+`../llm_q4nx/hsa_decode.py` patches the 248 L-dependent words per token — the same words
 mlir-air's xclbin path rewrites. One PDI serves every context length; the
 L=2048 and L=2047 builds are byte-identical.
 
@@ -223,12 +223,25 @@ reference.
 
 ## Files
 
+Llama-3.2-1B-specific, and that is all this directory holds:
+
 ```
-llama32_1b_q4nx_inference.py  # end to end: our prefill -> mlir-air's decode
+llama32_1b_q4nx_inference.py  # entry point: spec + prefill class -> the harness
 prefill.py                    # prefill alone, with the Paris gate
 model.py                      # the 16-layer forward pass and its operators
-kernels.py                    # the Triton kernels + NPU dispatch plumbing
 config.py                     # dims; re-exports mlir-air's loader and RoPE table
+```
+
+Shared with the other Q4NX model families, in `../llm_q4nx/`:
+
+```
+harness.py                    # the driver: args, KV handoff, gate, chat session
+kernels.py                    # the Triton kernels + NPU dispatch plumbing
+registry.py                   # per-model build facts, verbatim from mlir-air
+airsrc.py                     # finding mlir-air's sources; the decode-shape choice
+decode_kernels.py             # the six AIE kernels, compiled with Peano
+decode_build.py               # the templates, lowered through FusedDecodeOp
+hsa_decode.py                 # the decode on HsaRuntime instead of pyxrt
 transform_rms_norm_aie2p.mlir # f32 row reduction (see above)
 ```
 

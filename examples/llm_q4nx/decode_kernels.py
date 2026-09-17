@@ -29,7 +29,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import config  # noqa: E402
+import airsrc  # noqa: E402
+import registry  # noqa: E402
 
 # Optimization level is load-bearing and NOT a tuning knob. From mlir-air's
 # Makefile, which found both the hard way:
@@ -56,12 +57,14 @@ BASE_FLAGS = (
     "-Wno-empty-body",
     "-Wno-deprecated-declarations",
     "-DNDEBUG",
-    "-DMODEL_TYPE=LLAMA_3_2_1B",
     "-D__AIE_API_AIE_ADF_HPP__",
     "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
 )
 
-CACHE_FILE = ".decode_kernels.json"
+#: One cache file per model: the kernels differ by -DMODEL_TYPE and
+#: -DGLU_SLICE_EXPECTED, and two models sharing a cache file would each see the
+#: other's entries as its own and skip a rebuild it needs.
+CACHE_FILE_FMT = ".decode_kernels.{model_type}.json"
 
 
 def _peano_clang():
@@ -94,10 +97,38 @@ def _aie_include():
     return inc
 
 
-def _command(clang, src_dir, name, out, opt, extra=()):
+def glu_slice_expected(spec, src_dir):
+    """The builder's own GLU_SLICE for this model, or None.
+
+    `glu.cc` checks its compile-time slice against `GLU_SLICE_EXPECTED` and the
+    builder derives that from the model's egress-round parity, so the two have
+    to be told the same thing. mlir-air's Makefile asks the builder rather than
+    tabulating it (fused_decode/Makefile:65), and so does this -- a table would
+    be one more thing to get silently wrong per model.
+
+    Cheap and XRT-free: the print hook returns before `run()` imports pyxrt.
+    Returns None if the builder declines to answer, which leaves the define off
+    exactly as the Makefile's `$(if ...)` does.
+    """
+    env = dict(os.environ, **spec.decode_env, FUSED_DECODE_PRINT_CONST="GLU_SLICE")
+    r = subprocess.run(
+        [sys.executable, os.path.join(src_dir, "fused_decode.py")],
+        capture_output=True,
+        text=True,
+        cwd=src_dir,
+        env=env,
+    )
+    out = r.stdout.strip().splitlines()
+    if r.returncode != 0 or not out or not out[-1].strip().isdigit():
+        return None
+    return out[-1].strip()
+
+
+def _command(clang, src_dir, name, out, opt, extra=(), defines=()):
     flags = [
         clang,
         *BASE_FLAGS,
+        *defines,
         "-I",
         _aie_include(),
         "-I",
@@ -128,15 +159,38 @@ def _fingerprint(clang, src_dir, name, cmd):
     return h.hexdigest()[:16]
 
 
-def build(src_dir=None, out_dir=None, force=False, verbose=True):
-    """Compile all six kernels. Returns the list of artifact paths."""
-    src_dir = src_dir or str(config._air_llms_root().parent / "fused_decode")
-    out_dir = out_dir or src_dir
+def kernel_dir(spec, src_dir=None):
+    """Where this model's kernel objects are built.
+
+    Per model, because the objects carry the model in their defines while
+    keeping fixed names: one shared directory and two models would silently
+    hand each other the wrong `proj_qmm.o`.
+    """
+    src_dir = src_dir or airsrc.fused_decode_dir()
+    return os.path.join(src_dir, f"kernels_{spec.model_type.lower()}")
+
+
+def build(spec=None, src_dir=None, out_dir=None, force=False, verbose=True):
+    """Compile all six kernels for `spec`. Returns the list of artifact paths."""
+    spec = spec or registry.spec()
+    src_dir = src_dir or airsrc.fused_decode_dir()
+    out_dir = out_dir or kernel_dir(spec, src_dir)
     if not os.path.isdir(os.path.join(src_dir, "kernels")):
         raise SystemExit(f"no kernels/ under {src_dir}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Both defines are model-specific and neither failure is a build error:
+    # the wrong MODEL_TYPE compiles and decodes to garbage, and a GLU_SLICE
+    # mismatch trips glu.cc's own static check.
+    defines = [f"-DMODEL_TYPE={spec.model_type}"]
+    glu_slice = glu_slice_expected(spec, src_dir)
+    if glu_slice is not None:
+        defines.append(f"-DGLU_SLICE_EXPECTED={glu_slice}")
 
     clang = _peano_clang()
-    cache_path = os.path.join(out_dir, CACHE_FILE)
+    cache_path = os.path.join(
+        out_dir, CACHE_FILE_FMT.format(model_type=spec.model_type)
+    )
     cache = {}
     if not force and os.path.exists(cache_path):
         try:
@@ -155,7 +209,7 @@ def build(src_dir=None, out_dir=None, force=False, verbose=True):
     t0 = time.time()
     for name, out_name, opt, extra in jobs:
         out = os.path.join(out_dir, out_name)
-        cmd = _command(clang, src_dir, name, out, opt, extra)
+        cmd = _command(clang, src_dir, name, out, opt, extra, defines)
         fp = _fingerprint(clang, src_dir, name, cmd)
         if not force and cache.get(out_name) == fp and os.path.exists(out):
             outputs.append(out)
@@ -184,11 +238,16 @@ def build(src_dir=None, out_dir=None, force=False, verbose=True):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--model",
+        default=registry.DEFAULT,
+        help=f"model family ({', '.join(sorted(registry.SPECS))})",
+    )
     ap.add_argument("--src-dir", default=None, help="mlir-air's fused_decode directory")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--force", action="store_true", help="ignore the cache")
     args = ap.parse_args(argv)
-    build(args.src_dir, args.out_dir, force=args.force)
+    build(registry.spec(args.model), args.src_dir, args.out_dir, force=args.force)
     return 0
 
 

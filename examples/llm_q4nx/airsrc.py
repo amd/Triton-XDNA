@@ -1,0 +1,106 @@
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+"""Locating mlir-air's LLM sources, and choosing who dispatches the decode.
+
+Model-agnostic: every example under `examples/*_q4nx/` needs mlir-air's
+`programming_examples/` on `sys.path` (the wheel ships no `programming_examples`)
+and needs mlir-air's decoder kept off its own dispatch path. Neither depends on
+which model is being run, so both live here rather than in each model's config.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+#: Where mlir-air's sources may be, in priority order. The first is a
+#: developer's own working clone; the second is the sparse checkout
+#: `utils/fetch_mlir_air_src.py` makes at the pinned commit. Checking the
+#: working clone first means someone editing mlir-air sees their edits.
+_AIR_CHECKOUTS = ("mlir-air-local", "third_party/mlir-air-src")
+
+
+def air_llms_root():
+    """The mlir-air programming_examples/llms directory.
+
+    AIR_LLMS_ROOT overrides everything. Otherwise walk up looking for either
+    checkout; if neither exists, say how to get one rather than failing later
+    on an import of `fused_decode`.
+    """
+    env = os.environ.get("AIR_LLMS_ROOT")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        for rel in _AIR_CHECKOUTS:
+            cand = parent / rel / "programming_examples" / "llms"
+            if cand.is_dir():
+                return cand
+    raise RuntimeError(
+        "cannot find mlir-air's sources (programming_examples/llms).\n"
+        "  Fetch them at the pinned commit:\n"
+        "      python3 utils/fetch_mlir_air_src.py\n"
+        "  or point AIR_LLMS_ROOT at your own checkout."
+    )
+
+
+def fused_decode_dir():
+    """Where the decode's builder, kernels and built artifacts live."""
+    return str(air_llms_root().parent / "fused_decode")
+
+
+def add_air_paths(*packages):
+    """Put mlir-air's llms packages on sys.path.
+
+    `packages` are subdirectories of `llms/` this model needs -- its own q4nx
+    package and whatever base package it borrows its config and RoPE table
+    from. `llms/` itself and `programming_examples/` (for `shared.*`) are always
+    added.
+    """
+    llms = air_llms_root()
+    for p in (
+        str(llms),
+        *(str(llms / pkg) for pkg in packages),
+        str(llms.parent),  # programming_examples, for `shared.*`
+    ):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+
+class DecodeArtifactError(RuntimeError):
+    """Raised when the decode shape asked for is not one this example drives."""
+
+
+def select_decode_artifact(env=None):
+    """Keep mlir-air's decoder off *its own* full-ELF dispatch.
+
+    ``DECODE_ELF`` (``fused_decode/decode_elf.py``) does not select a decode
+    shape so much as select *who dispatches it*: set, ``FusedDecoder`` loads a
+    full ELF and runs it through pyxrt itself. These examples never want that.
+    They build the xclbin templates (``decode_build.py``) and run the decode
+    from those, and on HSA they drive the dispatch themselves.
+
+    It would not get that far in any case: mlir-air's ELF path brings up a
+    second LLVM and re-registers an option Triton has already registered
+    ("Option 'print-inst-addrs' registered more than once!"), which aborts the
+    process rather than raising. That is a bug to fix, not a shape rejected on
+    taste.
+
+    So the variable is written here rather than left to its default -- it is
+    the only channel ``FusedDecoder`` offers, its ``__init__`` taking no such
+    argument -- and an explicit request for it is refused with the reason,
+    which beats aborting later inside mlir-air.
+
+    Returns the value written, so a caller (and a test) can check it.
+    """
+    env = os.environ if env is None else env
+    asked = env.get("DECODE_ELF")
+    if asked is not None and asked != "0":
+        raise DecodeArtifactError(
+            f"DECODE_ELF={asked!r} hands the decode to mlir-air's own full-ELF "
+            "dispatch, which these examples never use: they run the xclbin "
+            "templates built by decode_build.py, and on HSA they dispatch the "
+            "decode themselves. mlir-air's route also aborts in-process on a "
+            "duplicate LLVM option registration. Unset DECODE_ELF."
+        )
+    env["DECODE_ELF"] = "0"
+    return env["DECODE_ELF"]

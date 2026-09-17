@@ -10,7 +10,11 @@ packages on sys.path and re-exports what the prefill needs.
 
 import os
 import sys
-from pathlib import Path
+
+#: The harness every Q4NX example shares.
+_SHARED = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "llm_q4nx"
+)
 
 # Llama-3.2-1B. Mirrors mlir-air's llama32_1b_q4nx_weights; kept here so the
 # kernels can be read without chasing an import.
@@ -34,91 +38,24 @@ RMS_EPS = 1e-6
 # The Paris gate, from llama32_1b_q4nx_prefill.py.
 PROMPT = [128000, 791, 6864, 315, 9822, 374]  # "The capital of France is"
 EXPECT_FIRST = 12366  # " Paris"
+BOS = 128000  # <|begin_of_text|>, for the session warmup
 
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Llama-3.2-1B-NPU2")
 
 
-#: Where mlir-air's sources may be, in priority order. The first is a
-#: developer's own working clone; the second is the sparse checkout
-#: `utils/fetch_mlir_air_src.py` makes at the pinned commit. Checking the
-#: working clone first means someone editing mlir-air sees their edits.
-_AIR_CHECKOUTS = ("mlir-air-local", "third_party/mlir-air-src")
+if _SHARED not in sys.path:
+    sys.path.insert(0, _SHARED)
 
+import airsrc  # noqa: E402
 
-def _air_llms_root():
-    """The mlir-air programming_examples/llms directory.
-
-    AIR_LLMS_ROOT overrides everything. Otherwise walk up looking for either
-    checkout; if neither exists, say how to get one rather than failing later
-    on an import of `fused_decode`.
-    """
-    env = os.environ.get("AIR_LLMS_ROOT")
-    if env:
-        return Path(env)
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        for rel in _AIR_CHECKOUTS:
-            cand = parent / rel / "programming_examples" / "llms"
-            if cand.is_dir():
-                return cand
-    raise RuntimeError(
-        "cannot find mlir-air's sources (programming_examples/llms).\n"
-        "  Fetch them at the pinned commit:\n"
-        "      python3 utils/fetch_mlir_air_src.py\n"
-        "  or point AIR_LLMS_ROOT at your own checkout."
-    )
-
-
-class DecodeArtifactError(RuntimeError):
-    """Raised when the decode shape asked for is not one this example builds."""
-
-
-def select_decode_artifact(env=None):
-    """Tell mlir-air's decoder which decode artifact to load.
-
-    mlir-air's ``FusedDecoder`` picks between a full ELF and the xclbin
-    templates by reading ``DECODE_ELF`` (``fused_decode/decode_elf.py``), and
-    that is the only channel it offers -- ``FusedDecoder.__init__`` takes no
-    such argument. So this writes the variable, but decides here rather than
-    letting the default decide, because the two shapes are not interchangeable
-    for us:
-
-    * The ELF route dispatches through pyxrt, which in this process aborts:
-      mlir-air's ELF path brings up a second LLVM and re-registers an option
-      Triton has already registered ("Option 'print-inst-addrs' registered more
-      than once!"). That is a bug to fix, not a shape we have rejected.
-    * ``decode_build.py`` builds the xclbin (and PDI) templates, so the ELF the
-      other route wants is not an artifact this example produces at all.
-
-    Asking for the ELF therefore cannot work today, and saying so here is worth
-    more than letting it fail later inside mlir-air on a missing ``.maxl``.
-
-    Returns the value written, so a caller (and a test) can check it.
-    """
-    env = os.environ if env is None else env
-    asked = env.get("DECODE_ELF")
-    if asked is not None and asked != "0":
-        raise DecodeArtifactError(
-            f"DECODE_ELF={asked!r} selects mlir-air's full-ELF decode. This "
-            "example builds the xclbin templates (decode_build.py --format "
-            "xclbin|pdi) and does not produce that ELF, and mlir-air's ELF "
-            "dispatch aborts in-process on a duplicate LLVM option "
-            "registration. Unset DECODE_ELF to use the templates."
-        )
-    env["DECODE_ELF"] = "0"
-    return env["DECODE_ELF"]
+#: mlir-air llms packages this model needs on sys.path: its own q4nx package
+#: (the weight reader) and the base llama32_1b package (LlamaConfig and the
+#: RoPE table).
+AIR_PACKAGES = ("llama32_1b_q4nx", "llama32_1b")
 
 
 def _add_air_paths():
-    llms = _air_llms_root()
-    for p in (
-        str(llms),
-        str(llms / "llama32_1b"),
-        str(llms / "llama32_1b_q4nx"),
-        str(llms.parent),  # programming_examples, for `shared.*`
-    ):
-        if p not in sys.path:
-            sys.path.insert(0, p)
+    airsrc.add_air_paths(*AIR_PACKAGES)
 
 
 def load_q4nx(model=None):
