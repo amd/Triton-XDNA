@@ -223,13 +223,16 @@ class LlamaPrefill:
     def _rope(self, x, lut, n_heads, backend=None):
         """Half-split RoPE (HuggingFace Llama convention). CPU only, see NPU_OPS.
 
-        x:   [N, n_heads*64]
-        lut: [N, 64] = [cos_0..cos_31, sin_0..sin_31]
+        x:   [N, n_heads*DH]
+        lut: [N, DH] = [cos_0..cos_{DH/2-1}, sin_0..sin_{DH/2-1}]
 
-            out[i]      = x[i]*cos[i] - x[i+32]*sin[i]
-            out[i+32]   = x[i]*sin[i] + x[i+32]*cos[i]
+        With H = DH // 2:
 
-        Pairs (i, i+32), NOT adjacent (2i, 2i+1).
+            out[i]      = x[i]*cos[i] - x[i+H]*sin[i]
+            out[i+H]    = x[i]*sin[i] + x[i+H]*cos[i]
+
+        Pairs (i, i+H), NOT adjacent (2i, 2i+1). H is 32 for the 1B's 64-wide
+        heads and 64 for the 3B's 128-wide ones.
         """
         with self.timer.track("rope"):
             N = x.shape[0]
@@ -377,15 +380,17 @@ class LlamaPrefill:
         and what its `seed_kv()` assumes -- because getting any of it wrong
         degrades quality without failing:
 
-            k, v : [16, P, 512] float32   (bf16-exact values)
+            k, v : [N_LAYERS, P, DK] float32   (bf16-exact values)
 
-        512 is 8 KV heads x 64, laid out as column `h*64 + d`, position-major,
-        heads contiguous within a position. No permutation and no interleaving
+        DK is N_KV_HEADS x DH, laid out as column `h*DH + d`, position-major,
+        heads contiguous within a position. That is [16, P, 512] for the 1B
+        and [28, P, 1024] for the 3B -- the shape follows the model, so read it
+        from `config` rather than from this line. No permutation and no interleaving
         at this boundary: the region-major scatter the decode wants happens
         inside its own `seed_kv()`.
 
         K is stored already rotated, V raw. The rotation is half-split --
-        `out[i] = x[i]*cos[i] - x[i+32]*sin[i]`, pairing i with i+32 rather
+        `out[i] = x[i]*cos[i] - x[i+DH/2]*sin[i]`, pairing i with i+DH/2 rather
         than adjacent lanes -- and its table carries llama3 frequency scaling
         (factor 32, low 1, high 4, old context 8192, theta 500000), which is
         why `config.rope_lut` re-exports mlir-air's generator instead of

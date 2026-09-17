@@ -56,6 +56,10 @@ class ModelSpec:
     air_inference: str
     tokenizer_fallback: str
     driver_api: str = "npz"
+    #: For `driver_api="prefiller"`: the decoder class that driver exposes.
+    #: Named per model (`FusedDecode3B`, `FusedDecode8B`), so it is recorded
+    #: rather than derived from the model name.
+    decoder_class: str = ""
     #: llms packages to put on sys.path, beyond `air_package`.
     extra_packages: tuple = field(default_factory=tuple)
 
@@ -129,10 +133,48 @@ LLAMA_3_2_3B = ModelSpec(
     tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.2-3B",
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",
+    decoder_class="FusedDecode3B",
 )
 
 
-SPECS = {s.name: s for s in (LLAMA_3_2_1B, LLAMA_3_2_3B)}
+#: Llama-3.1-8B. The 1B's architecture again, at 32 layers of 4096. Nothing
+#: new in the forward; what it exercises is size -- the resident decode weights
+#: and, on the host, a bf16 dequantization of an 8B model.
+#:
+#: Two values its Makefile moves that the smaller two leave alone, and both are
+#: derived rather than recorded here:
+#:
+#: * `DECODE_STACK=8064` lowers the AIE core stack from the builder's 10240
+#:   default. `decode_build` reads `fused_decode.STACK_SIZE` after importing the
+#:   builder under this environment, as mlir-air's own driver does, so it
+#:   follows from `DECODE_STACK` below rather than being repeated.
+#: * `DECODE_WGROUP=8` splits the DDR weight slab into groups.
+#:
+#: `W_DUAL_CHAN=1` again arrives by a bare `export`, not in `DECODE_ENV`.
+LLAMA_3_1_8B = ModelSpec(
+    name="llama-3.1-8b",
+    decode_env=dict(
+        DECODE_MODEL="llama-3.1-8b",
+        VOCAB_CHUNK_I2="16",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="1",
+        DECODE_GOLDEN="1",
+        DECODE_STACK="8064",
+        DECODE_WGROUP="8",
+        W_DUAL_CHAN="1",
+    ),
+    model_type="LLAMA_3_1_8B",
+    air_package="llama31_8b_q4nx",
+    air_inference="llama31_8b_q4nx_inference.py",
+    tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.1-8B",
+    extra_packages=("llama32_3b", "llama32_1b_q4nx"),
+    driver_api="prefiller",
+    decoder_class="FusedDecode8B",
+)
+
+
+SPECS = {s.name: s for s in (LLAMA_3_2_1B, LLAMA_3_2_3B, LLAMA_3_1_8B)}
 
 #: What `--model` defaults to where a single model is implied.
 DEFAULT = LLAMA_3_2_1B.name

@@ -7,8 +7,10 @@
 
 The prefill is this repo's -- Triton kernels on XDNA (prefill.py, and
 ../llm_q4nx/kernels.py). The decode is mlir-air's fused Q4NX decode, run
-unmodified: the shared harness writes the KV handoff npz that its `generate()`
-already loads, and neutralizes only the step that would have produced it.
+unmodified: the shared harness hands its `generate_stream` our prefill object
+directly, and that driver calls `clear_context()`, `prefill()` and `kv_view()`
+on it -- no handoff file, and nothing of theirs to neutralize. (The 1B's driver
+takes an npz instead; `ModelSpec.driver_api` names which.)
 
 Llama-3.2-3B is architecturally the 1B -- SwiGLU, one norm pair per block, no
 qk-norm -- so it shares the 1B's forward as well as the harness. Everything
