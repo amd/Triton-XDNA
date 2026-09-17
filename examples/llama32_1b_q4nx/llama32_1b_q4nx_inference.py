@@ -42,6 +42,12 @@ def _air_inference_module():
     """mlir-air's llama32_1b_q4nx_inference, importable and unmodified."""
     import importlib.util
 
+    # Before the import: mlir-air's module reads its decode-shape selection at
+    # import time, so a later choice would not be seen. See
+    # config.select_decode_artifact for why this example fixes it rather than
+    # taking mlir-air's default.
+    config.select_decode_artifact()
+
     config._add_air_paths()
     path = os.path.join(
         str(config._air_llms_root()),

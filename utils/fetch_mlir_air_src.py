@@ -4,7 +4,7 @@
 """Fetch mlir-air's sources at the same commit the wheel is pinned to.
 
 `utils/mlir-air-hash.txt` already pins mlir-air: `env_setup.sh` turns its
-`Commit:` field into the wheel version (`...+6746658.no.rtti`). Some examples
+`Commit:` field into the wheel version (`...+12e6f9f.no.rtti`). Some examples
 need mlir-air's *sources* too -- `examples/llama32_1b_q4nx` builds the fused
 decode from `fused_decode.build_module()` and compiles its AIE kernels from
 `kernels/*.cc`. Those live in `programming_examples/`, which the wheel does
