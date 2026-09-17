@@ -259,32 +259,37 @@ def generate_via_prefiller(air, spec, cfg, args, ids, prefiller):
 def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     """Generation for drivers whose `generate()` has no handoff parameter.
 
-    Qwen3-4B's driver does its own prefill unconditionally and hands the result
-    to the decode loop, so there is nothing to pass in -- but the prefill it
-    calls is one function, `_prefill_npu(prompt, model, seq_len=None) ->
-    (K, V, first, ttft)`, and replacing it puts our KV in front of their decode
-    without reaching past their public `generate()`. That is the same move the
-    npz path makes on `run_prefill`, and it is preferred to calling their
-    `_decode_loop` directly: `generate()` also builds the decoder, checks P
-    against ATTN_MAXL and prints the throughput lines the benchmark scrapes.
+    Qwen3-4B's and Gemma3-4B's drivers do their own prefill unconditionally and
+    hand the result to the decode loop, so there is nothing to pass in -- but
+    the prefill each calls is one function, `_prefill_npu(prompt, model,
+    seq_len=None) -> (K, V, first, ttft)`, and replacing it puts our KV in front
+    of their decode without reaching past their public `generate()`. That is the
+    same move the npz path makes on `run_prefill`, and it is preferred to
+    calling their `_decode_loop` directly: `generate()` also builds the decoder,
+    checks P against ATTN_MAXL and prints the throughput lines the benchmark
+    scrapes.
 
-    `stop_on_eos=False` for the same reason as the prefiller path: the other
-    routes generate a fixed count, and an EOS stop here would make the token
-    counts differ for reasons unrelated to the kernels.
+    `stop_on_eos=False` where it is accepted, for the same reason as the
+    prefiller path: the other routes generate a fixed count, and an EOS stop
+    would make the token counts differ for reasons unrelated to the kernels.
+    Qwen3's `generate` takes it and Gemma3's does not -- it stops on EOS
+    unconditionally -- so the argument is offered only when the signature has
+    somewhere to put it. Read off the function rather than recorded in the spec
+    because, unlike a build fact, this one cannot go stale: it is derived from
+    the very thing it describes.
     """
+    import inspect
+
     K, V = prefiller.kv_stack()
     # Their fourth return value is the time-to-first-token they print on a line
     # the nightly benchmark scrapes. It is our prefill that spent it, so the
     # measured wall clock goes back in rather than a zero that would read as a
     # free prefill.
     air._prefill_npu = lambda prompt, model, seq_len=None: (K, V, first, ttft)
-    return air.generate(
-        list(ids),
-        args.max_tokens,
-        model=args.model or cfg.MODEL_DEFAULT,
-        greedy=args.greedy,
-        stop_on_eos=False,
-    )
+    kwargs = dict(model=args.model or cfg.MODEL_DEFAULT, greedy=args.greedy)
+    if "stop_on_eos" in inspect.signature(air.generate).parameters:
+        kwargs["stop_on_eos"] = False
+    return air.generate(list(ids), args.max_tokens, **kwargs)
 
 
 def build_parser(doc):

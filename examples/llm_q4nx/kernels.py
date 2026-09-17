@@ -344,6 +344,77 @@ def triton_swiglu(gate, up, block=SWIGLU_BLOCK):
 
 
 # ---------------------------------------------------------------------------
+#: sqrt(2/pi), doubled. See `_geglu_kernel` for why it is doubled.
+_GELU_2C = 1.5957691216057308
+_GELU_K = 0.044715
+
+
+@triton.jit
+def _geglu_kernel(G, U, Y, C2: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
+    """gelu_tanh(gate) * up -- Gemma3's GLU, where Llama and Qwen3 use SiLU.
+
+    The activation is `gelu_pytorch_tanh`, exactly:
+
+        0.5 * x * (1 + tanh(c * (x + 0.044715 * x^3))),  c = sqrt(2/pi)
+
+    written here with sigmoid instead of tanh. `tl.math.tanh` does not exist in
+    this Triton version, and substituting the usual `x * sigmoid(1.702x)` fast
+    GELU (which is what examples/gelu uses) would be a different function --
+    mlir-air's decode runs gelu_tanh in `glu.cc`, so an approximation here would
+    make the prefill and the decode disagree about the model.
+
+    No approximation is needed, because tanh(z) = 2*sigmoid(2z) - 1 turns the
+    expression above into an exact identity:
+
+        0.5 * x * (1 + 2*sigmoid(2z) - 1)  =  x * sigmoid(2z)
+
+    with z = c * (x + 0.044715 x^3). That is why `C2` is *2*c and not c.
+
+    The op set is the SwiGLU kernel's -- mul, add, sigmoid -- so it lowers under
+    the same transform script, which is what makes this a new kernel rather than
+    a new schedule. f32 for the polynomial and the sigmoid, as tl.sigmoid
+    requires, rounded back to bf16 before the multiply by `up`.
+    """
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    gate = tl.load(G + offs[:])
+    up = tl.load(U + offs[:])
+    g = gate.to(tl.float32)
+    z = C2 * (g + K * g * g * g)
+    gelu_gate = (g * tl.sigmoid(z)).to(gate.dtype)
+    tl.store(Y + offs[:], gelu_gate * up)
+
+
+def triton_geglu(gate, up, block=SWIGLU_BLOCK):
+    """gelu_tanh(gate) * up over matching [M, N] tensors -> [M, N] float32.
+
+    The SwiGLU wrapper's chunking and padding, unchanged -- only the activation
+    differs -- so see `triton_swiglu` for why the chunk size is fixed.
+    """
+    shape = gate.shape
+    chunk = ROW_TILE * (shape[-1] if gate.ndim > 1 else block)
+    chunk = math.ceil(chunk / block) * block
+    n = gate.numel()
+    npad = math.ceil(n / chunk) * chunk
+    g = torch.nn.functional.pad(gate.reshape(-1).to(torch.bfloat16), (0, npad - n))
+    u = torch.nn.functional.pad(up.reshape(-1).to(torch.bfloat16), (0, npad - n))
+    g, u = g.contiguous(), u.contiguous()
+    y = torch.empty(npad, dtype=torch.bfloat16)
+    for o in range(0, npad, chunk):
+        launch(
+            _geglu_kernel,
+            (chunk // block,),
+            g[o : o + chunk],
+            u[o : o + chunk],
+            y[o : o + chunk],
+            transform_script=script("swiglu/transform_aie2p.mlir"),
+            C2=_GELU_2C,
+            K=_GELU_K,
+            BLOCK=block,
+        )
+    return y[:n].to(torch.float32).reshape(shape)
+
+
+# ---------------------------------------------------------------------------
 @triton.jit
 def _rms_norm_kernel(
     X,

@@ -265,8 +265,15 @@ class LlamaPrefill:
                 [x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1
             ).reshape(N, -1)
 
-    def _attention(self, q, k, v, n_q, n_kv, dh, backend=None):
+    def _attention(self, q, k, v, n_q, n_kv, dh, window=None, backend=None):
         """Causal GQA. q: [N, n_q*dh], k/v: [N, n_kv*dh] -> [N, n_q*dh].
+
+        `window` bounds how far back a position may attend: with it set, j is
+        visible to i only while `i - window < j <= i`. None is unbounded, which
+        is every Llama and Qwen3 layer; Gemma3 sets it on five layers in six.
+        A parameter rather than a subclass override because it is the same
+        operator with a different mask, exactly as `n_q`/`n_kv` are the same
+        operator at different head counts.
 
         CPU only, see NPU_OPS.
         """
@@ -280,6 +287,12 @@ class LlamaPrefill:
             vh = vh.repeat_interleave(rep, dim=0)
             scores = (qh @ kh.transpose(1, 2)) * (dh**-0.5)  # [n_q, N, N]
             mask = torch.full((N, N), float("-inf")).triu(1)
+            if window is not None:
+                # `tril(-window)` is -inf exactly where j <= i - window, which
+                # is what falls out of the window. Added to the causal mask
+                # rather than replacing it: a position must satisfy both, and
+                # j == i always survives, so no row is fully masked.
+                mask = mask + torch.full((N, N), float("-inf")).tril(-window)
             scores = scores + mask
             p = torch.softmax(scores, dim=-1)
             return (p @ vh).transpose(0, 1).reshape(N, n_q * dh)

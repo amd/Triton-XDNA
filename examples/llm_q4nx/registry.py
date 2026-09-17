@@ -47,11 +47,12 @@ class ModelSpec:
               `clear_context()`, `prefill()` and `kv_view()` on it -- which is
               the interface our prefill already has. No file, nothing to
               neutralize.
-            * `"kv_arrays"` -- Qwen3-4B. Its `generate()` has no handoff
-              parameter at all: it calls its own `_prefill_npu` and passes the
-              `(K, V, first)` straight to the decode loop. So that one function
-              is replaced with ours, which is the same trick the npz path uses
-              on `run_prefill` and keeps us on their public `generate()`.
+            * `"kv_arrays"` -- Qwen3-4B and Gemma3-4B. `generate()` has no
+              handoff parameter at all: it calls its own `_prefill_npu` and
+              passes the `(K, V, first)` straight to the decode loop. So that
+              one function is replaced with ours, which is the same trick the
+              npz path uses on `run_prefill` and keeps us on their public
+              `generate()`.
     """
 
     name: str
@@ -62,8 +63,9 @@ class ModelSpec:
     tokenizer_fallback: str
     driver_api: str = "npz"
     #: For `driver_api="prefiller"`: the decoder class that driver exposes.
-    #: Named per model (`FusedDecode3B`), so it is recorded
-    #: rather than derived from the model name.
+    #: Named per model (`FusedDecode3B`, `FusedDecode8B`, and plain
+    #: `FusedDecoder` for the kv_arrays ones), so it is recorded rather than
+    #: derived from the model name.
     decoder_class: str = ""
     #: Whether `AMD_TRITON_NPU_RUNTIME=hsa` works for this model. The HSA
     #: adapter subclasses `air.FusedDecoder`, which only the npz-API drivers
@@ -264,7 +266,52 @@ QWEN3_4B = ModelSpec(
 )
 
 
-SPECS = {s.name: s for s in (LLAMA_3_2_1B, LLAMA_3_2_3B, LLAMA_3_1_8B, QWEN3_4B)}
+#: Gemma3-4B (text). The furthest from the Llama block of anything here: a
+#: four-norm sandwich, dual-theta RoPE with a 1024-token sliding window on five
+#: layers in six, GELU-tanh in the GLU, and Qwen3's per-head qk-norm and
+#: decoupled q dim as well (`llm_q4nx/gemma3_prefill.py`).
+#:
+#: Its environment is the smallest of the four and still comes from two places:
+#: `DECODE_ENV` in `llms/gemma3_4b_q4nx/Makefile`, plus `W_DUAL_CHAN=1` by bare
+#: `export`. `VOCAB_CHUNK_I2=5` is its own -- the lowest here, and unsurprising
+#: at a 262208 vocabulary.
+#:
+#: Neither `DECODE_STACK` nor `DECODE_WGROUP` appears, because its Makefile sets
+#: neither; the builder defaults stand, and `decode_build` derives the stack
+#: from the builder rather than repeating a number.
+GEMMA3_4B = ModelSpec(
+    name="gemma3-4b",
+    decode_env=dict(
+        DECODE_MODEL="gemma3-4b",
+        VOCAB_CHUNK_I2="5",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="1",
+        DECODE_GOLDEN="1",
+        W_DUAL_CHAN="1",
+    ),
+    model_type="GEMMA3_4B",
+    air_package="gemma3_4b_q4nx",
+    air_inference="gemma3_4b_q4nx_inference.py",
+    # Like Qwen3's, its driver detokenizes from the weight repo and exports no
+    # tokenizer path. Gemma is gated on the Hub, so the fallback is the bundle
+    # repo rather than google/gemma-3-4b-it.
+    tokenizer_fallback="FastFlowLM/Gemma3-4B-NPU2",
+    driver_api="kv_arrays",
+    decoder_class="FusedDecoder",
+    decode_dir_env="Q4NX_GEMMA_DECODE_DIR",
+    # Measured: peak RSS of `--prefill-only` is 21.3 GiB, a little under
+    # Qwen3-4B's despite the larger vocabulary, because it has 34 layers rather
+    # than 36 and a narrower q projection. Same caveat as the other two: this
+    # is what the loader currently costs, not what the model needs.
+    min_host_gib=23.0,
+    supports_hsa=False,
+)
+
+
+SPECS = {
+    s.name: s for s in (LLAMA_3_2_1B, LLAMA_3_2_3B, LLAMA_3_1_8B, QWEN3_4B, GEMMA3_4B)
+}
 
 #: What `--model` defaults to where a single model is implied.
 DEFAULT = LLAMA_3_2_1B.name
