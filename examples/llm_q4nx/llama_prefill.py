@@ -89,6 +89,22 @@ def _t(a, dtype=torch.float32):
     return torch.from_numpy(np.ascontiguousarray(a)).to(dtype)
 
 
+def _as_bf16(a):
+    """A numpy array as ml_dtypes bfloat16, without a copy when it already is.
+
+    mlir-air's readers hand back float32 -- their `bf16()` upcasts on the way
+    out, and `dequant()` produces float32 by construction -- which is the right
+    default for a reference forward and the wrong one for a table we only ever
+    read a few rows of. Narrowing here means `_t` can then reinterpret rather
+    than convert, so a tied LM head aliases the embedding instead of copying it.
+    """
+    from ml_dtypes import bfloat16
+
+    if a.dtype == bfloat16:
+        return a
+    return a.astype(bfloat16)
+
+
 class OpTimer:
     """Per-op wall-clock timer. Zero overhead when disabled.
 
@@ -332,13 +348,36 @@ class LlamaPrefill:
     def load_weights(self, model=None):
         raw = load_q4nx(model or self.model)
         self.fingerprint = raw["fingerprint"]
-        self.embed = raw["embed"]  # float32 [VOCAB, D], kept as numpy (1 GB)
+        # The embedding table and the LM head, in bf16 rather than the float32
+        # mlir-air's readers return. Two savings, and the second is the larger:
+        #
+        #  * the table itself halves -- 1.45 -> 0.72 GiB on Qwen3-4B, 2.5 ->
+        #    1.25 on Gemma3's 262208-row one. Nothing here wants the extra
+        #    precision: `prefill` gathers a handful of rows and immediately
+        #    rounds them through bf16 anyway, because that is what the device
+        #    sees.
+        #  * where the head is tied, it becomes an *alias* of the table instead
+        #    of a second array. `_t` reinterprets a bf16 buffer rather than
+        #    converting it, so `self.lm_head` and `self.embed` end up sharing
+        #    one allocation; from float32 they could not, and the copy cost a
+        #    second full-size tensor.
+        #
+        # `raw` is emptied as we go: it holds the float32 originals, and the
+        # point is not to keep them alive alongside the bf16 ones.
+        # `raw` is emptied as we go: it holds the float32 originals, and the
+        # point is not to keep them alive alongside the bf16 ones.
+        embed = raw.pop("embed")
+        lm_head = raw.pop("lm_head")
+        # Tied to `embed` on the 1B, 3B and Qwen3-4B, and its own dequantized
+        # tensor on the 8B and Gemma3 -- `config.load_q4nx` decides which, so
+        # this must not assume either. Getting it wrong is silent: the 8B ran
+        # on the tied assumption and generated 57618 instead of " Paris".
+        tied = lm_head is embed
+        self.embed = _as_bf16(embed)
+        del embed
+        self.lm_head = _t(self.embed if tied else _as_bf16(lm_head), torch.bfloat16)
+        del lm_head
         self.final_norm = _t(raw["final_norm"])
-        # Tied to `embed` on the 1B and 3B, and its own dequantized tensor on
-        # the 8B -- `config.load_q4nx` decides which, so this line must not
-        # assume either. Getting it wrong is silent: the 8B ran on the tied
-        # assumption and generated 57618 instead of " Paris".
-        self.lm_head = _t(raw["lm_head"], torch.bfloat16)
         self._w = []
         # Pop as we go: `raw` holds every layer's numpy arrays at once, and
         # holding those alongside the torch copies doubles the resident set for
