@@ -67,6 +67,11 @@ class ModelSpec:
     #: Generalizing it belongs with the HSA scratchpad work, not with adding
     #: models.
     supports_hsa: bool = False
+    #: Host memory the prefill needs to hold this model's dequantized bf16
+    #: weights, in GiB. Checked before anything is allocated: an undersized
+    #: host is SIGKILLed partway through the load, and a process cannot catch
+    #: that to report the skip itself. 0 means unchecked.
+    min_host_gib: float = 0.0
     #: llms packages to put on sys.path, beyond `air_package`.
     extra_packages: tuple = field(default_factory=tuple)
 
@@ -145,7 +150,51 @@ LLAMA_3_2_3B = ModelSpec(
 )
 
 
-SPECS = {s.name: s for s in (LLAMA_3_2_1B, LLAMA_3_2_3B)}
+#: Llama-3.1-8B. The 1B's architecture again, at 32 layers of 4096. Nothing
+#: new in the forward; what it exercises is size -- the resident decode weights
+#: and, on the host, a bf16 dequantization of an 8B model.
+#:
+#: Two values its Makefile moves that the smaller two leave alone, and both are
+#: derived rather than recorded here:
+#:
+#: * `DECODE_STACK=8064` lowers the AIE core stack from the builder's 10240
+#:   default. `decode_build` reads `fused_decode.STACK_SIZE` after importing the
+#:   builder under this environment, as mlir-air's own driver does, so it
+#:   follows from `DECODE_STACK` below rather than being repeated.
+#: * `DECODE_WGROUP=8` splits the DDR weight slab into groups.
+#:
+#: `W_DUAL_CHAN=1` again arrives by a bare `export`, not in `DECODE_ENV`.
+LLAMA_3_1_8B = ModelSpec(
+    name="llama-3.1-8b",
+    decode_env=dict(
+        DECODE_MODEL="llama-3.1-8b",
+        VOCAB_CHUNK_I2="16",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="1",
+        DECODE_GOLDEN="1",
+        DECODE_STACK="8064",
+        DECODE_WGROUP="8",
+        W_DUAL_CHAN="1",
+    ),
+    model_type="LLAMA_3_1_8B",
+    air_package="llama31_8b_q4nx",
+    air_inference="llama31_8b_q4nx_inference.py",
+    tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.1-8B",
+    # Measured, not estimated: peak RSS of `--prefill-only` on this box is
+    # 31.6 GiB, against an arithmetic 16 for the weights themselves. The gap is
+    # torch allocator headroom and the transient while the fused QKV/gate-up
+    # are built, and an estimate would have set this at 20 and let a host
+    # through that still gets killed. The smaller two pass on CI's runner as
+    # they are, so they stay unchecked.
+    min_host_gib=34.0,
+    extra_packages=("llama32_3b", "llama32_1b_q4nx"),
+    driver_api="prefiller",
+    decoder_class="FusedDecode8B",
+)
+
+
+SPECS = {s.name: s for s in (LLAMA_3_2_1B, LLAMA_3_2_3B, LLAMA_3_1_8B)}
 
 #: What `--model` defaults to where a single model is implied.
 DEFAULT = LLAMA_3_2_1B.name

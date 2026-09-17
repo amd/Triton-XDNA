@@ -72,6 +72,33 @@ def tokenizer_dir(air, model):
     )
 
 
+def check_host_memory(spec):
+    """Decline before allocating if this host cannot hold the weights.
+
+    The prefill dequantizes to bf16 on the host, and an undersized host does
+    not raise -- it gets SIGKILLed partway through the load, which no `except`
+    can turn into the skip this would otherwise report. So the check has to be
+    up front and approximate. Linux only; elsewhere it passes and the caller
+    takes its chances, as it did before.
+    """
+    if not spec.min_host_gib:
+        return
+    try:
+        with open("/proc/meminfo") as f:
+            avail_kib = next(
+                int(line.split()[1]) for line in f if line.startswith("MemAvailable:")
+            )
+    except (OSError, StopIteration):
+        return
+    avail = avail_kib / 1024 / 1024
+    if avail < spec.min_host_gib:
+        raise ExampleUnavailable(
+            f"{spec.name} needs about {spec.min_host_gib:.0f} GiB of host memory "
+            f"for its dequantized bf16 weights; this host has {avail:.1f} GiB "
+            f"available"
+        )
+
+
 def run_prefill(
     prefill_cls, cfg, ids, backend, ops, max_seq, model, kv_path, profile=False
 ):
@@ -295,6 +322,8 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             f"for it exposes no Session/interactive_chat to host our prefill. "
             f"Use --max-tokens for a single turn."
         )
+
+    check_host_memory(spec)
 
     air = None if args.prefill_only else air_inference_module(spec)
 

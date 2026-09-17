@@ -298,6 +298,13 @@ class LlamaPrefill:
             # launches per prefill.
             w["qkv"] = torch.cat([w["q"], w["k"], w["v"]], dim=1).contiguous()
             w["gate_up"] = torch.cat([w["gate"], w["up"]], dim=1).contiguous()
+            # The unfused halves are dead once concatenated -- the forward only
+            # ever reads `qkv` and `gate_up` -- and keeping them doubles the
+            # host cost of everything that was just copied. That is 8.5 GiB on
+            # Llama-3.1-8B, a third of its footprint, and enough on its own to
+            # get the prefill OOM-killed on a small runner.
+            for dead in ("q", "k", "v", "gate", "up"):
+                del w[dead]
             self._w.append(w)
         # bf16 cos/sin, as the device applies them.
         self._lut = _t(rope_lut(self.max_seq)).to(torch.bfloat16).to(torch.float32)
