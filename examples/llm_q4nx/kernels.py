@@ -243,6 +243,43 @@ def shared_empty(shape, dtype):
         return torch.empty(shape, dtype=dtype)
 
 
+class ResidentWeight:
+    """A weight already padded for the NPU, carrying the dims it came from.
+
+    `_padded_weight` below caches its copy against the *original* tensor: keyed
+    on its address, weakref'd so the entry dies with it. That is right for a
+    cache, and it means the original can never be freed -- the copy would go
+    with it. So an NPU-only run holds both, which on Qwen3-4B is 6.8 GiB of
+    unpadded weights kept alive solely to anchor 10.6 GiB of padded ones.
+
+    This is the other arrangement: pad once, keep the logical `(K, N)` beside
+    the buffer, and hold no reference to the original at all, so the caller can
+    drop it. `shape` is exposed so `triton_matmul` reads the logical dims from
+    either kind of weight without asking which it has.
+
+    The trade is that there is no way back: a `ResidentWeight` cannot be used by
+    the torch reference path, and `_matmul` says so rather than failing
+    obscurely.
+    """
+
+    __slots__ = ("padded", "K", "N")
+
+    def __init__(self, padded, K, N):
+        self.padded, self.K, self.N = padded, K, N
+
+    @property
+    def shape(self):
+        return (self.K, self.N)
+
+
+def resident_weight(w, block_n=BLOCK_N):
+    """Pad `w` for the NPU now, returning a handle that does not reference it."""
+    K, N = w.shape
+    Kp, Np = _pow2(K), math.ceil(N / block_n) * block_n
+    padded = _resident_copy(_pad2d(w.to(torch.bfloat16), Kp, Np).contiguous())
+    return ResidentWeight(padded, K, N)
+
+
 def _padded_weight(w, Kp, Np):
     addr = w.data_ptr()
     entry = _wcache.get(addr)
@@ -267,7 +304,19 @@ def triton_matmul(x, w, block_m=BLOCK_M, block_n=BLOCK_N):
     Mp = math.ceil(M / block_m) * block_m
     Np = math.ceil(N / block_n) * block_n
     Kp = _pow2(K)  # tl.arange needs a power of two
-    b = _padded_weight(w, Kp, Np)
+    if isinstance(w, ResidentWeight):
+        # Padded ahead of time, by someone who then freed the original. Its
+        # padding was computed from the same rule, but a caller passing a
+        # different block_n would silently get a buffer shaped for another
+        # grid, so the shape is checked rather than assumed.
+        b = w.padded
+        if tuple(b.shape) != (Kp, Np):
+            raise ValueError(
+                f"resident weight padded to {tuple(b.shape)}, but this call "
+                f"needs {(Kp, Np)} (block_n={block_n})"
+            )
+    else:
+        b = _padded_weight(w, Kp, Np)
     # Pad input and output ONCE, then hand each dispatch a contiguous row slice
     # of them. Allocating per tile and copying the result back instead cost
     # more than the dispatch: an [128, 16384] f32 copy per GEMM, 64 GEMMs deep.

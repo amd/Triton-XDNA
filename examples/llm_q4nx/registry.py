@@ -194,18 +194,10 @@ LLAMA_3_1_8B = ModelSpec(
     air_package="llama31_8b_q4nx",
     air_inference="llama31_8b_q4nx_inference.py",
     tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.1-8B",
-    # Measured, not estimated: peak RSS of `--prefill-only` is 30.9 GiB, and
-    # the arithmetic for the weights alone is 16. Two separate attempts to
-    # reason this number out landed at 20, which would have let through a host
-    # that still gets killed, so it is set from `ru_maxrss` with a margin.
-    #
-    # Note what it is NOT: a statement that an 8B cannot fit in less. It is
-    # what *this* prefill currently costs, which is more than it needs to --
-    # the weights are all materialized before the first GEMM. Loading them
-    # per-layer would cut it a long way, and is the real fix if the runner
-    # turns out to be the thing in the way. The smaller two are unchecked;
-    # they pass on CI as they are.
-    min_host_gib=34.0,
+    # Measured, not estimated: peak RSS of `--prefill-only` is 23.9 GiB, set
+    # here with a margin. It was 30.7 before the padded weights stopped being
+    # held alongside the unpadded ones they were built from.
+    min_host_gib=26.0,
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",
     decoder_class="FusedDecode8B",
@@ -252,12 +244,10 @@ QWEN3_4B = ModelSpec(
     decoder_class="FusedDecoder",
     decode_dir_env="Q4NX_QWEN3_4B_DECODE_DIR",
     # Measured on this box, as the 8B's was: peak RSS of `--prefill-only` is
-    # 20.3 GiB. That is high for 4B parameters, and it is the same cost the
-    # 8B's comment describes rather than anything Qwen3 does -- 36 layers of
-    # 2560 dequantize to 3.6G bf16 parameters, and `load_q4nx` materializes all
-    # of them as numpy before the first is converted. Loading per layer is the
-    # fix, and it belongs to every model at once, not here.
-    min_host_gib=22.0,
+    # 12.4 GiB, down from 20.3. Most of that drop is `make_npu_resident` --
+    # this model's weights pad from 6.8 GiB to 10.6, and both used to be
+    # resident at once.
+    min_host_gib=14.0,
     extra_packages=("qwen3_8b_q4nx", "qwen3_4b"),
     # Its driver *does* name its decoder `FusedDecoder`, so the adapter would
     # import -- but nothing here has run it on hardware, and the ELF route it
@@ -300,11 +290,11 @@ GEMMA3_4B = ModelSpec(
     driver_api="kv_arrays",
     decoder_class="FusedDecoder",
     decode_dir_env="Q4NX_GEMMA_DECODE_DIR",
-    # Measured: peak RSS of `--prefill-only` is 21.3 GiB, a little under
-    # Qwen3-4B's despite the larger vocabulary, because it has 34 layers rather
-    # than 36 and a narrower q projection. Same caveat as the other two: this
-    # is what the loader currently costs, not what the model needs.
-    min_host_gib=23.0,
+    # Measured: peak RSS of `--prefill-only` is 15.1 GiB, down from 21.3. It
+    # is now the highest of the three 4B-class models rather than the lowest,
+    # because its 262208-row LM head is a separate tensor where Qwen3-4B's is
+    # tied.
+    min_host_gib=17.0,
     supports_hsa=False,
 )
 

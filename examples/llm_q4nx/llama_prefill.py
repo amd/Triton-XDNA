@@ -251,6 +251,16 @@ class LlamaPrefill:
                 import kernels
 
                 return kernels.triton_matmul(x, w)
+            if not hasattr(w, "to"):
+                # A ResidentWeight: padded for the device, original freed. The
+                # torch path cannot run against it, and saying so here beats an
+                # AttributeError three frames down.
+                raise RuntimeError(
+                    "this weight was made NPU-resident, which frees the "
+                    "unpadded copy the torch path needs. Build the model "
+                    "without make_npu_resident() to run matmul on the CPU "
+                    "(--compare-cpu and --ops without matmul both do)."
+                )
             return (x.to(torch.bfloat16).to(torch.float32) @ w.to(torch.float32)).to(
                 torch.float32
             )
@@ -331,7 +341,39 @@ class LlamaPrefill:
         with self.timer.track("lm_head"):
             return torch.matmul(x.to(torch.bfloat16), w.t()).to(torch.float32)
 
+    #: The projections `_matmul` sends to the NPU, and so the ones worth making
+    #: resident. The norms and the per-head q/k norms are kilobytes and stay as
+    #: they are.
+    NPU_WEIGHTS = ("qkv", "o", "gate_up", "down")
+
     # ---- weights ----
+    def make_npu_resident(self):
+        """Pad every projection for the device now, and free the unpadded copy.
+
+        `kernels.triton_matmul` pads each weight on first use and caches the
+        result for the process lifetime, so after one prefill both forms are
+        resident: 6.8 GiB unpadded plus 10.6 GiB padded on Qwen3-4B. On a run
+        that only ever goes to the NPU the unpadded form is dead the moment the
+        padded one exists -- but the cache cannot drop it, because it is keyed
+        on that tensor's address and weakref'd to it.
+
+        So the conversion is done here instead, one weight at a time, each
+        original released as its padded form is built. That also moves the work
+        off the first prefill, where it was the whole of an 11 GiB step.
+
+        Not the default: it is one-way (see `_matmul`), and the torch reference
+        path, `--ops` subsets that leave matmul on the CPU, and `--compare-cpu`
+        all need the original. The entry points that only ever run on the
+        device opt in.
+        """
+        import kernels
+
+        for w in self._w:
+            for name in self.NPU_WEIGHTS:
+                if name in w:
+                    w[name] = kernels.resident_weight(w[name])
+        return self
+
     def share_weights_from(self, other):
         """Adopt `other`'s loaded weights instead of loading them again.
 

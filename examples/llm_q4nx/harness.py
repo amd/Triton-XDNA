@@ -131,6 +131,13 @@ def run_prefill(
         m.load_weights()
     except Exception as e:  # noqa: BLE001 -- any failure to obtain weights
         raise ExampleUnavailable(f"cannot load the q4nx weights: {e}") from e
+    if backend == "npu" and "matmul" in m.enabled:
+        # Every GEMM here goes to the device, so the unpadded weights are dead
+        # once the padded ones exist. Freeing them halves what this process
+        # holds; see `make_npu_resident`. Done here rather than in the prefill
+        # class because it is one-way, and the debugging drivers -- which keep
+        # a CPU reference to diff against -- must not take it.
+        m.make_npu_resident()
     t_load = time.time() - t0
     if profile:  # one warm pass so timings exclude compilation
         m.prefill(ids)
