@@ -222,13 +222,41 @@ runs:
           if [ "$air_rc" -ne 0 ]; then
             echo "SKIP: Q4NX examples (mlir-air sources unavailable)"
           else
-            # Every Q4NX example, each gating on its own prompt's first token.
-            # They share the prefill kernels and the harness, so one of them
-            # passing says little about the others: the 3B is the first model
-            # whose dim is not a power of two, which the RMSNorm kernel has to
-            # pad for.
-            # Full inference where it is affordable, prefill-only otherwise.
-            # A prefill gate cannot see anything the decode carries -- the
+            # Reported the way scripts/run_tests.py reports the operator
+            # examples -- same markers, same roll-up -- because these used to
+            # print raw driver output instead. Searching a CI log for
+            # "PASS:" found every operator test and none of these, and the
+            # "Total:" above counts only run_tests.py's, so a reader had no
+            # way to see that the Q4NX gates ran at all.
+            #
+            # They are not run *through* run_tests.py because each needs its
+            # own arguments: it invokes an entry point bare, which for these
+            # means generating, and generation needs a decode build.
+            q_pass=0; q_fail=0; q_skip=0
+
+            # gate <example> <args...>
+            gate() {
+              local ex="$1"; shift
+              local rc=0
+              echo "📁 Example: $ex"
+              echo "   🔄 Running: ${ex}_inference.py $*"
+              ( cd "examples/$ex" \
+                && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+                   python "${ex}_inference.py" "$@" ) || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                echo "   ✅ PASS: ${ex}_inference.py $*"
+                q_pass=$((q_pass + 1))
+              elif [ "$rc" -eq 77 ]; then
+                echo "   ⏭️  SKIP: ${ex}_inference.py -- example declined (exit 77)"
+                q_skip=$((q_skip + 1))
+              else
+                echo "   ❌ FAIL: ${ex}_inference.py (exit code $rc)"
+                q_fail=$((q_fail + 1))
+              fi
+            }
+
+            # Full inference where it is affordable, prefill-only otherwise. A
+            # prefill gate cannot see anything the decode carries -- the
             # builder environment, -DMODEL_TYPE, GLU_SLICE, the core stack,
             # which driver API is used -- and that is most of what a new model
             # adds. The 1B pays 10 s to build its decode and 15 s to generate,
@@ -238,40 +266,32 @@ runs:
             # principle: its decode needs a requantized weight cache that a
             # fresh runner does not have, measured at ~7 min. Worth revisiting
             # if that can be cached between runs.
-            rc=0
-            echo "--- decode gate: llama32_1b_q4nx ---"
-            ( cd examples/llama32_1b_q4nx && make compile-decode ) || rc=$?
-            if [ "$rc" -ne 0 ]; then
-              echo "FAIL: llama32_1b_q4nx compile-decode (exit $rc)"
-              exit "$rc"
-            fi
-            ( cd examples/llama32_1b_q4nx \
-              && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
-                 python llama32_1b_q4nx_inference.py --max-tokens 8 --greedy ) || rc=$?
-            if [ "$rc" -eq 77 ]; then
-              echo "SKIP: llama32_1b_q4nx decode (exit 77)"
-            elif [ "$rc" -ne 0 ]; then
-              echo "FAIL: llama32_1b_q4nx decode (exit $rc)"
-              exit "$rc"
+            build_rc=0
+            echo "📁 Example: llama32_1b_q4nx (decode build)"
+            ( cd examples/llama32_1b_q4nx && make compile-decode ) || build_rc=$?
+            if [ "$build_rc" -ne 0 ]; then
+              echo "   ❌ FAIL: make compile-decode (exit code $build_rc)"
+              q_fail=$((q_fail + 1))
+            else
+              echo "   ✅ PASS: make compile-decode"
+              q_pass=$((q_pass + 1))
+              gate llama32_1b_q4nx --max-tokens 8 --greedy
             fi
 
-            for ex in llama32_3b_q4nx; do
-              # `|| rc=$?` rather than a bare call: this step runs under
-              # `bash -e`, so a non-zero exit -- including the 77 that means
-              # SKIP -- would otherwise abort the step before the check below
-              # could grade it.
-              rc=0
-              echo "--- gate: $ex ---"
-              ( cd "examples/$ex" \
-                && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
-                   python "${ex}_inference.py" --prefill-only ) || rc=$?
-              if [ "$rc" -eq 77 ]; then
-                echo "SKIP: $ex (exit 77)"
-              elif [ "$rc" -ne 0 ]; then
-                echo "FAIL: $ex (exit $rc)"
-                exit "$rc"
-              fi
-            done
+            gate llama32_3b_q4nx --prefill-only
+
+            echo ""
+            echo "--------------------------------------------------"
+            echo "Q4NX Gate Results:"
+            echo "  ✅ Passed:  $q_pass"
+            echo "  ❌ Failed:  $q_fail"
+            echo "  ⏭️  Skipped: $q_skip"
+            echo "  📊 Total:   $((q_pass + q_fail + q_skip))"
+            if [ "$q_fail" -ne 0 ]; then
+              echo "❌ Q4NX gates failed"
+              exit 1
+            fi
+            echo "🎉 All Q4NX gates passed!"
           fi
         else
           echo "Skipping Q4NX examples: npu2-only (device=$DEVICE)."
