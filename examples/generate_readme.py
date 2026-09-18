@@ -204,8 +204,9 @@ EXAMPLES = [
         "path": "llama31_8b_q4nx",
         "datatypes": "bf16 prefill, q4nx decode",
         "description": (
-            "The Llama-3.1-8B configuration of the same split. Architecturally "
-            "the 1B at 32 layers of 4096, with an untied LM head."
+            "The Llama-3.1-8B configuration of the same split. The same block "
+            "as the 1B -- SwiGLU, one norm pair, no qk-norm -- but 32 layers "
+            "of 4096 against the 1B's 16 of 2048, and an untied LM head."
         ),
     },
 ]
