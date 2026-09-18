@@ -3,8 +3,8 @@
 """Build the fused-decode templates through Triton-XDNA's own lowering.
 
 The AIR IR comes from mlir-air's `fused_decode.build_module()`; the compile
-goes through `FusedDecodeOp`, which hands it to the same `_aircc_compile`
-every other kernel in this backend uses. From there the artifact is an
+goes through `tl.extra.npu.fused_decode`, which hands it to the same
+`_aircc_compile` every other kernel in this backend uses. From there the artifact is an
 ordinary AIR design -- same aircc invocation, same artifact handling -- which
 is the point: the decode stops being a thing mlir-air's Makefile builds behind
 our back and becomes a thing this backend lowers.
@@ -16,16 +16,16 @@ slope reference.
     python decode_build.py                      # both templates
     python decode_build.py --context-length 2048   # one, in this process
 
-`build_module()` reads its geometry from the environment at import time, so
-each context length needs its own process; `--context-length` is how the
-parent re-enters for each.
+Both templates are built in one process. `build_module()` reads its geometry
+from the environment at import time, which is why this used to fork per context
+length; `tl.extra.npu.fused_decode` takes the configuration as arguments and
+scopes that environment to a single build, so it no longer has to.
+`--context-length` still builds just one, for when that is all you want.
 """
 
 import argparse
-import importlib.util
 import os
 import shutil
-import subprocess
 import sys
 import time
 
@@ -82,30 +82,22 @@ def check_stamp(model, out_dir=None):
 
 
 def lower_template(L, out_dir=None, output_format="xclbin", model=None):
-    """Lower one decode template -- the xclbin + insts pair for context length L.
+    """Lower one decode template -- the binary + insts pair for context length L.
 
-    Returns their paths. Must run in a process that has not yet imported
-    `fused_decode`: that module reads DECODE_GOLDEN_L (and the rest of its
-    geometry) at import time, so a second L in the same process would silently
-    reuse the first one's.
+    Returns their paths. Runs entirely in this process: the op scopes the
+    builder's environment to one build and restores it, so several context
+    lengths -- or several models -- can be built one after another without
+    forking, which is what this used to do.
     """
     model = model or registry.spec()
     fd_dir = airsrc.fused_decode_dir()
     out_dir = out_dir or fd_dir
-    os.environ.update(model.decode_env, DECODE_GOLDEN_L=str(L))
-
-    sys.path.insert(0, fd_dir)
-    mod_spec = importlib.util.spec_from_file_location(
-        "fused_decode", os.path.join(fd_dir, "fused_decode.py")
-    )
-    fd = importlib.util.module_from_spec(mod_spec)
-    sys.modules["fused_decode"] = fd
-    mod_spec.loader.exec_module(fd)
 
     kdir = decode_kernels.kernel_dir(model, fd_dir)
     objs = [os.path.join(kdir, o) for o in KERNEL_OBJECTS]
     missing = [o for o in objs if not os.path.exists(o)]
     if missing:
+        # The op refuses missing objects too, but this says how to get them.
         raise SystemExit(
             "missing decode kernel objects:\n  "
             + "\n  ".join(missing)
@@ -113,28 +105,23 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
             f"  make compile-decode MODEL={model.name}"
         )
 
-    from triton.backends.amd_triton_npu.fused_decode_op import FusedDecodeOp
+    from triton.language.extra.npu import fused_decode
 
-    # Take the AIE core stack from the builder rather than FusedDecodeOp's
-    # default, exactly as mlir-air's own driver does
-    # (`XRTBackend(stack_size=STACK_SIZE)`). It is per-model: the builder
-    # defaults to 10240, which Llama-3.2-1B and -3B take, while Llama-3.1-8B's
-    # Makefile lowers it to 8064 via DECODE_STACK. Deriving it means a model
-    # whose Makefile moves that value cannot silently keep ours.
-    op = FusedDecodeOp.from_builder(
-        fd.build_module,
+    cfg = model.decode_config(L)
+    print(f"[decode-build] L={L} {cfg}", flush=True)
+    t0 = time.time()
+    art = fused_decode(
+        cfg,
+        fd_dir,
         kernel_objects=objs,
+        output_format=output_format,
         name=f"fused_decode_{model.name}_L{L}",
-        stack_size=fd.STACK_SIZE,
     )
     print(
-        f"[decode-build] L={L} model={fd.MODEL_NAME} ATTN_MAXL={fd.ATTN_MAXL} "
-        f"stack={op.stack_size} aircc_args={' '.join(op.aircc_args)}",
+        f"[decode-build] L={L} ATTN_MAXL={art['attn_maxl']} lowered in "
+        f"{time.time() - t0:.1f}s",
         flush=True,
     )
-    t0 = time.time()
-    art = op.lower(output_format=output_format)
-    print(f"[decode-build] L={L} lowered in {time.time() - t0:.1f}s", flush=True)
 
     # Name them the way the decode's template loader expects to find them.
     ext = "pdi" if output_format == "pdi" else "xclbin"
@@ -182,23 +169,17 @@ def main(argv=None):
         lower_template(args.context_length, args.out_dir, args.format, model)
         return 0
 
-    # The loader wants the L template and an L-1 slope reference. Separate
-    # processes because the builder's geometry is import-time state.
+    # The loader wants the L template and an L-1 slope reference. Both in this
+    # process: the builder's geometry used to be import-time state that a
+    # second build in the same process would have inherited, which is why this
+    # forked. `tl.extra.npu.fused_decode` takes the configuration as arguments
+    # and scopes the environment to one build, so it no longer can.
     for L in (args.max_context_length, args.max_context_length - 1):
-        cmd = [
-            sys.executable,
-            os.path.abspath(__file__),
-            "--context-length",
-            str(L),
-            "--format",
-            args.format,
-            "--model",
-            model.name,
-        ]
-        if args.out_dir:
-            cmd += ["--out-dir", args.out_dir]
-        subprocess.run(cmd, check=True)
-    print("[decode-build] both templates lowered through FusedDecodeOp.", flush=True)
+        lower_template(L, args.out_dir, args.format, model)
+    print(
+        "[decode-build] both templates lowered through tl.extra.npu.fused_decode.",
+        flush=True,
+    )
     return 0
 
 

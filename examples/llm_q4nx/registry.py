@@ -88,6 +88,39 @@ class ModelSpec:
     #: that defaults to the latter has to be pointed back.
     decode_dir_env: str = ""
 
+    def decode_config(self, context_length):
+        """This spec as a `tl.extra.npu.DecodeConfig`.
+
+        The mapping lives here, once, rather than at each call site: every knob
+        is transcribed from `decode_env`, and transcribing it by hand per caller
+        is the same class of error the whole file exists to prevent -- a wrong
+        value builds cleanly and decodes to garbage.
+
+        `decode_env` keeps its string values because that is what mlir-air's
+        Makefiles hold and what makes them diffable against upstream; the op
+        takes them as they are. A knob absent from `decode_env` stays absent
+        here too, leaving the builder its own default -- which is deliberate for
+        `UNIFIED`, `DECODE_WGROUP`, `DECODE_STACK` and `PROJ_RC_CACHE`, each
+        documented above where it is or is not set.
+        """
+        from triton.language.extra.npu import DecodeConfig
+
+        e = self.decode_env
+        return DecodeConfig(
+            model=e["DECODE_MODEL"],
+            model_type=self.model_type,
+            context_length=context_length,
+            vocab_chunk=e["VOCAB_CHUNK_I2"],
+            layers_per_dispatch=e["NLAYERS"],
+            unified=e.get("UNIFIED"),
+            lm_head=e["LM_HEAD"],
+            golden=e["DECODE_GOLDEN"],
+            dual_channel=e["W_DUAL_CHAN"],
+            weight_group=e.get("DECODE_WGROUP"),
+            stack_size=e.get("DECODE_STACK"),
+            proj_rc_cache=e.get("PROJ_RC_CACHE"),
+        )
+
 
 #: Two places where this spec deliberately does *not* match mlir-air's
 #: Makefiles character for character. Both matter when adding a model.
