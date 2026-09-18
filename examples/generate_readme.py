@@ -215,9 +215,9 @@ EXAMPLES = [
         "path": "qwen3_4b_q4nx",
         "datatypes": "bf16 prefill, q4nx decode",
         "description": (
-            "Qwen3-4B on the same Triton-prefill / AIR-decode split. The first "
-            "non-Llama family here: each head is RMS-normalized between the "
-            "QKV projection and RoPE."
+            "Qwen3-4B on the same Triton-prefill / AIR-decode split, and the "
+            "first Q4NX model here that is not Llama-shaped: each head is "
+            "RMS-normalized between the QKV projection and RoPE."
         ),
     },
 ]

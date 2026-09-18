@@ -210,9 +210,10 @@ LLAMA_3_1_8B = ModelSpec(
 )
 
 
-#: Qwen3-4B. The first non-Llama family here, and the first to need its own
-#: forward: between the QKV projection and RoPE each head's 128 lanes are
-#: RMS-normalized by a per-layer weight (`llm_q4nx/qwen3_prefill.py`). Also the
+#: Qwen3-4B. The first Q4NX model here that is not Llama-shaped, and the first
+#: to need its own forward: between the QKV projection and RoPE each head's 128
+#: lanes are RMS-normalized by a per-layer weight
+#: (`llm_q4nx/qwen3_prefill.py`). Also the
 #: first with DQ != D -- 32 heads of 128 against a 2560 model dim -- so o_proj
 #: contracts 4096 -> 2560 instead of being square.
 #:
