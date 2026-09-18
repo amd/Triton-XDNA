@@ -45,6 +45,11 @@ def air_inference_module(model):
     # taking mlir-air's default.
     airsrc.select_decode_artifact()
 
+    # Also before the import, and for the same reason: the drivers that take
+    # this read it into a module-level constant. See `ModelSpec.decode_dir_env`.
+    if model.decode_dir_env:
+        os.environ[model.decode_dir_env] = airsrc.fused_decode_dir()
+
     airsrc.add_air_paths(model.air_package, *model.extra_packages)
     path = os.path.join(
         str(airsrc.air_llms_root()), model.air_package, model.air_inference
@@ -251,6 +256,37 @@ def generate_via_prefiller(air, spec, cfg, args, ids, prefiller):
     return gen
 
 
+def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
+    """Generation for drivers whose `generate()` has no handoff parameter.
+
+    Qwen3-4B's driver does its own prefill unconditionally and hands the result
+    to the decode loop, so there is nothing to pass in -- but the prefill it
+    calls is one function, `_prefill_npu(prompt, model, seq_len=None) ->
+    (K, V, first, ttft)`, and replacing it puts our KV in front of their decode
+    without reaching past their public `generate()`. That is the same move the
+    npz path makes on `run_prefill`, and it is preferred to calling their
+    `_decode_loop` directly: `generate()` also builds the decoder, checks P
+    against ATTN_MAXL and prints the throughput lines the benchmark scrapes.
+
+    `stop_on_eos=False` for the same reason as the prefiller path: the other
+    routes generate a fixed count, and an EOS stop here would make the token
+    counts differ for reasons unrelated to the kernels.
+    """
+    K, V = prefiller.kv_stack()
+    # Their fourth return value is the time-to-first-token they print on a line
+    # the nightly benchmark scrapes. It is our prefill that spent it, so the
+    # measured wall clock goes back in rather than a zero that would read as a
+    # free prefill.
+    air._prefill_npu = lambda prompt, model, seq_len=None: (K, V, first, ttft)
+    return air.generate(
+        list(ids),
+        args.max_tokens,
+        model=args.model or cfg.MODEL_DEFAULT,
+        greedy=args.greedy,
+        stop_on_eos=False,
+    )
+
+
 def build_parser(doc):
     ap = argparse.ArgumentParser(description=doc)
     ap.add_argument("--backend", choices=("cpu", "npu"), default="npu")
@@ -400,6 +436,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     else:
         kv_path = None
     try:
+        t_pf = time.time()
         first, P, prefiller = run_prefill(
             prefill_cls,
             cfg,
@@ -411,6 +448,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             kv_path,
             profile=args.profile,
         )
+        ttft = time.time() - t_pf
         # Stop rather than decode from a prefill already known to be wrong.
         # Generation would still produce fluent text -- the decode is fed a KV
         # cache, not a verdict -- so a caller reading the exit status would be
@@ -421,6 +459,10 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         t0 = time.time()
         if spec.driver_api == "prefiller":
             out = generate_via_prefiller(air, spec, cfg, args, ids, prefiller)
+        elif spec.driver_api == "kv_arrays":
+            out = generate_via_kv_arrays(
+                air, spec, cfg, args, ids, prefiller, first, ttft
+            )
         else:
             # The npz is already written, so the decode's own prefill step has
             # nothing left to do. Everything after it -- seed_kv, the dispatch

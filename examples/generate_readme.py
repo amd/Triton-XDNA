@@ -209,6 +209,17 @@ EXAMPLES = [
             "of 4096 against the 1B's 16 of 2048, and an untied LM head."
         ),
     },
+    {
+        "kind": "model",
+        "name": "Qwen3-4B (Q4NX)",
+        "path": "qwen3_4b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Qwen3-4B on the same Triton-prefill / AIR-decode split, and the "
+            "first Q4NX model here that is not Llama-shaped: each head is "
+            "RMS-normalized between the QKV projection and RoPE."
+        ),
+    },
 ]
 
 # Directories under examples/ that are not examples. Keep in step with
