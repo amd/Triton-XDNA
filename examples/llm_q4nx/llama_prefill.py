@@ -69,9 +69,19 @@ def bound_model():
 
 
 def _t(a, dtype=torch.float32):
-    """numpy (possibly ml_dtypes bfloat16) -> torch tensor."""
+    """numpy (possibly ml_dtypes bfloat16) -> torch tensor.
+
+    bf16 is reinterpreted rather than converted. torch cannot borrow an
+    ml_dtypes bfloat16 buffer directly, and the obvious workaround -- go via
+    float32 -- doubles every weight in transit, which on an 8B is 13 GiB of
+    transient float32 for a result that ends up bf16 again. The two types are
+    the same two bytes, so view them as `uint16` and relabel: no copy, no
+    intermediate, bit-identical to the float32 route.
+    """
     if a.dtype.kind == "V" or str(a.dtype) == "bfloat16":
-        a = a.astype(np.float32)
+        t = torch.from_numpy(np.ascontiguousarray(a).view(np.uint16))
+        t = t.view(torch.bfloat16)
+        return t if dtype == torch.bfloat16 else t.to(dtype)
     return torch.from_numpy(np.ascontiguousarray(a)).to(dtype)
 
 
@@ -280,9 +290,24 @@ class LlamaPrefill:
         self.fingerprint = raw["fingerprint"]
         self.embed = raw["embed"]  # float32 [VOCAB, D], kept as numpy (1 GB)
         self.final_norm = _t(raw["final_norm"])
-        self.lm_head = _t(raw["lm_head"], torch.bfloat16)  # tied to embed
+        # Tied to `embed` on the 1B and 3B, and its own dequantized tensor on
+        # the 8B -- `config.load_q4nx` decides which, so this line must not
+        # assume either. Getting it wrong is silent: the 8B ran on the tied
+        # assumption and generated 57618 instead of " Paris".
+        self.lm_head = _t(raw["lm_head"], torch.bfloat16)
         self._w = []
-        for L in raw["layers"]:
+        # Pop as we go: `raw` holds every layer's numpy arrays at once, and
+        # holding those alongside the torch copies doubles the resident set for
+        # the length of the loop. Each layer's source is dead once converted.
+        #
+        # Reversed so the pop comes off the tail. `pop(0)` shifts the whole list
+        # each time, which is O(n^2) for no reason; `pop()` is O(1) and the
+        # reverse restores the order the forward indexes `self._w` by. That
+        # order is load-bearing -- layer k's weights must land at `_w[k]`.
+        layers = raw["layers"]
+        layers.reverse()
+        while layers:
+            L = layers.pop()
             w = {
                 "attn_norm": _t(L["attn_norm"]),
                 "ffn_norm": _t(L["ffn_norm"]),
@@ -298,6 +323,13 @@ class LlamaPrefill:
             # launches per prefill.
             w["qkv"] = torch.cat([w["q"], w["k"], w["v"]], dim=1).contiguous()
             w["gate_up"] = torch.cat([w["gate"], w["up"]], dim=1).contiguous()
+            # The unfused halves are dead once concatenated -- the forward only
+            # ever reads `qkv` and `gate_up` -- and keeping them doubles the
+            # host cost of everything that was just copied. That is 8.5 GiB on
+            # Llama-3.1-8B, a third of its footprint, and enough on its own to
+            # get the prefill OOM-killed on a small runner.
+            for dead in ("q", "k", "v", "gate", "up"):
+                del w[dead]
             self._w.append(w)
         # bf16 cos/sin, as the device applies them.
         self._lut = _t(rope_lut(self.max_seq)).to(torch.bfloat16).to(torch.float32)

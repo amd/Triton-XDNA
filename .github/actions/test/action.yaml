@@ -139,6 +139,12 @@ runs:
         echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
         # Report what XRT sees, so a missing/unavailable NPU is obvious in the
         # log instead of surfacing as a per-test "No NPU devices found".
+        # Host memory, so a model that declines for lack of it leaves the
+        # number it declined against in the log. The Q4NX prefills dequantize
+        # to bf16 on the host and the largest needs tens of GiB; without this
+        # the only evidence of an undersized runner is an exit 137.
+        echo "--- host memory ---"
+        grep -E "^(MemTotal|MemAvailable):" /proc/meminfo || true
         echo "--- xrt version ---"
         xrt-smi --version || echo "WARNING: xrt-smi --version failed"
         echo "--- xrt-smi examine (exit status reported below) ---"
@@ -279,6 +285,14 @@ runs:
             fi
 
             gate llama32_3b_q4nx --prefill-only
+
+            # The 8B is prefill-only for the 3B's reason and skips itself for
+            # one of its own: its dequantized bf16 weights do not fit every
+            # runner, and an undersized host does not raise -- it SIGKILLs the
+            # load, which no `except` can turn into a skip. `min_host_gib` is
+            # checked before anything is allocated, so this reports SKIP rather
+            # than dying at exit 137.
+            gate llama31_8b_q4nx --prefill-only
 
             echo ""
             echo "--------------------------------------------------"
