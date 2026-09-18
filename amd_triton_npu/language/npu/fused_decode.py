@@ -76,6 +76,9 @@ class DecodeConfig:
             never defaulted: the builder's own default is Llama-3.2-1B, and
             silently building the wrong model is the failure this op exists to
             make impossible.
+        model_type: the ``-DMODEL_TYPE`` this model's AIE kernels were compiled
+            with, e.g. ``"QWEN3_4B"``. Checked against the objects that are
+            linked; see `_verify_kernels`.
         context_length: the ``L`` the template is built for. The artifact serves
             every length up to ``16*ceil(L/16)``.
         vocab_chunk: this model's ``VOCAB_CHUNK_I2``. Its legal values depend on
@@ -92,6 +95,7 @@ class DecodeConfig:
     def __init__(
         self,
         model,
+        model_type,
         context_length,
         vocab_chunk,
         layers_per_dispatch=1,
@@ -108,6 +112,14 @@ class DecodeConfig:
                 "'llama-3.2-1b', and inheriting that silently builds the wrong "
                 "model -- name it."
             )
+        if not model_type:
+            raise DecodeConfigError(
+                "model_type is required: it is the -DMODEL_TYPE the AIE kernels "
+                "were compiled with, and it is what lets `fused_decode` refuse "
+                "another model's objects. rms_residual.o and rope.o differ "
+                "between models while keeping the same filenames, so linking "
+                "the wrong ones is not an error -- it is wrong output."
+            )
         if int(context_length) < 1:
             raise DecodeConfigError(
                 f"context_length must be >= 1, got {context_length}"
@@ -115,6 +127,7 @@ class DecodeConfig:
         if int(vocab_chunk) < 1:
             raise DecodeConfigError(f"vocab_chunk must be >= 1, got {vocab_chunk}")
         self.model = str(model)
+        self.model_type = str(model_type)
         self.context_length = int(context_length)
         self.vocab_chunk = int(vocab_chunk)
         self.layers_per_dispatch = int(layers_per_dispatch)
@@ -143,7 +156,8 @@ class DecodeConfig:
 
     def __repr__(self):
         return (
-            f"DecodeConfig(model={self.model!r}, context_length="
+            f"DecodeConfig(model={self.model!r}, model_type={self.model_type!r}, "
+            f"context_length="
             f"{self.context_length}, attn_maxl={self.attn_maxl}, "
             f"vocab_chunk={self.vocab_chunk})"
         )
@@ -167,6 +181,52 @@ def _environment(values):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
+
+
+#: Left beside the objects by whoever compiled them, naming the `-DMODEL_TYPE`
+#: they were compiled with. `examples/llm_q4nx/decode_kernels.py` writes one per
+#: model; mlir-air's own Makefile writes none.
+_KERNEL_STAMP = ".decode_kernels.{model_type}.json"
+_KERNEL_STAMP_GLOB = ".decode_kernels.*.json"
+
+
+def _verify_kernels(kernel_objects, model_type):
+    """Refuse another model's AIE objects.
+
+    `rms_residual.o` and `rope.o` are compiled per model and keep the same
+    filenames, so handing this op one model's objects with another's config
+    links, builds, and decodes to garbage -- the silent failure the rest of this
+    file exists to remove, and one it would otherwise have kept.
+
+    The objects do not say what they were built for, so the check is on the
+    stamp left beside them. A stamp for a *different* model is refused. No stamp
+    at all is allowed, because mlir-air's own Makefile writes none and building
+    against those is legitimate -- the cost is that the check cannot run, which
+    is why the stamped path is the one the examples use.
+    """
+    import glob
+
+    missing = [o for o in kernel_objects if not os.path.exists(o)]
+    if missing:
+        raise DecodeConfigError(
+            "these AIE objects do not exist:\n  " + "\n  ".join(missing)
+        )
+
+    for directory in sorted(
+        {os.path.dirname(os.path.abspath(o)) for o in kernel_objects}
+    ):
+        stamps = glob.glob(os.path.join(directory, _KERNEL_STAMP_GLOB))
+        if not stamps:
+            continue
+        want = os.path.join(directory, _KERNEL_STAMP.format(model_type=model_type))
+        if want not in stamps:
+            found = ", ".join(os.path.basename(s).split(".")[2] for s in sorted(stamps))
+            raise DecodeConfigError(
+                f"the AIE objects in {directory} were compiled for {found}, not "
+                f"{model_type}. rms_residual.o and rope.o differ between models "
+                f"and keep the same names, so linking these would build cleanly "
+                f"and decode to garbage. Build this model's kernels first."
+            )
 
 
 def _load_builder(fused_decode_dir):
@@ -226,6 +286,8 @@ def fused_decode(
             f"config must be a DecodeConfig, got {type(config).__name__}. The "
             f"configuration is the op's argument, not the process environment."
         )
+
+    _verify_kernels(list(kernel_objects), config.model_type)
 
     with _environment(config.env()):
         builder = _load_builder(fused_decode_dir)

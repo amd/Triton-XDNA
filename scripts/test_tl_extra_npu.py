@@ -60,7 +60,9 @@ def test_model_is_required():
 
     for bad in ("", None):
         try:
-            tl.extra.npu.DecodeConfig(model=bad, context_length=2048, vocab_chunk=30)
+            tl.extra.npu.DecodeConfig(
+                model=bad, model_type="QWEN3_4B", context_length=2048, vocab_chunk=30
+            )
         except ValueError:
             continue
         raise AssertionError(f"model={bad!r} was accepted")
@@ -70,8 +72,10 @@ def test_rejects_nonsense_shapes():
     import triton.language as tl
 
     for kwargs in (
-        dict(model="qwen3-4b", context_length=0, vocab_chunk=30),
-        dict(model="qwen3-4b", context_length=2048, vocab_chunk=0),
+        dict(model="qwen3-4b", model_type="QWEN3_4B", context_length=0, vocab_chunk=30),
+        dict(
+            model="qwen3-4b", model_type="QWEN3_4B", context_length=2048, vocab_chunk=0
+        ),
     ):
         try:
             tl.extra.npu.DecodeConfig(**kwargs)
@@ -86,7 +90,11 @@ def test_env_is_derived_not_inherited():
     import triton.language as tl
 
     cfg = tl.extra.npu.DecodeConfig(
-        model="qwen3-4b", context_length=2047, vocab_chunk=30, unified=1
+        model="qwen3-4b",
+        model_type="QWEN3_4B",
+        context_length=2047,
+        vocab_chunk=30,
+        unified=1,
     )
     env = cfg.env()
     expected = {
@@ -103,6 +111,59 @@ def test_env_is_derived_not_inherited():
     # Unset knobs stay out, so the builder keeps its own default for them.
     if "DECODE_WGROUP" in env:
         raise AssertionError("an unset knob leaked into the environment")
+
+
+def test_refuses_another_models_kernels():
+    """The objects are per-model and keep the same filenames, so linking the
+    wrong ones builds cleanly and decodes to garbage. A stamp naming a different
+    -DMODEL_TYPE is refused; an unstamped directory is allowed, because
+    mlir-air's own Makefile writes no stamp."""
+    import os
+    import tempfile
+
+    import triton.language as tl
+    from triton.language.extra.npu.fused_decode import _verify_kernels
+
+    with tempfile.TemporaryDirectory() as d:
+        objs = [os.path.join(d, n) for n in ("rope.o", "rms_residual.o")]
+        for o in objs:
+            open(o, "w").close()
+
+        _verify_kernels(objs, "QWEN3_4B")  # unstamped: allowed
+
+        open(os.path.join(d, ".decode_kernels.GEMMA3_4B.json"), "w").close()
+        try:
+            _verify_kernels(objs, "QWEN3_4B")
+        except ValueError as e:
+            if "GEMMA3_4B" not in str(e) or "QWEN3_4B" not in str(e):
+                raise AssertionError(f"message names neither side: {e}")
+        else:
+            raise AssertionError("another model's objects were accepted")
+
+        os.rename(
+            os.path.join(d, ".decode_kernels.GEMMA3_4B.json"),
+            os.path.join(d, ".decode_kernels.QWEN3_4B.json"),
+        )
+        _verify_kernels(objs, "QWEN3_4B")  # matching: accepted
+
+    try:
+        _verify_kernels(["/nonexistent/rope.o"], "QWEN3_4B")
+    except ValueError:
+        return
+    raise AssertionError("a missing object was accepted")
+
+
+def test_model_type_is_required():
+    """It is what makes the check above possible."""
+    import triton.language as tl
+
+    try:
+        tl.extra.npu.DecodeConfig(
+            model="qwen3-4b", model_type="", context_length=2048, vocab_chunk=30
+        )
+    except ValueError:
+        return
+    raise AssertionError("an empty model_type was accepted")
 
 
 def test_config_must_be_a_config():
@@ -128,6 +189,8 @@ def main():
             "the environment is derived from the config",
             test_env_is_derived_not_inherited,
         ),
+        ("model_type is required", test_model_type_is_required),
+        ("another model's kernels are refused", test_refuses_another_models_kernels),
         ("a dict is not a DecodeConfig", test_config_must_be_a_config),
     ]
     print("tl.extra.npu:")
