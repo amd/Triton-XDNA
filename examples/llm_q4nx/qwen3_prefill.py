@@ -21,9 +21,12 @@ Two further Qwen3 facts, both handled in the model's `config` rather than here:
   scaling. `config.rope_lut` builds it from mlir-air's own per-position
   generator, so the table this forward rotates K with is the one the fused
   decode rotates its new tokens with.
-* **The LM head is tied** on Qwen3-4B (`tie_word_embeddings=true`), so the
-  inherited `_lm_head` against the embedding matrix is correct. Qwen3-8B is
-  *not* tied; a model added here must be checked rather than assumed.
+* **Whether the LM head is tied is per model, not per family.** Qwen3-4B sets
+  `tie_word_embeddings=true`, so the inherited `_lm_head` runs against the
+  embedding matrix; Qwen3-8B, which runs this same forward, ships a separate
+  Q4NX `lm_head.weight`. Each `config.load_q4nx` resolves its own, and getting
+  it wrong produces fluent text off a plausible logit vector rather than an
+  error.
 
 Not handled here, because Qwen3 does not have them: Gemma's (1+w) norm fold,
 its embedding scale, its dual-theta RoPE and its sliding window.
