@@ -55,12 +55,39 @@ def launch(kernel, grid, *args, transform_script=None, **constexprs):
     So all that is left to do here is scope the two globals a compile needs.
 
     NOTE: neither cache keys on the transform script. Triton hashes the kernel
-    source; a second script for the same kernel would silently reuse the first
-    binary. Not reachable today -- each kernel here has exactly one script --
-    but it is a trap for anyone autotuning by swapping scripts.
+    source and its constexprs; a second script for the *same* constexprs would
+    silently reuse the first binary, and the second shape would run a schedule
+    chosen for the first. That stopped being hypothetical when Qwen2.5-7B began
+    choosing a schedule per GEMM, so `_check_script` below turns it into an
+    error instead of leaving it to this comment.
     """
+    _check_script(kernel, constexprs, transform_script)
     with _npu_driver(), _tiling_script(transform_script):
         kernel[grid](*args, **constexprs)
+
+
+#: (kernel, constexprs) -> the transform script it was first launched with.
+_script_for_key = {}
+
+
+def _check_script(kernel, constexprs, transform_script):
+    """Refuse a second transform script for constexprs already compiled.
+
+    Triton's cache would hand back the first binary, so the second script would
+    be silently ignored -- the caller gets a schedule it did not ask for, at a
+    shape the first one may not lower correctly for. Raising names both scripts;
+    the fix is to give the two shapes different constexprs, or to settle on one
+    schedule for both.
+    """
+    key = (kernel, tuple(sorted(constexprs.items())))
+    first = _script_for_key.setdefault(key, transform_script)
+    if first != transform_script:
+        raise RuntimeError(
+            f"{getattr(kernel, '__name__', kernel)} was already compiled for "
+            f"{dict(key[1])} with transform script {first!r}; Triton's cache "
+            f"does not key on the script, so {transform_script!r} would be "
+            f"ignored and the first schedule used instead."
+        )
 
 
 class _npu_driver:
@@ -296,14 +323,44 @@ def _padded_weight(w, Kp, Np):
     return b
 
 
-def triton_matmul(x, w, block_m=BLOCK_M, block_n=BLOCK_N):
-    """x: [M, K] float32/bf16, w: [K, N] bf16 -> [M, N] float32, on the NPU."""
+#: Triton's own cap on the element count of one tile (`tl.load` of
+#: `[BLOCK_K, BLOCK_N]`). Not a device limit and not tunable -- the frontend
+#: refuses to build the tensor. It binds here because `BLOCK_K` is the *whole*
+#: padded reduction: at Kp=32768 a 256-wide tile is 8388608 elements, twice the
+#: maximum, and every model whose MLP intermediate exceeds 16384 hits it in the
+#: `down` projection. Checked before dispatch so the message names the knob
+#: rather than arriving as a CompilationError from inside the frontend.
+MAX_TILE_NUMEL = 4194304
+
+#: The matmul schedule. Hand-written for gpt2 and reused by every model here.
+#: It does not lower at every shape -- see `triton_matmul`'s `transform_script`.
+MATMUL_SCRIPT = "gpt2/transform_matmul_aie2p.mlir"
+
+
+def triton_matmul(
+    x, w, block_m=BLOCK_M, block_n=BLOCK_N, transform_script=MATMUL_SCRIPT
+):
+    """x: [M, K] float32/bf16, w: [K, N] bf16 -> [M, N] float32, on the NPU.
+
+    `transform_script` is the schedule to lower with, as an `examples`-relative
+    path, or None to let the driver generate one. The default is the shared
+    hand-written schedule; it is not universal, and the one shape here that it
+    rejects is recorded at the call site that passes None
+    (`qwen25_prefill._layer`), because a shape it rejects fails loudly in
+    aiecc rather than silently.
+    """
     M, K = x.shape
     Kw, N = w.shape
     assert K == Kw, (x.shape, w.shape)
     Mp = math.ceil(M / block_m) * block_m
     Np = math.ceil(N / block_n) * block_n
     Kp = _pow2(K)  # tl.arange needs a power of two
+    if Kp * block_n > MAX_TILE_NUMEL:
+        raise ValueError(
+            f"a [{Kp}, {block_n}] weight tile is {Kp * block_n} elements, over "
+            f"Triton's {MAX_TILE_NUMEL} maximum. K={K} pads to {Kp}; pass a "
+            f"block_n of at most {MAX_TILE_NUMEL // Kp}."
+        )
     if isinstance(w, ResidentWeight):
         # Padded ahead of time, by someone who then freed the original. Its
         # padding was computed from the same rule, but a caller passing a
@@ -336,7 +393,7 @@ def triton_matmul(x, w, block_m=BLOCK_M, block_n=BLOCK_N):
             Kp,
             Np,
             Np,
-            transform_script=script("gpt2/transform_matmul_aie2p.mlir"),
+            transform_script=(script(transform_script) if transform_script else None),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=Kp,

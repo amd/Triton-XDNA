@@ -239,18 +239,23 @@ class LlamaPrefill:
             inv = torch.rsqrt((v * v).mean(-1, keepdim=True) + eps)
             return v * inv * weight
 
-    def _matmul(self, x, w, backend=None):
+    def _matmul(self, x, w, backend=None, **mm):
         """x: [N, K] float32, w: [K, M] bfloat16 -> [N, M] float32.
 
         bf16 inputs with f32 accumulation, as the NPU GEMM does. Rounding x to
         bf16 here is not cosmetic: it is what the device sees, so keeping the
         reference in full f32 would hide a real error source.
+
+        `mm` is forwarded to `kernels.triton_matmul` -- `block_n` and
+        `transform_script`, both of which a wide-MLP model has to move off
+        their defaults (see `qwen25_prefill._layer`). The torch path ignores
+        them: they select a device schedule, and it has none.
         """
         with self.timer.track("matmul"):
             if self._on_npu("matmul", backend):
                 import kernels
 
-                return kernels.triton_matmul(x, w)
+                return kernels.triton_matmul(x, w, **mm)
             if not hasattr(w, "to"):
                 # A ResidentWeight: padded for the device, original freed. The
                 # torch path cannot run against it, and saying so here beats an
