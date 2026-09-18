@@ -301,6 +301,16 @@ runs:
             # the decoupled q dim are both in it.
             gate qwen3_4b_q4nx --prefill-only
 
+            # Gemma3-4B, prefill-only for the same two reasons. Its gate is
+            # worth more than the others' despite being the same shape: four
+            # bundle conventions, a norm sandwich, dual-theta RoPE and a GELU
+            # GLU all have to be right for the first token to come out, and
+            # each of them fails into fluent wrong text rather than an error.
+            # What it does NOT cover is the 1024-token sliding window -- the
+            # canonical prompt is six tokens, so the window never binds. Only
+            # the decode comparison against mlir-air's own generation does.
+            gate gemma3_4b_q4nx --prefill-only
+
             echo ""
             echo "--------------------------------------------------"
             echo "Q4NX Gate Results:"

@@ -220,6 +220,17 @@ EXAMPLES = [
             "RMS-normalized between the QKV projection and RoPE."
         ),
     },
+    {
+        "kind": "model",
+        "name": "Gemma3-4B (Q4NX)",
+        "path": "gemma3_4b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Gemma3-4B on the same split, and the furthest from the Llama "
+            "block: a four-norm sandwich, two RoPE thetas chosen per layer, a "
+            "1024-token sliding window, and a GELU-tanh GLU."
+        ),
+    },
 ]
 
 # Directories under examples/ that are not examples. Keep in step with

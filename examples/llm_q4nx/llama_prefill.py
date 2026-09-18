@@ -148,6 +148,14 @@ class LlamaPrefill:
     #: reason it exists -- see qwen3_prefill.py.
     EXTRA_LAYER_WEIGHTS = {}
 
+    #: Everything `load_weights` establishes, which is what a second instance
+    #: needs to share rather than reload. Declared here so `share_weights_from`
+    #: can copy it, because the alternative -- each caller listing the
+    #: attributes it remembers -- is a trap: a subclass that adds one gets an
+    #: AttributeError deep in the forward, from every call site that was
+    #: written before it existed. Gemma3's second RoPE table did exactly that.
+    WEIGHT_ATTRS = ("_w", "embed", "final_norm", "lm_head", "_lut", "fingerprint")
+
     def __init__(
         self,
         backend="cpu",
@@ -265,8 +273,15 @@ class LlamaPrefill:
                 [x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1
             ).reshape(N, -1)
 
-    def _attention(self, q, k, v, n_q, n_kv, dh, backend=None):
+    def _attention(self, q, k, v, n_q, n_kv, dh, window=None, backend=None):
         """Causal GQA. q: [N, n_q*dh], k/v: [N, n_kv*dh] -> [N, n_q*dh].
+
+        `window` bounds how far back a position may attend: with it set, j is
+        visible to i only while `i - window < j <= i`. None is unbounded, which
+        is every Llama and Qwen3 layer; Gemma3 sets it on five layers in six.
+        A parameter rather than a subclass override because it is the same
+        operator with a different mask, exactly as `n_q`/`n_kv` are the same
+        operator at different head counts.
 
         CPU only, see NPU_OPS.
         """
@@ -280,6 +295,12 @@ class LlamaPrefill:
             vh = vh.repeat_interleave(rep, dim=0)
             scores = (qh @ kh.transpose(1, 2)) * (dh**-0.5)  # [n_q, N, N]
             mask = torch.full((N, N), float("-inf")).triu(1)
+            if window is not None:
+                # `tril(-window)` is -inf exactly where j <= i - window, which
+                # is what falls out of the window. Added to the causal mask
+                # rather than replacing it: a position must satisfy both, and
+                # j == i always survives, so no row is fully masked.
+                mask = mask + torch.full((N, N), float("-inf")).tril(-window)
             scores = scores + mask
             p = torch.softmax(scores, dim=-1)
             return (p @ vh).transpose(0, 1).reshape(N, n_q * dh)
@@ -295,6 +316,19 @@ class LlamaPrefill:
             return torch.matmul(x.to(torch.bfloat16), w.t()).to(torch.float32)
 
     # ---- weights ----
+    def share_weights_from(self, other):
+        """Adopt `other`'s loaded weights instead of loading them again.
+
+        For `--compare-cpu`, which runs the same weights through a second
+        instance on the CPU backend: a reload would cost minutes and, worse,
+        would compare against a different dequantization rather than the same
+        one. `WEIGHT_ATTRS` is read off `other`'s class, so a subclass that adds
+        an attribute is covered by declaring it there and nowhere else.
+        """
+        for attr in type(other).WEIGHT_ATTRS:
+            setattr(self, attr, getattr(other, attr))
+        return self
+
     def load_weights(self, model=None):
         raw = load_q4nx(model or self.model)
         self.fingerprint = raw["fingerprint"]
