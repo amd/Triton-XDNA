@@ -69,7 +69,14 @@ class Qwen3Prefill(LlamaPrefill):
         )
 
     def _layer(self, x, L, N, keep=None):
-        """One Qwen3 decoder block. x: [N, D] float32. Returns [N, D].
+        """One Qwen3 transformer block, on the prompt. x: [N, D] -> [N, D].
+
+        "Block", not "decoder block". Qwen3 is a decoder-only model and the
+        usual name for one of these is a decoder layer -- HF's class is
+        `Qwen3DecoderLayer`. But in this repo "decode" means the *other half*
+        of the split: mlir-air's fused per-token kernel, the one
+        `decode_build.py` builds and `DECODE_MODEL` selects. This file is the
+        prefill, so it avoids the word rather than inviting the confusion.
 
         Llama's block with the two `_qk_norm` calls added, and o_proj no longer
         square: Qwen3-4B has DQ=4096 against D=2560, so attention output and
