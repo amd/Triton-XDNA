@@ -89,6 +89,22 @@ def _t(a, dtype=torch.float32):
     return torch.from_numpy(np.ascontiguousarray(a)).to(dtype)
 
 
+def _as_bf16(a):
+    """A numpy array as ml_dtypes bfloat16, without a copy when it already is.
+
+    mlir-air's readers hand back float32 -- their `bf16()` upcasts on the way
+    out, and `dequant()` produces float32 by construction -- which is the right
+    default for a reference forward and the wrong one for a table we only ever
+    read a few rows of. Narrowing here means `_t` can then reinterpret rather
+    than convert, so a tied LM head aliases the embedding instead of copying it.
+    """
+    from ml_dtypes import bfloat16
+
+    if a.dtype == bfloat16:
+        return a
+    return a.astype(bfloat16)
+
+
 class OpTimer:
     """Per-op wall-clock timer. Zero overhead when disabled.
 
@@ -235,6 +251,16 @@ class LlamaPrefill:
                 import kernels
 
                 return kernels.triton_matmul(x, w)
+            if not hasattr(w, "to"):
+                # A ResidentWeight: padded for the device, original freed. The
+                # torch path cannot run against it, and saying so here beats an
+                # AttributeError three frames down.
+                raise RuntimeError(
+                    "this weight was made NPU-resident, which frees the "
+                    "unpadded copy the torch path needs. Build the model "
+                    "without make_npu_resident() to run matmul on the CPU "
+                    "(--compare-cpu and --ops without matmul both do)."
+                )
             return (x.to(torch.bfloat16).to(torch.float32) @ w.to(torch.float32)).to(
                 torch.float32
             )
@@ -315,7 +341,39 @@ class LlamaPrefill:
         with self.timer.track("lm_head"):
             return torch.matmul(x.to(torch.bfloat16), w.t()).to(torch.float32)
 
+    #: The projections `_matmul` sends to the NPU, and so the ones worth making
+    #: resident. The norms and the per-head q/k norms are kilobytes and stay as
+    #: they are.
+    NPU_WEIGHTS = ("qkv", "o", "gate_up", "down")
+
     # ---- weights ----
+    def make_npu_resident(self):
+        """Pad every projection for the device now, and free the unpadded copy.
+
+        `kernels.triton_matmul` pads each weight on first use and caches the
+        result for the process lifetime, so after one prefill both forms are
+        resident: 6.8 GiB unpadded plus 10.6 GiB padded on Qwen3-4B. On a run
+        that only ever goes to the NPU the unpadded form is dead the moment the
+        padded one exists -- but the cache cannot drop it, because it is keyed
+        on that tensor's address and weakref'd to it.
+
+        So the conversion is done here instead, one weight at a time, each
+        original released as its padded form is built. That also moves the work
+        off the first prefill, where it was the whole of an 11 GiB step.
+
+        Not the default: it is one-way (see `_matmul`), and the torch reference
+        path, `--ops` subsets that leave matmul on the CPU, and `--compare-cpu`
+        all need the original. The entry points that only ever run on the
+        device opt in.
+        """
+        import kernels
+
+        for w in self._w:
+            for name in self.NPU_WEIGHTS:
+                if name in w:
+                    w[name] = kernels.resident_weight(w[name])
+        return self
+
     def share_weights_from(self, other):
         """Adopt `other`'s loaded weights instead of loading them again.
 
@@ -332,13 +390,36 @@ class LlamaPrefill:
     def load_weights(self, model=None):
         raw = load_q4nx(model or self.model)
         self.fingerprint = raw["fingerprint"]
-        self.embed = raw["embed"]  # float32 [VOCAB, D], kept as numpy (1 GB)
+        # The embedding table and the LM head, in bf16 rather than the float32
+        # mlir-air's readers return. Two savings, and the second is the larger:
+        #
+        #  * the table itself halves -- 1.45 -> 0.72 GiB on Qwen3-4B, 2.5 ->
+        #    1.25 on Gemma3's 262208-row one. Nothing here wants the extra
+        #    precision: `prefill` gathers a handful of rows and immediately
+        #    rounds them through bf16 anyway, because that is what the device
+        #    sees.
+        #  * where the head is tied, it becomes an *alias* of the table instead
+        #    of a second array. `_t` reinterprets a bf16 buffer rather than
+        #    converting it, so `self.lm_head` and `self.embed` end up sharing
+        #    one allocation; from float32 they could not, and the copy cost a
+        #    second full-size tensor.
+        #
+        # `raw` is emptied as we go: it holds the float32 originals, and the
+        # point is not to keep them alive alongside the bf16 ones.
+        # `raw` is emptied as we go: it holds the float32 originals, and the
+        # point is not to keep them alive alongside the bf16 ones.
+        embed = raw.pop("embed")
+        lm_head = raw.pop("lm_head")
+        # Tied to `embed` on the 1B, 3B and Qwen3-4B, and its own dequantized
+        # tensor on the 8B and Gemma3 -- `config.load_q4nx` decides which, so
+        # this must not assume either. Getting it wrong is silent: the 8B ran
+        # on the tied assumption and generated 57618 instead of " Paris".
+        tied = lm_head is embed
+        self.embed = _as_bf16(embed)
+        del embed
+        self.lm_head = _t(self.embed if tied else _as_bf16(lm_head), torch.bfloat16)
+        del lm_head
         self.final_norm = _t(raw["final_norm"])
-        # Tied to `embed` on the 1B and 3B, and its own dequantized tensor on
-        # the 8B -- `config.load_q4nx` decides which, so this line must not
-        # assume either. Getting it wrong is silent: the 8B ran on the tied
-        # assumption and generated 57618 instead of " Paris".
-        self.lm_head = _t(raw["lm_head"], torch.bfloat16)
         self._w = []
         # Pop as we go: `raw` holds every layer's numpy arrays at once, and
         # holding those alongside the torch copies doubles the resident set for

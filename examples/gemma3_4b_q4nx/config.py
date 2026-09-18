@@ -160,6 +160,12 @@ def load_q4nx(model=None):
 
     src = model or MODEL_DEFAULT
     qm = gw.Q4nxModel(src)
+    # Before the layers, not after, and for the reason the 8B's config gives:
+    # this bundle's LM head is a real Q4NX tensor, and dequantizing 262208x2560
+    # peaks well above the 2.5 GiB result it produces. Paying that spike while
+    # 34 layers are already resident sets the high-water mark for the whole
+    # load; paying it against an empty heap does not.
+    embed, final_norm, lm_head = qm.embed_norm_lmhead()
     layers = []
     for k in range(N_LAYERS):
         w = qm.layer_weights(k)
@@ -176,7 +182,6 @@ def load_q4nx(model=None):
                 **w,
             )
         )
-    embed, final_norm, lm_head = qm.embed_norm_lmhead()
     return dict(
         layers=layers,
         embed=embed,
