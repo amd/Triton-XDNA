@@ -111,7 +111,15 @@ class Gemma3Prefill(LlamaPrefill):
         )
 
     def _layer(self, x, L, N, keep=None):
-        """One Gemma3 decoder block. x: [N, D] float32. Returns [N, D].
+        """One Gemma3 transformer block, on the prompt. x: [N, D] -> [N, D].
+
+        "Block", not "decoder block" -- see `qwen3_prefill._layer` for why the
+        usual name is avoided in these files: "decode" here is mlir-air's fused
+        per-token kernel, the other half of the split, and this is the prefill.
+
+        Which RoPE table and which attention window this layer gets is decided
+        by `config.is_global_layer(L)`: one layer in six is global, the rest
+        are local with a 1024-token window.
 
         `keep` is how many leading rows are real; only those reach the KV
         cache. The rest are sequence padding (see `SEQ_BUCKET`).
