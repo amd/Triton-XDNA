@@ -39,7 +39,9 @@ triton-shared needs schedules written for it.
 """
 
 import contextlib
+import hashlib
 import os
+import threading
 
 #: Knobs mlir-air's builder reads from the environment, and the attribute on
 #: `DecodeConfig` that supplies each. Anything not listed here is left alone, so
@@ -55,6 +57,7 @@ _ENV = {
     "W_DUAL_CHAN": "dual_channel",
     "DECODE_WGROUP": "weight_group",
     "DECODE_STACK": "stack_size",
+    "PROJ_RC_CACHE": "proj_rc_cache",
 }
 
 
@@ -90,6 +93,11 @@ class DecodeConfig:
             one-BO limit. ``0`` disables it.
         stack_size: AIE core stack. ``None`` takes the builder's own, which is
             what every model but the 8B wants.
+        proj_rc_cache: the builder's ``PROJ_RC_CACHE``, which selects the cached
+            -- rather than recomputed -- reduction in ``proj_qmm.cc``. The
+            builder and the kernel read it separately and must agree, so a model
+            that moves it off the default has to say so here. ``None`` leaves the
+            builder's default (1), which is what every model currently takes.
     """
 
     def __init__(
@@ -105,6 +113,7 @@ class DecodeConfig:
         dual_channel=1,
         weight_group=None,
         stack_size=None,
+        proj_rc_cache=None,
     ):
         if not model:
             raise DecodeConfigError(
@@ -137,6 +146,7 @@ class DecodeConfig:
         self.dual_channel = dual_channel
         self.weight_group = weight_group
         self.stack_size = stack_size
+        self.proj_rc_cache = proj_rc_cache
 
     #: The context length the built artifact actually serves, which is rounded
     #: up to a multiple of 16. Two requests that round to the same value produce
@@ -144,6 +154,17 @@ class DecodeConfig:
     @property
     def attn_maxl(self):
         return 16 * ((self.context_length + 15) // 16)
+
+    def fingerprint(self):
+        """Short digest of every field that changes the artifact.
+
+        Used to name the build. `model` and `context_length` are in the name
+        already; this covers the rest, because two builds differing only in,
+        say, `weight_group` are different artifacts that would otherwise land on
+        the same path.
+        """
+        parts = "|".join(f"{k}={v}" for k, v in sorted(self.env().items()))
+        return hashlib.sha256(parts.encode()).hexdigest()[:8]
 
     def env(self):
         """This configuration as the environment mlir-air's builder reads."""
@@ -161,6 +182,15 @@ class DecodeConfig:
             f"{self.context_length}, attn_maxl={self.attn_maxl}, "
             f"vocab_chunk={self.vocab_chunk})"
         )
+
+
+#: One build at a time per process. `_environment` mutates `os.environ` and the
+#: builder reads it while it executes, so two concurrent calls would interleave
+#: their models and context lengths -- one resolving the other's configuration,
+#: and the restores clobbering each other. The window is the env swap plus the
+#: import plus the compile, so the lock covers all three rather than just the
+#: swap.
+_BUILD_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
@@ -188,6 +218,10 @@ def _environment(values):
 #: model; mlir-air's own Makefile writes none.
 _KERNEL_STAMP = ".decode_kernels.{model_type}.json"
 _KERNEL_STAMP_GLOB = ".decode_kernels.*.json"
+
+#: What `lower` accepts. `None` is not among them: the op always names a format,
+#: because the two it can produce go to different runtimes.
+_OUTPUT_FORMATS = frozenset({"xclbin", "elf", "pdi"})
 
 
 def _verify_kernels(kernel_objects, model_type):
@@ -277,7 +311,11 @@ def fused_decode(
             `rope.o` differ between models, and linking another model's is not
             an error, it is wrong output.
         output_format: ``"xclbin"``, ``"elf"`` or ``"pdi"``.
-        name: artifact name; defaults to the model and context length.
+        name: artifact name. Defaults to the model, the context length and a
+            digest of every other field that changes the artifact -- two builds
+            differing only in `vocab_chunk` or `weight_group` would otherwise
+            share a project directory, and the second would overwrite the first
+            while the first call's returned paths still pointed at it.
     """
     from triton.backends.amd_triton_npu.fused_decode_op import FusedDecodeOp
 
@@ -287,9 +325,19 @@ def fused_decode(
             f"configuration is the op's argument, not the process environment."
         )
 
+    # `_aircc_compile` treats anything that is not "elf" or "pdi" as "xclbin",
+    # so a typo silently produces the wrong kind of artifact rather than
+    # failing. Checked here instead.
+    if output_format not in _OUTPUT_FORMATS:
+        raise DecodeConfigError(
+            f"output_format={output_format!r} is not one of "
+            f"{sorted(_OUTPUT_FORMATS)}. Anything unrecognised would lower as "
+            f"xclbin without complaint."
+        )
+
     _verify_kernels(list(kernel_objects), config.model_type)
 
-    with _environment(config.env()):
+    with _BUILD_LOCK, _environment(config.env()):
         builder = _load_builder(fused_decode_dir)
         if builder.MODEL_NAME != config.model:
             raise DecodeConfigError(
@@ -300,7 +348,11 @@ def fused_decode(
         op = FusedDecodeOp.from_builder(
             builder.build_module,
             kernel_objects=list(kernel_objects),
-            name=name or f"fused_decode_{config.model}_L{config.context_length}",
+            name=name
+            or (
+                f"fused_decode_{config.model}_L{config.context_length}"
+                f"_{config.fingerprint()}"
+            ),
             stack_size=builder.STACK_SIZE,
         )
         artifacts = op.lower(output_format=output_format)
