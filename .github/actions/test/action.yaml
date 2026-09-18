@@ -211,6 +211,14 @@ runs:
         # build and is the stronger signal anyway: it gates on the canonical
         # prompt's first token, so a wrong kernel fails here rather than being
         # absorbed into fluent-looking output. npu2-only, like gpt2/qwen.
+        # Outside the device guard, and before everything else here: this checks
+        # that `tl.extra.npu` survived the build. Triton's setup.py installs it
+        # from amd_triton_npu/language/, so it is a property of the build rather
+        # than of the source tree -- and nothing in this repo imports it yet, so
+        # a build that stopped installing it would break nothing and be noticed
+        # by no one. Needs no NPU, no weights and no mlir-air sources.
+        python3 scripts/test_tl_extra_npu.py
+
         if [ "$DEVICE" = "aie2p" ]; then
           # Which decode artifact the example asks mlir-air for. Needs no NPU,
           # no weights and no mlir-air sources, so it runs before the fetch and
