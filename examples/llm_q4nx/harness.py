@@ -104,6 +104,25 @@ def check_host_memory(spec):
         )
 
 
+def load_prefill_weights(m, backend):
+    """Load `m`'s weights, and free what a device-only run does not need.
+
+    Both entry points go through here rather than each remembering the second
+    step. They did not: `run_prefill` converted and the interactive session did
+    not, so a chat kept the full unpadded set alongside the padded one and saw
+    none of the saving -- which is invisible, because the only symptom is a
+    bigger process.
+
+    The conversion is one-way (see `LlamaPrefill.make_npu_resident`), so it is
+    conditional on this run never needing the torch path: the NPU backend, with
+    matmul actually on it. `--compare-cpu` and `--ops` subsets that leave matmul
+    on the CPU build their own model and do not come through here at all.
+    """
+    m.load_weights()
+    if backend == "npu" and "matmul" in m.enabled:
+        m.make_npu_resident()
+
+
 def run_prefill(
     prefill_cls, cfg, ids, backend, ops, max_seq, model, kv_path, profile=False
 ):
@@ -128,16 +147,9 @@ def run_prefill(
     m.timer.enabled = profile
     t0 = time.time()
     try:
-        m.load_weights()
+        load_prefill_weights(m, backend)
     except Exception as e:  # noqa: BLE001 -- any failure to obtain weights
         raise ExampleUnavailable(f"cannot load the q4nx weights: {e}") from e
-    if backend == "npu" and "matmul" in m.enabled:
-        # Every GEMM here goes to the device, so the unpadded weights are dead
-        # once the padded ones exist. Freeing them halves what this process
-        # holds; see `make_npu_resident`. Done here rather than in the prefill
-        # class because it is one-way, and the debugging drivers -- which keep
-        # a CPU reference to diff against -- must not take it.
-        m.make_npu_resident()
     t_load = time.time() - t0
     if profile:  # one warm pass so timings exclude compilation
         m.prefill(ids)
@@ -190,7 +202,7 @@ def make_session_class(air, prefill_cls, cfg, backend, ops, model):
                 model=model,
                 expect_model=cfg.MODEL_NAME,
             )
-            self.prefiller.load_weights()
+            load_prefill_weights(self.prefiller, backend)
             print(
                 f"[session] Triton prefill resident ({time.perf_counter() - t0:.2f}s); "
                 f"building decode...",
