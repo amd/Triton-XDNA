@@ -455,6 +455,61 @@ QWEN2_5_7B = ModelSpec(
 )
 
 
+#: Phi-4-mini. Llama-shaped but for the rotation: `partial_rotary_factor=0.75`
+#: means RoPE covers 96 of each head's 128 lanes and the trailing 32 pass
+#: through, and the frequencies come from a LongRoPE factor table shipped in
+#: the bundle rather than from a closed form. That is a `_rope` override
+#: (`llm_q4nx/phi4_prefill.py`); the block itself is Llama's. Tied LM head, as
+#: on the 1B and 3B.
+#:
+#: **`model_type` is `PHI4_4B`, not `PHI4_MINI`.** The kernels are compiled
+#: against that name and the decoder class defaults to it; deriving a
+#: `-DMODEL_TYPE` from this spec's `name` would produce a header that does not
+#: exist. Taken from its Makefile, like every other value here.
+#:
+#: The smallest `decode_env` of any model here, and the absences are facts
+#: rather than omissions: no `DECODE_STACK`, no `DECODE_WGROUP` -- its
+#: Makefile's `DECODE_FLAGS` carries only `W_DUAL_CHAN`, which again arrives by
+#: a bare `export`. `VOCAB_CHUNK_I2=18` is emphatically not free: its Makefile
+#: records that `(K/PAYLOAD)=6` must divide `VOCAB_I2*PAIR_ROWS`, leaving
+#: {3,6,9,18} legal, and that the 1B's default is not even a divisor and would
+#: deadlock this model's vocab wave.
+PHI4_MINI = ModelSpec(
+    name="phi4-mini",
+    decode_env=dict(
+        DECODE_MODEL="phi4-mini",
+        VOCAB_CHUNK_I2="18",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="1",
+        DECODE_GOLDEN="1",
+        W_DUAL_CHAN="1",
+    ),
+    model_type="PHI4_4B",
+    air_package="phi4_mini_q4nx",
+    air_inference="phi4_mini_q4nx_inference.py",
+    # The Q4NX bundle carries no chat template, so its driver takes the
+    # tokenizer from the HF checkpoint -- which is also the bf16 reference its
+    # own verify gate compares against. Ungated.
+    tokenizer_fallback="microsoft/Phi-4-mini-instruct",
+    driver_api="prefiller",
+    # Its own name for the class, as `FusedDecode3B`/`FusedDecode8B` are
+    # theirs. It is imported into the inference module's namespace, which is
+    # where the harness looks.
+    decoder_class="FusedDecodePhi4",
+    # Its driver resolves the templates from `DECODE_TEMPLATES`, defaulting to
+    # its own directory; ours are written to the shared `fused_decode/` one.
+    decode_dir_env="DECODE_TEMPLATES",
+    # Measured, not estimated: peak RSS of `--prefill-only` is 12.1 GiB, set
+    # here with a margin. Under the 4B-class models despite a 200064-row
+    # embedding, because that embedding is also the LM head -- tied, so one
+    # allocation serves both.
+    min_host_gib=14.0,
+    extra_packages=("llama32_1b_q4nx", "llama32_3b"),
+    supports_hsa=False,
+)
+
+
 SPECS = {
     s.name: s
     for s in (
@@ -464,6 +519,7 @@ SPECS = {
         QWEN3_4B,
         QWEN3_8B,
         QWEN2_5_7B,
+        PHI4_MINI,
         GEMMA3_4B,
     )
 }

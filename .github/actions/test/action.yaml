@@ -327,6 +327,13 @@ runs:
             # biased projection -- every other forward here is y = x @ W.
             gate qwen25_7b_q4nx --prefill-only
 
+            # Phi-4-mini, prefill-only. Its gate is the only coverage of a
+            # partial rotation: 96 of 128 lanes rotated and the rest copied
+            # through, on LongRoPE frequencies. Getting either wrong leaves the
+            # head boundary intact and the text fluent, so nothing but the
+            # first-token comparison catches it.
+            gate phi4_mini_q4nx --prefill-only
+
             # Gemma3-4B, prefill-only for the same two reasons. Its gate is
             # worth more than the others' despite being the same shape: four
             # bundle conventions, a norm sandwich, dual-theta RoPE and a GELU

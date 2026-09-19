@@ -36,6 +36,7 @@ DEFAULT_SKIPPED_EXAMPLES = {
     "qwen3_4b_q4nx",
     "qwen3_8b_q4nx",
     "qwen25_7b_q4nx",
+    "phi4_mini_q4nx",
     "gemma3_4b_q4nx",
     # Not an example: the harness the *_q4nx examples share. Its files are
     # libraries, and the two with a __main__ are build steps -- running
@@ -70,6 +71,7 @@ SCRIPTLESS_UNSUPPORTED = {
         "qwen3_4b_q4nx": "npu2-only example",
         "qwen3_8b_q4nx": "npu2-only example",
         "qwen25_7b_q4nx": "npu2-only example",
+        "phi4_mini_q4nx": "npu2-only example",
         "gemma3_4b_q4nx": "npu2-only example",
     },
     "aie2p": {},
