@@ -233,6 +233,17 @@ EXAMPLES = [
     },
     {
         "kind": "model",
+        "name": "Qwen2.5-7B (Q4NX)",
+        "path": "qwen25_7b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Llama-shaped but for a bias on the q, k and v projections, which "
+            "nothing else here has. Its weights are not a bundle either: an "
+            "upstream checkpoint is quantized on load."
+        ),
+    },
+    {
+        "kind": "model",
         "name": "Gemma3-4B (Q4NX)",
         "path": "gemma3_4b_q4nx",
         "datatypes": "bf16 prefill, q4nx decode",

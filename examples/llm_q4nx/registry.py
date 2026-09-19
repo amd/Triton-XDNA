@@ -392,9 +392,80 @@ QWEN3_8B = ModelSpec(
 )
 
 
+#: Qwen2.5-7B. Llama-shaped in every respect the operator routing cares about
+#: -- one norm pair, fused QKV, half-split RoPE, SwiGLU, GQA (7 q heads per kv
+#: head), single theta, causal with no window -- and different in one place: q,
+#: k and v each carry a **bias**, added to the raw projection output before
+#: RoPE. Nothing else here has a bias on any projection, which is why it needs
+#: its own forward (`llm_q4nx/qwen25_prefill.py`). It emphatically does *not*
+#: have Qwen3's qk-norm.
+#:
+#: The first model here whose weights are **not a Q4NX bundle**. FastFlowLM
+#: publishes no Qwen2.5-7B NPU2 bundle -- their Qwen2.5 line stops at 3B, and
+#: that converter's output uses a nibble interleave the Llama/Qwen3 bundles do
+#: not -- so mlir-air quantizes an ungated upstream HF checkpoint on load
+#: instead, through the same quantizer the decode's cascade cache uses. Both
+#: sides therefore see bit-identical weights, and `config.load_q4nx` goes
+#: through mlir-air's `open_weight_source`, which picks the bundle reader only
+#: when the source really is a `model.q4nx`.
+#:
+#: `DECODE_ENV` plus the usual bare `export` for `W_DUAL_CHAN=1`. Its own
+#: values, all from its Makefile:
+#:
+#: * `VOCAB_CHUNK_I2=7`, on a 152064 vocabulary -- a fourth distinct value.
+#: * `DECODE_STACK=6144`, the same as Qwen3-8B's and for the same reason at a
+#:   different K: at K=3584 the seven K-wide L1 activation buffers leave too
+#:   little of the 64 KiB core memory for the builder's 10240 default.
+#: * `DECODE_WGROUP=7` -- 28 layers is 3.80 GiB and the lm-head adds 0.32, over
+#:   the 4 GiB a shim BD's uint32 byte offset can address in one BO.
+QWEN2_5_7B = ModelSpec(
+    name="qwen2.5-7b",
+    decode_env=dict(
+        DECODE_MODEL="qwen2.5-7b",
+        VOCAB_CHUNK_I2="7",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="1",
+        DECODE_GOLDEN="1",
+        DECODE_STACK="6144",
+        DECODE_WGROUP="7",
+        W_DUAL_CHAN="1",
+    ),
+    model_type="QWEN2_5_7B",
+    air_package="qwen25_7b_q4nx",
+    air_inference="qwen25_7b_q4nx_inference.py",
+    # The weight source *is* the tokenizer's checkpoint here, which is not true
+    # of the bundle-backed models: mlir-air's default `Q4NX_MODEL_SOURCE` for
+    # this one is the upstream repo itself. Ungated.
+    tokenizer_fallback="Qwen/Qwen2.5-7B-Instruct",
+    driver_api="kv_arrays",
+    decoder_class="FusedDecoder",
+    decode_dir_env="Q4NX_QWEN25_7B_DECODE_DIR",
+    # Measured, not estimated: peak RSS of `--prefill-only` is 33.8 GiB, set
+    # here with a margin. The largest of any model here, and not because it is
+    # the largest model -- Llama-3.1-8B has more parameters and peaks at 23.9.
+    # The difference is that this one quantizes on load: the mapped fp16
+    # checkpoint and the Q4NX-rounded result are both resident while the
+    # quantizer runs. Expect this to exceed a CI runner and skip.
+    min_host_gib=36.0,
+    # `qwen25_3b` holds the `LlamaConfig` this model's dims are read back
+    # against; mlir-air's own weights module inserts it at import.
+    extra_packages=("qwen25_3b",),
+    supports_hsa=False,
+)
+
+
 SPECS = {
     s.name: s
-    for s in (LLAMA_3_2_1B, LLAMA_3_2_3B, LLAMA_3_1_8B, QWEN3_4B, QWEN3_8B, GEMMA3_4B)
+    for s in (
+        LLAMA_3_2_1B,
+        LLAMA_3_2_3B,
+        LLAMA_3_1_8B,
+        QWEN3_4B,
+        QWEN3_8B,
+        QWEN2_5_7B,
+        GEMMA3_4B,
+    )
 }
 
 #: What `--model` defaults to where a single model is implied.

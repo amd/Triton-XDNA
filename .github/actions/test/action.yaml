@@ -319,6 +319,14 @@ runs:
             # SKIP is not a PASS.
             gate qwen3_8b_q4nx --prefill-only
 
+            # Qwen2.5-7B, prefill-only, and the one gate here that is not
+            # reading a prepared weight bundle: there is no FastFlowLM
+            # Qwen2.5-7B NPU2 bundle, so it quantizes an upstream checkpoint on
+            # load. That makes it the slowest of these and gives it a
+            # min_host_gib of its own, but it is also the only coverage of a
+            # biased projection -- every other forward here is y = x @ W.
+            gate qwen25_7b_q4nx --prefill-only
+
             # Gemma3-4B, prefill-only for the same two reasons. Its gate is
             # worth more than the others' despite being the same shape: four
             # bundle conventions, a norm sandwich, dual-theta RoPE and a GELU
