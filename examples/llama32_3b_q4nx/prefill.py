@@ -96,8 +96,7 @@ def main(argv=None):
 
     if args.compare_cpu and args.backend != "cpu":
         ref = LlamaPrefill(backend="cpu", n_layers=args.n_layers, max_seq=args.max_seq)
-        ref._w, ref.embed, ref.final_norm = m._w, m.embed, m.final_norm
-        ref.lm_head, ref._lut, ref.fingerprint = m.lm_head, m._lut, m.fingerprint
+        ref.share_weights_from(m)
         ref.prefill(ids)
         for L in range(args.n_layers):
             dk = np.abs(m.kv_k[L] - ref.kv_k[L]).max()

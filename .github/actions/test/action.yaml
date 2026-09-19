@@ -309,6 +309,16 @@ runs:
             # the decoupled q dim are both in it.
             gate qwen3_4b_q4nx --prefill-only
 
+            # Qwen3-8B runs the same forward as the 4B, so its gate is not
+            # there to cover the block a second time -- it covers the two
+            # things the 4B's cannot: an untied LM head (the failure mode is
+            # fluent text off a plausible logit vector, which cost a gate
+            # failure to find on Llama-3.1-8B) and, in the decode it does not
+            # reach here, a core stack and a weight split that are this
+            # model's alone. Like the 8B it may decline on min_host_gib; a
+            # SKIP is not a PASS.
+            gate qwen3_8b_q4nx --prefill-only
+
             # Gemma3-4B, prefill-only for the same two reasons. Its gate is
             # worth more than the others' despite being the same shape: four
             # bundle conventions, a norm sandwich, dual-theta RoPE and a GELU

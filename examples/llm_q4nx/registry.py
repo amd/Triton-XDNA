@@ -332,8 +332,69 @@ GEMMA3_4B = ModelSpec(
 )
 
 
+#: Qwen3-8B. Qwen3-4B's block at 4096 -- the same per-head qk-norm, the same
+#: single-theta RoPE, the same 36 layers -- so it runs `qwen3_prefill.py`
+#: unchanged and adds no forward of its own. Two differences that matter, and
+#: neither is in the forward:
+#:
+#: * **The LM head is untied**, where Qwen3-4B's is tied. The bundle carries a
+#:   separate Q4NX `lm_head.weight`; the 4B's bundle does not carry one at all.
+#: * **K is 4096, not 2560**, which is what moves the two decode knobs below.
+#:
+#: Its environment comes from the same two places as every other model's:
+#: `DECODE_ENV` in `llms/qwen3_8b_q4nx/Makefile`, plus `W_DUAL_CHAN=1` by bare
+#: `export`. Three values are this model's own:
+#:
+#: * `VOCAB_CHUNK_I2=8` -- Qwen3-4B's 30 does not transfer despite the shared
+#:   151936 vocabulary and the shared reader, because the divisibility
+#:   constraint is on NCX/NCY/PAIR_ROWS rather than on the vocabulary.
+#: * `DECODE_STACK=6144` -- a *third* distinct value (the 1B, 3B and Qwen3-4B
+#:   take the builder's 10240 default, Llama-3.1-8B 8064). At K=4096 the seven
+#:   K-wide L1 activation buffers leave under 8 KiB of the 64 KiB core memory,
+#:   so the default overflows. As with the 8B, `decode_build` reads
+#:   `fused_decode.STACK_SIZE` back from the builder rather than repeating it.
+#: * `DECODE_WGROUP=9` -- 36 layers at K=4096 is 4.04 GiB, and a shim BD's byte
+#:   offset is a uint32, so one BO only reaches 4 GiB. Four groups of nine keep
+#:   each at ~1 GiB. The host must slice the weights the same way, which
+#:   mlir-air's driver does from its own `DECODE_WGROUP = 9`.
+QWEN3_8B = ModelSpec(
+    name="qwen3-8b",
+    decode_env=dict(
+        DECODE_MODEL="qwen3-8b",
+        VOCAB_CHUNK_I2="8",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="1",
+        DECODE_GOLDEN="1",
+        DECODE_STACK="6144",
+        DECODE_WGROUP="9",
+        W_DUAL_CHAN="1",
+    ),
+    model_type="QWEN3_8B",
+    air_package="qwen3_8b_q4nx",
+    air_inference="qwen3_8b_q4nx_inference.py",
+    # Qwen3 ships one ungated checkpoint, base and instruct alike, and this
+    # driver detokenizes from the weight repo rather than exporting a tokenizer
+    # path -- same as Qwen3-4B's.
+    tokenizer_fallback="Qwen/Qwen3-8B",
+    driver_api="kv_arrays",
+    decoder_class="FusedDecoder",
+    decode_dir_env="Q4NX_QWEN3_8B_DECODE_DIR",
+    # Measured, not estimated: peak RSS of `--prefill-only` is 24.2 GiB, set
+    # here with a margin. Within a rounding of Llama-3.1-8B's 23.9, which is
+    # what a second 8B-parameter model dequantized to bf16 should cost.
+    min_host_gib=26.0,
+    # `qwen3_8b_q4nx_weights` puts `qwen3_4b` on sys.path itself (its
+    # `LlamaConfig` lives there), but naming it here keeps the path set the
+    # same whichever module gets imported first.
+    extra_packages=("qwen3_4b",),
+    supports_hsa=False,
+)
+
+
 SPECS = {
-    s.name: s for s in (LLAMA_3_2_1B, LLAMA_3_2_3B, LLAMA_3_1_8B, QWEN3_4B, GEMMA3_4B)
+    s.name: s
+    for s in (LLAMA_3_2_1B, LLAMA_3_2_3B, LLAMA_3_1_8B, QWEN3_4B, QWEN3_8B, GEMMA3_4B)
 }
 
 #: What `--model` defaults to where a single model is implied.

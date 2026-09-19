@@ -1,14 +1,16 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
-"""Run the Llama-3.2-1B Q4NX prefill and write the decode's KV handoff.
+"""Run the Qwen3-8B Q4NX prefill and write the decode's KV handoff.
 
     python prefill.py --backend cpu
     python prefill.py --backend npu --ops all
     python prefill.py --backend npu --kv-out /tmp/prefill_kv.npz
 
-The gate is the first generated token: 12366 (" Paris") for the canonical
-prompt. The npz is what mlir-air's fused decode consumes; `model.save_kv_npz`
-states that layout.
+The gate is the first generated token: 12095 (" Paris") for the canonical
+prompt. `--kv-out` writes the handoff as an npz; unlike the 1B, Qwen3-8B's
+mlir-air driver does not read one (it is handed the arrays -- see
+`ModelSpec.driver_api`), so this is for inspecting a prefill, not for feeding
+the decode. `model.save_kv_npz` states the layout.
 """
 
 import argparse
@@ -24,11 +26,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config  # noqa: E402
 
 # After `config`, and only after: it puts the shared harness on sys.path, and
-# the forward llama_prefill holds resolves its dims from the `config` this
+# the forward qwen3_prefill holds resolves its dims from the `config` this
 # directory just bound.
 sys.path.insert(0, config._SHARED)
 
-from llama_prefill import LlamaPrefill  # noqa: E402
+from qwen3_prefill import Qwen3Prefill  # noqa: E402
 
 
 def main(argv=None):
@@ -56,7 +58,7 @@ def main(argv=None):
         [int(t) for t in args.prompt.split(",")] if args.prompt else list(config.PROMPT)
     )
 
-    m = LlamaPrefill(
+    m = Qwen3Prefill(
         backend=args.backend,
         ops=args.ops,
         n_layers=args.n_layers,
@@ -95,7 +97,7 @@ def main(argv=None):
         verdict = "PASS"
 
     if args.compare_cpu and args.backend != "cpu":
-        ref = LlamaPrefill(backend="cpu", n_layers=args.n_layers, max_seq=args.max_seq)
+        ref = Qwen3Prefill(backend="cpu", n_layers=args.n_layers, max_seq=args.max_seq)
         ref.share_weights_from(m)
         ref.prefill(ids)
         for L in range(args.n_layers):

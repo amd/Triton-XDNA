@@ -222,6 +222,17 @@ EXAMPLES = [
     },
     {
         "kind": "model",
+        "name": "Qwen3-8B (Q4NX)",
+        "path": "qwen3_8b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Qwen3-4B's block at 4096, reusing its forward unchanged. What it "
+            "adds is size: an untied LM head, and a decode whose weights no "
+            "longer fit one buffer."
+        ),
+    },
+    {
+        "kind": "model",
         "name": "Gemma3-4B (Q4NX)",
         "path": "gemma3_4b_q4nx",
         "datatypes": "bf16 prefill, q4nx decode",
