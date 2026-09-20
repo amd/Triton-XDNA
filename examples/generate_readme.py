@@ -244,6 +244,17 @@ EXAMPLES = [
     },
     {
         "kind": "model",
+        "name": "Phi-4-mini (Q4NX)",
+        "path": "phi4_mini_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Llama-shaped but for the rotation: RoPE covers 96 of each head's "
+            "128 lanes, on frequencies read from a LongRoPE table in the "
+            "bundle. The first model here whose delta is in the operator."
+        ),
+    },
+    {
+        "kind": "model",
         "name": "Gemma3-4B (Q4NX)",
         "path": "gemma3_4b_q4nx",
         "datatypes": "bf16 prefill, q4nx decode",
