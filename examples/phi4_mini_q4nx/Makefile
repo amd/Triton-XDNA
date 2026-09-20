@@ -95,7 +95,7 @@ run: preflight
 	@cd $(srcdir) && $(PYTHON) $(DRIVER) $(COMMON) \
 		--text "$(PROMPT)" --max-tokens $(N_TOKENS) --greedy
 
-## Prefill on its own -- needs no decode build. Gates on first token == 12095.
+## Prefill on its own -- needs no decode build. Gates on first token == 12650.
 prefill: preflight
 	@cd $(srcdir) && $(PYTHON) $(DRIVER) --prefill-only $(COMMON)
 
