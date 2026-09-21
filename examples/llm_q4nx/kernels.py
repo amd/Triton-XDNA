@@ -328,8 +328,9 @@ def _padded_weight(w, Kp, Np):
 #: refuses to build the tensor. It binds here because `BLOCK_K` is the *whole*
 #: padded reduction: at Kp=32768 a 256-wide tile is 8388608 elements, twice the
 #: maximum, and every model whose MLP intermediate exceeds 16384 hits it in the
-#: `down` projection. Checked before dispatch so the message names the knob
-#: rather than arriving as a CompilationError from inside the frontend.
+#: `down` projection. Applied before dispatch, so the fix is a narrower tile
+#: rather than a CompilationError from inside the frontend pointing at a
+#: `tl.load`.
 MAX_TILE_NUMEL = 4194304
 
 #: The matmul schedule. Hand-written for gpt2 and reused by every model here.
@@ -352,15 +353,22 @@ def triton_matmul(
     M, K = x.shape
     Kw, N = w.shape
     assert K == Kw, (x.shape, w.shape)
+    Kp = _pow2(K)  # tl.arange needs a power of two
+    # Narrow the tile until it fits Triton's cap, rather than asking each model
+    # to know its own largest legal `block_n`. The bound is exact -- the tile is
+    # Kp x block_n elements and the cap is a constant -- so this is derived, not
+    # guessed, and a model that does not need it is not affected: at Kp <= 16384
+    # the default 256 already fits. Qwen2.5-7B's `down` (Kp=32768) is the only
+    # shape here that moves, to 128.
+    if Kp * block_n > MAX_TILE_NUMEL:
+        if Kp > MAX_TILE_NUMEL:
+            raise ValueError(
+                f"K={K} pads to {Kp}, which exceeds Triton's {MAX_TILE_NUMEL} "
+                f"maximum tensor size on its own; no block_n can fit."
+            )
+        block_n = MAX_TILE_NUMEL // Kp
     Mp = math.ceil(M / block_m) * block_m
     Np = math.ceil(N / block_n) * block_n
-    Kp = _pow2(K)  # tl.arange needs a power of two
-    if Kp * block_n > MAX_TILE_NUMEL:
-        raise ValueError(
-            f"a [{Kp}, {block_n}] weight tile is {Kp * block_n} elements, over "
-            f"Triton's {MAX_TILE_NUMEL} maximum. K={K} pads to {Kp}; pass a "
-            f"block_n of at most {MAX_TILE_NUMEL // Kp}."
-        )
     if isinstance(w, ResidentWeight):
         # Padded ahead of time, by someone who then freed the original. Its
         # padding was computed from the same rule, but a caller passing a
