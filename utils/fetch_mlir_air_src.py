@@ -36,6 +36,10 @@ DEST = "third_party/mlir-air-src"
 # and `shared/`; `fused_decode` carries the builder and the AIE kernels.
 SPARSE_PATHS = (
     "programming_examples/fused_decode",
+    # The PLE fork. A separate path because it is a separate directory, and
+    # without it a clean checkout has no `fused_decode_ple.py` and no `ple.cc`
+    # -- so Gemma4's `make compile-decode` fails before it builds anything.
+    "programming_examples/fused_decode_ple",
     "programming_examples/llms",
 )
 
@@ -74,12 +78,34 @@ def at_commit(dest, commit):
     return head.startswith(commit) or commit.startswith(head[: len(commit)])
 
 
+def _widen(dest, quiet=False):
+    """Re-apply SPARSE_PATHS to a checkout that already exists.
+
+    Needed whenever a path is ADDED to the list: an existing checkout is
+    already at the pinned commit, so `fetch` returns early and the new
+    directory is simply never materialized. The symptom is a missing file
+    rather than a stale one, which reads as a broken repo rather than a stale
+    checkout -- `fused_decode_ple` arrived this way.
+
+    `sparse-checkout set` is idempotent, so this is a no-op once the checkout
+    is wide enough. Quiet on failure: a tree someone widened by hand (or a
+    non-sparse clone) is a legitimate state, and narrowing it out from under
+    them would be worse than leaving it alone.
+    """
+    try:
+        _git("sparse-checkout", "set", *SPARSE_PATHS, cwd=dest, quiet=True)
+    except subprocess.CalledProcessError:
+        if not quiet:
+            print(f"[air-src] could not re-apply sparse paths in {dest}", flush=True)
+
+
 def fetch(dest=None, commit=None, quiet=False):
     """Ensure a sparse checkout of mlir-air at the pinned commit. Returns its path."""
     dest = Path(dest) if dest else repo_root() / DEST
     commit = commit or pinned_commit()
 
     if at_commit(dest, commit):
+        _widen(dest, quiet)
         if not quiet:
             print(f"[air-src] {dest} already at {commit}", flush=True)
         return dest

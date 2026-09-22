@@ -129,8 +129,8 @@ ENGINES = {
     ),
 }
 
-#: What a caller gets if it does not choose. The shared engine, because it is
-#: what eight of the nine models here use and what `fused_decode` meant before
+#: What a caller gets if it does not choose. The shared engine: it is what
+#: every model here but Gemma4-E2B uses, and what `fused_decode` meant before
 #: there was a second one.
 DEFAULT_ENGINE = "fused_decode"
 
@@ -337,15 +337,33 @@ _BUILD_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
-def _environment(values):
+def _environment(values, owned=()):
     """Apply `values` for the duration of one build, then restore.
 
     Scoped rather than assigned, because the environment is process-global and
     a build that leaked its model name into it would change what the *next*
     build produced -- which is the failure mode this op removes.
+
+    `owned` is every variable the engine reads. Those NOT in `values` are
+    **removed** for the duration rather than left alone, which is the other
+    half of the same guarantee: on an engine that still reads the environment,
+    omitting a knob is how a caller asks for the builder's own default, and
+    leaving an inherited `W_DUAL_CHAN=0` in place would silently answer with
+    something else. It would not be recorded either -- `fingerprint` hashes
+    `env()`, which by construction does not contain what the caller never set.
+
+    Only matters for the PLE engine today; the shared one resolves those four
+    from `_MODELS` and would ignore them either way. Applied uniformly because
+    "which engine reads what" is already the engine's business, not this
+    function's.
     """
-    saved = {k: os.environ.get(k) for k in values}
-    os.environ.update(values)
+    keys = set(values) | set(owned)
+    saved = {k: os.environ.get(k) for k in keys}
+    for k in keys:
+        if k in values:
+            os.environ[k] = values[k]
+        else:
+            os.environ.pop(k, None)
     try:
         yield
     finally:
@@ -484,7 +502,7 @@ def fused_decode(
 
     _verify_kernels(list(kernel_objects), config.model_type)
 
-    with _BUILD_LOCK, _environment(config.env()):
+    with _BUILD_LOCK, _environment(config.env(), ENGINES[config.engine].env):
         builder = _load_builder(fused_decode_dir, config.engine)
         if builder.MODEL_NAME != config.model:
             raise DecodeConfigError(

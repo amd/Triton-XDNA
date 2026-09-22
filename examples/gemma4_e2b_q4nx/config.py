@@ -154,11 +154,13 @@ BOS = 2
 #: the run to STOP on 106 (<end_of_turn>) after them.
 EXPECT_IDS = [9079, 236761]
 
-#: The token the generation must stop on, after EXPECT_IDS. Part of upstream's
-#: gate and recorded with it: two tokens is a short sequence, so "stopped in
-#: the right place" carries real signal here that it would not on a model
-#: generating ten.
-EXPECT_STOP = 106  # <end_of_turn>
+#: Upstream's gate additionally requires the run to STOP on 106
+#: (<end_of_turn>) after those two tokens, and ours does not: the shared
+#: harness compares the leading ids and has no notion of where a generation
+#: ended. Recorded as a KNOWN GAP rather than as a constant, because a
+#: constant nothing reads is worse than none -- it reads as a check that is
+#: running. Closing it means teaching the harness about the stop token, which
+#: belongs with the first decode run on this model rather than ahead of it.
 
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Gemma4-E2B-IT-NPU2")
 

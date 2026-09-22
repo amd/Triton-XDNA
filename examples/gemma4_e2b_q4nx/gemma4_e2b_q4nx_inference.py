@@ -7,22 +7,40 @@
 
 The prefill is this repo's -- Triton kernels on XDNA (prefill.py, and
 ../llm_q4nx/kernels.py). The decode is mlir-air's fused Q4NX decode, run
-unmodified: 34 layers plus the tied LM head in one dispatch.
+unmodified: 35 layers plus its own untied LM head in one dispatch.
 
-Gemma3-4B is the furthest from the Llama block of anything here
-(`../llm_q4nx/gemma4_prefill.py`): each sublayer is wrapped in a norm sandwich
-rather than preceded by one norm, RoPE uses two thetas chosen per layer, five
-layers in six limit attention to a 1024-token sliding window, and the GLU is
-GELU-tanh instead of SiLU -- the one new Triton kernel this model needed. It
-also carries Qwen3's per-head qk-norm and decoupled q dim.
+Gemma4-E2B takes over from Gemma3-4B as the furthest from the Llama block of
+anything here (`../llm_q4nx/gemma4_prefill.py`). 35 layers, an untied LM head,
+and three things no other model here has:
 
-Four Gemma conventions are already resolved in the weight bundle -- the (1+w)
-norm fold, the embedding scale, the separately-stored unscaled LM head, and the
-folded qk-norm weights. `config.load_q4nx` lists them; re-applying any produces
-fluent wrong text rather than an error.
+* **per-layer embeddings** -- a 256-wide vector per layer per token, computed
+  once from the input embeddings and injected after the MLP through a gated
+  projection and a fifth norm;
+* **layers that differ in shape from each other** -- four sliding layers then
+  one full, repeating, with the head dim (256 vs 512), the RoPE base (1e4 vs
+  1e6) and the window (512 vs none) all following, and the FFN doubling to
+  12288 from layer 15 up;
+* **twenty layers with no KV cache of their own**, which attend a lower
+  layer's.
 
-Its driver takes the same `kv_arrays` handoff Qwen3's does: no handoff
-parameter, so the harness substitutes the one prefill function it calls.
+It keeps Gemma3's norm sandwich, GELU-tanh GLU and per-head qk-norm. Two
+smaller things are quiet when wrong: the attention scale is 1.0 rather than
+`head_dim**-0.5`, and each block's output carries a per-layer scalar.
+
+Unlike Gemma3, the (1+w) norm fold is **not** applied to this model -- the
+bundle ships raw HF weights and the device multiplies by `w` with no add.
+Copying the sibling here is the obvious mistake; `config.RMS_NORM_ADDS_ONE`
+records it.
+
+**Its decode is the only one here built by a different engine**: mlir-air's
+`fused_decode_ple`, a fork carrying the per-layer-embedding branch.
+`registry.ModelSpec.engine` says so and `tl.extra.npu.fused_decode` takes it as
+an argument.
+
+Its driver takes the same `kv_arrays` handoff Qwen3's and Gemma3's do: no
+handoff parameter, so the harness substitutes the one prefill function it
+calls. On this model that handoff is a pair of LISTS rather than stacked
+arrays, because the per-layer caches are not the same width.
 
 Prerequisite for generation (not for --prefill-only):
 

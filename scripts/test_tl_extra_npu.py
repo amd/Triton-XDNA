@@ -226,8 +226,66 @@ def test_engine_decides_where_knobs_go():
     try:
         cfg("fused_decode_ple")  # the directory name, not the engine key
     except tl.extra.npu.DecodeConfigError:
-        return
-    raise AssertionError("an unknown engine was accepted")
+        pass
+    else:
+        raise AssertionError("an unknown engine was accepted")
+
+
+def test_build_scope_clears_what_it_does_not_set():
+    """An inherited value cannot stand in for a knob the caller left unset.
+
+    On an engine that reads these from the environment, omitting one is how a
+    spec asks for the builder's own default -- Gemma4 names no `W_DUAL_CHAN`
+    at all. Merely not setting it would leave an exported `W_DUAL_CHAN=0` in
+    place, so the builder would answer with 0, the artifact would be built for
+    a different shim channel split, and `fingerprint` would not record it: it
+    hashes `env()`, which by construction does not contain what was never set.
+    """
+    import importlib
+    import os
+
+    import triton.language as tl
+
+    fd = importlib.import_module("triton.language.extra.npu.fused_decode")
+    # `dual_channel=None` is how a spec says "this model names no
+    # W_DUAL_CHAN", which is Gemma4's case -- the field defaults to 1, so
+    # leaving it out would emit a value rather than omit one. That is exactly
+    # what `registry.ModelSpec.decode_config` passes for this model.
+    cfg = tl.extra.npu.DecodeConfig(
+        model="gemma4-e2b",
+        model_type="GEMMA4_E2B",
+        context_length=128,
+        vocab_chunk=27,
+        dual_channel=None,
+        engine="ple",
+    )
+    if "W_DUAL_CHAN" in cfg.env():
+        raise AssertionError("an omitted knob was emitted anyway")
+
+    saved = {k: os.environ.get(k) for k in ("W_DUAL_CHAN", "DECODE_STACK")}
+    try:
+        os.environ["W_DUAL_CHAN"] = "0"
+        os.environ["DECODE_STACK"] = "99999"
+        with fd._environment(cfg.env(), fd.ENGINES[cfg.engine].env):
+            for var in ("W_DUAL_CHAN", "DECODE_STACK"):
+                if var in os.environ:
+                    raise AssertionError(
+                        f"{var} survived into the build scope, so the builder "
+                        f"would read {os.environ[var]!r} rather than its own "
+                        f"default"
+                    )
+            # What the caller DID set is still applied.
+            if os.environ.get("VOCAB_CHUNK_I2") != "27":
+                raise AssertionError("a configured knob was not applied")
+        # And the caller's environment comes back untouched either way.
+        if os.environ.get("W_DUAL_CHAN") != "0":
+            raise AssertionError("a cleared variable was not restored")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_refuses_another_models_kernels():
@@ -313,6 +371,10 @@ def main():
         (
             "the engine decides which knobs are environment",
             test_engine_decides_where_knobs_go,
+        ),
+        (
+            "the build scope clears knobs it does not set",
+            test_build_scope_clears_what_it_does_not_set,
         ),
         ("model_type is required", test_model_type_is_required),
         ("another model's kernels are refused", test_refuses_another_models_kernels),

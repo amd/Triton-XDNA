@@ -44,7 +44,12 @@ N_TOKENS ?= 4
 # it, so a 35-layer model pays for the depth on every dispatch. Raise it for
 # longer sessions.
 DECODE_L ?= 128
-PROMPT   ?= The capital of France is
+# The canonical prompt, as IDS -- `config.PROMPT`, whose leading 2 is a <bos>
+# this tokenizer does not emit. Keep the two in step: the harness gates the
+# decode only when the ids it ran match `config.PROMPT` exactly.
+PROMPT_IDS  ?= 2,818,5279,529,7001,563
+# Ask something else:  make run PROMPT_TEXT="Why is the sky blue?"
+PROMPT_TEXT ?=
 MODEL    ?=
 
 MODEL_ARG  := $(if $(MODEL),--model "$(MODEL)",)
@@ -73,7 +78,8 @@ preflight:
 help:
 	@echo "Gemma4-E2B Q4NX -- Triton prefill + mlir-air fused decode"
 	@echo ""
-	@echo "  make run              One prompt: PROMPT=\"...\" N_TOKENS=$(N_TOKENS)"
+	@echo "  make run              The canonical prompt (gated), N_TOKENS=$(N_TOKENS)"
+	@echo "                        PROMPT_TEXT=\"...\" asks something else, ungated"
 	@echo "  make prefill          Prefill only + Paris gate (no decode build)"
 	@echo "  make profile          Per-operator prefill timing"
 	@echo "  make compile-decode   Build the decode from nothing (~22 s, run once)"
@@ -91,9 +97,20 @@ help:
 # only fail is worse than no target.
 
 ## One prompt, greedy, N_TOKENS of output.
+##
+## Sends token IDS rather than text, unlike every sibling here, and that is the
+## difference between gating the decode and not gating it. This tokenizer emits
+## no <bos>, so `--text` produces ids starting at 818 where `config.PROMPT`
+## starts at 2 -- and the harness only applies the recorded continuation when
+## `ids == cfg.PROMPT`. The check would be silently skipped, and the target
+## would pass by not testing anything.
+##
+## Override PROMPT with text to ask something else; that path takes `--text`
+## and correctly does not gate.
 run: preflight
 	@cd $(srcdir) && $(PYTHON) $(DRIVER) $(COMMON) \
-		--text "$(PROMPT)" --max-tokens $(N_TOKENS) --greedy
+		$(if $(PROMPT_TEXT),--text "$(PROMPT_TEXT)",--prompt "$(PROMPT_IDS)") \
+		--max-tokens $(N_TOKENS) --greedy
 
 ## Prefill on its own -- needs no decode build. Gates on first token == 9079.
 prefill: preflight
@@ -107,7 +124,9 @@ profile: preflight
 ##
 ## Two steps, both owned here:
 ##
-##   1. ../llm_q4nx/decode_kernels.py -- the six AIE kernels, compiled with Peano (~13 s).
+##   1. ../llm_q4nx/decode_kernels.py -- the SEVEN AIE kernels this engine links,
+##      compiled with Peano (~19 s). Six come from the shared engine; `ple.cc`
+##      is the PLE fork's own.
 ##      Byte-identical to what mlir-air's Makefile produces, and cached on the
 ##      source and flags, so a re-run is free.
 ##   2. ../llm_q4nx/decode_build.py -- the xclbins, lowered through FusedDecodeOp: mlir-air's
