@@ -50,24 +50,14 @@ def air_inference_module(model):
     if model.decode_dir_env:
         os.environ[model.decode_dir_env] = airsrc.fused_decode_dir()
 
-    # And `W_DUAL_CHAN`, which is a RUN-time fact as much as a build-time one.
-    # `fused_decode` reads it at import (`fused_decode.py`, defaulting to 1) and
-    # it selects both the shim channel split and the DDR weight cascade order,
-    # so the artifact and the host that feeds it must agree. The build gets it
-    # from `decode_config`; the run has to be told separately, because the op
-    # scopes that environment to the build and restores it.
-    #
-    # mlir-air's Makefiles do exactly this, with a bare `export W_DUAL_CHAN`
-    # at file scope reaching both the build and the run.
-    #
-    # It went unnoticed while every model set 1, which is also the default.
-    # Qwen2.5-3B is the first to set 0, and the symptom was not an error: the
-    # prefill's first token was right and every token after it was garbage,
-    # because the decode was reading correctly-built weights in the wrong
-    # order.
-    dual = model.decode_env.get("W_DUAL_CHAN")
-    if dual is not None:
-        os.environ["W_DUAL_CHAN"] = str(dual)
+    # No `W_DUAL_CHAN` here. It selects the shim channel split and the DDR
+    # weight cascade order, so the artifact and the host must agree -- and
+    # until mlir-air `deffe6f1` the engine read it from the environment,
+    # defaulting to 1, so this function had to set it or Qwen2.5-3B (the only
+    # model that wants 0) decoded a correct first token and then garbage.
+    # It now comes from the model's own `_MODELS` entry and the environment is
+    # not consulted, so setting it here would be inert. `DecodeConfig` still
+    # records the value and `_check_model_table` verifies it against that entry.
 
     airsrc.add_air_paths(model.air_package, *model.extra_packages)
     path = os.path.join(
