@@ -47,6 +47,14 @@ KERNEL_OBJECTS = (
     "attn_kv.ll",
 )
 
+#: What each engine links beyond those six. Mirrors
+#: `decode_kernels.ENGINE_KERNELS` in object form: the PLE fork's own `ple.o`,
+#: which the shared engine has no herd for.
+ENGINE_OBJECTS = {
+    "fused_decode": (),
+    "ple": ("ple.o",),
+}
+
 DEFAULT_L = 2048
 
 
@@ -59,9 +67,9 @@ DEFAULT_L = 2048
 STAMP = "decode_model.txt"
 
 
-def read_stamp(out_dir=None):
+def read_stamp(out_dir=None, engine="fused_decode"):
     """The model whose artifacts are in `out_dir`, or None if unstamped."""
-    path = os.path.join(out_dir or airsrc.fused_decode_dir(), STAMP)
+    path = os.path.join(out_dir or airsrc.fused_decode_dir(engine), STAMP)
     try:
         with open(path) as f:
             return f.read().strip() or None
@@ -71,10 +79,11 @@ def read_stamp(out_dir=None):
 
 def check_stamp(model, out_dir=None):
     """Refuse to run one model's decode against another's artifacts."""
-    built = read_stamp(out_dir)
+    built = read_stamp(out_dir, model.engine)
     if built is not None and built != model.name:
         raise SystemExit(
-            f"the decode artifacts in {out_dir or airsrc.fused_decode_dir()} were "
+            f"the decode artifacts in "
+            f"{out_dir or airsrc.fused_decode_dir(model.engine)} were "
             f"built for {built!r}, not {model.name!r}. They share a directory and "
             f"a filename, so rebuild before switching:\n"
             f"  make compile-decode MODEL={model.name}"
@@ -90,11 +99,13 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
     forking, which is what this used to do.
     """
     model = model or registry.spec()
-    fd_dir = airsrc.fused_decode_dir()
+    fd_dir = airsrc.fused_decode_dir(model.engine)
     out_dir = out_dir or fd_dir
 
     kdir = decode_kernels.kernel_dir(model, fd_dir)
-    objs = [os.path.join(kdir, o) for o in KERNEL_OBJECTS]
+    objs = [
+        os.path.join(kdir, o) for o in KERNEL_OBJECTS + ENGINE_OBJECTS[model.engine]
+    ]
     missing = [o for o in objs if not os.path.exists(o)]
     if missing:
         # The op refuses missing objects too, but this says how to get them.

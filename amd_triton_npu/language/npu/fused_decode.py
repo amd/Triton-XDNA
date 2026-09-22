@@ -43,30 +43,32 @@ import hashlib
 import os
 import threading
 
-#: Knobs mlir-air's builder reads from the environment, and the attribute on
-#: `DecodeConfig` that supplies each. Anything not listed here is left alone, so
-#: a builder that grows a knob keeps its own default until it is named.
-_ENV = {
+#: Knobs every one of mlir-air's fused-decode builders reads from the
+#: environment, and the attribute on `DecodeConfig` that supplies each. Anything
+#: not listed is left alone, so a builder that grows a knob keeps its own
+#: default until it is named.
+_COMMON_ENV = {
     "DECODE_MODEL": "model",
     "DECODE_GOLDEN_L": "context_length",
     "NLAYERS": "layers_per_dispatch",
     "LM_HEAD": "lm_head",
     "DECODE_GOLDEN": "golden",
+    "DECODE_UNI_DEC": "decode_waves",
     "PROJ_RC_CACHE": "proj_rc_cache",
 }
 
-#: Knobs the builder no longer takes from the environment: since mlir-air
-#: `deffe6f1` they are properties of the model, living in its `_MODELS` entry
-#: and reached through the builder's merged `MODEL` dict. Setting them would be
-#: inert, so they are CHECKED instead -- `_check_model_table` compares what the
-#: caller recorded against what the builder resolved.
+#: The four knobs that moved. In the shared engine, mlir-air `deffe6f1` made
+#: them properties of the model -- they live in its `_MODELS` entry, reached
+#: through the builder's merged `MODEL` dict, and the environment is no longer
+#: read for them. In the PLE fork, which predates that commit, they are still
+#: environment variables.
 #:
-#: Keeping them on `DecodeConfig` rather than deleting them is deliberate. They
-#: are still facts about the model that a caller transcribes from its Makefile,
-#: and the whole point of transcribing them is to notice when ours and
-#: upstream's disagree. Dropping them would make that divergence invisible;
-#: silently setting an ignored variable would too.
-_MODEL_TABLE = {
+#: So they are named once here and placed differently per engine: `env` for a
+#: builder that reads them, `model_table` for one that does not. Getting this
+#: backwards is silent either way -- setting an ignored variable builds the
+#: wrong geometry, checking an absent table key checks nothing -- which is why
+#: it is a property of the engine rather than a guess made per call.
+_MOVED_KNOBS = {
     "VOCAB_CHUNK_I2": "vocab_chunk",
     "W_DUAL_CHAN": "dual_channel",
     "DECODE_WGROUP": "weight_group",
@@ -74,8 +76,71 @@ _MODEL_TABLE = {
 }
 
 
+class DecodeEngine:
+    """One of mlir-air's fused-decode builders.
+
+    There are two, and they are not interchangeable:
+
+    * ``"fused_decode"`` -- the shared engine, which drives every model whose
+      geometry its `_MODELS` table describes.
+    * ``"ple"`` -- `fused_decode_ple`, a fork carrying the per-layer-embedding
+      branch and the per-layer class map that Gemma4-E2B needs. Its `_MODELS`
+      is a superset of the shared engine's, so it can build the other models
+      too; upstream keeps that property deliberately, as the fork's only
+      defence against drifting from its parent.
+
+    What differs here is not just the filename. The fork predates `deffe6f1`,
+    so the four knobs in `_MOVED_KNOBS` are environment variables to it and
+    table entries to the shared engine -- see that constant.
+
+    Attributes:
+        name: the `engine` value on `DecodeConfig`.
+        directory: the engine's directory under `programming_examples`.
+        module: its builder module's filename.
+        env: knobs this engine reads from the environment, as
+            ``{variable: DecodeConfig attribute}``.
+        model_table: knobs this engine takes from its `_MODELS` entry instead,
+            same shape. Checked rather than set.
+    """
+
+    def __init__(self, name, directory, module, env, model_table):
+        self.name = name
+        self.directory = directory
+        self.module = module
+        self.env = dict(env)
+        self.model_table = dict(model_table)
+
+
+#: The engines `DecodeConfig(engine=...)` accepts.
+ENGINES = {
+    "fused_decode": DecodeEngine(
+        name="fused_decode",
+        directory="fused_decode",
+        module="fused_decode.py",
+        env=_COMMON_ENV,
+        model_table=_MOVED_KNOBS,
+    ),
+    "ple": DecodeEngine(
+        name="ple",
+        directory="fused_decode_ple",
+        module="fused_decode_ple.py",
+        env={**_COMMON_ENV, **_MOVED_KNOBS},
+        model_table={},
+    ),
+}
+
+#: What a caller gets if it does not choose. The shared engine, because it is
+#: what eight of the nine models here use and what `fused_decode` meant before
+#: there was a second one.
+DEFAULT_ENGINE = "fused_decode"
+
+
 def _check_model_table(builder, config):
     """Refuse to build when our recorded knobs differ from `_MODELS`.
+
+    Only for engines that take those knobs from the table -- for one that still
+    reads the environment, `model_table` is empty and this does nothing, because
+    the values were applied rather than resolved.
 
     A mismatch means the model's entry upstream moved, or was transcribed
     wrongly here. Either way the build would quietly use the builder's value
@@ -85,17 +150,18 @@ def _check_model_table(builder, config):
     table = getattr(builder, "MODEL", None)
     if not table:  # a builder without the table: nothing to check against
         return
-    for var, attr in _MODEL_TABLE.items():
+    for var, attr in ENGINES[config.engine].model_table.items():
         want = getattr(config, attr, None)
         if want is None or var not in table:
             continue
         if int(want) != int(table[var]):
             raise DecodeConfigError(
                 f"{config.model!r} records {var}={want}, but mlir-air's "
-                f"_MODELS entry says {table[var]}. The builder no longer reads "
-                f"this from the environment, so the build would use "
-                f"{table[var]} and the recorded value would be silently wrong. "
-                f"Reconcile the spec with the model's entry upstream."
+                f"_MODELS entry says {table[var]}. The {config.engine!r} "
+                f"builder no longer reads this from the environment, so the "
+                f"build would use {table[var]} and the recorded value would be "
+                f"silently wrong. Reconcile the spec with the model's entry "
+                f"upstream."
             )
 
 
@@ -127,15 +193,23 @@ class DecodeConfig:
             models even within a family.
         layers_per_dispatch, lm_head, golden: the remaining Makefile knobs the
             builder still reads from the environment, as strings or ints.
+        engine: which of mlir-air's builders drives this model, a key of
+            `ENGINES`. ``"fused_decode"`` unless the model needs the
+            per-layer-embedding fork; see `DecodeEngine`.
         dual_channel: this model's ``W_DUAL_CHAN``. Selects the shim channel
             split and the DDR weight cascade order, so the artifact and the
-            host that feeds it must agree. Owned by `_MODELS` upstream and
-            checked here rather than set; see `_MODEL_TABLE`.
+            host that feeds it must agree. Set or checked depending on the
+            engine; see `_MOVED_KNOBS`.
+        decode_waves: ``DECODE_UNI_DEC`` -- decoder layers in the unified
+            sequence. ``None`` takes the model's own `UNI_DEC`, which is what
+            every model built through the shared engine wants. Named explicitly
+            only where a Makefile does: the PLE engine defaults it to 1 for its
+            single-layer gate, so a full-depth Gemma4 template has to ask.
         unified: accepted and unused. `UNIFIED` is set by every one of
             mlir-air's own Makefiles and read by none of its code, at this pin
             or any recent one -- so it is kept only so a spec transcribed from
-            a Makefile does not have to drop a line, and is deliberately not
-            in `_ENV`.
+            a Makefile does not have to drop a line, and is deliberately in no
+            engine's `env` map.
         weight_group: layers per weight buffer, for models past the 4 GiB
             one-BO limit. ``0`` disables it.
         stack_size: AIE core stack. ``None`` takes the builder's own, which is
@@ -161,7 +235,15 @@ class DecodeConfig:
         weight_group=None,
         stack_size=None,
         proj_rc_cache=None,
+        engine=DEFAULT_ENGINE,
+        decode_waves=None,
     ):
+        if engine not in ENGINES:
+            raise DecodeConfigError(
+                f"engine={engine!r} is not one of {sorted(ENGINES)}. It selects "
+                f"which of mlir-air's builders lowers this model, and they do "
+                f"not read the same knobs from the same places."
+            )
         if not model:
             raise DecodeConfigError(
                 "model is required. mlir-air's builder defaults to "
@@ -194,6 +276,8 @@ class DecodeConfig:
         self.weight_group = weight_group
         self.stack_size = stack_size
         self.proj_rc_cache = proj_rc_cache
+        self.engine = engine
+        self.decode_waves = decode_waves
 
     #: The context length the built artifact actually serves, which is rounded
     #: up to a multiple of 16. Two requests that round to the same value produce
@@ -209,14 +293,26 @@ class DecodeConfig:
         already; this covers the rest, because two builds differing only in,
         say, `weight_group` are different artifacts that would otherwise land on
         the same path.
+
+        The engine is hashed in alongside the environment rather than left to
+        it: the two builders emit different designs for the same model, and for
+        the shared engine `env()` does not even contain the knobs in
+        `_MOVED_KNOBS`, so without this a pair of engines could fingerprint
+        alike.
         """
-        parts = "|".join(f"{k}={v}" for k, v in sorted(self.env().items()))
+        parts = "|".join(
+            f"{k}={v}" for k, v in sorted({**self.env(), "ENGINE": self.engine}.items())
+        )
         return hashlib.sha256(parts.encode()).hexdigest()[:8]
 
     def env(self):
-        """This configuration as the environment mlir-air's builder reads."""
+        """This configuration as the environment mlir-air's builder reads.
+
+        Which variables that is depends on the engine -- the PLE fork takes
+        four knobs here that the shared engine takes from its model table.
+        """
         out = {}
-        for var, attr in _ENV.items():
+        for var, attr in ENGINES[self.engine].env.items():
             value = getattr(self, attr)
             if value is not None:
                 out[var] = str(value)
@@ -225,7 +321,7 @@ class DecodeConfig:
     def __repr__(self):
         return (
             f"DecodeConfig(model={self.model!r}, model_type={self.model_type!r}, "
-            f"context_length="
+            f"engine={self.engine!r}, context_length="
             f"{self.context_length}, attn_maxl={self.attn_maxl}, "
             f"vocab_chunk={self.vocab_chunk})"
         )
@@ -310,8 +406,8 @@ def _verify_kernels(kernel_objects, model_type):
             )
 
 
-def _load_builder(fused_decode_dir):
-    """mlir-air's `fused_decode` module, freshly executed.
+def _load_builder(fused_decode_dir, engine=DEFAULT_ENGINE):
+    """mlir-air's builder module for `engine`, freshly executed.
 
     A fresh module object each time, deliberately: the builder resolves its
     geometry into module-level constants while it executes, so re-executing is
@@ -322,7 +418,7 @@ def _load_builder(fused_decode_dir):
     import importlib.util
     import sys
 
-    path = os.path.join(fused_decode_dir, "fused_decode.py")
+    path = os.path.join(fused_decode_dir, ENGINES[engine].module)
     if not os.path.exists(path):
         raise DecodeConfigError(
             f"{path} does not exist. It comes from mlir-air's sources; fetch "
@@ -352,7 +448,11 @@ def fused_decode(
 
     Args:
         config: a `DecodeConfig`.
-        fused_decode_dir: mlir-air's `programming_examples/fused_decode`.
+        fused_decode_dir: the engine's directory under mlir-air's
+            `programming_examples` -- `fused_decode`, or `fused_decode_ple`
+            when `config.engine` says so. The two must agree: the directory
+            says where to look and the engine says what to look for, and a
+            mismatch is refused rather than searched around.
         kernel_objects: the AIE objects to link, built against this model's
             `-DMODEL_TYPE`. They are model-specific: `rms_residual.o` and
             `rope.o` differ between models, and linking another model's is not
@@ -385,7 +485,7 @@ def fused_decode(
     _verify_kernels(list(kernel_objects), config.model_type)
 
     with _BUILD_LOCK, _environment(config.env()):
-        builder = _load_builder(fused_decode_dir)
+        builder = _load_builder(fused_decode_dir, config.engine)
         if builder.MODEL_NAME != config.model:
             raise DecodeConfigError(
                 f"asked for {config.model!r} but mlir-air's builder resolved "

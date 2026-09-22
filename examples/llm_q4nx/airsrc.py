@@ -43,9 +43,26 @@ def air_llms_root():
     )
 
 
-def fused_decode_dir():
-    """Where the decode's builder, kernels and built artifacts live."""
-    return str(air_llms_root().parent / "fused_decode")
+def fused_decode_dir(engine="fused_decode"):
+    """Where the decode's builder, kernels and built artifacts live.
+
+    `engine` is a key of `tl.extra.npu.ENGINES` -- there are two builders, the
+    shared one and the per-layer-embedding fork, and they are separate
+    directories under `programming_examples`. Resolved through that table
+    rather than by name here so the directory and the module that has to be in
+    it cannot drift apart.
+
+    The kernel *sources* stay in the shared engine's directory either way: the
+    fork ships only its own `ple.cc` and compiles the other six out of its
+    parent's `kernels/`, which is `decode_kernels`' business, not this one's.
+    """
+    from triton.language.extra.npu import ENGINES
+
+    if engine not in ENGINES:
+        raise RuntimeError(
+            f"unknown decode engine {engine!r}; known: {sorted(ENGINES)}"
+        )
+    return str(air_llms_root().parent / ENGINES[engine].directory)
 
 
 def add_air_paths(*packages):

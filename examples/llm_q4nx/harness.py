@@ -48,7 +48,7 @@ def air_inference_module(model):
     # Also before the import, and for the same reason: the drivers that take
     # this read it into a module-level constant. See `ModelSpec.decode_dir_env`.
     if model.decode_dir_env:
-        os.environ[model.decode_dir_env] = airsrc.fused_decode_dir()
+        os.environ[model.decode_dir_env] = airsrc.fused_decode_dir(model.engine)
 
     # No `W_DUAL_CHAN` here. It selects the shim channel split and the DDR
     # weight cascade order, so the artifact and the host must agree -- and
@@ -263,7 +263,7 @@ def generate_via_prefiller(air, spec, cfg, args, ids, prefiller):
     """
     dec = getattr(air, spec.decoder_class)(
         args.model or cfg.MODEL_DEFAULT,
-        airsrc.fused_decode_dir(),
+        airsrc.fused_decode_dir(spec.engine),
         model_type=spec.model_type,
     )
     gen, t_prompt, t_gen = air.generate_stream(
@@ -407,7 +407,9 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and air is not None:
         from hsa_decode import make_hsa_decoder_class
 
-        air.FusedDecoder = make_hsa_decoder_class(air, airsrc.fused_decode_dir())
+        air.FusedDecoder = make_hsa_decoder_class(
+            air, airsrc.fused_decode_dir(spec.engine)
+        )
 
     if args.interactive:
         # Swap our prefill into mlir-air's Session, then hand off to its REPL.
