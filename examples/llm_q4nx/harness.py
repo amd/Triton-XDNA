@@ -314,9 +314,15 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     # measured wall clock goes back in rather than a zero that would read as a
     # free prefill.
     air._prefill_npu = lambda prompt, model, seq_len=None: (K, V, first, ttft)
-    kwargs = dict(model=args.model or cfg.MODEL_DEFAULT, greedy=args.greedy)
-    if "stop_on_eos" in inspect.signature(air.generate).parameters:
-        kwargs["stop_on_eos"] = False
+    params = inspect.signature(air.generate).parameters
+    kwargs = dict(model=args.model or cfg.MODEL_DEFAULT)
+    # Both offered only where the signature has somewhere to put them. Qwen3
+    # takes the pair, Gemma3 takes `greedy` alone, and Gemma4-E2B takes
+    # neither -- it is greedy unconditionally and stops on EOS
+    # unconditionally, which is why its recorded continuation is two tokens.
+    for name, value in (("greedy", args.greedy), ("stop_on_eos", False)):
+        if name in params:
+            kwargs[name] = value
     return air.generate(list(ids), args.max_tokens, **kwargs)
 
 

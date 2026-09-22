@@ -391,6 +391,10 @@ GEMMA4_E2B = ModelSpec(
     driver_api="kv_arrays",
     decoder_class="FusedDecoder",
     decode_dir_env="Q4NX_GEMMA4_DECODE_DIR",
+    # Measured: peak RSS of `--prefill-only` is 14.2 GiB, which is under
+    # Gemma3-4B's 15.1 despite the extra 35-layer depth -- this model's D is
+    # 1536 against Gemma3's 2560, and its LM head is the same 262144 rows.
+    min_host_gib=16.0,
     supports_hsa=False,
 )
 

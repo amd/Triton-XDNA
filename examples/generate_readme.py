@@ -275,6 +275,18 @@ EXAMPLES = [
             "1024-token sliding window, and a GELU-tanh GLU."
         ),
     },
+    {
+        "kind": "model",
+        "name": "Gemma4-E2B (Q4NX)",
+        "path": "gemma4_e2b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Gemma3's block plus per-layer embeddings, layers that differ in "
+            "shape from each other, and twenty that carry no KV cache of "
+            "their own. The only model here whose decode runs on mlir-air's "
+            "per-layer-embedding engine rather than the shared one."
+        ),
+    },
 ]
 
 # Directories under examples/ that are not examples. Keep in step with
