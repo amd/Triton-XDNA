@@ -87,11 +87,27 @@ def _widen(dest, quiet=False):
     rather than a stale one, which reads as a broken repo rather than a stale
     checkout -- `fused_decode_ple` arrived this way.
 
-    `sparse-checkout set` is idempotent, so this is a no-op once the checkout
-    is wide enough. Quiet on failure: a tree someone widened by hand (or a
-    non-sparse clone) is a legitimate state, and narrowing it out from under
-    them would be worse than leaving it alone.
+    **Only widens a checkout that is already sparse.** `sparse-checkout set`
+    does not just edit the path list -- on a full clone it ENABLES sparse mode
+    and deletes every tracked file outside the list. So a developer who cloned
+    mlir-air here by hand would find most of it gone, silently and with a zero
+    exit status. A full clone already contains everything this needs, so there
+    is nothing to widen; it is left exactly as it was.
+
+    Detected on `core.sparseCheckout` rather than on the exit status of
+    `sparse-checkout list`, which is 128 on a full worktree -- that would work
+    too, but only by running a command whose failure is the answer. Within a
+    sparse checkout `set` is idempotent, so this is a no-op once it is wide
+    enough.
     """
+    try:
+        enabled = _git(
+            "config", "--get", "core.sparseCheckout", cwd=dest, quiet=True
+        ).stdout
+    except subprocess.CalledProcessError:
+        enabled = ""  # unset: a full clone, which has everything already
+    if (enabled or "").strip().lower() != "true":
+        return
     try:
         _git("sparse-checkout", "set", *SPARSE_PATHS, cwd=dest, quiet=True)
     except subprocess.CalledProcessError:
