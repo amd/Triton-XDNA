@@ -510,6 +510,55 @@ PHI4_MINI = ModelSpec(
 )
 
 
+#: Qwen2.5-3B. Qwen2.5-7B's block at 2048, so it runs `qwen25_prefill.py`
+#: unchanged -- the same q/k/v projection bias, no qk-norm. GQA 8 (16 q heads
+#: over 2 kv heads), the widest ratio here.
+#:
+#: Its mlir-air directory is `llms/qwen25_3b_q4`, not `_q4nx`, and that names
+#: the *weight* codec rather than the decode: the decode is the same Q4NX fused
+#: engine every model here drives (`DECODE_MODEL=qwen2.5-3b`). Its default
+#: source is a FastFlowLM `model.q4nx` bundle; `open_weight_source` falls back
+#: to Q4_0-quantizing an HF checkpoint, which is what the name refers to.
+#:
+#: **`W_DUAL_CHAN=0`, alone among the models here**, and its Makefile is
+#: emphatic about why: the dual feed wedges every decode dispatch on a Krackan
+#: NPU -- 0 of 13 complete at every context from 1024 to 32768, with no prefill
+#: and no weights involved -- while another model runs at 28 tok/s on the same
+#: part minutes apart. Off completes 10 of 10 and costs ~16% decode throughput
+#: on Strix. It is exported there rather than `?=`-assigned because the builder
+#: reads it from the environment; a value that reaches only the stamp is
+#: cosmetic.
+#:
+#: `VOCAB_CHUNK_I2=12` is likewise not free: it must pair with the model
+#: entry's `UNI_LM=25`, and its Makefile records that 20 and 15 satisfy every
+#: divisibility rule and still deadlock the vocab wave on device.
+QWEN2_5_3B = ModelSpec(
+    name="qwen2.5-3b",
+    decode_env=dict(
+        DECODE_MODEL="qwen2.5-3b",
+        VOCAB_CHUNK_I2="12",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="1",
+        DECODE_GOLDEN="1",
+        W_DUAL_CHAN="0",
+    ),
+    model_type="QWEN2_5_3B",
+    air_package="qwen25_3b_q4",
+    air_inference="qwen25_3b_q4_inference.py",
+    tokenizer_fallback="Qwen/Qwen2.5-3B-Instruct",
+    driver_api="kv_arrays",
+    decoder_class="FusedDecoder",
+    decode_dir_env="Q4NX_QWEN25_3B_DECODE_DIR",
+    # Measured, not estimated: peak RSS of `--prefill-only` is 10.3 GiB, set
+    # here with a margin. The smallest of the non-1B models, and comfortably
+    # inside CI's runner -- unlike its 7B sibling, which declines there.
+    min_host_gib=12.0,
+    extra_packages=("qwen25_3b",),
+    supports_hsa=False,
+)
+
+
 SPECS = {
     s.name: s
     for s in (
@@ -519,6 +568,7 @@ SPECS = {
         QWEN3_4B,
         QWEN3_8B,
         QWEN2_5_7B,
+        QWEN2_5_3B,
         PHI4_MINI,
         GEMMA3_4B,
     )

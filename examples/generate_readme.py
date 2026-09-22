@@ -244,6 +244,17 @@ EXAMPLES = [
     },
     {
         "kind": "model",
+        "name": "Qwen2.5-3B (Q4NX)",
+        "path": "qwen25_3b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Qwen2.5-7B's block at 2048, on the same biased-QKV forward. The "
+            "only model here whose decode runs with the dual-channel weight "
+            "feed off."
+        ),
+    },
+    {
+        "kind": "model",
         "name": "Phi-4-mini (Q4NX)",
         "path": "phi4_mini_q4nx",
         "datatypes": "bf16 prefill, q4nx decode",

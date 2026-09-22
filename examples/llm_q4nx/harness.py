@@ -50,6 +50,15 @@ def air_inference_module(model):
     if model.decode_dir_env:
         os.environ[model.decode_dir_env] = airsrc.fused_decode_dir()
 
+    # No `W_DUAL_CHAN` here. It selects the shim channel split and the DDR
+    # weight cascade order, so the artifact and the host must agree -- and
+    # until mlir-air `deffe6f1` the engine read it from the environment,
+    # defaulting to 1, so this function had to set it or Qwen2.5-3B (the only
+    # model that wants 0) decoded a correct first token and then garbage.
+    # It now comes from the model's own `_MODELS` entry and the environment is
+    # not consulted, so setting it here would be inert. `DecodeConfig` still
+    # records the value and `_check_model_table` verifies it against that entry.
+
     airsrc.add_air_paths(model.air_package, *model.extra_packages)
     path = os.path.join(
         str(airsrc.air_llms_root()), model.air_package, model.air_inference

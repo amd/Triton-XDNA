@@ -327,6 +327,12 @@ runs:
             # biased projection -- every other forward here is y = x @ W.
             gate qwen25_7b_q4nx --prefill-only
 
+            # Qwen2.5-3B, prefill-only. Same forward as the 7B, so its value
+            # here is not the block: it is the only model whose decode env sets
+            # W_DUAL_CHAN=0, and unlike the 7B it fits the runner, so it is the
+            # one Qwen2.5 gate that actually executes rather than declining.
+            gate qwen25_3b_q4nx --prefill-only
+
             # Phi-4-mini, prefill-only. Its gate is the only coverage of a
             # partial rotation: 96 of 128 lanes rotated and the rest copied
             # through, on LongRoPE frequencies. Getting either wrong leaves the

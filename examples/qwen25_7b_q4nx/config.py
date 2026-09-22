@@ -78,6 +78,14 @@ EXPECT_IDS = [12095, 13, 1084, 374, 7407, 304, 279, 18172, 949, 315]
 
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "Qwen/Qwen2.5-7B-Instruct")
 
+#: Lower the model-dim GEMMs with the driver-generated matmul schedule rather
+#: than the shared hand-written one. Forced by this model's fused `gate_up`:
+#: 2*18944 = 37888 columns, for which the shared schedule emits a DMA stride of
+#: 2424832 against a hardware range of [1, 1048576]. Measured -- N=32768 lowers
+#: under it and N=37888 does not. `llm_q4nx/qwen25_prefill.py` explains why the
+#: flag covers `qkv` and `o` too, and why `down` is excluded.
+MATMUL_GENERATED_SCHEDULE = True
+
 
 if _SHARED not in sys.path:
     sys.path.insert(0, _SHARED)

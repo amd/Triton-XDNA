@@ -4,8 +4,8 @@
 """``tl.extra.npu.fused_decode`` -- one dispatch for a whole decoder stack.
 
 The op every Q4NX example's decode goes through. What it replaces is a set of
-**process-global environment variables**: `DECODE_MODEL`, `VOCAB_CHUNK_I2`,
-`NLAYERS`, `DECODE_GOLDEN_L` and the rest were read by mlir-air's builder at
+**process-global environment variables**: `DECODE_MODEL`, `NLAYERS`,
+`DECODE_GOLDEN_L` and the rest were read by mlir-air's builder at
 import time, which made the configuration a property of the *process* rather
 than of the call. Two consequences, both gone here:
 
@@ -49,16 +49,54 @@ import threading
 _ENV = {
     "DECODE_MODEL": "model",
     "DECODE_GOLDEN_L": "context_length",
-    "VOCAB_CHUNK_I2": "vocab_chunk",
     "NLAYERS": "layers_per_dispatch",
-    "UNIFIED": "unified",
     "LM_HEAD": "lm_head",
     "DECODE_GOLDEN": "golden",
+    "PROJ_RC_CACHE": "proj_rc_cache",
+}
+
+#: Knobs the builder no longer takes from the environment: since mlir-air
+#: `deffe6f1` they are properties of the model, living in its `_MODELS` entry
+#: and reached through the builder's merged `MODEL` dict. Setting them would be
+#: inert, so they are CHECKED instead -- `_check_model_table` compares what the
+#: caller recorded against what the builder resolved.
+#:
+#: Keeping them on `DecodeConfig` rather than deleting them is deliberate. They
+#: are still facts about the model that a caller transcribes from its Makefile,
+#: and the whole point of transcribing them is to notice when ours and
+#: upstream's disagree. Dropping them would make that divergence invisible;
+#: silently setting an ignored variable would too.
+_MODEL_TABLE = {
+    "VOCAB_CHUNK_I2": "vocab_chunk",
     "W_DUAL_CHAN": "dual_channel",
     "DECODE_WGROUP": "weight_group",
     "DECODE_STACK": "stack_size",
-    "PROJ_RC_CACHE": "proj_rc_cache",
 }
+
+
+def _check_model_table(builder, config):
+    """Refuse to build when our recorded knobs differ from `_MODELS`.
+
+    A mismatch means the model's entry upstream moved, or was transcribed
+    wrongly here. Either way the build would quietly use the builder's value
+    and the caller's record would be a lie -- which is the failure mode this
+    whole module exists to avoid, one step removed.
+    """
+    table = getattr(builder, "MODEL", None)
+    if not table:  # a builder without the table: nothing to check against
+        return
+    for var, attr in _MODEL_TABLE.items():
+        want = getattr(config, attr, None)
+        if want is None or var not in table:
+            continue
+        if int(want) != int(table[var]):
+            raise DecodeConfigError(
+                f"{config.model!r} records {var}={want}, but mlir-air's "
+                f"_MODELS entry says {table[var]}. The builder no longer reads "
+                f"this from the environment, so the build would use "
+                f"{table[var]} and the recorded value would be silently wrong. "
+                f"Reconcile the spec with the model's entry upstream."
+            )
 
 
 class DecodeConfigError(ValueError):
@@ -87,8 +125,17 @@ class DecodeConfig:
         vocab_chunk: this model's ``VOCAB_CHUNK_I2``. Its legal values depend on
             the model's own core geometry, so it does not transfer between
             models even within a family.
-        layers_per_dispatch, unified, lm_head, golden, dual_channel: the
-            remaining Makefile knobs, as strings or ints.
+        layers_per_dispatch, lm_head, golden: the remaining Makefile knobs the
+            builder still reads from the environment, as strings or ints.
+        dual_channel: this model's ``W_DUAL_CHAN``. Selects the shim channel
+            split and the DDR weight cascade order, so the artifact and the
+            host that feeds it must agree. Owned by `_MODELS` upstream and
+            checked here rather than set; see `_MODEL_TABLE`.
+        unified: accepted and unused. `UNIFIED` is set by every one of
+            mlir-air's own Makefiles and read by none of its code, at this pin
+            or any recent one -- so it is kept only so a spec transcribed from
+            a Makefile does not have to drop a line, and is deliberately not
+            in `_ENV`.
         weight_group: layers per weight buffer, for models past the 4 GiB
             one-BO limit. ``0`` disables it.
         stack_size: AIE core stack. ``None`` takes the builder's own, which is
@@ -345,6 +392,7 @@ def fused_decode(
                 f"{builder.MODEL_NAME!r}. It is one of "
                 f"{sorted(getattr(builder, '_MODELS', {}))}."
             )
+        _check_model_table(builder, config)
         op = FusedDecodeOp.from_builder(
             builder.build_module,
             kernel_objects=list(kernel_objects),

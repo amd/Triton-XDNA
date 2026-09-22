@@ -100,8 +100,6 @@ def test_env_is_derived_not_inherited():
     expected = {
         "DECODE_MODEL": "qwen3-4b",
         "DECODE_GOLDEN_L": "2047",
-        "VOCAB_CHUNK_I2": "30",
-        "UNIFIED": "1",
     }
     for k, v in expected.items():
         if env.get(k) != v:
@@ -111,6 +109,52 @@ def test_env_is_derived_not_inherited():
     # Unset knobs stay out, so the builder keeps its own default for them.
     if "DECODE_WGROUP" in env:
         raise AssertionError("an unset knob leaked into the environment")
+    # Since mlir-air `deffe6f1` these four are properties of the model, read
+    # from its `_MODELS` entry and NOT from the environment. Setting them would
+    # be inert, so the config must not; `_check_model_table` verifies them
+    # against the builder instead. `UNIFIED` is not here either: every one of
+    # mlir-air's Makefiles sets it and none of its code reads it.
+    for k in ("VOCAB_CHUNK_I2", "W_DUAL_CHAN", "DECODE_STACK", "UNIFIED"):
+        if k in env:
+            raise AssertionError(
+                f"{k} is owned by mlir-air's _MODELS table, but the config put "
+                f"it in the environment, where it is ignored"
+            )
+
+
+def test_model_table_mismatch_is_refused():
+    """A knob that disagrees with mlir-air's `_MODELS` entry stops the build.
+
+    The builder would quietly use its own value, leaving the spec's recorded
+    one a lie -- the same class of silent-wrong this module exists to prevent.
+    """
+    import importlib
+    import triton.language as tl
+
+    # By name, `fused_decode` is both the submodule and the function the
+    # package exports; `__init__` binds the function, so the module has to be
+    # imported explicitly.
+    fd = importlib.import_module("triton.language.extra.npu.fused_decode")
+
+    cfg = tl.extra.npu.DecodeConfig(
+        model="qwen3-4b", model_type="QWEN3_4B", context_length=16, vocab_chunk=30
+    )
+
+    class _Builder:  # stands in for the imported mlir-air module
+        MODEL = {"VOCAB_CHUNK_I2": 5, "W_DUAL_CHAN": 1}
+
+    try:
+        fd._check_model_table(_Builder, cfg)
+    except tl.extra.npu.DecodeConfigError as e:
+        if "VOCAB_CHUNK_I2" not in str(e):
+            raise AssertionError(f"unhelpful message: {e}")
+    else:
+        raise AssertionError("a mismatched _MODELS value was not refused")
+
+    # Agreement is silent, and a builder without the table is not second-guessed.
+    _Builder.MODEL = {"VOCAB_CHUNK_I2": 30, "W_DUAL_CHAN": 1}
+    fd._check_model_table(_Builder, cfg)
+    fd._check_model_table(object(), cfg)
 
 
 def test_refuses_another_models_kernels():
@@ -188,6 +232,10 @@ def main():
         (
             "the environment is derived from the config",
             test_env_is_derived_not_inherited,
+        ),
+        (
+            "a knob disagreeing with mlir-air's _MODELS is refused",
+            test_model_table_mismatch_is_refused,
         ),
         ("model_type is required", test_model_type_is_required),
         ("another model's kernels are refused", test_refuses_another_models_kernels),

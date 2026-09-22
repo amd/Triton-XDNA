@@ -21,13 +21,17 @@ One fact is handled in the model's `config` rather than here: the three biases
 arrive already concatenated as a single `qkv_bias`, because the projection they
 correct is itself fused into one GEMM. `config.load_q4nx` documents it.
 
-What is *not* about Qwen2.5 at all, and is handled here because this is the
-first model to reach it, is the size of its MLP: `INTER` is 18944, half again
-the widest before it. Both GEMMs that touch it fall outside what the shared
-matmul defaults lower -- see `_layer`.
+One thing here is not about Qwen2.5 at all: which matmul schedule the
+model-dim GEMMs are lowered with. The shared hand-written schedule does not
+lower every width, and Qwen2.5-7B's fused `gate_up` is past what it takes --
+so the choice is read from each model's `config` (`MATMUL_GENERATED_SCHEDULE`)
+rather than fixed for the family. Qwen2.5-3B, on the same forward, does not
+need it. See `GENERATED_SCHEDULE`.
 """
 
 import torch
+
+import config as _config
 
 from config import (
     DH,
@@ -54,31 +58,40 @@ class Qwen25Prefill(LlamaPrefill):
     #: leaves them, like the norms, in bf16.
     EXTRA_LAYER_WEIGHTS = {"qkv_bias": torch.float32}
 
-    #: The driver-generated matmul schedule rather than the hand-written one
-    #: every other model here uses, for the three GEMMs that pad K to 4096.
+    #: Whether this model's GEMMs need the driver-GENERATED matmul schedule in
+    #: place of the hand-written one every other model here uses. A per-model
+    #: fact, so it is read from the model's own `config` rather than fixed for
+    #: the family: Qwen2.5-7B needs it and Qwen2.5-3B does not.
     #:
-    #: Forced by `gate_up`, whose fused output is 2*18944 = 37888 columns. The
-    #: shared schedule emits a DMA descriptor with stride 2424832 for it,
-    #: against a hardware range of [1, 1048576], and aiecc rejects it. The
-    #: generated schedule lowers the same shape. Measured, not reasoned:
-    #: N=32768 lowers under the shared schedule and N=37888 does not, so the
-    #: boundary is somewhere between and is not simply "N is large".
+    #: What forces it, on the 7B: `gate_up`, whose fused output is 2*18944 =
+    #: 37888 columns. The shared schedule emits a DMA descriptor with stride
+    #: 2424832 for it, against a hardware range of [1, 1048576], and aiecc
+    #: rejects it. Measured, not reasoned: N=32768 lowers under the shared
+    #: schedule and N=37888 does not, so the boundary is between the two and is
+    #: not simply "N is large". The 3B's fused `gate_up` is 22016 columns, under
+    #: the largest width measured to lower.
     #:
-    #: It applies to `qkv` and `o` as well, and that is not a preference. All
-    #: three share (BLOCK_M=128, BLOCK_N=256, BLOCK_K=4096), Triton's cache
+    #: It is one flag for `qkv`, `o` and `gate_up` together, and that is not a
+    #: preference. All three share (BLOCK_M, BLOCK_N, BLOCK_K), Triton's cache
     #: keys on constexprs and not on the schedule, and so one binary serves all
-    #: three: asking for two schedules across them means one of them silently
-    #: gets the other's. `kernels._check_script` now raises rather than
-    #: allowing it.
-    WIDE_SCRIPT = None
+    #: three: asking for two schedules across them means one silently gets the
+    #: other's. `kernels._check_script` raises rather than allowing it.
+    #:
+    #: `down` is excluded deliberately. It lands on its own constexprs (its K is
+    #: the MLP dim, not the model dim), so it can and should keep the shared
+    #: schedule -- on the 7B the generated one did not finish lowering it in 25
+    #: minutes, where the shared one takes seconds. Its narrower weight tile is
+    #: derived inside `kernels.triton_matmul`, not declared here.
+    GENERATED_SCHEDULE = getattr(_config, "MATMUL_GENERATED_SCHEDULE", False)
 
-    #: `down` contracts INTER=18944, which pads to 32768, and its weight tile
-    #: is BLOCK_K x BLOCK_N elements. At the default 256 that is 8388608,
-    #: twice Triton's 4194304 per-tensor maximum -- a frontend limit, not a
-    #: device one. 128 is the largest that fits. It also puts `down` on its own
-    #: constexprs, which is why it can keep the shared schedule (and should:
-    #: the generated one did not finish lowering this shape in 25 minutes).
-    DOWN_BLOCK_N = 128
+    @property
+    def _wide(self):
+        """Schedule override for the three model-dim GEMMs, as kwargs.
+
+        Empty when the shared schedule serves, so `triton_matmul` keeps its own
+        default rather than this file restating it.
+        """
+        return {"transform_script": None} if self.GENERATED_SCHEDULE else {}
 
     def _layer(self, x, L, N, keep=None):
         """One Qwen2.5 transformer block, on the prompt. x: [N, D] -> [N, D].
@@ -104,9 +117,7 @@ class Qwen25Prefill(LlamaPrefill):
         # The Qwen2.5 delta. One add on the fused [DQ+DK+DV] output rather than
         # three on the split halves: same arithmetic, and it keeps the bias
         # laid out the way the GEMM that produced the tensor already is.
-        qkv = (
-            self._matmul(h, w["qkv"], transform_script=self.WIDE_SCRIPT) + w["qkv_bias"]
-        )
+        qkv = self._matmul(h, w["qkv"], **self._wide) + w["qkv_bias"]
         q, k, v = qkv.split([DQ, DK, DV], dim=1)
 
         q = self._rope(q, self._lut[:N], N_Q_HEADS)
@@ -118,12 +129,10 @@ class Qwen25Prefill(LlamaPrefill):
         self.kv_v[L][:keep] = v[:keep].to(torch.float32).numpy()
 
         a = self._attention(q, k, v, N_Q_HEADS, N_KV_HEADS, DH)  # [N, DQ]
-        x = x + self._matmul(a, w["o"], transform_script=self.WIDE_SCRIPT)
+        x = x + self._matmul(a, w["o"], **self._wide)
 
         h = self._rms_norm(x, w["ffn_norm"], RMS_EPS)
-        g, u = self._matmul(h, w["gate_up"], transform_script=self.WIDE_SCRIPT).split(
-            [INTER, INTER], dim=1
-        )
-        return x + self._matmul(
-            self._swiglu(g, u), w["down"], block_n=self.DOWN_BLOCK_N
-        )
+        g, u = self._matmul(h, w["gate_up"], **self._wide).split([INTER, INTER], dim=1)
+        # `down` keeps the shared schedule and the default block_n; its tile
+        # width is narrowed by triton_matmul itself where K demands it.
+        return x + self._matmul(self._swiglu(g, u), w["down"])
