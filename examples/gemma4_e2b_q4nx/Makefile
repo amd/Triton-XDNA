@@ -44,12 +44,15 @@ N_TOKENS ?= 4
 # it, so a 35-layer model pays for the depth on every dispatch. Raise it for
 # longer sessions.
 DECODE_L ?= 128
+# EMPTY by default, and that is load-bearing -- the same shape mlir-air's own
+# Gemma4 Makefile uses. An absent PROMPT selects the canonical token IDS below,
+# which is what lets `make run` gate the decode; setting it sends text, exactly
+# as on every sibling here, and correctly does not gate.
+PROMPT   ?=
 # The canonical prompt, as IDS -- `config.PROMPT`, whose leading 2 is a <bos>
-# this tokenizer does not emit. Keep the two in step: the harness gates the
-# decode only when the ids it ran match `config.PROMPT` exactly.
-PROMPT_IDS  ?= 2,818,5279,529,7001,563
-# Ask something else:  make run PROMPT_TEXT="Why is the sky blue?"
-PROMPT_TEXT ?=
+# this tokenizer does not emit. Keep the two in step: the harness applies the
+# recorded continuation only when the ids it ran match `config.PROMPT` exactly.
+PROMPT_IDS ?= 2,818,5279,529,7001,563
 MODEL    ?=
 
 MODEL_ARG  := $(if $(MODEL),--model "$(MODEL)",)
@@ -79,7 +82,7 @@ help:
 	@echo "Gemma4-E2B Q4NX -- Triton prefill + mlir-air fused decode"
 	@echo ""
 	@echo "  make run              The canonical prompt (gated), N_TOKENS=$(N_TOKENS)"
-	@echo "                        PROMPT_TEXT=\"...\" asks something else, ungated"
+	@echo "                        PROMPT=\"...\" asks something else, ungated"
 	@echo "  make prefill          Prefill only + Paris gate (no decode build)"
 	@echo "  make profile          Per-operator prefill timing"
 	@echo "  make compile-decode   Build the decode from nothing (~22 s, run once)"
@@ -105,11 +108,11 @@ help:
 ## `ids == cfg.PROMPT`. The check would be silently skipped, and the target
 ## would pass by not testing anything.
 ##
-## Override PROMPT with text to ask something else; that path takes `--text`
-## and correctly does not gate.
+## `make run PROMPT="..."` asks something else, through `--text`, exactly as on
+## every sibling here -- and correctly does not gate, because the ids differ.
 run: preflight
 	@cd $(srcdir) && $(PYTHON) $(DRIVER) $(COMMON) \
-		$(if $(PROMPT_TEXT),--text "$(PROMPT_TEXT)",--prompt "$(PROMPT_IDS)") \
+		$(if $(PROMPT),--text "$(PROMPT)",--prompt "$(PROMPT_IDS)") \
 		--max-tokens $(N_TOKENS) --greedy
 
 ## Prefill on its own -- needs no decode build. Gates on first token == 9079.
