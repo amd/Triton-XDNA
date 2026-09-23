@@ -58,6 +58,8 @@ here use -- seeds the decode from that aliased oracle, so on **this** model it
 is not a reference at all. Gate against mlir-air's own NPU prefill instead.
 """
 
+import os
+
 import numpy as np
 import torch
 
@@ -203,6 +205,59 @@ class Gemma4Prefill(LlamaPrefill):
             .to(torch.float32)
             for L in range(self.n_layers)
         ]
+        self._build_fused_mlp()
+
+    def _build_fused_mlp(self):
+        """Pad every layer's MLP weights into a per-width fused chain.
+
+        One `FusedMLP` per distinct FFN width -- two here, since the width
+        changes at `FIRST_KV_SHARED` -- each owning one chain shared by its
+        layers. Done at load time because that is when the padding is paid for
+        anyway; the point of the chain is that it is then never paid again.
+
+        Only on the NPU path, and only when both operators the chain subsumes
+        would have gone there: an `--ops` bisection that pins either one to
+        torch is asking to compare against the unfused path, and silently
+        running the chain would answer a different question.
+
+        Leaves `_fused_mlp` None on failure, which sends `_layer` down the
+        unfused path. Deliberately narrow in what it catches: a
+        CompilationError or a missing transform script means the chain is
+        broken, and swallowing that here would report ~10x slower numbers under
+        the same label rather than saying so.
+        """
+        self._fused_mlp = None
+        if self.backend != "npu" or not {"matmul", "geglu"} <= self.enabled:
+            return
+        if os.environ.get("Q4NX_FUSED_MLP", "1") != "1":
+            print("[gemma4] fused MLP disabled by Q4NX_FUSED_MLP=0")
+            return
+        try:
+            from fused_mlp import FusedMLP
+
+            by_width = {}
+            for L in range(self.n_layers):
+                inter = mlp_inter(L)
+                mlp = by_width.get(inter)
+                if mlp is None:
+                    mlp = by_width[inter] = FusedMLP(D, inter)
+                mlp.add_layer(L, self._w[L]["gate_up"], self._w[L]["down"])
+                # Drop the originals. The chain holds its own padded copies and
+                # nothing on this path reads these again -- keeping them would
+                # hold ~80% of the model's weight bytes alive twice, which took
+                # peak RSS past the `min_host_gib` this model declares.
+                # `kernels.ResidentWeight` makes the same trade for the same
+                # reason. The unfused path still needs them, so this runs only
+                # once the chain is known to be built.
+                del self._w[L]["gate_up"], self._w[L]["down"]
+            self._fused_mlp = {L: by_width[mlp_inter(L)] for L in range(self.n_layers)}
+            print(
+                f"[gemma4] fused MLP: {len(by_width)} chains "
+                f"(inter={sorted(by_width)}) over {self.n_layers} layers",
+                flush=True,
+            )
+        except ImportError as e:
+            print(f"[gemma4] fused MLP unavailable ({e}); using the unfused path")
 
     # ---- forward ----
     def _geglu(self, gate, up, backend=None):
@@ -312,9 +367,15 @@ class Gemma4Prefill(LlamaPrefill):
         # ---- MLP sublayer, norm-sandwiched the same way ----
         residual = x
         h = self._rms_norm(x, w["ffn_norm"], RMS_EPS)  # pre_feedforward
-        inter = mlp_inter(L)
-        g, u = self._matmul(h, w["gate_up"]).split([inter, inter], dim=1)
-        d = self._matmul(self._geglu(g, u), w["down"])
+        if self._fused_mlp is not None:
+            # gate | up | merge | down as one dispatch, with the two weights
+            # that are 80% of this model's staged bytes already on the device.
+            with self.timer.track("mlp_fused"):
+                d = self._fused_mlp[L].run(L, h)
+        else:
+            inter = mlp_inter(L)
+            g, u = self._matmul(h, w["gate_up"]).split([inter, inter], dim=1)
+            d = self._matmul(self._geglu(g, u), w["down"])
         x = residual + self._rms_norm(d, w["post_ffn_norm"], RMS_EPS)
 
         # ---- per-layer embedding injection ----
