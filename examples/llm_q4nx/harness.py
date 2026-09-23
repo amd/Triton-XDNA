@@ -154,7 +154,7 @@ def check_host_memory(spec):
         )
 
 
-def load_prefill_weights(m, backend):
+def load_prefill_weights(m, backend, npu_resident=True):
     """Load `m`'s weights, and free what a device-only run does not need.
 
     Both entry points go through here rather than each remembering the second
@@ -169,12 +169,32 @@ def load_prefill_weights(m, backend):
     on the CPU build their own model and do not come through here at all.
     """
     m.load_weights()
-    if backend == "npu" and "matmul" in m.enabled:
+    # `hetero` too: it puts matmul on the NPU exactly as `npu` does and differs
+    # only in where RoPE and attention go, so it wants the same resident
+    # weights. Missing it here costs nothing visible -- the run is simply
+    # slower and larger -- which is why it is worth stating.
+    #
+    # `npu_resident=False` is how a GPU decode opts out. The conversion is
+    # ONE-WAY: it replaces each projection with a padded device-resident form
+    # and releases the torch tensor, so a decode that then wants to multiply
+    # with it gets `unsupported operand type(s) for @: Tensor and
+    # ResidentWeight`. The prefill pays for that -- it re-pads per call -- and
+    # that is the trade a hybrid run makes.
+    if npu_resident and backend in ("npu", "hetero") and "matmul" in m.enabled:
         m.make_npu_resident()
 
 
 def run_prefill(
-    prefill_cls, cfg, ids, backend, ops, max_seq, model, kv_path, profile=False
+    prefill_cls,
+    cfg,
+    ids,
+    backend,
+    ops,
+    max_seq,
+    model,
+    kv_path,
+    profile=False,
+    npu_resident=True,
 ):
     """Our prefill -> the handoff npz.
 
@@ -197,7 +217,7 @@ def run_prefill(
     m.timer.enabled = profile
     t0 = time.time()
     try:
-        load_prefill_weights(m, backend)
+        load_prefill_weights(m, backend, npu_resident=npu_resident)
     except Exception as e:  # noqa: BLE001 -- any failure to obtain weights
         raise ExampleUnavailable(f"cannot load the q4nx weights: {e}") from e
     t_load = time.time() - t0
@@ -367,9 +387,52 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     return air.generate(list(ids), args.max_tokens, **kwargs)
 
 
+def generate_on_gpu(cfg, args, prefiller, first, ids):
+    """Greedy decode in torch on the iGPU, seeded by the NPU prefill.
+
+    The hybrid: prefill stays wherever `--backend` put it, and the decode that
+    would have been mlir-air's single fused NPU dispatch runs here instead, one
+    token at a time. Slower by construction -- 35 layers of small GEMMs against
+    one dispatch -- and useful for two things the NPU decode cannot do: running
+    generation without a built decode template, and giving the fused kernel a
+    reference to be scored against.
+
+    Model-specific, and deliberately not dressed up as general: only Gemma4
+    has a `Gemma4GpuDecode` today, and a base-class hook with one implementation
+    would claim more than it delivers.
+    """
+    if cfg.MODEL_NAME != "gemma4-e2b":
+        raise ExampleUnavailable(
+            f"--decode gpu is implemented for gemma4-e2b only; "
+            f"{cfg.MODEL_NAME} has no GPU decode. Use --decode npu."
+        )
+    from gemma4_prefill import Gemma4GpuDecode
+
+    P = prefiller.current_context_length
+    dec = Gemma4GpuDecode(prefiller, max_L=P + args.max_tokens + 1)
+    eos = tuple(getattr(cfg, "EOS_IDS", ()) or ())
+    return dec.generate(first, args.max_tokens, eos=eos)
+
+
 def build_parser(doc):
     ap = argparse.ArgumentParser(description=doc)
-    ap.add_argument("--backend", choices=("cpu", "npu"), default="npu")
+    ap.add_argument(
+        "--decode",
+        choices=("npu", "gpu"),
+        default="npu",
+        help="npu: mlir-air's fused decode, all layers in one dispatch. gpu: "
+        "torch on the iGPU, token by token -- the hybrid half of a run whose "
+        "prefill is still on the NPU. Only Gemma4-E2B implements it.",
+    )
+    ap.add_argument(
+        "--backend",
+        choices=("cpu", "npu", "hetero"),
+        default="npu",
+        help="cpu: every operator in torch. npu: the operators with an NPU "
+        "kernel on the NPU, the rest (RoPE, attention) in torch on the host. "
+        "hetero: the same NPU split, but those two on the iGPU -- the name "
+        "examples/qwen2_5 and examples/gpt2 already use for it.",
+    )
     ap.add_argument(
         "--ops", default="all", help="NPU ops: all, or a comma-separated subset"
     )
@@ -529,6 +592,8 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             args.model,
             kv_path,
             profile=args.profile,
+            # A GPU decode reads the torch weights this would have released.
+            npu_resident=args.decode != "gpu",
         )
         ttft = time.time() - t_pf
         # Stop rather than decode from a prefill already known to be wrong.
@@ -539,7 +604,9 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             return 1
 
         t0 = time.time()
-        if spec.driver_api == "prefiller":
+        if args.decode == "gpu":
+            out = generate_on_gpu(cfg, args, prefiller, first, ids)
+        elif spec.driver_api == "prefiller":
             out = generate_via_prefiller(air, spec, cfg, args, ids, prefiller)
         elif spec.driver_api == "kv_arrays":
             out = generate_via_kv_arrays(

@@ -38,7 +38,7 @@ from gemma4_prefill import Gemma4Prefill  # noqa: E402
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--backend", choices=("cpu", "npu"), default="npu")
+    ap.add_argument("--backend", choices=("cpu", "npu", "hetero"), default="npu")
     ap.add_argument(
         "--ops",
         default=None,
