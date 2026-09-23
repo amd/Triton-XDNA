@@ -84,6 +84,8 @@ from config import (
     rope_lut,
 )
 
+import gpu_kernels
+
 from llama_prefill import LlamaPrefill, _as_bf16, _t
 
 
@@ -523,7 +525,7 @@ class Gemma4Prefill(LlamaPrefill):
 
 
 class Gemma4GpuDecode:
-    """Greedy decode for Gemma4-E2B, in torch, on the iGPU.
+    """Greedy decode for Gemma4-E2B, in Triton, on the iGPU.
 
     Built from a `Gemma4Prefill` that has already run: it takes that object's
     weights and its KV cache, so the prompt is not re-run. The weights are
@@ -534,6 +536,21 @@ class Gemma4GpuDecode:
     with the twenty KV-shared layers holding no cache at all and reading the
     one belonging to `kv_source_layer(L)` -- the same arrangement
     `Gemma4Prefill.__init__` uses, and for the same reason.
+
+    Every operator is a Triton kernel from `gpu_kernels`
+    ----------------------------------------------------
+    The projections, both norms, RoPE, the GLU and the attention. `README.md`
+    is explicit that *"PyTorch is used by the examples as a CPU reference"*,
+    and `examples/gpt2` and `examples/qwen2_5` have had `*_kernel_gpu` for
+    precisely this since they grew a GPU path -- a torch forward here would
+    mean the one path in this repository that runs on a GPU exercises none of
+    the compiler the repository is for.
+
+    What is still torch is glue, and stays glue on purpose: moving weights and
+    the cache to the device, the row gather out of the embedding table,
+    `argmax` over the logits, and three scalar multiplies inside `_ple` on
+    256-wide rows. None of them is an operator the model defines; a kernel for
+    any of them would be slower than the launch it saved.
     """
 
     def __init__(self, pf, max_L, device="cuda"):
@@ -594,16 +611,29 @@ class Gemma4GpuDecode:
             self.v.append(v)
 
     def _mm(self, x, w):
-        """bf16 in, f32 accumulation -- what `_matmul`'s torch body does."""
-        return (x.to(torch.bfloat16) @ w).to(torch.float32)
+        """One activation row against a projection. bf16 in, f32 accumulation.
+
+        `gpu_kernels.gemv`, not `x @ w`: this is the hot path -- ~281 of these
+        per token across 35 layers and the head -- and at one row the cost is
+        launch count, not arithmetic. See `gpu_kernels` for why it reduces over
+        K rather than calling `tl.dot`.
+        """
+        return gpu_kernels.gemv(x, w)
 
     def _norm(self, x, weight=None):
-        inv = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + RMS_EPS)
-        y = x * inv
-        return y if weight is None else y * weight
+        """RMSNorm over the last axis. `weight=None` is the weightless value norm."""
+        return gpu_kernels.rmsnorm(x, weight, RMS_EPS)
 
     def _head_norm(self, x, weight, n_heads, dh):
         return self._norm(x.reshape(n_heads, dh), weight).reshape(1, n_heads * dh)
+
+    def _norm_residual(self, x, weight, residual, scale=1.0):
+        """The sublayer tail, `(residual + norm(x) * weight) * scale`, fused.
+
+        Every Gemma4 sublayer ends this way, so this is three launches a layer
+        rather than nine.
+        """
+        return gpu_kernels.rmsnorm_residual(x, weight, RMS_EPS, residual, scale)
 
     def _rope(self, x, L, pos, n_heads, dh):
         """Half-split rotary on one row, at one position.
@@ -612,12 +642,7 @@ class Gemma4GpuDecode:
         adjacent lanes -- against this layer's own table. The partial rotary on
         the full layers is in that table, not here; see `config.rope_lut`.
         """
-        row = self.lut[L][pos]
-        half = row.shape[-1] // 2
-        cos, sin = row[:half], row[half:]
-        v = x.reshape(n_heads, 2 * half)
-        x1, x2 = v[:, :half], v[:, half:]
-        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).reshape(1, -1)
+        return gpu_kernels.rope(x, self.lut[L][pos], n_heads, dh)
 
     def _ple(self, x):
         """This token's per-layer vectors, [N_LAYERS, PLI_D].
@@ -635,6 +660,17 @@ class Gemma4GpuDecode:
 
     def step(self, token, pos):
         """One token through all 35 layers. Returns its logits, [VOCAB].
+
+        The driver scope is here rather than around each launch: a step issues
+        several hundred, and every one of them has to reach the GPU backend
+        rather than the NPU one that a preceding prefill leaves active. See
+        `gpu_kernels.gpu_driver`.
+        """
+        with gpu_kernels.gpu_driver():
+            return self._step(token, pos)
+
+    def _step(self, token, pos):
+        """`step`'s body, with a GPU driver already selected.
 
         `pos` is the position this token occupies -- the length of everything
         before it. The cache rows `[0, pos)` are the context; this step writes
@@ -677,34 +713,31 @@ class Gemma4GpuDecode:
             lo = max(0, pos - SLIDING_WINDOW + 1) if is_sliding(L) else 0
             kc = self.k[src][lo : pos + 1]  # [S, dh]
             vc = self.v[src][lo : pos + 1]
-            qh = q.reshape(N_Q_HEADS, dh)
-            scores = (qh @ kc.T) * ATTN_SCALE  # [n_q, S]
-            a = (torch.softmax(scores, -1) @ vc).reshape(1, N_Q_HEADS * dh)
+            a = gpu_kernels.attn_decode(q, kc, vc, N_Q_HEADS, dh, ATTN_SCALE)
 
             a = self._mm(a, w["o"])
-            x = residual + self._norm(a, w["post_attn_norm"])
+            x = self._norm_residual(a, w["post_attn_norm"], residual)
 
             residual = x
             h = self._norm(x, w["ffn_norm"])
             inter = mlp_inter(L)
             g, u = self._mm(h, w["gate_up"]).split([inter, inter], dim=1)
-            d = self._mm(torch.nn.functional.gelu(g, approximate="tanh") * u, w["down"])
-            x = residual + self._norm(d, w["post_ffn_norm"])
+            d = self._mm(gpu_kernels.geglu(g, u), w["down"])
+            x = self._norm_residual(d, w["post_ffn_norm"], residual)
 
-            # Per-layer embedding injection, then the per-layer output scale.
+            # Per-layer embedding injection, then the per-layer output scale --
+            # folded into the same launch as the norm that precedes it.
             residual = x
-            gate = (
-                torch.nn.functional.gelu(self._mm(x, w["inp_gate"]), approximate="tanh")
-                * pli[L]
-            )
+            gate = gpu_kernels.geglu(self._mm(x, w["inp_gate"]), pli[L])
             pr = self._mm(gate, w["per_layer_projection"])
-            x = residual + self._norm(pr, w["post_ple_norm"])
-            x = x * w["out_scale"]
+            x = self._norm_residual(
+                pr, w["post_ple_norm"], residual, scale=w["out_scale"]
+            )
 
         x = self._norm(x, self.final_norm)
         logits = self._mm(x, self.lm_head.T)[0]
         if FINAL_LOGIT_SOFTCAP:
-            logits = FINAL_LOGIT_SOFTCAP * torch.tanh(logits / FINAL_LOGIT_SOFTCAP)
+            logits = gpu_kernels.logit_softcap(logits, FINAL_LOGIT_SOFTCAP)
         return logits
 
     def generate(self, first, n_tokens, eos=()):
@@ -716,16 +749,22 @@ class Gemma4GpuDecode:
         """
         out = [int(first)]
         pos = self.P
-        for _ in range(max(0, n_tokens - 1)):
-            if pos >= self.max_L:
-                print(f"[gpu-decode] hit max_L={self.max_L}; stopping", flush=True)
-                break
-            with self.timer.track("gpu_decode_step"):
-                logits = self.step(out[-1], pos)
-            nxt = int(torch.argmax(logits))
-            pos += 1
-            if nxt in eos:
+        # One driver scope for the whole loop. `step` takes one too, which
+        # no-ops inside this; what must not happen is a *switch* per token,
+        # because that drops Triton's kernel cache and recompiles every shape
+        # the token touches -- 7.5 s of an 9.3 s, 64-token run before this was
+        # hoisted. See `gpu_kernels.gpu_driver`.
+        with gpu_kernels.gpu_driver():
+            for _ in range(max(0, n_tokens - 1)):
+                if pos >= self.max_L:
+                    print(f"[gpu-decode] hit max_L={self.max_L}; stopping", flush=True)
+                    break
+                with self.timer.track("gpu_decode_step"):
+                    logits = self.step(out[-1], pos)
+                nxt = int(torch.argmax(logits))
+                pos += 1
+                if nxt in eos:
+                    out.append(nxt)
+                    break
                 out.append(nxt)
-                break
-            out.append(nxt)
         return out
