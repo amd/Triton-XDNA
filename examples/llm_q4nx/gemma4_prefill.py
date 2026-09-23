@@ -102,6 +102,12 @@ class Gemma4Prefill(LlamaPrefill):
     #: reloading a multi-GB bundle.
     WEIGHT_ATTRS = LlamaPrefill.WEIGHT_ATTRS + ("ple_proj_norm", "_ple_rows")
 
+    #: The per-layer fused MLP chains, or None for the torch path. Declared on
+    #: the class, not just assigned in `_build_fused_mlp`: an instance built
+    #: for `share_weights_from` never runs `load_weights`, and `_layer` reads
+    #: this on every layer.
+    _fused_mlp = None
+
     def __init__(self, *a, **kw):
         """Llama's, with a per-layer KV cache.
 
@@ -258,6 +264,30 @@ class Gemma4Prefill(LlamaPrefill):
             )
         except ImportError as e:
             print(f"[gemma4] fused MLP unavailable ({e}); using the unfused path")
+
+    def share_weights_from(self, other):
+        """Llama's, plus the MLP weights the fused path drops.
+
+        `_w` is shared by reference, so an instance adopting a fused NPU
+        model's weights sees the `gate_up`/`down` that `_build_fused_mlp`
+        deleted -- and being a torch-path instance, it is exactly the one that
+        needs them. `--compare-cpu` is the caller, and it raised before this.
+
+        Rebuilt from the chain's padded copies rather than reloaded: a reload
+        costs minutes and would compare against a different dequantization,
+        which is the reason this method exists at all.
+
+        The restored tensors land in the shared dicts, so the fused instance
+        gets them back too. That is memory on a debug path and nothing more --
+        its own `_layer` still goes through the chain, and `_fused_mlp` is what
+        decides that, not the presence of these keys.
+        """
+        super().share_weights_from(other)
+        for L, mlp in (getattr(other, "_fused_mlp", None) or {}).items():
+            w = self._w[L]
+            if "gate_up" not in w:
+                w["gate_up"], w["down"] = mlp.logical_weights(L)
+        return self
 
     # ---- forward ----
     def _geglu(self, gate, up, backend=None):

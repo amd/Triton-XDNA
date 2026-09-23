@@ -95,6 +95,20 @@ def _pow2(n):
     return 1 << (n - 1).bit_length()
 
 
+def _as_torch_bf16(a):
+    """ml_dtypes bfloat16 numpy -> torch bfloat16, reinterpreted not converted.
+
+    `llama_prefill._t`'s bf16 branch, inlined rather than imported: that module
+    pulls in an example's `config`, and this one is a library parameterized on
+    dimensions -- like `kernels.py`, it imports nothing example-local. Going via
+    float32 instead would double every weight in transit for a result that ends
+    up bf16 again.
+    """
+    return torch.from_numpy(np.ascontiguousarray(a).view(np.uint16)).view(
+        torch.bfloat16
+    )
+
+
 @triton.jit
 def _mm_kernel(
     A,
@@ -223,6 +237,23 @@ class FusedMLP:
     def add_layer(self, layer_idx, gate_up, down):
         """Pad and keep this layer's weights. Call once, at load time."""
         self._weights[layer_idx] = self.prep_weights(gate_up, down)
+
+    def logical_weights(self, layer_idx):
+        """This layer's `gate_up` and `down`, as `load_weights` held them.
+
+        Exact rather than close: `prep_weights` only split and zero-padded, and
+        both forms are bf16, so slicing the padding back off returns the values
+        that went in -- `_t` reinterprets the two bytes rather than converting,
+        so this is bit-identical.
+
+        For `--compare-cpu`, which shares `_w` with a torch-path instance after
+        the caller has dropped the originals. It allocates, so it belongs on
+        that path and nowhere near a forward.
+        """
+        Bg, Bu, Bd = self._weights[layer_idx]
+        D, H = self.D, self.H
+        gate_up = torch.cat([_as_torch_bf16(Bg[:D, :H]), _as_torch_bf16(Bu[:D, :H])], 1)
+        return gate_up.contiguous(), _as_torch_bf16(Bd[:H, :D]).contiguous()
 
     # ---- chain ----
     def _get_chain(self):

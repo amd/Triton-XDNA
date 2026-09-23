@@ -81,6 +81,17 @@ def check(inter, n_rows, layers=(0, 1)):
         print(f"  L{L} repeat drift   : {drift}   (must be 0.0)")
         ok &= drift == 0.0
 
+    # (4) the originals come back exactly. `_build_fused_mlp` drops them, and
+    # `share_weights_from` rebuilds them from these padded copies for
+    # `--compare-cpu`; anything less than bit-identical would show up there as
+    # a spurious diff against the CPU reference.
+    for L in layers:
+        gate_up, down = mlp.logical_weights(L)
+        g_ref, d_ref = w[L]
+        exact = torch.equal(gate_up, g_ref) and torch.equal(down, d_ref)
+        print(f"  L{L} weight round-trip: {'exact' if exact else 'DIFFERS'}")
+        ok &= exact
+
     mlp.close()
     print("  ->", "PASS" if ok else "FAIL")
     return ok
