@@ -15,6 +15,18 @@ tile semantics. `tl.extra.cuda.libdevice` is the precedent: not a tile
 primitive, still a language op.
 """
 
-from .fused_decode import DecodeConfig, DecodeConfigError, fused_decode
+from .fused_decode import (
+    ENGINES,
+    DecodeConfig,
+    DecodeConfigError,
+    DecodeEngine,
+    fused_decode,
+)
 
-__all__ = ["DecodeConfig", "DecodeConfigError", "fused_decode"]
+__all__ = [
+    "ENGINES",
+    "DecodeConfig",
+    "DecodeConfigError",
+    "DecodeEngine",
+    "fused_decode",
+]

@@ -350,6 +350,18 @@ runs:
             # the decode comparison against mlir-air's own generation does.
             gate gemma3_4b_q4nx --prefill-only
 
+            # Gemma4-E2B. The widest gate here per token of prompt: the first
+            # token cannot come out unless the per-layer embeddings, the
+            # per-layer class map (which layers slide, which share a KV cache,
+            # which carry the wide FFN), the 1.0 attention scale and the
+            # per-layer output scalar are all right, and every one of them
+            # fails into fluent wrong text rather than an error.
+            #
+            # Prefill only, like its siblings, so it does NOT cover the decode
+            # -- which on this model is the one built by a different engine.
+            # That is `make run` locally.
+            gate gemma4_e2b_q4nx --prefill-only
+
             echo ""
             echo "--------------------------------------------------"
             echo "Q4NX Gate Results:"

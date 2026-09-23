@@ -36,6 +36,10 @@ DEST = "third_party/mlir-air-src"
 # and `shared/`; `fused_decode` carries the builder and the AIE kernels.
 SPARSE_PATHS = (
     "programming_examples/fused_decode",
+    # The PLE fork. A separate path because it is a separate directory, and
+    # without it a clean checkout has no `fused_decode_ple.py` and no `ple.cc`
+    # -- so Gemma4's `make compile-decode` fails before it builds anything.
+    "programming_examples/fused_decode_ple",
     "programming_examples/llms",
 )
 
@@ -74,12 +78,50 @@ def at_commit(dest, commit):
     return head.startswith(commit) or commit.startswith(head[: len(commit)])
 
 
+def _widen(dest, quiet=False):
+    """Re-apply SPARSE_PATHS to a checkout that already exists.
+
+    Needed whenever a path is ADDED to the list: an existing checkout is
+    already at the pinned commit, so `fetch` returns early and the new
+    directory is simply never materialized. The symptom is a missing file
+    rather than a stale one, which reads as a broken repo rather than a stale
+    checkout -- `fused_decode_ple` arrived this way.
+
+    **Only widens a checkout that is already sparse.** `sparse-checkout set`
+    does not just edit the path list -- on a full clone it ENABLES sparse mode
+    and deletes every tracked file outside the list. So a developer who cloned
+    mlir-air here by hand would find most of it gone, silently and with a zero
+    exit status. A full clone already contains everything this needs, so there
+    is nothing to widen; it is left exactly as it was.
+
+    Detected on `core.sparseCheckout` rather than on the exit status of
+    `sparse-checkout list`, which is 128 on a full worktree -- that would work
+    too, but only by running a command whose failure is the answer. Within a
+    sparse checkout `set` is idempotent, so this is a no-op once it is wide
+    enough.
+    """
+    try:
+        enabled = _git(
+            "config", "--get", "core.sparseCheckout", cwd=dest, quiet=True
+        ).stdout
+    except subprocess.CalledProcessError:
+        enabled = ""  # unset: a full clone, which has everything already
+    if (enabled or "").strip().lower() != "true":
+        return
+    try:
+        _git("sparse-checkout", "set", *SPARSE_PATHS, cwd=dest, quiet=True)
+    except subprocess.CalledProcessError:
+        if not quiet:
+            print(f"[air-src] could not re-apply sparse paths in {dest}", flush=True)
+
+
 def fetch(dest=None, commit=None, quiet=False):
     """Ensure a sparse checkout of mlir-air at the pinned commit. Returns its path."""
     dest = Path(dest) if dest else repo_root() / DEST
     commit = commit or pinned_commit()
 
     if at_commit(dest, commit):
+        _widen(dest, quiet)
         if not quiet:
             print(f"[air-src] {dest} already at {commit}", flush=True)
         return dest

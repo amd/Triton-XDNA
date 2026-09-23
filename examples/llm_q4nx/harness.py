@@ -37,6 +37,32 @@ class ExampleUnavailable(Exception):
     """The example cannot run here (weights, tokenizer or decode build)."""
 
 
+def _apply_engine_env(model):
+    """Put the build's engine-owned knobs in the environment, for the runtime.
+
+    Only for engines that read them; see the caller. Unrecorded knobs are
+    removed rather than left, because on such an engine an absent variable is
+    how a spec asks for the builder's own default, and an inherited value
+    would answer with something else on the host while the artifact was built
+    without it.
+
+    Not scoped: this is the process that goes on to run the decode, and the
+    driver reads these at import into module-level constants.
+    """
+    from triton.language.extra.npu import ENGINES
+
+    engine = ENGINES[model.engine]
+    if not engine.model_table:
+        # This engine reads the four from the environment (it has no table
+        # entry for them), so they are ours to set.
+        recorded = model.decode_env
+        for var in ("W_DUAL_CHAN", "VOCAB_CHUNK_I2", "DECODE_WGROUP", "DECODE_STACK"):
+            if var in recorded:
+                os.environ[var] = str(recorded[var])
+            else:
+                os.environ.pop(var, None)
+
+
 def air_inference_module(model):
     """mlir-air's driver for this model, importable and unmodified."""
     # Before the import: mlir-air's module reads its decode-shape selection at
@@ -48,16 +74,31 @@ def air_inference_module(model):
     # Also before the import, and for the same reason: the drivers that take
     # this read it into a module-level constant. See `ModelSpec.decode_dir_env`.
     if model.decode_dir_env:
-        os.environ[model.decode_dir_env] = airsrc.fused_decode_dir()
+        os.environ[model.decode_dir_env] = airsrc.fused_decode_dir(model.engine)
 
-    # No `W_DUAL_CHAN` here. It selects the shim channel split and the DDR
-    # weight cascade order, so the artifact and the host must agree -- and
-    # until mlir-air `deffe6f1` the engine read it from the environment,
-    # defaulting to 1, so this function had to set it or Qwen2.5-3B (the only
-    # model that wants 0) decoded a correct first token and then garbage.
-    # It now comes from the model's own `_MODELS` entry and the environment is
-    # not consulted, so setting it here would be inert. `DecodeConfig` still
-    # records the value and `_check_model_table` verifies it against that entry.
+    # And before the import for a third reason, on the engines that need it:
+    # the knobs the BUILD was configured with.
+    #
+    # The shared engine needs nothing here. Since mlir-air `deffe6f1` it takes
+    # `W_DUAL_CHAN`, `VOCAB_CHUNK_I2`, `DECODE_WGROUP` and `DECODE_STACK` from
+    # the model's own `_MODELS` entry and does not consult the environment, so
+    # setting them would be inert -- `DecodeConfig` records them and
+    # `_check_model_table` verifies them against that entry instead.
+    #
+    # The PLE fork predates that commit and still reads all four from the
+    # environment, on BOTH sides: mlir-air's own `validate_layer_npu._load_fd`,
+    # which its Gemma4 driver imports the builder through, sets the eight knobs
+    # it cares about and leaves these four to the builder's defaults. So an
+    # exported `W_DUAL_CHAN=0` reaches the host's idea of the weight layout
+    # while the artifact on disk was built without it, and the two disagree
+    # about the shim channel split and the DDR cascade order. Nothing says so:
+    # the dispatch completes, the first token is right, and the rest is
+    # garbage. That is exactly the Qwen2.5-3B failure, from the other side.
+    #
+    # So on a PLE model the recorded knobs are applied and the unrecorded ones
+    # are CLEARED -- the same rule `tl.extra.npu`'s build scope follows, which
+    # is what makes the two sides agree by construction rather than by luck.
+    _apply_engine_env(model)
 
     airsrc.add_air_paths(model.air_package, *model.extra_packages)
     path = os.path.join(
@@ -263,7 +304,7 @@ def generate_via_prefiller(air, spec, cfg, args, ids, prefiller):
     """
     dec = getattr(air, spec.decoder_class)(
         args.model or cfg.MODEL_DEFAULT,
-        airsrc.fused_decode_dir(),
+        airsrc.fused_decode_dir(spec.engine),
         model_type=spec.model_type,
     )
     gen, t_prompt, t_gen = air.generate_stream(
@@ -314,9 +355,15 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     # measured wall clock goes back in rather than a zero that would read as a
     # free prefill.
     air._prefill_npu = lambda prompt, model, seq_len=None: (K, V, first, ttft)
-    kwargs = dict(model=args.model or cfg.MODEL_DEFAULT, greedy=args.greedy)
-    if "stop_on_eos" in inspect.signature(air.generate).parameters:
-        kwargs["stop_on_eos"] = False
+    params = inspect.signature(air.generate).parameters
+    kwargs = dict(model=args.model or cfg.MODEL_DEFAULT)
+    # Both offered only where the signature has somewhere to put them. Qwen3
+    # takes the pair, Gemma3 takes `greedy` alone, and Gemma4-E2B takes
+    # neither -- it is greedy unconditionally and stops on EOS
+    # unconditionally, which is why its recorded continuation is two tokens.
+    for name, value in (("greedy", args.greedy), ("stop_on_eos", False)):
+        if name in params:
+            kwargs[name] = value
     return air.generate(list(ids), args.max_tokens, **kwargs)
 
 
@@ -407,7 +454,9 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and air is not None:
         from hsa_decode import make_hsa_decoder_class
 
-        air.FusedDecoder = make_hsa_decoder_class(air, airsrc.fused_decode_dir())
+        air.FusedDecoder = make_hsa_decoder_class(
+            air, airsrc.fused_decode_dir(spec.engine)
+        )
 
     if args.interactive:
         # Swap our prefill into mlir-air's Session, then hand off to its REPL.

@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: MIT
 """What the decode build needs to know about a model.
 
-mlir-air's `fused_decode` engine drives every model family from one builder;
+mlir-air's `fused_decode` engine drives most model families from one builder;
 which one it builds is module-level state read from the environment at import
 time (`_MODELS` / `MODEL_NAME` in `fused_decode.py`). `build_module()` takes no
 arguments, so the environment is the only interface there is.
+
+There is a second builder -- `fused_decode_ple`, a fork of the first -- and one
+model here needs it. Which one a spec uses is its `engine`; it changes the
+module that is executed AND where four of the knobs below are applied, because
+the fork predates the commit that moved them into the model table.
 
 Each spec below is copied **verbatim** from that model's Makefile in
 mlir-air -- its `DECODE_ENV`, its `-DMODEL_TYPE`. These are not defaults chosen
@@ -47,7 +52,7 @@ class ModelSpec:
               `clear_context()`, `prefill()` and `kv_view()` on it -- which is
               the interface our prefill already has. No file, nothing to
               neutralize.
-            * `"kv_arrays"` -- Qwen3-4B and Gemma3-4B. `generate()` has no
+            * `"kv_arrays"` -- Qwen3-4B, Gemma3-4B and Gemma4-E2B. `generate()` has no
               handoff parameter at all: it calls its own `_prefill_npu` and
               passes the `(K, V, first)` straight to the decode loop. So that
               one function is replaced with ours, which is the same trick the
@@ -87,6 +92,18 @@ class ModelSpec:
     #: mlir-air's Makefiles leave each model's in its own directory, so a driver
     #: that defaults to the latter has to be pointed back.
     decode_dir_env: str = ""
+    #: Which of mlir-air's builders lowers this model -- a key of
+    #: `tl.extra.npu.ENGINES`. Every model here but Gemma4 uses the shared
+    #: `fused_decode`; Gemma4 needs `"ple"`, the fork carrying the per-layer
+    #: embedding branch and the per-layer class map. It is not a preference:
+    #: the shared engine's `_MODELS` has no `gemma4-e2b` entry at all.
+    #:
+    #: It also decides where four of the knobs below are applied. The fork
+    #: predates mlir-air `deffe6f1`, so it still reads `W_DUAL_CHAN`,
+    #: `VOCAB_CHUNK_I2`, `DECODE_WGROUP` and `DECODE_STACK` from the
+    #: environment, where the shared engine takes them from its model table.
+    #: The op owns that split; see `tl.extra.npu.DecodeEngine`.
+    engine: str = "fused_decode"
 
     def decode_config(self, context_length):
         """This spec as a `tl.extra.npu.DecodeConfig`.
@@ -100,8 +117,8 @@ class ModelSpec:
         Makefiles hold and what makes them diffable against upstream; the op
         takes them as they are. A knob absent from `decode_env` stays absent
         here too, leaving the builder its own default -- which is deliberate for
-        `UNIFIED`, `DECODE_WGROUP`, `DECODE_STACK` and `PROJ_RC_CACHE`, each
-        documented above where it is or is not set.
+        `UNIFIED`, `DECODE_WGROUP`, `DECODE_STACK`, `DECODE_UNI_DEC` and
+        `PROJ_RC_CACHE`, each documented above where it is or is not set.
         """
         from triton.language.extra.npu import DecodeConfig
 
@@ -115,10 +132,16 @@ class ModelSpec:
             unified=e.get("UNIFIED"),
             lm_head=e["LM_HEAD"],
             golden=e["DECODE_GOLDEN"],
-            dual_channel=e["W_DUAL_CHAN"],
+            # `.get`, unlike its siblings above: Gemma4's Makefiles name no
+            # W_DUAL_CHAN at all, where every shared-engine model's does. Absent
+            # leaves the PLE fork its own default of 1, which is what upstream
+            # builds that model with.
+            dual_channel=e.get("W_DUAL_CHAN"),
             weight_group=e.get("DECODE_WGROUP"),
             stack_size=e.get("DECODE_STACK"),
             proj_rc_cache=e.get("PROJ_RC_CACHE"),
+            decode_waves=e.get("DECODE_UNI_DEC"),
+            engine=self.engine,
         )
 
 
@@ -328,6 +351,50 @@ GEMMA3_4B = ModelSpec(
     # because its 262208-row LM head is a separate tensor where Qwen3-4B's is
     # tied.
     min_host_gib=17.0,
+    supports_hsa=False,
+)
+
+#: `DECODE_ENV` in `fused_decode_ple/Makefile` -- the ENGINE's, not the model's:
+#: `llms/gemma4_e2b_q4nx/Makefile` builds no template itself, it delegates to
+#: `make -C ../../fused_decode_ple compile-decode` and overrides two variables.
+#: So the environment is read from the engine and the overrides applied on top.
+#:
+#: `NLAYERS` and `DECODE_UNI_DEC` are the two overridden, and they are the same
+#: number twice (`NLAYERS=$(UNI_DEC)` upstream). 35 is `SWEEP_UNI_DEC`, what the
+#: TOKEN driver's template is built with. The engine defaults both to 1, which
+#: is the LAYER GATE's build -- a one-layer dispatch that produces no token. It
+#: does not fail, it decodes a 1/35-scale model, which is why the number is
+#: named here rather than left to the engine.
+#:
+#: No `W_DUAL_CHAN`: no Makefile on this path sets one, so the PLE engine's own
+#: default of 1 stands. Unlike the shared-engine models above, that default is
+#: read from the environment rather than from `_MODELS` -- see `engine`.
+GEMMA4_E2B = ModelSpec(
+    name="gemma4-e2b",
+    decode_env=dict(
+        DECODE_MODEL="gemma4-e2b",
+        VOCAB_CHUNK_I2="27",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="35",
+        DECODE_GOLDEN="1",
+        DECODE_UNI_DEC="35",
+    ),
+    model_type="GEMMA4_E2B",
+    engine="ple",
+    air_package="gemma4_e2b_q4nx",
+    air_inference="gemma4_e2b_q4nx_inference.py",
+    # Its driver detokenizes from the weight repo and exports no tokenizer
+    # path, like Qwen3's and Gemma3's. Gemma is gated on the Hub, so the
+    # fallback is the bundle repo rather than google/gemma-4-e2b-it.
+    tokenizer_fallback="FastFlowLM/Gemma4-E2B-IT-NPU2",
+    driver_api="kv_arrays",
+    decoder_class="FusedDecoder",
+    decode_dir_env="Q4NX_GEMMA4_DECODE_DIR",
+    # Measured: peak RSS of `--prefill-only` is 14.2 GiB, which is under
+    # Gemma3-4B's 15.1 despite the extra 35-layer depth -- this model's D is
+    # 1536 against Gemma3's 2560, and its LM head is the same 262144 rows.
+    min_host_gib=16.0,
     supports_hsa=False,
 )
 
@@ -571,6 +638,7 @@ SPECS = {
         QWEN2_5_3B,
         PHI4_MINI,
         GEMMA3_4B,
+        GEMMA4_E2B,
     )
 }
 

@@ -86,7 +86,12 @@ def test_rejects_nonsense_shapes():
 
 def test_env_is_derived_not_inherited():
     """The knobs come from the config, and `attn_maxl` rounds as the builder
-    does -- two context lengths that round together share an artifact."""
+    does -- two context lengths that round together share an artifact.
+
+    On the default engine, which is the shared `fused_decode`. The PLE fork
+    places four of them differently; `test_engine_decides_where_knobs_go`
+    covers that.
+    """
     import triton.language as tl
 
     cfg = tl.extra.npu.DecodeConfig(
@@ -155,6 +160,132 @@ def test_model_table_mismatch_is_refused():
     _Builder.MODEL = {"VOCAB_CHUNK_I2": 30, "W_DUAL_CHAN": 1}
     fd._check_model_table(_Builder, cfg)
     fd._check_model_table(object(), cfg)
+
+
+def test_engine_decides_where_knobs_go():
+    """The same four knobs are environment on one engine and table on the other.
+
+    mlir-air's PLE fork predates `deffe6f1`, so it still reads `W_DUAL_CHAN`,
+    `VOCAB_CHUNK_I2`, `DECODE_WGROUP` and `DECODE_STACK` from the environment
+    where the shared engine takes them from `_MODELS`. Getting that backwards
+    is silent in both directions -- setting a variable nothing reads builds the
+    wrong geometry, checking a table key that is not there checks nothing -- so
+    it is a property of the engine and worth asserting rather than assuming.
+    """
+    import importlib
+    import triton.language as tl
+
+    fd = importlib.import_module("triton.language.extra.npu.fused_decode")
+    moved = ("VOCAB_CHUNK_I2", "W_DUAL_CHAN", "DECODE_STACK", "DECODE_WGROUP")
+
+    def cfg(engine):
+        return tl.extra.npu.DecodeConfig(
+            model="gemma4-e2b",
+            model_type="GEMMA4_E2B",
+            context_length=128,
+            vocab_chunk=27,
+            dual_channel=1,
+            weight_group=0,
+            stack_size=10240,
+            engine=engine,
+        )
+
+    ple, shared = cfg("ple"), cfg("fused_decode")
+    for k in moved:
+        if k not in ple.env():
+            raise AssertionError(
+                f"{k} is missing from the PLE environment; that engine reads it "
+                f"there, so the build would silently take its own default"
+            )
+        if k in shared.env():
+            raise AssertionError(
+                f"{k} leaked into the shared engine's environment, where it is "
+                f"ignored -- it belongs to that engine's _MODELS entry"
+            )
+
+    # And the check runs only where the value was resolved rather than applied.
+    # Gemma4's PLE entry carries none of these keys, so a table that disagrees
+    # is not an error there: nothing read it.
+    class _Builder:
+        MODEL = {"VOCAB_CHUNK_I2": 5}
+
+    fd._check_model_table(_Builder, ple)
+    try:
+        fd._check_model_table(_Builder, shared)
+    except tl.extra.npu.DecodeConfigError:
+        pass
+    else:
+        raise AssertionError("the shared engine did not check its model table")
+
+    # Two engines building the same model are different artifacts, and the
+    # name they are built under has to say so -- for the shared engine the
+    # moved knobs are not even in `env()` to tell them apart.
+    if ple.fingerprint() == shared.fingerprint():
+        raise AssertionError("both engines fingerprinted alike")
+
+    try:
+        cfg("fused_decode_ple")  # the directory name, not the engine key
+    except tl.extra.npu.DecodeConfigError:
+        pass
+    else:
+        raise AssertionError("an unknown engine was accepted")
+
+
+def test_build_scope_clears_what_it_does_not_set():
+    """An inherited value cannot stand in for a knob the caller left unset.
+
+    On an engine that reads these from the environment, omitting one is how a
+    spec asks for the builder's own default -- Gemma4 names no `W_DUAL_CHAN`
+    at all. Merely not setting it would leave an exported `W_DUAL_CHAN=0` in
+    place, so the builder would answer with 0, the artifact would be built for
+    a different shim channel split, and `fingerprint` would not record it: it
+    hashes `env()`, which by construction does not contain what was never set.
+    """
+    import importlib
+    import os
+
+    import triton.language as tl
+
+    fd = importlib.import_module("triton.language.extra.npu.fused_decode")
+    # `dual_channel=None` is how a spec says "this model names no
+    # W_DUAL_CHAN", which is Gemma4's case -- the field defaults to 1, so
+    # leaving it out would emit a value rather than omit one. That is exactly
+    # what `registry.ModelSpec.decode_config` passes for this model.
+    cfg = tl.extra.npu.DecodeConfig(
+        model="gemma4-e2b",
+        model_type="GEMMA4_E2B",
+        context_length=128,
+        vocab_chunk=27,
+        dual_channel=None,
+        engine="ple",
+    )
+    if "W_DUAL_CHAN" in cfg.env():
+        raise AssertionError("an omitted knob was emitted anyway")
+
+    saved = {k: os.environ.get(k) for k in ("W_DUAL_CHAN", "DECODE_STACK")}
+    try:
+        os.environ["W_DUAL_CHAN"] = "0"
+        os.environ["DECODE_STACK"] = "99999"
+        with fd._environment(cfg.env(), fd.ENGINES[cfg.engine].env):
+            for var in ("W_DUAL_CHAN", "DECODE_STACK"):
+                if var in os.environ:
+                    raise AssertionError(
+                        f"{var} survived into the build scope, so the builder "
+                        f"would read {os.environ[var]!r} rather than its own "
+                        f"default"
+                    )
+            # What the caller DID set is still applied.
+            if os.environ.get("VOCAB_CHUNK_I2") != "27":
+                raise AssertionError("a configured knob was not applied")
+        # And the caller's environment comes back untouched either way.
+        if os.environ.get("W_DUAL_CHAN") != "0":
+            raise AssertionError("a cleared variable was not restored")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_refuses_another_models_kernels():
@@ -236,6 +367,14 @@ def main():
         (
             "a knob disagreeing with mlir-air's _MODELS is refused",
             test_model_table_mismatch_is_refused,
+        ),
+        (
+            "the engine decides which knobs are environment",
+            test_engine_decides_where_knobs_go,
+        ),
+        (
+            "the build scope clears knobs it does not set",
+            test_build_scope_clears_what_it_does_not_set,
         ),
         ("model_type is required", test_model_type_is_required),
         ("another model's kernels are refused", test_refuses_another_models_kernels),

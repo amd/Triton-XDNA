@@ -304,7 +304,7 @@ class LlamaPrefill:
                 [x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1
             ).reshape(N, -1)
 
-    def _attention(self, q, k, v, n_q, n_kv, dh, window=None, backend=None):
+    def _attention(self, q, k, v, n_q, n_kv, dh, window=None, scale=None, backend=None):
         """Causal GQA. q: [N, n_q*dh], k/v: [N, n_kv*dh] -> [N, n_q*dh].
 
         `window` bounds how far back a position may attend: with it set, j is
@@ -314,17 +314,24 @@ class LlamaPrefill:
         operator with a different mask, exactly as `n_q`/`n_kv` are the same
         operator at different head counts.
 
+        `scale` multiplies the scores. `None` is `dh**-0.5`, the usual
+        attention scale and what every model here but Gemma4 wants -- that one
+        configures 1.0, which is not a normalization anyone would guess from
+        the head dim, so it is passed rather than derived. Wrong here is quiet:
+        the softmax still normalizes, it just runs at the wrong temperature.
+
         CPU only, see NPU_OPS.
         """
         with self.timer.track("attention"):
             N = q.shape[0]
             rep = n_q // n_kv
+            scale = dh**-0.5 if scale is None else scale
             qh = q.reshape(N, n_q, dh).transpose(0, 1)  # [n_q, N, dh]
             kh = k.reshape(N, n_kv, dh).transpose(0, 1)  # [n_kv, N, dh]
             vh = v.reshape(N, n_kv, dh).transpose(0, 1)
             kh = kh.repeat_interleave(rep, dim=0)  # GQA broadcast
             vh = vh.repeat_interleave(rep, dim=0)
-            scores = (qh @ kh.transpose(1, 2)) * (dh**-0.5)  # [n_q, N, N]
+            scores = (qh @ kh.transpose(1, 2)) * scale  # [n_q, N, N]
             mask = torch.full((N, N), float("-inf")).triu(1)
             if window is not None:
                 # `tril(-window)` is -inf exactly where j <= i - window, which
