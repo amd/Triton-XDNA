@@ -418,3 +418,260 @@ def attn_decode(q, kc, vc, n_heads, dh, scale):
         BLOCK_D=_pow2(dh),
     )
     return out.reshape(1, n_heads * dh)
+
+
+# ===========================================================================
+# Prefill shapes: N rows rather than one
+# ===========================================================================
+# Everything above assumes a single activation row, which is decode. These are
+# the same operators at N > 1, and they are separate kernels rather than the
+# same ones with a loop because the shape changes what is worth doing: a GEMV's
+# K-reduction becomes a tiled `tl.dot`, and attention stops fitting its scores
+# in registers and needs an online softmax.
+
+
+@triton.jit
+def _matmul_kernel(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """`[M, K] @ [K, N] -> [M, N]`, bf16 in, f32 out.
+
+    f32 out because that is what `LlamaPrefill._matmul` returns and what the
+    next operator reads; qwen2_5's `matmul_kernel_gpu` stores bf16 because its
+    chain wants bf16 next.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        a = tl.load(
+            A + offs_m[:, None] * stride_am + offs_k[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+        acc += tl.dot(a, b)
+    tl.store(
+        C + offs_m[:, None] * stride_cm + offs_n[None, :],
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def matmul(x, w, block_m=64, block_n=64, block_k=64):
+    """x: [M, K] -> [M, N] against w: [K, N]. f32 out.
+
+    Falls through to `gemv` at M == 1: `tl.dot` needs a minimum M on AMD and
+    would pad the row out to it.
+    """
+    if x.shape[0] == 1:
+        return gemv(x, w)
+    M, K = x.shape
+    _, N = w.shape
+    x = x.to(torch.bfloat16).contiguous()
+    out = torch.empty((M, N), dtype=torch.float32, device=x.device)
+    _matmul_kernel[(triton.cdiv(M, block_m), triton.cdiv(N, block_n))](
+        x,
+        w,
+        out,
+        M,
+        N,
+        K,
+        x.stride(0),
+        w.stride(0),
+        w.stride(1),
+        out.stride(0),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+    )
+    return out
+
+
+@triton.jit
+def _rope_batch_kernel(
+    X, LUT, Y, n_heads, half, stride_x, stride_l, BLOCK: tl.constexpr
+):
+    """Half-split rotary over N rows, one program per (row, head)."""
+    row = tl.program_id(0)
+    h = tl.program_id(1)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < half
+    cos = tl.load(LUT + row * stride_l + offs, mask=mask, other=0.0).to(tl.float32)
+    sin = tl.load(LUT + row * stride_l + half + offs, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    base = row * stride_x + h * 2 * half
+    x1 = tl.load(X + base + offs, mask=mask, other=0.0).to(tl.float32)
+    x2 = tl.load(X + base + half + offs, mask=mask, other=0.0).to(tl.float32)
+    tl.store(Y + base + offs, x1 * cos - x2 * sin, mask=mask)
+    tl.store(Y + base + half + offs, x1 * sin + x2 * cos, mask=mask)
+
+
+def rope_batch(x, lut, n_heads, dh):
+    """x: [N, n_heads*dh], lut: [N, dh] -> [N, n_heads*dh], f32."""
+    N = x.shape[0]
+    x = x.contiguous()
+    lut = lut.contiguous()
+    out = torch.empty_like(x, dtype=torch.float32)
+    half = dh // 2
+    _rope_batch_kernel[(N, n_heads)](
+        x, lut, out, n_heads, half, x.stride(0), lut.stride(0), BLOCK=_pow2(half)
+    )
+    return out
+
+
+@triton.jit
+def _attn_prefill_kernel(
+    Q,
+    K,
+    V,
+    OUT,
+    N,
+    dh,
+    scale,
+    rep,
+    window,
+    stride_q,
+    stride_k,
+    HAS_WINDOW: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Causal GQA with an optional sliding window, flash-style.
+
+    One program per (query head, query block), streaming the key blocks with an
+    online softmax so the `[n_q, N, N]` score matrix the torch body materializes
+    never exists -- that matrix is where a long prompt spends its prefill.
+
+    The mask is the torch body's, restated per element: `j > i` is the causal
+    half, and with a window `i - j >= window` is the other. `j == i` survives
+    both, so no row is fully masked.
+    """
+    h = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    kvh = h // rep  # GQA: several query heads share one kv head
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < N
+    mask_d = offs_d < dh
+
+    q = tl.load(
+        Q + offs_m[:, None] * stride_q + h * dh + offs_d[None, :],
+        mask=mask_m[:, None] & mask_d[None, :],
+        other=0.0,
+    )
+
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    for j0 in range(0, N, BLOCK_N):
+        offs_n = j0 + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+        k = tl.load(
+            K + offs_n[:, None] * stride_k + kvh * dh + offs_d[None, :],
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        # `tl.dot`, not a broadcast multiply-reduce: the latter materializes a
+        # [BLOCK_M, BLOCK_N, BLOCK_D] intermediate, which at Gemma4's 512-wide
+        # heads is 72 KB against this part's 64 KB of LDS.
+        s = tl.dot(q, tl.trans(k)) * scale
+
+        keep = mask_n[None, :] & (offs_n[None, :] <= offs_m[:, None])
+        if HAS_WINDOW:
+            keep = keep & (offs_m[:, None] - offs_n[None, :] < window)
+        s = tl.where(keep, s, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+
+        v = tl.load(
+            V + offs_n[:, None] * stride_k + kvh * dh + offs_d[None, :],
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        acc += tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+
+    out = acc / l_i[:, None]
+    tl.store(
+        OUT + offs_m[:, None] * stride_q + h * dh + offs_d[None, :],
+        out,
+        mask=mask_m[:, None] & mask_d[None, :],
+    )
+
+
+def _attn_blocks(dh):
+    """Query/key tiles that fit 64 KB of LDS at this head width.
+
+    The tiles are bounded by `dh`, not chosen for throughput: q, k, v and the
+    accumulator are each `tile x dh` f32, so a 512-wide head -- which Gemma4's
+    full-attention layers have, four times what a typical flash-attention
+    kernel is tuned for -- leaves room for a 16-row tile and no more.
+    """
+    if dh >= 512:
+        return 16, 16
+    if dh >= 256:
+        return 16, 32
+    return 32, 64
+
+
+def attn_prefill(
+    q, k, v, n_q, n_kv, dh, window=None, scale=None, block_m=None, block_n=None
+):
+    """q: [N, n_q*dh], k/v: [N, n_kv*dh] -> [N, n_q*dh]. Causal, GQA, windowed."""
+    N = q.shape[0]
+    if block_m is None or block_n is None:
+        bm, bn = _attn_blocks(dh)
+        block_m = block_m or bm
+        block_n = block_n or bn
+    scale = dh**-0.5 if scale is None else scale
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    out = torch.empty((N, n_q * dh), dtype=torch.float32, device=q.device)
+    _attn_prefill_kernel[(n_q, triton.cdiv(N, block_m))](
+        q,
+        k,
+        v,
+        out,
+        N,
+        dh,
+        scale,
+        n_q // n_kv,
+        window if window is not None else 0,
+        q.stride(0),
+        k.stride(0),
+        HAS_WINDOW=window is not None,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=_pow2(dh),
+    )
+    return out

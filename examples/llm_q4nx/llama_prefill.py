@@ -331,16 +331,25 @@ class LlamaPrefill:
             # its GPU attention.
             dev = self._gpu_device(backend)
             if dev is not None:
-                x, lut = x.to(dev), lut.to(dev)
+                # A Triton kernel, not torch on a GPU tensor: torch is this
+                # repository's CPU reference (README), and `examples/gpt2` and
+                # `examples/qwen2_5` have run their GPU half as `*_kernel_gpu`
+                # since they grew one.
+                import gpu_kernels
+
+                with gpu_kernels.gpu_driver():
+                    out = gpu_kernels.rope_batch(
+                        x.to(dev), lut.to(dev), n_heads, lut.shape[-1]
+                    )
+                return out.cpu()
             half = lut.shape[-1] // 2
             cos = lut[:, :half].unsqueeze(1)  # [N, 1, 32]
             sin = lut[:, half:].unsqueeze(1)
             v = x.reshape(N, n_heads, 2 * half)
             x1, x2 = v[..., :half], v[..., half:]
-            out = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).reshape(
-                N, -1
-            )
-            return out.cpu() if dev is not None else out
+            return torch.cat(
+                [x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1
+            ).reshape(N, -1)
 
     def _attention(self, q, k, v, n_q, n_kv, dh, window=None, scale=None, backend=None):
         """Causal GQA. q: [N, n_q*dh], k/v: [N, n_kv*dh] -> [N, n_q*dh].
@@ -369,7 +378,17 @@ class LlamaPrefill:
             # prompt spends its prefill. See `_gpu_device`.
             dev = self._gpu_device(backend)
             if dev is not None:
-                q, k, v = q.to(dev), k.to(dev), v.to(dev)
+                # Flash-style, so the [n_q, N, N] score matrix the torch body
+                # below materializes never exists -- that matrix is what makes
+                # a long prompt expensive here. See `_rope` for why it is a
+                # kernel rather than torch on a GPU tensor.
+                import gpu_kernels
+
+                with gpu_kernels.gpu_driver():
+                    out = gpu_kernels.attn_prefill(
+                        q.to(dev), k.to(dev), v.to(dev), n_q, n_kv, dh, window, scale
+                    )
+                return out.cpu()
             qh = q.reshape(N, n_q, dh).transpose(0, 1)  # [n_q, N, dh]
             kh = k.reshape(N, n_kv, dh).transpose(0, 1)  # [n_kv, N, dh]
             vh = v.reshape(N, n_kv, dh).transpose(0, 1)
@@ -385,8 +404,7 @@ class LlamaPrefill:
                 mask = mask + torch.full((N, N), float("-inf")).tril(-window)
             scores = scores + mask.to(scores.device)
             p = torch.softmax(scores, dim=-1)
-            out = (p @ vh).transpose(0, 1).reshape(N, n_q * dh)
-            return out.cpu() if dev is not None else out
+            return (p @ vh).transpose(0, 1).reshape(N, n_q * dh)
 
     def _lm_head(self, x, w, backend=None):
         """x: [N, D] -> logits [N, VOCAB]. w is [VOCAB, D] (tied embed).

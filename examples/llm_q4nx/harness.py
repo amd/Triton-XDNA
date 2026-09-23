@@ -421,17 +421,20 @@ def build_parser(doc):
         choices=("npu", "gpu"),
         default="npu",
         help="npu: mlir-air's fused decode, all layers in one dispatch. gpu: "
-        "torch on the iGPU, token by token -- the hybrid half of a run whose "
+        "Triton on the iGPU, token by token -- the hybrid half of a run whose "
         "prefill is still on the NPU. Only Gemma4-E2B implements it.",
     )
     ap.add_argument(
         "--backend",
-        choices=("cpu", "npu", "hetero"),
+        choices=("cpu", "npu", "hetero", "hetero-fast"),
         default="npu",
-        help="cpu: every operator in torch. npu: the operators with an NPU "
-        "kernel on the NPU, the rest (RoPE, attention) in torch on the host. "
-        "hetero: the same NPU split, but those two on the iGPU -- the name "
-        "examples/qwen2_5 and examples/gpt2 already use for it.",
+        help="cpu: every operator in torch on the host -- this stack's own "
+        "reference, NOT examples/gpt2's --backend reference, which is "
+        "HuggingFace. npu: the operators with an NPU kernel on the NPU, the "
+        "rest (RoPE, attention) in torch on the host. hetero: the same NPU "
+        "split, but those two as Triton kernels on the iGPU. hetero-fast: "
+        "hetero plus a GPU decode, i.e. --backend hetero --decode gpu, spelled "
+        "the way examples/gpt2 and examples/qwen2_5 spell it.",
     )
     ap.add_argument(
         "--ops", default="all", help="NPU ops: all, or a comma-separated subset"
@@ -475,6 +478,19 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         prefill_cls: its prefill class, from `model.py`.
     """
     args = build_parser(doc).parse_args(argv)
+
+    # `hetero-fast` is one name for two knobs, and it exists because
+    # examples/gpt2 and examples/qwen2_5 have spelled it that way since before
+    # this directory had a GPU path at all. Expanded here rather than carried
+    # inward so nothing below has to know there are two spellings.
+    if args.backend == "hetero-fast":
+        if args.decode != "gpu" and "--decode" in (argv or sys.argv[1:]):
+            raise SystemExit(
+                "--backend hetero-fast already means --decode gpu; "
+                f"--decode {args.decode} contradicts it. Use --backend hetero "
+                f"--decode {args.decode} if that is what you meant."
+            )
+        args.backend, args.decode = "hetero", "gpu"
 
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and not spec.supports_hsa:
         # Up front, for the same reason --interactive is below: a property of
