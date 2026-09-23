@@ -233,7 +233,12 @@ class Gemma4Prefill(LlamaPrefill):
         the same label rather than saying so.
         """
         self._fused_mlp = None
-        if self.backend != "npu" or not {"matmul", "geglu"} <= self.enabled:
+        # `_NPU_BACKENDS`, not `== "npu"`: `hetero` puts these two operators on
+        # the NPU exactly as `npu` does, so it wants the chain for exactly the
+        # same reason. Spelled as the shared tuple so the next backend that
+        # routes to the NPU does not have to remember this line exists.
+        fused_ops = {"matmul", "geglu"}
+        if self.backend not in self._NPU_BACKENDS or not fused_ops <= self.enabled:
             return
         if os.environ.get("Q4NX_FUSED_MLP", "1") != "1":
             print("[gemma4] fused MLP disabled by Q4NX_FUSED_MLP=0")
