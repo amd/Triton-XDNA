@@ -67,6 +67,7 @@ contracts against the matching zero rows of `Bd`. Nothing has to trim anything.
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 import torch
@@ -89,6 +90,16 @@ MERGE_BLOCK = 1024
 MATMUL_SCRIPT = "gpt2/transform_matmul_aie2p.mlir"
 #: Qwen's, unmodified. See the module docstring.
 MERGE_SCRIPT = "qwen2_5/transform_swiglu_f32in_aie2p.mlir"
+
+
+def _host(w):
+    """The numpy view of a weight, whether it is a shared buffer or an array."""
+    return w.numpy() if hasattr(w, "numpy") else w
+
+
+def _bo(w):
+    """The XRT buffer object to bind, or None when the weight is not shared."""
+    return getattr(w, "bo", None)
 
 
 def _pow2(n):
@@ -226,34 +237,87 @@ class FusedMLP:
         )
         gu = gate_up.to(torch.float32).cpu().numpy()
         dn = down.to(torch.float32).cpu().numpy()
-        Bg = np.zeros((K_pad, HID_pad), dtype=bfloat16)
-        Bg[:D, :H] = gu[:, :H].astype(bfloat16)
-        Bu = np.zeros((K_pad, HID_pad), dtype=bfloat16)
-        Bu[:D, :H] = gu[:, H:].astype(bfloat16)
-        Bd = np.zeros((HID_pad, D_pad), dtype=bfloat16)
-        Bd[:H, :D] = dn.astype(bfloat16)
+        Bg, Bu, Bd = (
+            self._alloc(K_pad, HID_pad),
+            self._alloc(K_pad, HID_pad),
+            self._alloc(HID_pad, D_pad),
+        )
+        _host(Bg)[:D, :H] = gu[:, :H].astype(bfloat16)
+        _host(Bu)[:D, :H] = gu[:, H:].astype(bfloat16)
+        _host(Bd)[:H, :D] = dn.astype(bfloat16)
         return Bg, Bu, Bd
+
+    def _alloc(self, rows, cols):
+        """A zeroed `[rows, cols]` bf16 weight, shared with the iGPU if possible.
+
+        Shared, because this is the only copy that needs to exist. The NPU
+        dispatches on it by naming its BO; a GPU decode reads the same pages
+        through `.torch()`. Allocating it privately here is what forced a
+        second, device-resident copy to be built for the decode -- and, since
+        the originals are dropped once this exists, a third to be reconstructed
+        on the way there.
+
+        Falls back to a plain array where the interop is unavailable, which
+        costs the sharing and nothing else: the contents and the layout are
+        identical either way.
+        """
+        try:
+            from triton.backends.amd_triton_npu import shared
+
+            return shared.zeros(
+                rows, cols, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
+            )
+        except Exception as e:  # noqa: BLE001 -- see the docstring
+            if os.environ.get("AMD_TRITON_NPU_DEBUG"):
+                print(f"[fused_mlp] weights stay private: {e}", flush=True)
+            from ml_dtypes import bfloat16 as _bf16
+
+            return np.zeros((rows, cols), dtype=_bf16)
 
     def add_layer(self, layer_idx, gate_up, down):
         """Pad and keep this layer's weights. Call once, at load time."""
         self._weights[layer_idx] = self.prep_weights(gate_up, down)
 
     def logical_weights(self, layer_idx):
-        """This layer's `gate_up` and `down`, as `load_weights` held them.
+        """This layer's `gate_up` and `down` unpadded, on the host.
 
-        Exact rather than close: `prep_weights` only split and zero-padded, and
-        both forms are bf16, so slicing the padding back off returns the values
-        that went in -- `_t` reinterprets the two bytes rather than converting,
-        so this is bit-identical.
+        For `--compare-cpu`, whose reference instance runs the torch path and
+        needs the shapes `load_weights` held. Exact rather than close:
+        `prep_weights` only split and zero-padded, both forms are bf16, and the
+        reinterpret does not convert.
 
-        For `--compare-cpu`, which shares `_w` with a torch-path instance after
-        the caller has dropped the originals. It allocates, so it belongs on
-        that path and nowhere near a forward.
+        A decode wants `device_weights` instead -- this one allocates, and
+        undoes padding the GPU does not mind.
         """
-        Bg, Bu, Bd = self._weights[layer_idx]
+        Bg, Bu, Bd = (_host(b) for b in self._weights[layer_idx])
         D, H = self.D, self.H
         gate_up = torch.cat([_as_torch_bf16(Bg[:D, :H]), _as_torch_bf16(Bu[:D, :H])], 1)
         return gate_up.contiguous(), _as_torch_bf16(Bd[:H, :D]).contiguous()
+
+    def device_weights(self, layer_idx):
+        """This layer's padded weights as iGPU tensors over the same pages.
+
+        The point of allocating them shared: a GPU decode reads exactly what
+        the NPU dispatches on, so the model exists once. They come back padded,
+        which is what the caller has to account for -- `K_pad` rows and
+        `HID_pad` columns, zero past the logical extent. A GEMV over that is
+        bit-identical to one over the unpadded form, since the padding
+        contributes nothing, provided the activation is zero out to `K_pad`.
+
+        Raises where the weights are not shared; there is no device view to
+        give, and silently handing back a host array would be worse.
+        """
+        w = self._weights[layer_idx]
+        if any(not hasattr(b, "torch") for b in w):
+            raise RuntimeError(
+                "this layer's weights are not in shared pages, so they have no "
+                "iGPU view; the decode has to copy them instead"
+            )
+        return tuple(b.torch() for b in w)
+
+    def shapes(self):
+        """`(K_pad, HID_pad, D_pad)` -- what `device_weights` is padded to."""
+        return self.K_pad, self.HID_pad, self.D_pad
 
     # ---- chain ----
     def _get_chain(self):
@@ -345,6 +409,9 @@ class FusedMLP:
 
         D, K_pad, HID_pad, D_pad = self.D, self.K_pad, self.HID_pad, self.D_pad
         Bg, Bu, Bd = self._weights[layer_idx]
+        bound = {
+            i: _bo(w) for i, w in ((1, Bg), (3, Bu), (6, Bd)) if _bo(w) is not None
+        } or None
 
         h2d = h.reshape(-1, D).to(torch.float32).cpu().numpy()
         N = h2d.shape[0]
@@ -369,12 +436,17 @@ class FusedMLP:
                 Cu = np.empty((BLOCK_M, HID_pad), dtype=np.float32)
                 H = np.empty(BLOCK_M * HID_pad, dtype=bfloat16)
                 OUT = np.empty((BLOCK_M, D_pad), dtype=np.float32)
+                # The weights are bound where they are shared, so the chain
+                # dispatches on the pages they already occupy instead of
+                # staging a BO of its own. `static_indices` still names them:
+                # bound or not, they carry no new host data per call.
                 got = chain.run(
-                    [A, Bg, Cg, Bu, Cu, H, Bd, OUT],
+                    [A, _host(Bg), Cg, _host(Bu), Cu, H, _host(Bd), OUT],
                     bo_key=f"q4nx_mlp_{self.H}_L{layer_idx}",
                     static_indices={1, 3, 6},
                     intermediate_indices={2, 4, 5},
                     output_indices={7},
+                    bound_buffers=bound,
                 )
                 out[m0 : m0 + rows] = got[7].astype(np.float32)[:rows, :D]
 

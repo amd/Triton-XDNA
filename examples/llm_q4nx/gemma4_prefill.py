@@ -651,12 +651,23 @@ class Gemma4GpuDecode:
         # chain's padded copies -- the same door `share_weights_from` uses, and
         # for the same reason: a reload would cost minutes and would compare
         # against a different dequantization.
+        # The MLP weights are the chain's, read where they lie. Only where that
+        # is impossible -- no interop, so they were never shared -- is a
+        # private copy rebuilt, which is the path `logical_weights` exists for.
         fused = getattr(pf, "_fused_mlp", None) or {}
+        self._mlp_w = None
+        if fused:
+            try:
+                self._mlp_w = {L: m.device_weights(L) for L, m in fused.items()}
+            except RuntimeError:
+                self._mlp_w = None
         self.w = []
         for L, w in enumerate(pf._w):
             w = dict(w)
-            if "gate_up" not in w and L in fused:
+            if self._mlp_w is None and "gate_up" not in w and L in fused:
                 w["gate_up"], w["down"] = fused[L].logical_weights(L)
+            elif self._mlp_w is not None:
+                w.pop("gate_up", None), w.pop("down", None)
             self.w.append(
                 {
                     k: (v.to(device) if isinstance(v, torch.Tensor) else v)
@@ -729,6 +740,31 @@ class Gemma4GpuDecode:
         rather than nine.
         """
         return gpu_kernels.rmsnorm_residual(x, weight, RMS_EPS, residual, scale)
+
+    def _mlp(self, h, L, w):
+        """`down(gelu_tanh(gate(h)) * up(h))` for one token.
+
+        Reads the *chain's* weights where they are shared -- the same pages the
+        NPU prefill dispatches on -- rather than a device-resident copy of its
+        own. That is the whole reason they are allocated shared: the model
+        exists once instead of three times.
+
+        They come back padded, so the activation is zeroed out to `K_pad`
+        before the projections. The padding contributes nothing: the weights
+        are zero past the logical extent, so the tail of `gate`/`up` is zero,
+        the merge maps zero to zero, and `down` contracts it against its own
+        zero rows. The result is bit-identical to the unpadded form.
+        """
+        if self._mlp_w is None:
+            inter = mlp_inter(L)
+            g, u = self._mm(h, w["gate_up"]).split([inter, inter], dim=1)
+            return self._mm(gpu_kernels.geglu(g, u), w["down"])
+        Bg, Bu, Bd = self._mlp_w[L]
+        K_pad = Bg.shape[0]
+        hp = torch.zeros(1, K_pad, dtype=torch.float32, device=self.dev)
+        hp[0, : h.shape[-1]] = h.reshape(-1)
+        y = gpu_kernels.geglu(self._mm(hp, Bg), self._mm(hp, Bu))
+        return self._mm(y, Bd)[:, : self.pf._w[L]["post_ffn_norm"].shape[-1]]
 
     def _rope(self, x, L, pos, n_heads, dh):
         """Half-split rotary on one row, at one position.
@@ -815,9 +851,7 @@ class Gemma4GpuDecode:
 
             residual = x
             h = self._norm(x, w["ffn_norm"])
-            inter = mlp_inter(L)
-            g, u = self._mm(h, w["gate_up"]).split([inter, inter], dim=1)
-            d = self._mm(gpu_kernels.geglu(g, u), w["down"])
+            d = self._mlp(h, L, w)
             x = self._norm_residual(d, w["post_ffn_norm"], residual)
 
             # Per-layer embedding injection, then the per-layer output scale --
