@@ -105,19 +105,16 @@ class Gemma4Prefill(LlamaPrefill):
     #: schedule. Named as its own operator so `--ops` can bisect it.
     NPU_OPS = ("matmul", "rms_norm", "geglu")
 
-    #: `rms_norm` is deliberately NOT in the default. It has an NPU kernel and
-    #: the kernel is correct, but this model issues ~315 of them per prefill --
-    #: five per layer plus the per-head q/k/v norms plus the PLE norm -- over
-    #: rows that are a handful of tokens wide. At that size a dispatch costs
-    #: more than the arithmetic, and the staging it forces between the GEMMs
-    #: costs more still:
+    #: `rms_norm` is not in the default. Its NPU kernel is correct, but this
+    #: model issues one per sublayer plus the per-head q/k/v norms plus the PLE
+    #: norm -- some hundreds per prefill, each over rows a few tokens wide. At
+    #: that size the dispatch costs more than the arithmetic, and it splits the
+    #: GEMMs either side of it into separate staged launches. Running it on the
+    #: host is faster at every prompt length tried, with the same first token.
     #:
-    #:     P=6     all 4.62 s   matmul,geglu 1.25 s   (3.7x)
-    #:     P=151   all 5.78 s   matmul,geglu 2.06 s   (2.8x)
-    #:
-    #: Same first token either way, and `test_decode_vs_prefill.py` passes on
-    #: both. `--ops all` still puts it back, which is how the numbers above
-    #: were taken.
+    #: `--ops all` puts it back, which is how that was measured. Re-measure
+    #: before assuming it still holds: the answer turns on dispatch overhead,
+    #: which is exactly what the XRT launcher work would change.
     DEFAULT_OPS = ("matmul", "geglu")
 
     #: Everything `load_weights` establishes. `_lut` is a LIST here, one table
@@ -424,37 +421,43 @@ class Gemma4Prefill(LlamaPrefill):
         residual = x
         h = self._rms_norm(x, w["attn_norm"], RMS_EPS)  # input_layernorm
 
-        # One GPU-driver scope over the whole attention sublayer rather than
-        # one per operator. `gpu_driver` no-ops when the GPU backend is already
-        # active, so the scopes inside `_rope` and `_attention` become free --
-        # and switching is not free: `set_active` drops Triton's compiled-kernel
-        # cache, so alternating per call recompiles the same shapes. Measured at
-        # 105 rope calls, 1.8 ms with the scope held against 25.2 ms
-        # alternating.
+        # One GPU-driver scope over the sublayer rather than one per operator.
+        # `gpu_driver` no-ops when the GPU backend is already active, so the
+        # scopes inside `_rope` and `_attention` cost nothing. Switching does
+        # cost: `set_active` drops Triton's kernel cache.
         #
-        # The qkv GEMM inside still switches to the NPU and back, which is
-        # correct and unavoidable; what this removes is the two ropes and the
-        # attention each doing it again.
+        # The qkv GEMM inside still switches to the NPU and back. That is
+        # unavoidable; what this removes is the two ropes and the attention
+        # each doing it again.
+        # The projections first, outside the GPU scope below. They are NPU
+        # work, and an NPU launch inside that scope would switch the active
+        # driver and drop the GPU kernels' compiled cache -- the thing the
+        # scope exists to keep.
+        if L < FIRST_KV_SHARED:
+            qkv = self._matmul(h, w["qkv"])
+            q, k, v = qkv.split([dq, dkv, dkv], dim=1)
+            src = None
+        else:
+            # A KV-shared layer projects q alone and attends the cache of
+            # `kv_source_layer(L)`, which -- being lower -- has already run.
+            q = self._matmul(h, w["qkv"])
+            k = v = None
+            src = kv_source_layer(L)
+
+        # Everything from here to the attention is GPU work under `hetero`, so
+        # it runs under one scope instead of each operator opening its own.
         with self._gpu_scope():
-            if L < FIRST_KV_SHARED:
-                qkv = self._matmul(h, w["qkv"])
-                q, k, v = qkv.split([dq, dkv, dkv], dim=1)
-                q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
+            q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
+            q = self._rope(q, lut[:N], N_Q_HEADS)
+            if src is None:
                 k = self._head_norm(k, w["k_norm"], N_KV_HEADS, dh)
                 # The value norm is weightless: `with_scale=False` upstream.
                 v = self._head_norm(v, None, N_KV_HEADS, dh)
-                q = self._rope(q, lut[:N], N_Q_HEADS)
                 k = self._rope(k, lut[:N], N_KV_HEADS)
                 # The decode's handoff: roped K, normalized V.
                 self.kv_k[L][:keep] = k[:keep].to(torch.float32).numpy()
                 self.kv_v[L][:keep] = v[:keep].to(torch.float32).numpy()
             else:
-                # A KV-shared layer projects q alone and attends the cache of
-                # `kv_source_layer(L)`, which -- being lower -- has already run.
-                q = self._matmul(h, w["qkv"])
-                q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
-                q = self._rope(q, lut[:N], N_Q_HEADS)
-                src = kv_source_layer(L)
                 k = _t(self.kv_k[src][:N])
                 v = _t(self.kv_v[src][:N])
 
@@ -530,6 +533,10 @@ class Gemma4Prefill(LlamaPrefill):
             # reference applies it, which is what makes the two comparable as
             # logits rather than only as a predicted token.
             logits = FINAL_LOGIT_SOFTCAP * torch.tanh(logits / FINAL_LOGIT_SOFTCAP)
+        # Kept so a decode does not have to be handed this separately. It and
+        # the KV are written by the same call, and a decode seeded from one
+        # prefill's token over another's KV answers for neither.
+        self.last_first_token = int(logits.argmax())
         return logits
 
     # ---- decode handoff ----
@@ -662,16 +669,15 @@ class Gemma4GpuDecode:
         self.ple_proj_norm = pf.ple_proj_norm.to(device)
         self.lut = [t.to(device) for t in pf._lut]
 
-        # The cache. Where the prefill allocated it in shared pages, the torch
-        # view of those same pages *is* the decode's cache -- the prefill wrote
-        # through the numpy view of the same memory, so there is nothing to
-        # copy and nothing to keep in step. The buffer is already `max_seq`
-        # deep, so a step never reallocates either.
+        # Where the prefill allocated the cache in shared pages, the torch
+        # view of those pages is the decode's cache: the prefill wrote through
+        # the numpy view of the same memory, so there is nothing to copy and
+        # nothing to keep in step. The buffer is already `max_seq` deep, so a
+        # step never reallocates.
         #
-        # Measured on the canonical prompt: the copy this replaces was 33.5 ms
-        # of a 6444 ms end-to-end run. Small, and the reason to take it is that
-        # it is free -- a decode attention reads shared pages at 1.00x of a
-        # native device tensor at S=2048, bit-identical.
+        # The copy this replaces is small. It is here because it is what lets a
+        # decoder outlive a turn -- a new prompt's context is simply already
+        # visible -- not for its own sake.
         self.P = pf.current_context_length
         self.k = []
         self.v = []
@@ -829,13 +835,20 @@ class Gemma4GpuDecode:
             logits = gpu_kernels.logit_softcap(logits, FINAL_LOGIT_SOFTCAP)
         return logits
 
-    def generate(self, first, n_tokens, eos=()):
+    def generate(self, first=None, n_tokens=1, eos=()):
         """Greedy continuation, `first` included. Returns the ids.
 
         `first` is the prefill's own prediction, so it is emitted without a
         step: the step that produced it was the prefill. Each subsequent token
         is one `step` at the next position.
         """
+        # Both taken from the prefiller unless overridden, and taken *now*
+        # rather than at construction: the cached decoder outlives a turn, and
+        # a caller that ran another prefill in between would otherwise decode
+        # one prompt's token against another's cache.
+        if first is None:
+            first = self.pf.last_first_token
+        self.P = self.pf.current_context_length
         out = [int(first)]
         pos = self.P
         # One driver scope for the whole loop. `step` takes one too, which

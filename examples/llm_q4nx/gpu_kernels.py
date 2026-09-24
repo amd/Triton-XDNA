@@ -3,35 +3,23 @@
 
 """Triton kernels for the iGPU half of a hybrid run.
 
-`kernels.py` is this directory's NPU kernel set; this is its GPU counterpart,
-and it exists for the reason `README.md` states outright -- *"PyTorch is used by
-the examples as a CPU reference."* torch is the oracle these are checked
-against, not the way an example computes on a device. `examples/gpt2` and
-`examples/qwen2_5` have had `*_kernel_gpu` for exactly this since they grew a
-GPU path; `llm_q4nx` had no GPU path at all until now, which is why it had none
-of these.
+The GPU counterpart to `kernels.py`. Both exist because torch is this
+repository's CPU reference, as `README.md` says, rather than how an example
+computes on a device; `examples/gpt2` and `examples/qwen2_5` have had
+`*_kernel_gpu` since they grew a GPU path.
 
-Written for **decode**, where the shapes are not the prefill's
-------------------------------------------------------------
-Every kernel here assumes one row of activations. That is not a simplification,
-it is the whole design point: at N=1 every projection is a GEMV, `tl.dot` has
-nothing to contract over on AMD, and the cost is dominated by *launch count*
-rather than arithmetic. Gemma4-E2B issues ~281 projections per token -- 8 per
-layer across 35 layers, plus the head -- so what matters is that each is one
-kernel rather than a torch op with its own dispatch, allocation and type
-promotion.
+The decode kernels take one row of activations, and that shapes them. Every
+projection is a GEMV with nothing for `tl.dot` to contract over, and a forward
+issues one per projection per layer, so launch count matters more than
+arithmetic: `_gemv_kernel` reduces over K by hand, and the elementwise kernels
+are written to fuse into as few launches as the forward allows.
 
-So `_gemv_kernel` reduces over K instead of calling `tl.dot`, and the
-elementwise kernels are shaped to be fused into as few launches as the forward
-allows. A prefill kernel set would look nothing like this; use `kernels.py`.
+The prefill kernels at the bottom take N > 1 and look nothing like them -- a
+tiled `tl.dot`, and an attention carrying an online softmax so the score matrix
+never exists at once.
 
-Bucketed context length
------------------------
-`attn_decode` is compiled per `BLOCK_S`, which would otherwise track the
-position and recompile on every token. It is rounded up to a power of two and
-masked, so a 2048-token session pays at most eleven compiles instead of two
-thousand -- the same bargain `kernels.ROW_TILE` makes on the NPU side, for the
-same reason.
+Nothing that varies per call is a constexpr. A tile derived from the context
+length, in particular, recompiles the kernel as the context grows.
 """
 
 from __future__ import annotations
@@ -63,13 +51,10 @@ class gpu_driver:
     (`failed to legalize operation 'memref.copy'`) rather than compiling for
     gfx1151.
 
-    **Enter it once around a whole generation, not per step.** Re-entering is
-    free -- it no-ops when the GPU backend is already active -- but *switching*
-    is not: `set_active` drops Triton's compiled-kernel cache, so a scope
-    entered per token recompiles the shapes that token uses. Measured over 64
-    tokens, per-step scoping spent 7547 ms recompiling against 883 ms when the
-    scope is held across the loop, which is the difference between 9.30 s and
-    2.74 s of wall clock for the same output.
+    Enter it once around a whole generation, not per step. Re-entering is free;
+    it no-ops when the GPU backend is already active. Switching is not:
+    `set_active` drops Triton's compiled-kernel cache, so a scope entered per
+    token recompiles everything that token touches.
     """
 
     _AMD = "triton.backends.amd.driver"
@@ -376,13 +361,12 @@ def _attn_decode_kernel(
     construction, and the window is applied by the caller as a lower bound on
     the slice. MQA -- every query head reads the one kv head's cache.
 
-    `BLOCK_S` is a **fixed** tile and `S` is a runtime argument, so one compile
-    serves every context length. It used to be `next_pow2(S)`, which made the
-    tile track the position and recompiled the kernel on almost every token:
-    measured 1165 ms/token at a 151-token prompt against 31.7 ms at six.
-    mlir-air's llama-1b decode makes the same choice for the same reason -- one
-    xclbin at ATTN_MAXL=2048 with a compile-time attention loop, serving every
-    L in [1, 2048] rather than a template per window.
+    `BLOCK_S` is a fixed tile and `S` is a runtime argument, so one compile
+    serves every context length. A tile derived from `S` would instead track
+    the position and recompile on nearly every token. mlir-air's llama-1b
+    decode makes the same choice: one xclbin with a compile-time attention
+    loop serving every L in [1, ATTN_MAXL], rather than a template per
+    window.
 
     The running max and sum are the online-softmax pair, so the scores for the
     whole context never exist at once.

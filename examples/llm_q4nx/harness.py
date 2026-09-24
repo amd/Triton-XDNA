@@ -395,6 +395,12 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     return list(out[0] if isinstance(out, tuple) else out)
 
 
+#: Models with a `--decode gpu` implementation. One entry, deliberately: a
+#: registry with a single member is still clearer than the same string tested
+#: in two places that can drift apart.
+GPU_DECODE_MODELS = frozenset({"gemma4-e2b"})
+
+
 def generate_on_gpu(cfg, args, prefiller, first, ids):
     """Greedy decode in torch on the iGPU, seeded by the NPU prefill.
 
@@ -409,10 +415,11 @@ def generate_on_gpu(cfg, args, prefiller, first, ids):
     has a `Gemma4GpuDecode` today, and a base-class hook with one implementation
     would claim more than it delivers.
     """
-    if cfg.MODEL_NAME != "gemma4-e2b":
+    if cfg.MODEL_NAME not in GPU_DECODE_MODELS:
         raise ExampleUnavailable(
-            f"--decode gpu is implemented for gemma4-e2b only; "
-            f"{cfg.MODEL_NAME} has no GPU decode. Use --decode npu."
+            f"--decode gpu is implemented for "
+            f"{', '.join(sorted(GPU_DECODE_MODELS))} only; {cfg.MODEL_NAME} "
+            f"has no GPU decode. Use --decode npu."
         )
     from gemma4_prefill import Gemma4GpuDecode
 
@@ -431,7 +438,6 @@ def generate_on_gpu(cfg, args, prefiller, first, ids):
     if dec is None:
         dec = Gemma4GpuDecode(prefiller, max_L=prefiller.max_seq)
         prefiller._gpu_decoder = dec
-    dec.P = prefiller.current_context_length
     eos = tuple(getattr(cfg, "EOS_IDS", ()) or ())
     return dec.generate(first, args.max_tokens, eos=eos)
 
@@ -526,6 +532,18 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
                 f"--decode {args.decode} if that is what you meant."
             )
         args.backend, args.decode = "hetero", "gpu"
+
+    # `--decode gpu` is implemented per model, and only Gemma4-E2B has one.
+    # Checked here rather than in `generate_on_gpu`, which runs after the
+    # weights have loaded -- minutes to say a flag combination was never going
+    # to work. `hetero-fast` reaches this through the expansion above, which is
+    # the point: it advertises a GPU decode on every model and only one has it.
+    if args.decode == "gpu" and cfg.MODEL_NAME not in GPU_DECODE_MODELS:
+        raise SystemExit(
+            f"--decode gpu (and --backend hetero-fast, which implies it) is "
+            f"implemented for {', '.join(sorted(GPU_DECODE_MODELS))} only; "
+            f"{cfg.MODEL_NAME} has none. Use --backend hetero --decode npu."
+        )
 
     # The interactive session comes from mlir-air and always drives its own
     # fused NPU decoder; it never consults `--decode`. Accepting the pair would

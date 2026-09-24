@@ -40,7 +40,8 @@ def main(argv=None):
         "--ops",
         default=None,
         help="NPU ops to enable: 'all', or a comma list of "
-        "matmul,rms_norm,geglu (default: all)",
+        "matmul,rms_norm,geglu (default: the model's own, "
+        "which is not necessarily all -- see its `DEFAULT_OPS`)",
     )
     ap.add_argument("--prompt", default=None, help="token ids, comma separated")
     ap.add_argument("--n-layers", type=int, default=config.N_LAYERS)
