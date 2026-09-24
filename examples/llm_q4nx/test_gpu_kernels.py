@@ -141,6 +141,58 @@ def main():
         ref = (torch.softmax((qh @ kc.T) * 1.0, -1) @ vc).reshape(1, N_Q_HEADS * dh)
         ok &= check(f"S={S} dh={dh}", G.attn_decode(q, kc, vc, N_Q_HEADS, dh, 1.0), ref)
 
+    # --- prefill shapes: N > 1, which the decode cases above never reach ---
+    print("\nmatmul  [M,K]@[K,N]  (prefill)")
+    for M, K, N in ((6, D, 5120), (163, D, 2 * 12288), (163, 6144, D), (37, D, 256)):
+        x = torch.randn(M, K, device=dev)
+        w = (torch.randn(K, N, device=dev) * 0.05).to(torch.bfloat16)
+        ref = (x.to(torch.bfloat16) @ w).to(torch.float32)
+        ok &= check(f"M={M} K={K} N={N}", G.matmul(x, w), ref)
+
+    print("\nrope_batch  (prefill)")
+    for N, nh, dh in ((6, N_Q_HEADS, DH_SLIDING), (163, 1, DH_GLOBAL)):
+        x = torch.randn(N, nh * dh, device=dev)
+        lut = torch.randn(N, dh, device=dev)
+        half = dh // 2
+        cos, sin = lut[:, :half].unsqueeze(1), lut[:, half:].unsqueeze(1)
+        v = x.reshape(N, nh, 2 * half)
+        x1, x2 = v[..., :half], v[..., half:]
+        ref = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).reshape(
+            N, nh * dh
+        )
+        ok &= check(f"N={N} heads={nh} dh={dh}", G.rope_batch(x, lut, nh, dh), ref)
+
+    # Causal GQA, both window modes, and lengths past the window -- a key block
+    # entirely outside it leaves every score masked, which is where the softmax
+    # produced NaN until the running maximum was guarded. Non-powers of two on
+    # purpose: the tiles are fixed, so the masked tail is the interesting part.
+    print("\nattn_prefill  (prefill; causal GQA, windowed and not)")
+    for N, dh, win in (
+        (6, DH_SLIDING, 512),
+        (37, DH_SLIDING, None),
+        (163, DH_GLOBAL, None),
+        (163, DH_SLIDING, 512),
+        (700, DH_SLIDING, 512),  # past the window: the NaN case
+        (1024, DH_SLIDING, 512),
+    ):
+        q = torch.randn(N, N_Q_HEADS * dh, device=dev)
+        k = torch.randn(N, dh, device=dev)
+        v = torch.randn(N, dh, device=dev)
+        qh = q.reshape(N, N_Q_HEADS, dh).transpose(0, 1)
+        kh = k.reshape(N, 1, dh).transpose(0, 1).repeat_interleave(N_Q_HEADS, 0)
+        vh = v.reshape(N, 1, dh).transpose(0, 1).repeat_interleave(N_Q_HEADS, 0)
+        mask = torch.full((N, N), float("-inf"), device=dev).triu(1)
+        if win is not None:
+            mask = mask + torch.full((N, N), float("-inf"), device=dev).tril(-win)
+        ref = torch.softmax((qh @ kh.transpose(1, 2)) * 1.0 + mask, -1) @ vh
+        ref = ref.transpose(0, 1).reshape(N, N_Q_HEADS * dh)
+        got = G.attn_prefill(q, k, v, N_Q_HEADS, 1, dh, win, 1.0)
+        if torch.isnan(got).any():
+            print(f"  N={N} dh={dh} win={win}  NaN  FAIL")
+            ok = False
+            continue
+        ok &= check(f"N={N} dh={dh} win={win}", got, ref)
+
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

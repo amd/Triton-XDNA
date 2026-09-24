@@ -510,14 +510,32 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     # examples/gpt2 and examples/qwen2_5 have spelled it that way since before
     # this directory had a GPU path at all. Expanded here rather than carried
     # inward so nothing below has to know there are two spellings.
+    raw_argv = sys.argv[1:] if argv is None else argv
     if args.backend == "hetero-fast":
-        if args.decode != "gpu" and "--decode" in (argv or sys.argv[1:]):
+        # `--decode npu` and `--decode=npu` are the same argument to argparse
+        # and have to be the same argument here; testing for the bare flag let
+        # the second form through and then silently overwrote it, which is
+        # precisely what the error below promises does not happen.
+        asked_decode = any(
+            a == "--decode" or a.startswith("--decode=") for a in raw_argv
+        )
+        if args.decode != "gpu" and asked_decode:
             raise SystemExit(
                 "--backend hetero-fast already means --decode gpu; "
                 f"--decode {args.decode} contradicts it. Use --backend hetero "
                 f"--decode {args.decode} if that is what you meant."
             )
         args.backend, args.decode = "hetero", "gpu"
+
+    # The interactive session comes from mlir-air and always drives its own
+    # fused NPU decoder; it never consults `--decode`. Accepting the pair would
+    # run a different decode than the one asked for and say nothing.
+    if args.decode == "gpu" and getattr(args, "interactive", False):
+        raise SystemExit(
+            "--decode gpu cannot be combined with --interactive: the "
+            "interactive session is mlir-air's and always uses its fused NPU "
+            "decode. Use --decode npu for a chat, or drop --interactive."
+        )
 
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and not spec.supports_hsa:
         # Up front, for the same reason --interactive is below: a property of

@@ -58,6 +58,7 @@ here use -- seeds the decode from that aliased oracle, so on **this** model it
 is not a reference at all. Gate against mlir-air's own NPU prefill instead.
 """
 
+import contextlib
 import os
 
 import numpy as np
@@ -398,6 +399,12 @@ class Gemma4Prefill(LlamaPrefill):
                 out[n:, L] = proj[n:] * PLE_INPUT_SCALE
             return out
 
+    def _gpu_scope(self):
+        """Hold the GPU driver across a region, or do nothing on the host path."""
+        if self._gpu_device() is None:
+            return contextlib.nullcontext()
+        return gpu_kernels.gpu_driver()
+
     def _layer(self, x, L, N, keep=None, pli=None):
         """One Gemma4 block, on the prompt. x: [N, D] -> [N, D].
 
@@ -417,38 +424,50 @@ class Gemma4Prefill(LlamaPrefill):
         residual = x
         h = self._rms_norm(x, w["attn_norm"], RMS_EPS)  # input_layernorm
 
-        if L < FIRST_KV_SHARED:
-            qkv = self._matmul(h, w["qkv"])
-            q, k, v = qkv.split([dq, dkv, dkv], dim=1)
-            q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
-            k = self._head_norm(k, w["k_norm"], N_KV_HEADS, dh)
-            # The value norm is weightless: `with_scale=False` upstream.
-            v = self._head_norm(v, None, N_KV_HEADS, dh)
-            q = self._rope(q, lut[:N], N_Q_HEADS)
-            k = self._rope(k, lut[:N], N_KV_HEADS)
-            # The decode's handoff: roped K, normalized V.
-            self.kv_k[L][:keep] = k[:keep].to(torch.float32).numpy()
-            self.kv_v[L][:keep] = v[:keep].to(torch.float32).numpy()
-        else:
-            # A KV-shared layer projects q alone and attends the cache of
-            # `kv_source_layer(L)`, which -- being lower -- has already run.
-            q = self._matmul(h, w["qkv"])
-            q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
-            q = self._rope(q, lut[:N], N_Q_HEADS)
-            src = kv_source_layer(L)
-            k = _t(self.kv_k[src][:N])
-            v = _t(self.kv_v[src][:N])
+        # One GPU-driver scope over the whole attention sublayer rather than
+        # one per operator. `gpu_driver` no-ops when the GPU backend is already
+        # active, so the scopes inside `_rope` and `_attention` become free --
+        # and switching is not free: `set_active` drops Triton's compiled-kernel
+        # cache, so alternating per call recompiles the same shapes. Measured at
+        # 105 rope calls, 1.8 ms with the scope held against 25.2 ms
+        # alternating.
+        #
+        # The qkv GEMM inside still switches to the NPU and back, which is
+        # correct and unavoidable; what this removes is the two ropes and the
+        # attention each doing it again.
+        with self._gpu_scope():
+            if L < FIRST_KV_SHARED:
+                qkv = self._matmul(h, w["qkv"])
+                q, k, v = qkv.split([dq, dkv, dkv], dim=1)
+                q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
+                k = self._head_norm(k, w["k_norm"], N_KV_HEADS, dh)
+                # The value norm is weightless: `with_scale=False` upstream.
+                v = self._head_norm(v, None, N_KV_HEADS, dh)
+                q = self._rope(q, lut[:N], N_Q_HEADS)
+                k = self._rope(k, lut[:N], N_KV_HEADS)
+                # The decode's handoff: roped K, normalized V.
+                self.kv_k[L][:keep] = k[:keep].to(torch.float32).numpy()
+                self.kv_v[L][:keep] = v[:keep].to(torch.float32).numpy()
+            else:
+                # A KV-shared layer projects q alone and attends the cache of
+                # `kv_source_layer(L)`, which -- being lower -- has already run.
+                q = self._matmul(h, w["qkv"])
+                q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
+                q = self._rope(q, lut[:N], N_Q_HEADS)
+                src = kv_source_layer(L)
+                k = _t(self.kv_k[src][:N])
+                v = _t(self.kv_v[src][:N])
 
-        a = self._attention(
-            q,
-            k,
-            v,
-            N_Q_HEADS,
-            N_KV_HEADS,
-            dh,
-            window=SLIDING_WINDOW if sliding else None,
-            scale=ATTN_SCALE,
-        )
+            a = self._attention(
+                q,
+                k,
+                v,
+                N_Q_HEADS,
+                N_KV_HEADS,
+                dh,
+                window=SLIDING_WINDOW if sliding else None,
+                scale=ATTN_SCALE,
+            )
         a = self._matmul(a, w["o"])  # o contracts dq -> D
         x = residual + self._rms_norm(a, w["post_attn_norm"], RMS_EPS)
 

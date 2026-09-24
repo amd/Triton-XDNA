@@ -158,7 +158,11 @@ def gemv(x, w, block_n=None, block_k=None):
         bn, bk = _gemv_blocks(K, N)
         block_n = block_n or bn
         block_k = block_k or bk
-    x = x.reshape(-1).contiguous()
+    # bf16 in, f32 accumulation -- `LlamaPrefill._matmul` rounds the activation
+    # before the product and the NPU GEMM does the same, so feeding f32 here
+    # would make the GPU decode compute from different inputs than the path it
+    # is meant to reproduce, and drift a token at a time.
+    x = x.reshape(-1).to(torch.bfloat16).contiguous()
     out = torch.empty(N, dtype=torch.float32, device=x.device)
     _gemv_kernel[(triton.cdiv(N, block_n),)](
         x,
@@ -632,8 +636,21 @@ def _attn_prefill_kernel(
         s = tl.where(keep, s, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(s - m_new[:, None])
+        # A key block entirely outside the sliding window leaves every score
+        # masked, so `m_new` is -inf and `exp(-inf - -inf)` is NaN, which then
+        # poisons `l_i` and `acc` for the rest of the row. Substituting any
+        # finite value in the *exponent* fixes it without a branch: both
+        # `exp(m_i - 0)` and `exp(s - 0)` are then `exp(-inf) = 0`, so the
+        # block contributes nothing and the running state is untouched.
+        # `m_i` keeps the real -inf, so the first block that does have keys
+        # still sets the maximum correctly.
+        #
+        # Reachable on this model: the sliding layers use a 512-token window,
+        # and a prompt past roughly `window + BLOCK_N` NaNs on four layers in
+        # five. It was not caught because the tests stopped at N=163.
+        m_exp = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_exp)
+        p = tl.exp(s - m_exp[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
 
