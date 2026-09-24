@@ -175,7 +175,7 @@ class LlamaPrefill:
     def __init__(
         self,
         backend="cpu",
-        ops="all",
+        ops=None,
         n_layers=N_LAYERS,
         max_seq=2048,
         model=None,
@@ -202,15 +202,26 @@ class LlamaPrefill:
         self.kv_v = [np.zeros((max_seq, DV), np.float32) for _ in range(n_layers)]
         self._w = None
 
+    #: What `--ops` selects when nothing is asked for. `None` means every
+    #: operator with an NPU kernel, which is right wherever the NPU is faster
+    #: at all of them. A subclass narrows it where measurement says otherwise;
+    #: `NPU_OPS` stays the full set either way, so `--ops rms_norm` can still
+    #: put one back for a bisection.
+    DEFAULT_OPS = None
+
     @classmethod
     def _resolve_ops(cls, spec):
         """Which operators may go to the NPU: "all", or a comma-separated list.
 
         LLAMA_NPU_OPS is consulted when the caller passes nothing, so a
         bisection can be driven from the environment without touching argv.
+        "all" is literal -- every operator in `NPU_OPS` -- where passing
+        nothing takes the class's `DEFAULT_OPS`.
         """
         if spec is None:
-            spec = os.environ.get("LLAMA_NPU_OPS", "all")
+            spec = os.environ.get("LLAMA_NPU_OPS") or (
+                ",".join(cls.DEFAULT_OPS) if cls.DEFAULT_OPS else "all"
+            )
         if spec in ("all", "*"):
             return set(cls.NPU_OPS)
         enabled = {o.strip() for o in spec.split(",") if o.strip()}

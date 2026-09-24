@@ -416,8 +416,22 @@ def generate_on_gpu(cfg, args, prefiller, first, ids):
         )
     from gemma4_prefill import Gemma4GpuDecode
 
-    P = prefiller.current_context_length
-    dec = Gemma4GpuDecode(prefiller, max_L=P + args.max_tokens + 1)
+    # Built once and cached on the prefiller. The weights it moves to the iGPU
+    # -- 5.09 GiB, 0.55 s -- do not change between turns, so rebuilding per
+    # call spent that on every turn of a multi-turn session: measured 4842 ms
+    # for a turn against 5338 ms when rebuilt, a tenth of the latency for a
+    # transfer whose result was already sitting there.
+    #
+    # `max_L` is the prefiller's whole window rather than this turn's, so no
+    # turn can outgrow it and force a rebuild. Nothing else has to be reset:
+    # the KV lives in pages the prefill writes and this reads, so the new
+    # turn's context is already visible -- only `P`, which says how much of it
+    # is context, moves.
+    dec = getattr(prefiller, "_gpu_decoder", None)
+    if dec is None:
+        dec = Gemma4GpuDecode(prefiller, max_L=prefiller.max_seq)
+        prefiller._gpu_decoder = dec
+    dec.P = prefiller.current_context_length
     eos = tuple(getattr(cfg, "EOS_IDS", ()) or ())
     return dec.generate(first, args.max_tokens, eos=eos)
 
@@ -445,7 +459,12 @@ def build_parser(doc):
         "the way examples/gpt2 and examples/qwen2_5 spell it.",
     )
     ap.add_argument(
-        "--ops", default="all", help="NPU ops: all, or a comma-separated subset"
+        "--ops",
+        default=None,
+        help="NPU ops: all, or a comma-separated subset. Unset takes the "
+        "model's default, which is every operator with an NPU kernel unless "
+        "the model narrows it -- Gemma4-E2B leaves rms_norm on the host, see "
+        "`Gemma4Prefill.DEFAULT_OPS`.",
     )
     ap.add_argument("--prompt", default=None, help="token ids, comma separated")
     ap.add_argument("--text", default=None, help="prompt text (needs transformers)")

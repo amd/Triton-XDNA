@@ -89,6 +89,13 @@ import gpu_kernels
 from llama_prefill import LlamaPrefill, _as_bf16, _t
 
 
+def _host_view(buf):
+    """The numpy view of a KV slot, whether it is a shared buffer or an array."""
+    if buf is None:
+        return None
+    return buf.numpy() if hasattr(buf, "numpy") else buf
+
+
 class Gemma4Prefill(LlamaPrefill):
     """Q4NX Gemma4-E2B prefill producing the decode's KV handoff."""
 
@@ -96,6 +103,21 @@ class Gemma4Prefill(LlamaPrefill):
     #: GELU-tanh, which is a different function rather than a different
     #: schedule. Named as its own operator so `--ops` can bisect it.
     NPU_OPS = ("matmul", "rms_norm", "geglu")
+
+    #: `rms_norm` is deliberately NOT in the default. It has an NPU kernel and
+    #: the kernel is correct, but this model issues ~315 of them per prefill --
+    #: five per layer plus the per-head q/k/v norms plus the PLE norm -- over
+    #: rows that are a handful of tokens wide. At that size a dispatch costs
+    #: more than the arithmetic, and the staging it forces between the GEMMs
+    #: costs more still:
+    #:
+    #:     P=6     all 4.62 s   matmul,geglu 1.25 s   (3.7x)
+    #:     P=151   all 5.78 s   matmul,geglu 2.06 s   (2.8x)
+    #:
+    #: Same first token either way, and `test_decode_vs_prefill.py` passes on
+    #: both. `--ops all` still puts it back, which is how the numbers above
+    #: were taken.
+    DEFAULT_OPS = ("matmul", "geglu")
 
     #: Everything `load_weights` establishes. `_lut` is a LIST here, one table
     #: per layer, where the base class has a single tensor -- see
@@ -121,22 +143,51 @@ class Gemma4Prefill(LlamaPrefill):
         wrong sharing map look like a cache of zeros rather than an error.
         """
         super().__init__(*a, **kw)
-        self.kv_k = [
-            (
-                np.zeros((self.max_seq, head_dim(L)), np.float32)
-                if L < FIRST_KV_SHARED
-                else None
-            )
+        # Shared pages where they can be had, so the GPU decode reads the
+        # prefill's KV where it lies instead of copying it across. `kv_k` and
+        # `kv_v` stay numpy either way -- they are *views* over the shared
+        # pages here -- so `kv_view`, `kv_stack`, `_layer` and `--compare-cpu`
+        # are unchanged and do not need to know. `_kv_sb_*` holds the buffers
+        # so `Gemma4GpuDecode` can ask for the torch view of the same pages.
+        self._kv_sb_k, self._kv_sb_v = self._alloc_kv()
+        self.kv_k = [_host_view(b) for b in self._kv_sb_k]
+        self.kv_v = [_host_view(b) for b in self._kv_sb_v]
+
+    def _alloc_kv(self):
+        """One `[max_seq, dh]` pair per layer that owns a cache, shared if possible.
+
+        Falls back to plain numpy when the interop is unavailable -- no pyxrt,
+        no ROCm torch, no visible device. This is an optimisation, and a cache
+        the decode has to copy is better than a model that will not load.
+        """
+        shapes = [
+            (self.max_seq, head_dim(L)) if L < FIRST_KV_SHARED else None
             for L in range(self.n_layers)
         ]
-        self.kv_v = [
-            (
-                np.zeros((self.max_seq, head_dim(L)), np.float32)
-                if L < FIRST_KV_SHARED
-                else None
+        try:
+            from triton.backends.amd_triton_npu import shared
+
+            bufs = [
+                [
+                    (
+                        shared.zeros(
+                            *sh, dtype=torch.float32, device="xrt:0", share="hip:0"
+                        )
+                        if sh
+                        else None
+                    )
+                    for sh in shapes
+                ]
+                for _ in range(2)
+            ]
+            return bufs[0], bufs[1]
+        except Exception as e:  # noqa: BLE001 -- see the docstring
+            if os.environ.get("AMD_TRITON_NPU_DEBUG"):
+                print(f"[gemma4] KV stays host-only: {e}", flush=True)
+            return (
+                [np.zeros(sh, np.float32) if sh else None for sh in shapes],
+                [np.zeros(sh, np.float32) if sh else None for sh in shapes],
             )
-            for L in range(self.n_layers)
-        ]
 
     # ---- weights ----
     def load_weights(self, model=None):
@@ -592,16 +643,31 @@ class Gemma4GpuDecode:
         self.ple_proj_norm = pf.ple_proj_norm.to(device)
         self.lut = [t.to(device) for t in pf._lut]
 
-        # The cache, seeded from the prefill and padded out to `max_L` so a
-        # step never reallocates.
+        # The cache. Where the prefill allocated it in shared pages, the torch
+        # view of those same pages *is* the decode's cache -- the prefill wrote
+        # through the numpy view of the same memory, so there is nothing to
+        # copy and nothing to keep in step. The buffer is already `max_seq`
+        # deep, so a step never reallocates either.
+        #
+        # Measured on the canonical prompt: the copy this replaces was 33.5 ms
+        # of a 6444 ms end-to-end run. Small, and the reason to take it is that
+        # it is free -- a decode attention reads shared pages at 1.00x of a
+        # native device tensor at S=2048, bit-identical.
         self.P = pf.current_context_length
         self.k = []
         self.v = []
+        shared_kv = getattr(pf, "_kv_sb_k", None) is not None
         for L in range(pf.n_layers):
             if pf.kv_k[L] is None:
                 self.k.append(None)
                 self.v.append(None)
                 continue
+            sbk, sbv = pf._kv_sb_k[L], pf._kv_sb_v[L]
+            if shared_kv and hasattr(sbk, "torch"):
+                self.k.append(sbk.torch())
+                self.v.append(sbv.torch())
+                continue
+            # Host-only fallback: no interop, so the cache has to be copied.
             dh = head_dim(L)
             k = torch.zeros((max_L, dh), dtype=torch.float32, device=device)
             v = torch.zeros((max_L, dh), dtype=torch.float32, device=device)
@@ -609,6 +675,10 @@ class Gemma4GpuDecode:
             v[: self.P] = _t(pf.kv_v[L][: self.P]).to(device)
             self.k.append(k)
             self.v.append(v)
+        # The buffers outlive this object only if something holds them; `pf`
+        # does, and the decode is built from it, so the pages cannot go away
+        # underneath the views above.
+        self._kv_owner = pf
 
     def _mm(self, x, w):
         """One activation row against a projection. bf16 in, f32 accumulation.
