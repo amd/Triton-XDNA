@@ -408,12 +408,17 @@ runs:
           #
           #   hetero       the prefill's RoPE and attention on the iGPU, the
           #                rest on the NPU. Gates the first token, like 9b.
-          #   hetero-fast  the same prefill plus the GPU decode, gating the
+          #                Coverage for that routing, not a faster path.
+          #   hetero-fast  the NPU prefill plus the GPU decode, gating the
           #                recorded continuation. It needs no `make
           #                compile-decode`: the decode under test is the torch
           #                -- now Triton -- one, not mlir-air's template. That
           #                makes it the only end-to-end decode gate this model
           #                has in CI.
+          #
+          # So the two runs cover the two halves separately: the first is the
+          # only gate on the iGPU prefill operators, the second the only gate
+          # on the GPU decode.
           #
           # Skipped rather than failed when the weights or mlir-air's sources
           # are unreachable; the example exits 77 for both.

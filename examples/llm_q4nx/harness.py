@@ -494,9 +494,12 @@ def build_parser(doc):
         "reference, NOT examples/gpt2's --backend reference, which is "
         "HuggingFace. npu: the operators with an NPU kernel on the NPU, the "
         "rest (RoPE, attention) in torch on the host. hetero: the same NPU "
-        "split, but those two as Triton kernels on the iGPU. hetero-fast: "
-        "hetero plus a GPU decode, i.e. --backend hetero --decode gpu, spelled "
-        "the way examples/gpt2 and examples/qwen2_5 spell it.",
+        "split, but those two as Triton kernels on the iGPU -- coverage for "
+        "the iGPU path, not a speedup; the per-layer driver switch it costs "
+        "outweighs what the two operators save. hetero-fast: the NPU prefill "
+        "plus the GPU decode, i.e. --backend npu --decode gpu, which is the "
+        "fastest combination measured here. Only Gemma4-E2B has a GPU decode, "
+        "so hetero-fast and --decode gpu decline on the other models.",
     )
     ap.add_argument(
         "--ops",
@@ -550,6 +553,16 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     # examples/gpt2 and examples/qwen2_5 have spelled it that way since before
     # this directory had a GPU path at all. Expanded here rather than carried
     # inward so nothing below has to know there are two spellings.
+    #
+    # It expands to the NPU prefill, NOT the hetero one, and that is a
+    # DELIBERATE divergence from the siblings, where `hetero-fast` is "hetero
+    # for prefill, all-GPU decode". The name promises the fastest way to get a
+    # token out of this model, and on this model it is not the hetero prefill:
+    # the layers are sequential, so routing RoPE and attention to the iGPU
+    # switches the active Triton driver twice per layer, each switch dropping
+    # the compiled-kernel cache. Measured on npu2 + Radeon 8060S, that costs
+    # more than the two operators save. `--backend hetero --decode gpu` still
+    # spells the sibling meaning for anyone comparing the two.
     raw_argv = sys.argv[1:] if argv is None else argv
     if args.backend == "hetero-fast":
         # `--decode npu` and `--decode=npu` are the same argument to argparse
@@ -565,7 +578,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
                 f"--decode {args.decode} contradicts it. Use --backend hetero "
                 f"--decode {args.decode} if that is what you meant."
             )
-        args.backend, args.decode = "hetero", "gpu"
+        args.backend, args.decode = "npu", "gpu"
 
     # `--decode gpu` is implemented per model, and only Gemma4-E2B has one.
     # Checked here rather than in `generate_on_gpu`, which runs after the
