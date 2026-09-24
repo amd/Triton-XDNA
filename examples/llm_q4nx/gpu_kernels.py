@@ -371,37 +371,60 @@ def _attn_decode_kernel(
     No causal mask: every cached key is at or before this position by
     construction, and the window is applied by the caller as a lower bound on
     the slice. MQA -- every query head reads the one kv head's cache.
+
+    `BLOCK_S` is a **fixed** tile and `S` is a runtime argument, so one compile
+    serves every context length. It used to be `next_pow2(S)`, which made the
+    tile track the position and recompiled the kernel on almost every token:
+    measured 1165 ms/token at a 151-token prompt against 31.7 ms at six.
+    mlir-air's llama-1b decode makes the same choice for the same reason -- one
+    xclbin at ATTN_MAXL=2048 with a compile-time attention loop, serving every
+    L in [1, 2048] rather than a template per window.
+
+    The running max and sum are the online-softmax pair, so the scores for the
+    whole context never exist at once.
     """
     h = tl.program_id(0)
     offs_d = tl.arange(0, BLOCK_D)
-    offs_s = tl.arange(0, BLOCK_S)
     mask_d = offs_d < dh
-    mask_s = offs_s < S
-
     q = tl.load(Q + h * dh + offs_d, mask=mask_d, other=0.0).to(tl.float32)
-    k = tl.load(
-        KC + offs_s[:, None] * dh + offs_d[None, :],
-        mask=mask_s[:, None] & mask_d[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    scores = tl.sum(q[None, :] * k, axis=1) * scale
-    # Masked lanes to -inf so they leave the max alone and exp to zero.
-    scores = tl.where(mask_s, scores, float("-inf"))
-    p = tl.exp(scores - tl.max(scores, axis=0))
-    p = p / tl.sum(p, axis=0)
 
-    v = tl.load(
-        VC + offs_s[:, None] * dh + offs_d[None, :],
-        mask=mask_s[:, None] & mask_d[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    tl.store(OUT + h * dh + offs_d, tl.sum(p[:, None] * v, axis=0), mask=mask_d)
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    m_i = float("-inf")
+    l_i = 0.0
+
+    for j0 in range(0, S, BLOCK_S):
+        offs_s = j0 + tl.arange(0, BLOCK_S)
+        mask_s = offs_s < S
+        k = tl.load(
+            KC + offs_s[:, None] * dh + offs_d[None, :],
+            mask=mask_s[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        s = tl.sum(q[None, :] * k, axis=1) * scale
+        s = tl.where(mask_s, s, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s, axis=0))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha
+
+        v = tl.load(
+            VC + offs_s[:, None] * dh + offs_d[None, :],
+            mask=mask_s[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(p[:, None] * v, axis=0)
+        m_i = m_new
+
+    tl.store(OUT + h * dh + offs_d, acc / l_i, mask=mask_d)
 
 
-def attn_decode(q, kc, vc, n_heads, dh, scale):
+def attn_decode(q, kc, vc, n_heads, dh, scale, block_s=64):
     """q: [1, n_heads*dh] against kc/vc: [S, dh] -> [1, n_heads*dh].
 
-    `BLOCK_S` is bucketed to a power of two; see the module docstring.
+    `block_s` is fixed, so the only constexpr that varies is `BLOCK_D`, and
+    `dh` takes two values on this model -- two compiles for the whole run.
     """
     S = kc.shape[0]
     q = q.reshape(-1).contiguous()
@@ -414,7 +437,7 @@ def attn_decode(q, kc, vc, n_heads, dh, scale):
         S,
         dh,
         scale,
-        BLOCK_S=_pow2(S),
+        BLOCK_S=block_s,
         BLOCK_D=_pow2(dh),
     )
     return out.reshape(1, n_heads * dh)
