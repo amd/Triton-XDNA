@@ -400,6 +400,36 @@ runs:
               hetero_rc=1
             fi
           done
+
+          # Gemma4-E2B, the one Q4NX model with a GPU decode. STEP 9b runs
+          # every Q4NX gate with the iGPU hidden, so `hetero` and `--decode
+          # gpu` have no coverage there at all -- which is what this step is
+          # for. Two runs, because they fail differently:
+          #
+          #   hetero       the prefill's RoPE and attention on the iGPU, the
+          #                rest on the NPU. Gates the first token, like 9b.
+          #   hetero-fast  the same prefill plus the GPU decode, gating the
+          #                recorded continuation. It needs no `make
+          #                compile-decode`: the decode under test is the torch
+          #                -- now Triton -- one, not mlir-air's template. That
+          #                makes it the only end-to-end decode gate this model
+          #                has in CI.
+          #
+          # Skipped rather than failed when the weights or mlir-air's sources
+          # are unreachable; the example exits 77 for both.
+          for args in "--backend hetero --prefill-only" \
+                      "--backend hetero-fast --prompt 2,818,5279,529,7001,563 --max-tokens 3 --greedy"; do
+            echo "--- hetero: gemma4_e2b_q4nx $args ---"
+            rc=0
+            ( cd examples/gemma4_e2b_q4nx \
+              && python gemma4_e2b_q4nx_inference.py $args ) || rc=$?
+            if [ "$rc" -eq 77 ]; then
+              echo "SKIP: gemma4_e2b_q4nx $args (exit 77)"
+            elif [ "$rc" -ne 0 ]; then
+              echo "FAIL: gemma4_e2b_q4nx $args (exit $rc)"
+              hetero_rc=1
+            fi
+          done
           exit $hetero_rc
         else
           echo "Skipping hetero run: gpt2/qwen are npu2-only (device=$DEVICE)."

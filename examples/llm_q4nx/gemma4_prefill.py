@@ -58,6 +58,7 @@ here use -- seeds the decode from that aliased oracle, so on **this** model it
 is not a reference at all. Gate against mlir-air's own NPU prefill instead.
 """
 
+import contextlib
 import os
 
 import numpy as np
@@ -84,7 +85,16 @@ from config import (
     rope_lut,
 )
 
+import gpu_kernels
+
 from llama_prefill import LlamaPrefill, _as_bf16, _t
+
+
+def _host_view(buf):
+    """The numpy view of a KV slot, whether it is a shared buffer or an array."""
+    if buf is None:
+        return None
+    return buf.numpy() if hasattr(buf, "numpy") else buf
 
 
 class Gemma4Prefill(LlamaPrefill):
@@ -94,6 +104,18 @@ class Gemma4Prefill(LlamaPrefill):
     #: GELU-tanh, which is a different function rather than a different
     #: schedule. Named as its own operator so `--ops` can bisect it.
     NPU_OPS = ("matmul", "rms_norm", "geglu")
+
+    #: `rms_norm` is not in the default. Its NPU kernel is correct, but this
+    #: model issues one per sublayer plus the per-head q/k/v norms plus the PLE
+    #: norm -- some hundreds per prefill, each over rows a few tokens wide. At
+    #: that size the dispatch costs more than the arithmetic, and it splits the
+    #: GEMMs either side of it into separate staged launches. Running it on the
+    #: host is faster at every prompt length tried, with the same first token.
+    #:
+    #: `--ops all` puts it back, which is how that was measured. Re-measure
+    #: before assuming it still holds: the answer turns on dispatch overhead,
+    #: which is exactly what the XRT launcher work would change.
+    DEFAULT_OPS = ("matmul", "geglu")
 
     #: Everything `load_weights` establishes. `_lut` is a LIST here, one table
     #: per layer, where the base class has a single tensor -- see
@@ -119,22 +141,51 @@ class Gemma4Prefill(LlamaPrefill):
         wrong sharing map look like a cache of zeros rather than an error.
         """
         super().__init__(*a, **kw)
-        self.kv_k = [
-            (
-                np.zeros((self.max_seq, head_dim(L)), np.float32)
-                if L < FIRST_KV_SHARED
-                else None
-            )
+        # Shared pages where they can be had, so the GPU decode reads the
+        # prefill's KV where it lies instead of copying it across. `kv_k` and
+        # `kv_v` stay numpy either way -- they are *views* over the shared
+        # pages here -- so `kv_view`, `kv_stack`, `_layer` and `--compare-cpu`
+        # are unchanged and do not need to know. `_kv_sb_*` holds the buffers
+        # so `Gemma4GpuDecode` can ask for the torch view of the same pages.
+        self._kv_sb_k, self._kv_sb_v = self._alloc_kv()
+        self.kv_k = [_host_view(b) for b in self._kv_sb_k]
+        self.kv_v = [_host_view(b) for b in self._kv_sb_v]
+
+    def _alloc_kv(self):
+        """One `[max_seq, dh]` pair per layer that owns a cache, shared if possible.
+
+        Falls back to plain numpy when the interop is unavailable -- no pyxrt,
+        no ROCm torch, no visible device. This is an optimisation, and a cache
+        the decode has to copy is better than a model that will not load.
+        """
+        shapes = [
+            (self.max_seq, head_dim(L)) if L < FIRST_KV_SHARED else None
             for L in range(self.n_layers)
         ]
-        self.kv_v = [
-            (
-                np.zeros((self.max_seq, head_dim(L)), np.float32)
-                if L < FIRST_KV_SHARED
-                else None
+        try:
+            from triton.backends.amd_triton_npu import shared
+
+            bufs = [
+                [
+                    (
+                        shared.zeros(
+                            *sh, dtype=torch.float32, device="xrt:0", share="hip:0"
+                        )
+                        if sh
+                        else None
+                    )
+                    for sh in shapes
+                ]
+                for _ in range(2)
+            ]
+            return bufs[0], bufs[1]
+        except Exception as e:  # noqa: BLE001 -- see the docstring
+            if os.environ.get("AMD_TRITON_NPU_DEBUG"):
+                print(f"[gemma4] KV stays host-only: {e}", flush=True)
+            return (
+                [np.zeros(sh, np.float32) if sh else None for sh in shapes],
+                [np.zeros(sh, np.float32) if sh else None for sh in shapes],
             )
-            for L in range(self.n_layers)
-        ]
 
     # ---- weights ----
     def load_weights(self, model=None):
@@ -233,7 +284,12 @@ class Gemma4Prefill(LlamaPrefill):
         the same label rather than saying so.
         """
         self._fused_mlp = None
-        if self.backend != "npu" or not {"matmul", "geglu"} <= self.enabled:
+        # `_NPU_BACKENDS`, not `== "npu"`: `hetero` puts these two operators on
+        # the NPU exactly as `npu` does, so it wants the chain for exactly the
+        # same reason. Spelled as the shared tuple so the next backend that
+        # routes to the NPU does not have to remember this line exists.
+        fused_ops = {"matmul", "geglu"}
+        if self.backend not in self._NPU_BACKENDS or not fused_ops <= self.enabled:
             return
         if os.environ.get("Q4NX_FUSED_MLP", "1") != "1":
             print("[gemma4] fused MLP disabled by Q4NX_FUSED_MLP=0")
@@ -340,6 +396,12 @@ class Gemma4Prefill(LlamaPrefill):
                 out[n:, L] = proj[n:] * PLE_INPUT_SCALE
             return out
 
+    def _gpu_scope(self):
+        """Hold the GPU driver across a region, or do nothing on the host path."""
+        if self._gpu_device() is None:
+            return contextlib.nullcontext()
+        return gpu_kernels.gpu_driver()
+
     def _layer(self, x, L, N, keep=None, pli=None):
         """One Gemma4 block, on the prompt. x: [N, D] -> [N, D].
 
@@ -359,38 +421,56 @@ class Gemma4Prefill(LlamaPrefill):
         residual = x
         h = self._rms_norm(x, w["attn_norm"], RMS_EPS)  # input_layernorm
 
+        # One GPU-driver scope over the sublayer rather than one per operator.
+        # `gpu_driver` no-ops when the GPU backend is already active, so the
+        # scopes inside `_rope` and `_attention` cost nothing. Switching does
+        # cost: `set_active` drops Triton's kernel cache.
+        #
+        # The qkv GEMM inside still switches to the NPU and back. That is
+        # unavoidable; what this removes is the two ropes and the attention
+        # each doing it again.
+        # The projections first, outside the GPU scope below. They are NPU
+        # work, and an NPU launch inside that scope would switch the active
+        # driver and drop the GPU kernels' compiled cache -- the thing the
+        # scope exists to keep.
         if L < FIRST_KV_SHARED:
             qkv = self._matmul(h, w["qkv"])
             q, k, v = qkv.split([dq, dkv, dkv], dim=1)
-            q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
-            k = self._head_norm(k, w["k_norm"], N_KV_HEADS, dh)
-            # The value norm is weightless: `with_scale=False` upstream.
-            v = self._head_norm(v, None, N_KV_HEADS, dh)
-            q = self._rope(q, lut[:N], N_Q_HEADS)
-            k = self._rope(k, lut[:N], N_KV_HEADS)
-            # The decode's handoff: roped K, normalized V.
-            self.kv_k[L][:keep] = k[:keep].to(torch.float32).numpy()
-            self.kv_v[L][:keep] = v[:keep].to(torch.float32).numpy()
+            src = None
         else:
             # A KV-shared layer projects q alone and attends the cache of
             # `kv_source_layer(L)`, which -- being lower -- has already run.
             q = self._matmul(h, w["qkv"])
+            k = v = None
+            src = kv_source_layer(L)
+
+        # Everything from here to the attention is GPU work under `hetero`, so
+        # it runs under one scope instead of each operator opening its own.
+        with self._gpu_scope():
             q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
             q = self._rope(q, lut[:N], N_Q_HEADS)
-            src = kv_source_layer(L)
-            k = _t(self.kv_k[src][:N])
-            v = _t(self.kv_v[src][:N])
+            if src is None:
+                k = self._head_norm(k, w["k_norm"], N_KV_HEADS, dh)
+                # The value norm is weightless: `with_scale=False` upstream.
+                v = self._head_norm(v, None, N_KV_HEADS, dh)
+                k = self._rope(k, lut[:N], N_KV_HEADS)
+                # The decode's handoff: roped K, normalized V.
+                self.kv_k[L][:keep] = k[:keep].to(torch.float32).numpy()
+                self.kv_v[L][:keep] = v[:keep].to(torch.float32).numpy()
+            else:
+                k = _t(self.kv_k[src][:N])
+                v = _t(self.kv_v[src][:N])
 
-        a = self._attention(
-            q,
-            k,
-            v,
-            N_Q_HEADS,
-            N_KV_HEADS,
-            dh,
-            window=SLIDING_WINDOW if sliding else None,
-            scale=ATTN_SCALE,
-        )
+            a = self._attention(
+                q,
+                k,
+                v,
+                N_Q_HEADS,
+                N_KV_HEADS,
+                dh,
+                window=SLIDING_WINDOW if sliding else None,
+                scale=ATTN_SCALE,
+            )
         a = self._matmul(a, w["o"])  # o contracts dq -> D
         x = residual + self._rms_norm(a, w["post_attn_norm"], RMS_EPS)
 
@@ -453,6 +533,10 @@ class Gemma4Prefill(LlamaPrefill):
             # reference applies it, which is what makes the two comparable as
             # logits rather than only as a predicted token.
             logits = FINAL_LOGIT_SOFTCAP * torch.tanh(logits / FINAL_LOGIT_SOFTCAP)
+        # Kept so a decode does not have to be handed this separately. It and
+        # the KV are written by the same call, and a decode seeded from one
+        # prefill's token over another's KV answers for neither.
+        self.last_first_token = int(logits.argmax())
         return logits
 
     # ---- decode handoff ----
@@ -488,3 +572,301 @@ class Gemma4Prefill(LlamaPrefill):
             ks.append(np.asarray(self.kv_k[src][:c], np.float32))
             vs.append(np.asarray(self.kv_v[src][:c], np.float32))
         return ks, vs
+
+
+# ---------------------------------------------------------------------------
+# GPU decode
+# ---------------------------------------------------------------------------
+#
+# The other half of a hybrid run: Triton prefill on the NPU, then token-by-token
+# decode in torch on the iGPU, instead of mlir-air's fused NPU superkernel.
+#
+# Named after `examples/qwen2_5`'s `hetero-fast`, which is the same split for
+# that model -- hetero prefill, all-GPU decode -- and reached the same way, by
+# running the ordinary forward at one token with a KV cache. The math below is
+# `_layer`'s, at N=1, with three differences that only appear at N=1:
+#
+#   * the new token attends the CACHE, so K and V come from it rather than from
+#     this step's projections, and the sliding window becomes a bound on how far
+#     back into the cache a single row may look;
+#   * there is no causal mask -- one query row, every cached key at or before it
+#     is visible;
+#   * the per-layer embeddings come from THIS token's embedding. That is the
+#     same rule the prompt follows (`per_layer_inputs` takes the embeddings of
+#     the tokens being processed), not a decode-specific special case.
+#
+# Why a decode at all, when the NPU has one: it is the only way to run this
+# model's generation without the PLE decode template, and it is a reference the
+# fused kernel can be scored against -- one that lives here rather than
+# upstream. It is not faster; the NPU path is one dispatch for all 35 layers.
+
+
+class Gemma4GpuDecode:
+    """Greedy decode for Gemma4-E2B, in Triton, on the iGPU.
+
+    Built from a `Gemma4Prefill` that has already run: it takes that object's
+    weights and its KV cache, so the prompt is not re-run. The weights are
+    moved once, not per token -- on this model that is several GiB, and moving
+    them per step would dominate everything else.
+
+    The cache is held on the device as `[max_L, dh]` per layer that owns one,
+    with the twenty KV-shared layers holding no cache at all and reading the
+    one belonging to `kv_source_layer(L)` -- the same arrangement
+    `Gemma4Prefill.__init__` uses, and for the same reason.
+
+    Every operator is a Triton kernel from `gpu_kernels`
+    ----------------------------------------------------
+    The projections, both norms, RoPE, the GLU and the attention. `README.md`
+    is explicit that *"PyTorch is used by the examples as a CPU reference"*,
+    and `examples/gpt2` and `examples/qwen2_5` have had `*_kernel_gpu` for
+    precisely this since they grew a GPU path -- a torch forward here would
+    mean the one path in this repository that runs on a GPU exercises none of
+    the compiler the repository is for.
+
+    What is still torch is glue, and stays glue on purpose: moving weights and
+    the cache to the device, the row gather out of the embedding table,
+    `argmax` over the logits, and three scalar multiplies inside `_ple` on
+    256-wide rows. None of them is an operator the model defines; a kernel for
+    any of them would be slower than the launch it saved.
+    """
+
+    def __init__(self, pf, max_L, device="cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "no ROCm device visible to torch. This decode is the GPU half "
+                "of a hybrid run; use the NPU decode instead, or install a "
+                "ROCm build of torch."
+            )
+        self.pf = pf
+        self.dev = device
+        self.max_L = max_L
+        self.timer = pf.timer
+
+        # Weights, once. bf16 as the prefill holds them; the norms and the
+        # RoPE tables stay float32 because that is what they are applied in.
+        # The MLP weights may not be in `_w` at all: the fused NPU path hands
+        # `gate_up`/`down` to its chain and deletes them, because holding ~80%
+        # of the model's weight bytes twice takes peak RSS past this model's
+        # declared `min_host_gib`. `logical_weights` rebuilds them from the
+        # chain's padded copies -- the same door `share_weights_from` uses, and
+        # for the same reason: a reload would cost minutes and would compare
+        # against a different dequantization.
+        fused = getattr(pf, "_fused_mlp", None) or {}
+        self.w = []
+        for L, w in enumerate(pf._w):
+            w = dict(w)
+            if "gate_up" not in w and L in fused:
+                w["gate_up"], w["down"] = fused[L].logical_weights(L)
+            self.w.append(
+                {
+                    k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                    for k, v in w.items()
+                }
+            )
+        self.embed = _t(pf.embed, torch.bfloat16).to(device)
+        self.lm_head = pf.lm_head.to(device)
+        self.final_norm = pf.final_norm.to(device)
+        self.ple_proj_norm = pf.ple_proj_norm.to(device)
+        self.lut = [t.to(device) for t in pf._lut]
+
+        # Where the prefill allocated the cache in shared pages, the torch
+        # view of those pages is the decode's cache: the prefill wrote through
+        # the numpy view of the same memory, so there is nothing to copy and
+        # nothing to keep in step. The buffer is already `max_seq` deep, so a
+        # step never reallocates.
+        #
+        # The copy this replaces is small. It is here because it is what lets a
+        # decoder outlive a turn -- a new prompt's context is simply already
+        # visible -- not for its own sake.
+        self.P = pf.current_context_length
+        self.k = []
+        self.v = []
+        shared_kv = getattr(pf, "_kv_sb_k", None) is not None
+        for L in range(pf.n_layers):
+            if pf.kv_k[L] is None:
+                self.k.append(None)
+                self.v.append(None)
+                continue
+            sbk, sbv = pf._kv_sb_k[L], pf._kv_sb_v[L]
+            if shared_kv and hasattr(sbk, "torch"):
+                self.k.append(sbk.torch())
+                self.v.append(sbv.torch())
+                continue
+            # Host-only fallback: no interop, so the cache has to be copied.
+            dh = head_dim(L)
+            k = torch.zeros((max_L, dh), dtype=torch.float32, device=device)
+            v = torch.zeros((max_L, dh), dtype=torch.float32, device=device)
+            k[: self.P] = _t(pf.kv_k[L][: self.P]).to(device)
+            v[: self.P] = _t(pf.kv_v[L][: self.P]).to(device)
+            self.k.append(k)
+            self.v.append(v)
+        # The buffers outlive this object only if something holds them; `pf`
+        # does, and the decode is built from it, so the pages cannot go away
+        # underneath the views above.
+        self._kv_owner = pf
+
+    def _mm(self, x, w):
+        """One activation row against a projection. bf16 in, f32 accumulation.
+
+        `gpu_kernels.gemv`, not `x @ w`: this is the hot path -- ~281 of these
+        per token across 35 layers and the head -- and at one row the cost is
+        launch count, not arithmetic. See `gpu_kernels` for why it reduces over
+        K rather than calling `tl.dot`.
+        """
+        return gpu_kernels.gemv(x, w)
+
+    def _norm(self, x, weight=None):
+        """RMSNorm over the last axis. `weight=None` is the weightless value norm."""
+        return gpu_kernels.rmsnorm(x, weight, RMS_EPS)
+
+    def _head_norm(self, x, weight, n_heads, dh):
+        return self._norm(x.reshape(n_heads, dh), weight).reshape(1, n_heads * dh)
+
+    def _norm_residual(self, x, weight, residual, scale=1.0):
+        """The sublayer tail, `(residual + norm(x) * weight) * scale`, fused.
+
+        Every Gemma4 sublayer ends this way, so this is three launches a layer
+        rather than nine.
+        """
+        return gpu_kernels.rmsnorm_residual(x, weight, RMS_EPS, residual, scale)
+
+    def _rope(self, x, L, pos, n_heads, dh):
+        """Half-split rotary on one row, at one position.
+
+        The same pairing `LlamaPrefill._rope` uses -- (i, i + dh/2), not
+        adjacent lanes -- against this layer's own table. The partial rotary on
+        the full layers is in that table, not here; see `config.rope_lut`.
+        """
+        return gpu_kernels.rope(x, self.lut[L][pos], n_heads, dh)
+
+    def _ple(self, x):
+        """This token's per-layer vectors, [N_LAYERS, PLI_D].
+
+        From the token's own embedding, which is the same rule the prompt
+        follows -- see the note above this class.
+        """
+        tbl = _t(self.pf._ple_rows([self._tok])).to(self.dev)  # [1, N_LAYERS, PLI_D]
+        out = torch.empty((N_LAYERS, PLI_D), dtype=torch.float32, device=self.dev)
+        for L in range(self.pf.n_layers):
+            proj = self._mm(x, self.w[L]["model_proj"]) * PLE_MODEL_PROJ_SCALE
+            proj = self._norm(proj, self.ple_proj_norm)
+            out[L] = (proj[0] + tbl[0, L]) * PLE_INPUT_SCALE
+        return out
+
+    def step(self, token, pos):
+        """One token through all 35 layers. Returns its logits, [VOCAB].
+
+        The driver scope is here rather than around each launch: a step issues
+        several hundred, and every one of them has to reach the GPU backend
+        rather than the NPU one that a preceding prefill leaves active. See
+        `gpu_kernels.gpu_driver`.
+        """
+        with gpu_kernels.gpu_driver():
+            return self._step(token, pos)
+
+    def _step(self, token, pos):
+        """`step`'s body, with a GPU driver already selected.
+
+        `pos` is the position this token occupies -- the length of everything
+        before it. The cache rows `[0, pos)` are the context; this step writes
+        row `pos` on the layers that own a cache and then attends `[0, pos]`.
+        """
+        self._tok = int(token)
+        dev = self.dev
+        # `self.embed` is already a torch tensor on the device -- staged once
+        # in __init__ -- so this is a row gather, not another conversion.
+        x = self.embed[self._tok : self._tok + 1].to(torch.float32)  # [1, D]
+        pli = self._ple(x)
+
+        for L in range(self.pf.n_layers):
+            w = self.w[L]
+            dh = head_dim(L)
+            dq, dkv = N_Q_HEADS * dh, N_KV_HEADS * dh
+            src = kv_source_layer(L)
+
+            residual = x
+            h = self._norm(x, w["attn_norm"])
+
+            if L < FIRST_KV_SHARED:
+                qkv = self._mm(h, w["qkv"])
+                q, k, v = qkv.split([dq, dkv, dkv], dim=1)
+                q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
+                k = self._head_norm(k, w["k_norm"], N_KV_HEADS, dh)
+                v = self._head_norm(v, None, N_KV_HEADS, dh)  # weightless
+                q = self._rope(q, L, pos, N_Q_HEADS, dh)
+                k = self._rope(k, L, pos, N_KV_HEADS, dh)
+                self.k[L][pos] = k[0]
+                self.v[L][pos] = v[0]
+            else:
+                q = self._mm(h, w["qkv"])
+                q = self._head_norm(q, w["q_norm"], N_Q_HEADS, dh)
+                q = self._rope(q, L, pos, N_Q_HEADS, dh)
+
+            # One query row against the cache. No causal mask -- every cached
+            # key is at or before this position by construction. The sliding
+            # window survives as a lower bound on how far back it may look.
+            lo = max(0, pos - SLIDING_WINDOW + 1) if is_sliding(L) else 0
+            kc = self.k[src][lo : pos + 1]  # [S, dh]
+            vc = self.v[src][lo : pos + 1]
+            a = gpu_kernels.attn_decode(q, kc, vc, N_Q_HEADS, dh, ATTN_SCALE)
+
+            a = self._mm(a, w["o"])
+            x = self._norm_residual(a, w["post_attn_norm"], residual)
+
+            residual = x
+            h = self._norm(x, w["ffn_norm"])
+            inter = mlp_inter(L)
+            g, u = self._mm(h, w["gate_up"]).split([inter, inter], dim=1)
+            d = self._mm(gpu_kernels.geglu(g, u), w["down"])
+            x = self._norm_residual(d, w["post_ffn_norm"], residual)
+
+            # Per-layer embedding injection, then the per-layer output scale --
+            # folded into the same launch as the norm that precedes it.
+            residual = x
+            gate = gpu_kernels.geglu(self._mm(x, w["inp_gate"]), pli[L])
+            pr = self._mm(gate, w["per_layer_projection"])
+            x = self._norm_residual(
+                pr, w["post_ple_norm"], residual, scale=w["out_scale"]
+            )
+
+        x = self._norm(x, self.final_norm)
+        logits = self._mm(x, self.lm_head.T)[0]
+        if FINAL_LOGIT_SOFTCAP:
+            logits = gpu_kernels.logit_softcap(logits, FINAL_LOGIT_SOFTCAP)
+        return logits
+
+    def generate(self, first=None, n_tokens=1, eos=()):
+        """Greedy continuation, `first` included. Returns the ids.
+
+        `first` is the prefill's own prediction, so it is emitted without a
+        step: the step that produced it was the prefill. Each subsequent token
+        is one `step` at the next position.
+        """
+        # Both taken from the prefiller unless overridden, and taken *now*
+        # rather than at construction: the cached decoder outlives a turn, and
+        # a caller that ran another prefill in between would otherwise decode
+        # one prompt's token against another's cache.
+        if first is None:
+            first = self.pf.last_first_token
+        self.P = self.pf.current_context_length
+        out = [int(first)]
+        pos = self.P
+        # One driver scope for the whole loop. `step` takes one too, which
+        # no-ops inside this; what must not happen is a *switch* per token,
+        # because that drops Triton's kernel cache and recompiles every shape
+        # the token touches -- 7.5 s of an 9.3 s, 64-token run before this was
+        # hoisted. See `gpu_kernels.gpu_driver`.
+        with gpu_kernels.gpu_driver():
+            for _ in range(max(0, n_tokens - 1)):
+                if pos >= self.max_L:
+                    print(f"[gpu-decode] hit max_L={self.max_L}; stopping", flush=True)
+                    break
+                with self.timer.track("gpu_decode_step"):
+                    logits = self.step(out[-1], pos)
+                nxt = int(torch.argmax(logits))
+                pos += 1
+                if nxt in eos:
+                    out.append(nxt)
+                    break
+                out.append(nxt)
+        return out

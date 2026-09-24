@@ -175,7 +175,7 @@ class LlamaPrefill:
     def __init__(
         self,
         backend="cpu",
-        ops="all",
+        ops=None,
         n_layers=N_LAYERS,
         max_seq=2048,
         model=None,
@@ -202,15 +202,26 @@ class LlamaPrefill:
         self.kv_v = [np.zeros((max_seq, DV), np.float32) for _ in range(n_layers)]
         self._w = None
 
+    #: What `--ops` selects when nothing is asked for. `None` means every
+    #: operator with an NPU kernel, which is right wherever the NPU is faster
+    #: at all of them. A subclass narrows it where measurement says otherwise;
+    #: `NPU_OPS` stays the full set either way, so `--ops rms_norm` can still
+    #: put one back for a bisection.
+    DEFAULT_OPS = None
+
     @classmethod
     def _resolve_ops(cls, spec):
         """Which operators may go to the NPU: "all", or a comma-separated list.
 
         LLAMA_NPU_OPS is consulted when the caller passes nothing, so a
         bisection can be driven from the environment without touching argv.
+        "all" is literal -- every operator in `NPU_OPS` -- where passing
+        nothing takes the class's `DEFAULT_OPS`.
         """
         if spec is None:
-            spec = os.environ.get("LLAMA_NPU_OPS", "all")
+            spec = os.environ.get("LLAMA_NPU_OPS") or (
+                ",".join(cls.DEFAULT_OPS) if cls.DEFAULT_OPS else "all"
+            )
         if spec in ("all", "*"):
             return set(cls.NPU_OPS)
         enabled = {o.strip() for o in spec.split(",") if o.strip()}
@@ -219,9 +230,38 @@ class LlamaPrefill:
             raise ValueError(f"unknown ops {sorted(unknown)}; known: {cls.NPU_OPS}")
         return enabled
 
+    #: Backends that put the NPU-capable operators on the NPU. `hetero` does
+    #: too -- it differs only in where the REST go, which is `_gpu_device`.
+    _NPU_BACKENDS = ("npu", "hetero")
+
     def _on_npu(self, op, backend):
         """True when `op` should run as a Triton kernel for this call."""
-        return (backend or self.backend) == "npu" and op in self.enabled
+        return (backend or self.backend) in self._NPU_BACKENDS and op in self.enabled
+
+    def _gpu_device(self, backend=None):
+        """Where an operator that is NOT on the NPU should run.
+
+        `None` means torch on the CPU, which is what `cpu` and `npu` both do:
+        under `npu` the operators without an NPU kernel -- RoPE and attention --
+        stay on the host. Under `hetero` they go to the iGPU instead, which is
+        the whole of what that backend means here. The same split
+        `examples/qwen2_5` calls hetero, named the same way on purpose.
+
+        Returns None rather than raising when there is no ROCm device, so a
+        host without one degrades to the CPU path instead of failing: this is a
+        placement decision, not a correctness one, and CI has no iGPU.
+        """
+        if (backend or self.backend) != "hetero":
+            return None
+        if not hasattr(self, "_gpu_ok"):
+            self._gpu_ok = torch.cuda.is_available()
+            if not self._gpu_ok:
+                print(
+                    "[hetero] no ROCm device visible to torch; the operators "
+                    "without an NPU kernel stay on the CPU",
+                    flush=True,
+                )
+        return "cuda" if self._gpu_ok else None
 
     # ---- operators ----
     # Each is torch by default and Triton on the NPU when enabled. The torch
@@ -295,6 +335,24 @@ class LlamaPrefill:
         """
         with self.timer.track("rope"):
             N = x.shape[0]
+            # Under `hetero` this runs on the iGPU: it has no NPU kernel, so
+            # the choice is host or GPU, not NPU or GPU. The result comes back
+            # to the CPU because the next operator is an NPU GEMM, which reads
+            # host memory -- the same round trip examples/qwen2_5 makes around
+            # its GPU attention.
+            dev = self._gpu_device(backend)
+            if dev is not None:
+                # A Triton kernel, not torch on a GPU tensor: torch is this
+                # repository's CPU reference (README), and `examples/gpt2` and
+                # `examples/qwen2_5` have run their GPU half as `*_kernel_gpu`
+                # since they grew one.
+                import gpu_kernels
+
+                with gpu_kernels.gpu_driver():
+                    out = gpu_kernels.rope_batch(
+                        x.to(dev), lut.to(dev), n_heads, lut.shape[-1]
+                    )
+                return out.cpu()
             half = lut.shape[-1] // 2
             cos = lut[:, :half].unsqueeze(1)  # [N, 1, 32]
             sin = lut[:, half:].unsqueeze(1)
@@ -326,6 +384,22 @@ class LlamaPrefill:
             N = q.shape[0]
             rep = n_q // n_kv
             scale = dh**-0.5 if scale is None else scale
+            # The other op with no NPU kernel, and the one that pays for the
+            # transfer: the scores are [n_q, N, N], so this is where a long
+            # prompt spends its prefill. See `_gpu_device`.
+            dev = self._gpu_device(backend)
+            if dev is not None:
+                # Flash-style, so the [n_q, N, N] score matrix the torch body
+                # below materializes never exists -- that matrix is what makes
+                # a long prompt expensive here. See `_rope` for why it is a
+                # kernel rather than torch on a GPU tensor.
+                import gpu_kernels
+
+                with gpu_kernels.gpu_driver():
+                    out = gpu_kernels.attn_prefill(
+                        q.to(dev), k.to(dev), v.to(dev), n_q, n_kv, dh, window, scale
+                    )
+                return out.cpu()
             qh = q.reshape(N, n_q, dh).transpose(0, 1)  # [n_q, N, dh]
             kh = k.reshape(N, n_kv, dh).transpose(0, 1)  # [n_kv, N, dh]
             vh = v.reshape(N, n_kv, dh).transpose(0, 1)
@@ -339,7 +413,7 @@ class LlamaPrefill:
                 # rather than replacing it: a position must satisfy both, and
                 # j == i always survives, so no row is fully masked.
                 mask = mask + torch.full((N, N), float("-inf")).tril(-window)
-            scores = scores + mask
+            scores = scores + mask.to(scores.device)
             p = torch.softmax(scores, dim=-1)
             return (p @ vh).transpose(0, 1).reshape(N, n_q * dh)
 
