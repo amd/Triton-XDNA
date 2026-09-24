@@ -194,17 +194,23 @@ class Gemma4Prefill(LlamaPrefill):
     def _resolve_attn_maxl(self):
         """The slab's row count: the decode template's ATTN_MAXL, or `max_seq`.
 
-        See `airsrc.decode_attn_maxl` for why both ends pin to the largest
-        calibrated window rather than each deriving one. With no decode build
-        present -- `--prefill-only`, `--decode gpu` -- there is no template to
-        agree with and `max_seq` is the right size.
+        See `airsrc.decode_attn_maxl` for why both ends agree on a window from
+        `max_seq` rather than each deriving one from the generation length.
+        With no decode build present -- `--prefill-only`, `--decode gpu` --
+        there is no template to agree with and `max_seq` is the right size.
+
+        When a template IS present its size wins even if it is SMALLER than
+        `max_seq`. Deferring to `max_seq` there looks like the safe choice and
+        is the opposite: the slab would be laid out for rows the template does
+        not have, so every offset past the first layer would be wrong. The
+        decode cannot serve a context past its ATTN_MAXL in any case, so a
+        prompt that needs more rows is a prompt this build cannot run --
+        `prefill` says so rather than writing past the slab.
         """
         import airsrc
 
-        got = airsrc.decode_attn_maxl("ple")
-        if got is None or got < self.max_seq:
-            return self.max_seq
-        return got
+        got = airsrc.decode_attn_maxl("ple", want=self.max_seq)
+        return self.max_seq if got is None else got
 
     def _alloc_kv(self):
         """The `[n_layers, layer_elems]` bf16 slab, in shared pages if possible.
@@ -589,6 +595,15 @@ class Gemma4Prefill(LlamaPrefill):
         assert self._w is not None, "call load_weights() first"
         N = len(ids)
         assert N <= self.max_seq, (N, self.max_seq)
+        if N > self.kv_attn_maxl:
+            # The slab is the decode template's shape, so this is the same
+            # limit `FusedDecoder.seed_kv` enforces -- raised here instead,
+            # before `_store_kv` writes past the rows the layout has.
+            raise ValueError(
+                f"a {N}-token prompt needs {N} KV rows, but the decode "
+                f"template on disk is ATTN_MAXL={self.kv_attn_maxl}. Rebuild "
+                f"it larger: make compile-decode DECODE_L=<n>."
+            )
         # Pad to a bucket. Safe under causal masking: the padded rows sit after
         # every real one, so no real position attends to them, and their own
         # outputs are discarded.
@@ -1120,9 +1135,12 @@ def make_npu_decoder_class(air, prefiller):
             # `generate()` constructs this itself, as `FusedDecoder(model=...,
             # max_L=...)`, and knows nothing to pass.
             self._pf = prefiller
-            # Largest calibrated window, matching the prefill. A LARGER window
-            # than the prompt needs is always correct; a different one is not.
-            kw["max_L"] = None
+            # The window the SLAB was laid out for, not the one this prompt
+            # would have chosen. It is itself calibrated, so upstream's
+            # "smallest covering" lands exactly on it. Passing the generation
+            # reach instead is what would pick a different window, and a
+            # different window is a different layout.
+            kw["max_L"] = prefiller.kv_attn_maxl
             super().__init__(*a, **kw)
             if self.ATTN_MAXL != prefiller.kv_attn_maxl:
                 raise RuntimeError(
