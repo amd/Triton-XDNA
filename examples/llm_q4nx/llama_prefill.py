@@ -197,10 +197,18 @@ class LlamaPrefill:
         self.max_seq = max_seq
         self.model = model
         self.current_context_length = 0
-        # Per-layer KV cache: roped K and raw V, [max_seq, 512], head-major.
+        self._alloc_base_kv(n_layers, max_seq)
+        self._w = None
+
+    #: Per-layer KV cache: roped K and raw V, `[max_seq, 512]`, head-major.
+    #:
+    #: A method rather than two assignments because a subclass may hold its
+    #: cache in another shape entirely -- Gemma4-E2B keeps one slab in the
+    #: decode's own layout -- and would otherwise pay for these and drop them.
+    #: At `max_seq=2048` that is ~294 MiB allocated and immediately orphaned.
+    def _alloc_base_kv(self, n_layers, max_seq):
         self.kv_k = [np.zeros((max_seq, DK), np.float32) for _ in range(n_layers)]
         self.kv_v = [np.zeros((max_seq, DV), np.float32) for _ in range(n_layers)]
-        self._w = None
 
     #: What `--ops` selects when nothing is asked for. `None` means every
     #: operator with an NPU kernel, which is right wherever the NPU is faster

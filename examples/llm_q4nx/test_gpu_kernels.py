@@ -141,6 +141,36 @@ def main():
         ref = (torch.softmax((qh @ kc.T) * 1.0, -1) @ vc).reshape(1, N_Q_HEADS * dh)
         ok &= check(f"S={S} dh={dh}", G.attn_decode(q, kc, vc, N_Q_HEADS, dh, 1.0), ref)
 
+    # The same attention against the SHARED cache layout: rows REGION_W wide,
+    # the head scattered as [real_lo | zeros | real_hi | zeros]. Same answer as
+    # the dense case above or the layout unification is silently wrong -- and
+    # silently is the word, because a mis-read cache still produces fluent
+    # text. Compared against the dense call rather than against torch so that
+    # only the layout is under test.
+    print("\nattn_decode  (shared cache layout: strided rows, padded head)")
+    import kv_layout as KVL
+
+    for S, dh in (
+        (7, DH_SLIDING),
+        (163, DH_GLOBAL),
+        (512, DH_SLIDING),
+        (2048, DH_SLIDING),
+    ):
+        q = torch.randn(1, N_Q_HEADS * dh, device=dev)
+        kd = torch.randn(S, dh, device=dev).to(torch.bfloat16)
+        vd = torch.randn(S, dh, device=dev).to(torch.bfloat16)
+        slab = torch.zeros(S, KVL.REGION_W, dtype=torch.bfloat16, device=dev)
+        slabv = torch.zeros_like(slab)
+        KVL.scatter_rows(slab, kd, dh)
+        KVL.scatter_rows(slabv, vd, dh)
+        shift = KVL.DH_A // 2 - dh // 2
+        ref = G.attn_decode(q, kd, vd, N_Q_HEADS, dh, 1.0)
+        got = G.attn_decode(q, slab, slabv, N_Q_HEADS, dh, 1.0, lane_shift=shift)
+        # Bit-identical, not merely close: the same values reach the same
+        # accumulator in the same order, and only the address arithmetic
+        # differs. A tolerance here would hide a lane map that is off by one.
+        ok &= check(f"S={S} dh={dh} shift={shift}", got, ref, tol=1e-9)
+
     # --- prefill shapes: N > 1, which the decode cases above never reach ---
     print("\nmatmul  [M,K]@[K,N]  (prefill)")
     for M, K, N in ((6, D, 5120), (163, D, 2 * 12288), (163, 6144, D), (37, D, 256)):

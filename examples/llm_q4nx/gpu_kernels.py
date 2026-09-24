@@ -352,8 +352,11 @@ def _attn_decode_kernel(
     S,
     dh,
     scale,
+    stride_s,
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    LANE_SHIFT: tl.constexpr,
+    HALF: tl.constexpr,
 ):
     """softmax(q . K^T * scale) . V for one token, one program per query head.
 
@@ -370,10 +373,23 @@ def _attn_decode_kernel(
 
     The running max and sum are the online-softmax pair, so the scores for the
     whole context never exist at once.
+
+    `stride_s` and the lane map are what let this read the cache WHERE IT LIES
+    rather than a repacked copy. In the shared layout a row is `REGION_W` wide
+    and a narrow head is scattered as `[real_lo | zeros | real_hi | zeros]`
+    (see `kv_layout`), so dimension `d` of the head is at
+
+        d < HALF ? d : d + LANE_SHIFT
+
+    with `LANE_SHIFT = DH_A//2 - dh//2`, which is zero for a full-width head --
+    so the same expression is the identity there and there is no second case to
+    keep in step. The real lanes are two contiguous 128-element runs, so the
+    loads stay coalesced; nothing extra is fetched.
     """
     h = tl.program_id(0)
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < dh
+    lane = tl.where(offs_d < HALF, offs_d, offs_d + LANE_SHIFT)
     q = tl.load(Q + h * dh + offs_d, mask=mask_d, other=0.0).to(tl.float32)
 
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
@@ -384,7 +400,7 @@ def _attn_decode_kernel(
         offs_s = j0 + tl.arange(0, BLOCK_S)
         mask_s = offs_s < S
         k = tl.load(
-            KC + offs_s[:, None] * dh + offs_d[None, :],
+            KC + offs_s[:, None] * stride_s + lane[None, :],
             mask=mask_s[:, None] & mask_d[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -398,7 +414,7 @@ def _attn_decode_kernel(
         acc = acc * alpha
 
         v = tl.load(
-            VC + offs_s[:, None] * dh + offs_d[None, :],
+            VC + offs_s[:, None] * stride_s + lane[None, :],
             mask=mask_s[:, None] & mask_d[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -408,25 +424,44 @@ def _attn_decode_kernel(
     tl.store(OUT + h * dh + offs_d, acc / l_i, mask=mask_d)
 
 
-def attn_decode(q, kc, vc, n_heads, dh, scale, block_s=64):
-    """q: [1, n_heads*dh] against kc/vc: [S, dh] -> [1, n_heads*dh].
+def attn_decode(q, kc, vc, n_heads, dh, scale, block_s=64, lane_shift=0):
+    """q: [1, n_heads*dh] against kc/vc: [S, *] -> [1, n_heads*dh].
 
-    `block_s` is fixed, so the only constexpr that varies is `BLOCK_D`, and
-    `dh` takes two values on this model -- two compiles for the whole run.
+    `kc`/`vc` are rows of the cache, NOT necessarily `[S, dh]` and NOT required
+    to be contiguous: the row stride is read off the tensor and `lane_shift`
+    places the second half of a padded head (see `_attn_decode_kernel`). A
+    caller holding a dense `[S, dh]` cache passes `lane_shift=0` and gets the
+    previous behaviour exactly.
+
+    The tensors are deliberately NOT forced contiguous. They used to be, which
+    was free while every caller held a dense cache and would now silently
+    repack the shared cache on every layer of every token -- reintroducing the
+    copy this signature exists to avoid.
+
+    `block_s` is fixed, so the only constexprs that vary are `BLOCK_D` and the
+    lane map, and `dh` takes two values on this model -- two compiles per run.
     """
     S = kc.shape[0]
+    if kc.stride(0) != vc.stride(0):
+        raise ValueError(
+            f"K and V rows must be equally spaced, got {kc.stride(0)} and "
+            f"{vc.stride(0)}: one stride is passed to the kernel for both"
+        )
     q = q.reshape(-1).contiguous()
     out = torch.empty(n_heads * dh, dtype=torch.float32, device=q.device)
     _attn_decode_kernel[(n_heads,)](
         q,
-        kc.contiguous(),
-        vc.contiguous(),
+        kc,
+        vc,
         out,
         S,
         dh,
         scale,
+        kc.stride(0),
         BLOCK_S=block_s,
         BLOCK_D=_pow2(dh),
+        LANE_SHIFT=lane_shift,
+        HALF=dh // 2,
     )
     return out.reshape(1, n_heads * dh)
 

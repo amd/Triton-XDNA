@@ -345,6 +345,37 @@ def generate_via_prefiller(air, spec, cfg, args, ids, prefiller):
     return gen
 
 
+def _install_shared_kv(air, prefiller):
+    """Point the driver's decoder at the prefill's KV cache, if it can be.
+
+    A prefiller that writes mlir-air's own device layout has nothing to hand
+    over: the decoder reads the cache where it lies. Swapping the driver's
+    `FusedDecoder` for the subclass that knows this is the same move
+    `hsa_decode` makes for the dispatch, and for the same reason -- it is the
+    only channel their `generate()` offers, since it constructs the decoder
+    itself.
+
+    Returns the `(K, V)` to hand `_prefill_npu`: placeholders that carry the
+    shape their `generate()` reads `P` from and raise if anything reads a
+    value, or `(None, None)` when this model has no shared layout and the
+    caller should build the arrays the old way.
+    """
+    make = getattr(prefiller, "make_npu_decoder_class", None)
+    if make is None or getattr(prefiller, "_kv_slab", None) is None:
+        return None, None
+    air.FusedDecoder = make(air, prefiller)
+    p = prefiller.current_context_length
+    ks, vs = prefiller.kv_placeholders(p)
+    shared = getattr(prefiller._kv_slab, "bo", None) is not None
+    print(
+        f"[e2e] KV handed over in place: {p} rows already in the decode's "
+        f"layout, nothing to rearrange"
+        + ("" if shared else " (copied once: no shared pages here)"),
+        flush=True,
+    )
+    return ks, vs
+
+
 def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     """Generation for drivers whose `generate()` has no handoff parameter.
 
@@ -369,7 +400,10 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     """
     import inspect
 
-    K, V = prefiller.kv_stack()
+    K, V = _install_shared_kv(air, prefiller)
+    if K is None:
+        # No shared layout for this model: build the handoff arrays as before.
+        K, V = prefiller.kv_stack()
     # Their fourth return value is the time-to-first-token they print on a line
     # the nightly benchmark scrapes. It is our prefill that spent it, so the
     # measured wall clock goes back in rather than a zero that would read as a

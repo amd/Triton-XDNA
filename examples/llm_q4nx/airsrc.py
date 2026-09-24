@@ -83,6 +83,42 @@ def add_air_paths(*packages):
             sys.path.insert(0, p)
 
 
+def decode_attn_maxl(engine="fused_decode", artifact_dir=None):
+    """The LARGEST calibrated ATTN_MAXL among the decode templates on disk.
+
+    For a prefill that wants to write mlir-air's device KV layout directly: the
+    slab's geometry is a function of ATTN_MAXL, so it has to be known before
+    the prefill runs -- but the decoder that fixes it is built afterwards, and
+    it picks the *smallest* window covering `P + n_tokens`, which the prefill
+    cannot know either.
+
+    The way out is that a larger window is never wrong, only possibly slower: a
+    template built at ATTN_MAXL serves every L in [1, ATTN_MAXL]. So both sides
+    pin to the largest calibrated window and cannot disagree, rather than each
+    deriving one and matching by luck. A mismatch would not raise -- it would
+    place every row at the wrong offset and decode to nonsense.
+
+    Resolved through mlir-air's own `DecodeInstsGen` rather than by globbing
+    for `decode_L*.xclbin`, so "calibrated" means what it means there (a pair
+    of same-ATTN_MAXL builds whose instruction streams differ by a constant
+    slope), not what a filename suggests.
+
+    Returns None when no calibrated template exists -- an ordinary state, not
+    an error: `--decode gpu` and `--prefill-only` never build one.
+    """
+    import sys as _sys
+
+    d = artifact_dir or fused_decode_dir(engine)
+    try:
+        if d not in _sys.path:
+            _sys.path.insert(0, str(air_llms_root().parent / "fused_decode"))
+        from decode_insts_gen import DecodeInstsGen
+
+        return int(DecodeInstsGen(str(d), None).attn_maxl)
+    except Exception:  # noqa: BLE001 -- see the docstring
+        return None
+
+
 class DecodeArtifactError(RuntimeError):
     """Raised when the decode shape asked for is not one this example drives."""
 
