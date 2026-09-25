@@ -61,6 +61,10 @@ class Phi4Prefill(LlamaPrefill):
         Phi-4-mini, not (0, 64). Pairing across the whole head instead would
         rotate lane 0 against lane 64, which is in the *unrotated* tail, and
         produce fluent wrong text rather than an error.
+
+        Goes to the iGPU under `hetero`, like the rotation it overrides. The
+        partial width is the kernel's `rot`; the tail it copies through is the
+        same one the torch body concatenates unchanged.
         """
         with self.timer.track("rope"):
             N = x.shape[0]
@@ -71,6 +75,15 @@ class Phi4Prefill(LlamaPrefill):
                     f"partial RoPE needs a {R}-wide LUT (cos|sin of {half}); "
                     f"got {lut.shape[-1]}"
                 )
+            dev = self._gpu_device(backend)
+            if dev is not None:
+                import gpu_kernels
+
+                with gpu_kernels.gpu_driver():
+                    out = gpu_kernels.rope_batch(
+                        x.to(dev), lut.to(dev), n_heads, x.shape[-1] // n_heads, rot=R
+                    )
+                return out.cpu()
             cos = lut[:, :half].unsqueeze(1)  # [N, 1, half]
             sin = lut[:, half:].unsqueeze(1)
             v = x.reshape(N, n_heads, -1)

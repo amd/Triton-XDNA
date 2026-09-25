@@ -69,7 +69,6 @@ from config import (
     D,
     FINAL_LOGIT_SOFTCAP,
     FIRST_KV_SHARED,
-    N_LAYERS,
     N_KV_HEADS,
     N_Q_HEADS,
     PLE_INPUT_SCALE,
@@ -461,7 +460,7 @@ class Gemma4Prefill(LlamaPrefill):
         return out.reshape(N, n_heads * dh)
 
     def per_layer_inputs(self, x, N):
-        """The PLE vector for every layer: [N, N_LAYERS, PLI_D].
+        """The PLE vector for every layer: [N, n_layers, PLI_D].
 
         Computed **once, from the input embeddings** `x`, before the layer
         loop. Not from each layer's hidden state -- see the module docstring
@@ -472,8 +471,11 @@ class Gemma4Prefill(LlamaPrefill):
         own per-layer embedding, and scale again.
         """
         with self.timer.track("ple_inputs"):
-            tbl = _t(self._ple_rows(self._ids))  # [n, N_LAYERS, PLI_D]
-            out = torch.zeros((N, N_LAYERS, PLI_D), dtype=torch.float32)
+            tbl = _t(self._ple_rows(self._ids))  # [n, all layers, PLI_D]
+            # Sized by the layers this prefill actually holds, not the model's
+            # full depth: `--n-layers` truncates, and a buffer sized past what
+            # the loop below fills is a tail nothing defines.
+            out = torch.zeros((N, self.n_layers, PLI_D), dtype=torch.float32)
             n = tbl.shape[0]
             for L in range(self.n_layers):
                 proj = self._matmul(x, self._w[L]["model_proj"]) * PLE_MODEL_PROJ_SCALE
@@ -960,13 +962,19 @@ class Gemma4GpuDecode:
         return gpu_kernels.rope(x, self.lut[L][pos], n_heads, dh)
 
     def _ple(self, x):
-        """This token's per-layer vectors, [N_LAYERS, PLI_D].
+        """This token's per-layer vectors, [n_layers, PLI_D].
 
         From the token's own embedding, which is the same rule the prompt
         follows -- see the note above this class.
+
+        Sized by the prefill's layer count for the same reason
+        `per_layer_inputs` is: `--n-layers` truncates, and this one is
+        `empty`, so a tail past what the loop fills would be uninitialized.
         """
-        tbl = _t(self.pf._ple_rows([self._tok])).to(self.dev)  # [1, N_LAYERS, PLI_D]
-        out = torch.empty((N_LAYERS, PLI_D), dtype=torch.float32, device=self.dev)
+        tbl = _t(self.pf._ple_rows([self._tok])).to(self.dev)  # [1, all, PLI_D]
+        out = torch.empty(
+            (self.pf.n_layers, PLI_D), dtype=torch.float32, device=self.dev
+        )
         for L in range(self.pf.n_layers):
             proj = self._mm(x, self.w[L]["model_proj"]) * PLE_MODEL_PROJ_SCALE
             proj = self._norm(proj, self.ple_proj_norm)

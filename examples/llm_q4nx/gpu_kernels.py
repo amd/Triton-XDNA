@@ -558,33 +558,70 @@ def matmul(x, w, block_m=64, block_n=64, block_k=64):
 
 @triton.jit
 def _rope_batch_kernel(
-    X, LUT, Y, n_heads, half, stride_x, stride_l, BLOCK: tl.constexpr
+    X,
+    LUT,
+    Y,
+    stride_x,
+    stride_l,
+    DH: tl.constexpr,
+    HALF: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TBLOCK: tl.constexpr,
 ):
-    """Half-split rotary over N rows, one program per (row, head)."""
+    """Half-split rotary over N rows, one program per (row, head).
+
+    `2*HALF` of each head's `DH` lanes are rotated and the rest copied through.
+    Equal when the whole head rotates; Phi-4-mini's partial_rotary_factor=0.75
+    leaves a tail. The pairing is (i, i+HALF) *within the rotated slice*, so it
+    never reaches across into the tail.
+    """
     row = tl.program_id(0)
     h = tl.program_id(1)
     offs = tl.arange(0, BLOCK)
-    mask = offs < half
+    mask = offs < HALF
     cos = tl.load(LUT + row * stride_l + offs, mask=mask, other=0.0).to(tl.float32)
-    sin = tl.load(LUT + row * stride_l + half + offs, mask=mask, other=0.0).to(
+    sin = tl.load(LUT + row * stride_l + HALF + offs, mask=mask, other=0.0).to(
         tl.float32
     )
-    base = row * stride_x + h * 2 * half
+    base = row * stride_x + h * DH
     x1 = tl.load(X + base + offs, mask=mask, other=0.0).to(tl.float32)
-    x2 = tl.load(X + base + half + offs, mask=mask, other=0.0).to(tl.float32)
+    x2 = tl.load(X + base + HALF + offs, mask=mask, other=0.0).to(tl.float32)
     tl.store(Y + base + offs, x1 * cos - x2 * sin, mask=mask)
-    tl.store(Y + base + half + offs, x1 * sin + x2 * cos, mask=mask)
+    tl.store(Y + base + HALF + offs, x1 * sin + x2 * cos, mask=mask)
+    if TBLOCK > 0:
+        toffs = 2 * HALF + tl.arange(0, TBLOCK)
+        tmask = toffs < DH
+        tail = tl.load(X + base + toffs, mask=tmask, other=0.0).to(tl.float32)
+        tl.store(Y + base + toffs, tail, mask=tmask)
 
 
-def rope_batch(x, lut, n_heads, dh):
-    """x: [N, n_heads*dh], lut: [N, dh] -> [N, n_heads*dh], f32."""
+def rope_batch(x, lut, n_heads, dh, rot=None):
+    """x: [N, n_heads*dh], lut: [N, rot] -> [N, n_heads*dh], f32.
+
+    `rot` is how many of each head's lanes rotate, defaulting to all of them.
+    The LUT's width is what says how wide the rotation is, so it is checked
+    against `rot` rather than trusted: a LUT sized for a different rotation
+    would reinterpret the head boundary instead of failing.
+    """
+    rot = dh if rot is None else rot
+    if rot % 2 or not 0 < rot <= dh:
+        raise ValueError(f"rot must be even and in (0, {dh}], got {rot}")
+    if lut.shape[-1] != rot:
+        raise ValueError(f"rope lut is {lut.shape[-1]} wide, need {rot} (cos|sin)")
     N = x.shape[0]
     x = x.contiguous()
     lut = lut.contiguous()
     out = torch.empty_like(x, dtype=torch.float32)
-    half = dh // 2
     _rope_batch_kernel[(N, n_heads)](
-        x, lut, out, n_heads, half, x.stride(0), lut.stride(0), BLOCK=_pow2(half)
+        x,
+        lut,
+        out,
+        x.stride(0),
+        lut.stride(0),
+        DH=dh,
+        HALF=rot // 2,
+        BLOCK=_pow2(rot // 2),
+        TBLOCK=_pow2(dh - rot) if dh > rot else 0,
     )
     return out
 

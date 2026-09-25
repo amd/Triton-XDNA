@@ -40,6 +40,49 @@ def check(name, got, ref, tol=2e-2):
     return ok
 
 
+def _phi4_partial_rope(dev):
+    """`Phi4Prefill._rope` must agree with itself on both backends.
+
+    Phi-4 advertises `hetero`, and its `_rope` override used to ignore the
+    backend and stay on the host -- so the one operator that differs from
+    Llama's was also the one that never reached the iGPU. This drives the real
+    method, host path against GPU path, on a stub: the model's bundle is
+    several GB and nothing here needs a weight.
+    """
+    print("\nPhi4Prefill._rope  (partial rotary, host vs iGPU)")
+    # `phi4_prefill` resolves its dims from whichever `config` the example
+    # directory bound, so that directory has to lead sys.path. This file
+    # deliberately binds no config of its own, so there is nothing to shadow.
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(here, "..", "phi4_mini_q4nx"))
+    try:
+        import phi4_prefill
+        from llama_prefill import OpTimer
+    except ImportError as e:  # its config reaches into mlir-air's sources
+        print(f"  SKIP: {e}")
+        return True
+
+    pf = phi4_prefill.Phi4Prefill.__new__(phi4_prefill.Phi4Prefill)
+    pf.timer = OpTimer()
+    R, nh, dh, N = pf.ROPE_DIM, 3, 128, 21
+    x = torch.randn(N, nh * dh)
+    lut = torch.randn(N, R)
+
+    pf._gpu_device = lambda backend=None: None
+    host = pf._rope(x, lut, nh)
+    pf._gpu_device = lambda backend=None: dev
+    gpu = pf._rope(x, lut, nh)
+
+    # The tail is the half the rotation must not touch, so it is checked on its
+    # own rather than being averaged into the whole row.
+    tail_moved = (gpu.reshape(N, nh, dh)[..., R:] - x.reshape(N, nh, dh)[..., R:]).abs()
+    if tail_moved.max() > 0:
+        print(f"  FAIL: the unrotated tail moved by {tail_moved.max():.3e}")
+        return False
+    print(f"  PASS: tail of {dh - R} lanes per head passed through untouched")
+    return check(f"N={N} heads={nh} dh={dh} rot={R}", gpu, host)
+
+
 def main():
     if not torch.cuda.is_available():
         print("SKIP: no ROCm device visible to torch")
@@ -179,18 +222,50 @@ def main():
         ref = (x.to(torch.bfloat16) @ w).to(torch.float32)
         ok &= check(f"M={M} K={K} N={N}", G.matmul(x, w), ref)
 
-    print("\nrope_batch  (prefill)")
-    for N, nh, dh in ((6, N_Q_HEADS, DH_SLIDING), (163, 1, DH_GLOBAL)):
+    # `rot < dh` is Phi-4-mini's partial rotary (128-wide heads, 96 rotated).
+    # The tail must come through untouched and the pairing must stay inside the
+    # rotated slice: pairing across the whole head would reach lane 0 against a
+    # tail lane and give fluent wrong text rather than an error. 128/96 is the
+    # real shape; 64/34 is a rot whose half is not a power of two.
+    print("\nrope_batch  (prefill; whole head and partial rotary)")
+    for N, nh, dh, rot in (
+        (6, N_Q_HEADS, DH_SLIDING, None),
+        (163, 1, DH_GLOBAL, None),
+        (37, 24, 128, 96),
+        (8, 3, 64, 34),
+    ):
+        R = dh if rot is None else rot
         x = torch.randn(N, nh * dh, device=dev)
-        lut = torch.randn(N, dh, device=dev)
-        half = dh // 2
+        lut = torch.randn(N, R, device=dev)
+        half = R // 2
         cos, sin = lut[:, :half].unsqueeze(1), lut[:, half:].unsqueeze(1)
-        v = x.reshape(N, nh, 2 * half)
-        x1, x2 = v[..., :half], v[..., half:]
-        ref = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).reshape(
+        v = x.reshape(N, nh, dh)
+        x1, x2, tail = v[..., :half], v[..., half:R], v[..., R:]
+        ref = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos, tail], -1).reshape(
             N, nh * dh
         )
-        ok &= check(f"N={N} heads={nh} dh={dh}", G.rope_batch(x, lut, nh, dh), ref)
+        ok &= check(
+            f"N={N} heads={nh} dh={dh} rot={R}",
+            G.rope_batch(x, lut, nh, dh, rot=rot),
+            ref,
+        )
+
+    # A LUT that does not match the rotation is the silent failure this guards:
+    # it would reinterpret the head boundary rather than raise.
+    try:
+        G.rope_batch(
+            torch.randn(4, 2 * 128, device=dev),
+            torch.randn(4, 128, device=dev),
+            2,
+            128,
+            rot=96,
+        )
+        print("FAIL: rope_batch accepted a LUT wider than its rotation")
+        ok = False
+    except ValueError:
+        print("PASS: rope_batch refuses a LUT that does not match `rot`")
+
+    ok &= _phi4_partial_rope(dev)
 
     # Causal GQA, both window modes, and lengths past the window -- a key block
     # entirely outside it leaves every score masked, which is where the softmax
