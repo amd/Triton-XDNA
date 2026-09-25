@@ -55,19 +55,24 @@ reading both column halves at a row stride; every spelling of that failed --
 script hangs the device, and a 1D linear-index form (`row = offs // INTER`)
 fails in aircc.
 
-Padding
--------
-`down` contracts over `inter`, and `tl.arange` needs a power of two, so the
-merge output is `HID_pad = next_pow2(inter)` wide -- 8192 for 6144, 16384 for
-12288. The gate/up GEMMs write that full width; their weights are zero past
-`inter`, so the tail columns are zeros the merge maps to zeros and `down`
-contracts against the matching zero rows of `Bd`. Nothing has to trim anything.
+The contraction, and why it is split
+------------------------------------
+`_mm_kernel` contracts the whole of K in one tile, which asks two things of K
+at once: `tl.arange` wants a power of two, and `rows * K` has to stay under
+Triton's tensor cap. `down` contracts the FFN width, so both used to bind on it
+-- 12288 padded to 16384, and then a row tile of 256 where the rest of the
+chain runs 512, which is half the array.
 
-It is not free, though, and it is the same constraint twice: `_mm_kernel`
-contracts all of K in one tile, so K must be a power of two AND `rows * K` must
-stay under Triton's tensor cap. The first pads the arithmetic; the second is
-what holds `down` to a partial herd on a wide layer, through `_row_tile`. A
-kernel that looped over K would drop both.
+Cutting the contraction into equal power-of-two pieces answers both without
+padding anything, whenever the width has a large enough power of two in it:
+12288 is 3 x 4096 and 6144 is 3 x 2048. Each piece is its own GEMM over a slice
+of `H`'s columns and `Bd`'s rows, and the pieces are added back. `_plan_down`
+picks the piece, and falls back to padding the width where no such factor
+exists.
+
+`K_pad` is the same constraint on `gate`/`up`, and stays: D is 1536, which has
+no factor above 512, so splitting it would cost more ops than the padding
+costs arithmetic.
 
 Tiling
 ------
@@ -93,6 +98,7 @@ import triton.language as tl
 from kernels import (
     BLOCK_N,
     MAX_TILE_NUMEL,
+    WIDE_M,
     _GELU_2C,
     _GELU_K,
     _npu_driver,
@@ -106,6 +112,21 @@ MERGE_BLOCK = 1024
 MATMUL_SCRIPT = "gpt2/transform_matmul_aie2p.mlir"
 #: Qwen's, unmodified. See the module docstring.
 MERGE_SCRIPT = "qwen2_5/transform_swiglu_f32in_aie2p.mlir"
+#: The f32 variant: these operands are produced on-device by the GEMMs before
+#: it and never touch the host, so they are still f32 rather than bf16.
+#: It splits the range over four of npu2's eight columns. Widening it to eight
+#: was tried and is slower at this size -- the extra L2 split costs more than
+#: the idle columns do.
+ADD_SCRIPT = "gpt2/transform_add_f32_aie2p.mlir"
+
+#: Elementwise tile for the fold, as `MERGE_BLOCK` is for the merge.
+ADD_BLOCK = 1024
+
+#: How many pieces `down`'s contraction may be cut into before padding the FFN
+#: width is the better deal. Each piece is a GEMM op and all but the first also
+#: an add, so the chain grows by two ops per piece -- cheap next to the
+#: arithmetic a padded width would add, but not without limit.
+MAX_DOWN_SPLIT = 4
 
 
 def _host(w):
@@ -120,6 +141,27 @@ def _bo(w):
 
 def _pow2(n):
     return 1 << (n - 1).bit_length()
+
+
+def _plan_down(inter):
+    """`(HID, chunk)` -- the width the merge writes, and one `down` K tile.
+
+    `down` contracts the FFN width, and `_mm_kernel` does a whole contraction
+    in one tile: `tl.arange` wants a power of two and `rows * K` has to stay
+    under Triton's cap. Contracting in equal power-of-two pieces satisfies both
+    WITHOUT padding anything, whenever the width has a large enough power of
+    two in it -- 12288 is 3 x 4096 and 6144 is 3 x 2048, so Gemma4 pays no
+    padding at either width and every piece still gets a full-width herd.
+
+    A width with no such factor falls back to padding it to a power of two, as
+    this did throughout before: correct at any width, and the pieces are then
+    trivially powers of two as well.
+    """
+    cap = 1 << (MAX_TILE_NUMEL // WIDE_M).bit_length() - 1
+    chunk = inter & -inter  # the largest power of two dividing it
+    if min(chunk, cap) * MAX_DOWN_SPLIT >= inter:
+        return inter, min(chunk, cap)
+    return _pow2(inter), min(_pow2(inter), cap)
 
 
 def _row_tile(rows, k):
@@ -163,21 +205,37 @@ def _mm_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    aoff: tl.constexpr = 0,
+    boff: tl.constexpr = 0,
 ):
     """bf16 x bf16 -> f32, one tile per program. Qwen's `_mm_kernel`.
 
     Spelled with explicit strides rather than reusing `kernels._matmul_kernel`
     because a chain op's operands are whole padded buffers, so the row stride
     and the logical width come apart.
+
+    `aoff`/`boff` start the contraction part-way into both operands, which is
+    what lets several of these share one pair of buffers and each take a slice
+    of K. A chain's `arg_map` names a whole buffer and nothing else, so the
+    slice has to be the kernel's business; constexpr, so each slice is its own
+    compiled program with no address arithmetic at run time.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a = tl.load(A + offs_m[:, None] * sam + offs_k[None, :] * sak)
-    b = tl.load(B + offs_k[:, None] * sbk + offs_n[None, :] * sbn)
+    a = tl.load(A + aoff + offs_m[:, None] * sam + offs_k[None, :] * sak)
+    b = tl.load(B + boff + offs_k[:, None] * sbk + offs_n[None, :] * sbn)
     tl.store(C + offs_m[:, None] * scm + offs_n[None, :] * scn, tl.dot(a, b))
+
+
+@triton.jit
+def _add_f32(A, B, C, n_elements: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    """C = A + B over three f32 buffers. Qwen's `_add_kernel`."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    tl.store(C + offsets[:], tl.load(A + offsets[:]) + tl.load(B + offsets[:]))
 
 
 @triton.jit
@@ -218,17 +276,18 @@ class FusedMLP:
 
     Combined-arg layout, which `run` indexes with::
 
-        0 A    bf16 (rows, K_pad)      caller's activation, per dispatch
-        1 Bg   bf16 (K_pad, HID_pad)   static
-        2 Cg    f32 (rows, HID_pad)    intermediate
-        3 Bu   bf16 (K_pad, HID_pad)   static
-        4 Cu    f32 (rows, HID_pad)    intermediate
-        5 H    bf16 (rows * HID_pad)   intermediate
-        6 Bd   bf16 (HID_pad, D_pad)   static
-        7 OUT   f32 (rows, D_pad)      output
+        0 A    bf16 (rows, K_pad)   caller's activation, per dispatch
+        1 Bg   bf16 (K_pad, HID)    static
+        2 Cg    f32 (rows, HID)     intermediate
+        3 Bu   bf16 (K_pad, HID)    static
+        4 Cu    f32 (rows, HID)     intermediate
+        5 H    bf16 (rows * HID)    intermediate
+        6 Bd   bf16 (HID, D_pad)    static
+        7 OUT   f32 (rows, D_pad)   output
+        8..     f32 (rows, D_pad)   the split contraction's partials and sums
 
-    Four ops, so the single-op chain corruption defect documented on `NPUChain`
-    does not apply.
+    More than one op, so the single-op chain corruption defect documented on
+    `NPUChain` does not apply.
 
     `rows` is one of `kernels.ROW_TIERS`, chosen per call and built on first
     use. A
@@ -241,7 +300,7 @@ class FusedMLP:
         self.D = d_model
         self.H = inter
         self.K_pad = _pow2(d_model)
-        self.HID_pad = _pow2(inter)
+        self.HID, self.down_chunk = _plan_down(inter)
         # `down`'s N. A multiple of BLOCK_N or the grid truncates and silently
         # drops output columns; Gemma4's D=1536 already is, but derive it rather
         # than rely on that.
@@ -255,24 +314,24 @@ class FusedMLP:
 
         `gate_up` is `[D, 2*inter]` as `load_weights` concatenated it, so the
         halves are a plain column split -- done once here, never per dispatch.
-        Everything past the logical extent stays zero: that is what makes the
-        `HID_pad` tail harmless end to end (see the module docstring).
+        The rows past `D` stay zero, which is what makes `K_pad` harmless: the
+        gate/up GEMMs contract them against the zeros `run` leaves in `A`.
         """
         from ml_dtypes import bfloat16
 
-        D, H, K_pad, HID_pad, D_pad = (
+        D, H, K_pad, HID, D_pad = (
             self.D,
             self.H,
             self.K_pad,
-            self.HID_pad,
+            self.HID,
             self.D_pad,
         )
         gu = gate_up.to(torch.float32).cpu().numpy()
         dn = down.to(torch.float32).cpu().numpy()
         Bg, Bu, Bd = (
-            self._alloc(K_pad, HID_pad),
-            self._alloc(K_pad, HID_pad),
-            self._alloc(HID_pad, D_pad),
+            self._alloc(K_pad, HID),
+            self._alloc(K_pad, HID),
+            self._alloc(HID, D_pad),
         )
         _host(Bg)[:D, :H] = gu[:, :H].astype(bfloat16)
         _host(Bu)[:D, :H] = gu[:, H:].astype(bfloat16)
@@ -330,11 +389,12 @@ class FusedMLP:
         """This layer's padded weights as iGPU tensors over the same pages.
 
         The point of allocating them shared: a GPU decode reads exactly what
-        the NPU dispatches on, so the model exists once. They come back padded,
-        which is what the caller has to account for -- `K_pad` rows and
-        `HID_pad` columns, zero past the logical extent. A GEMV over that is
-        bit-identical to one over the unpadded form, since the padding
-        contributes nothing, provided the activation is zero out to `K_pad`.
+        the NPU dispatches on, so the model exists once. They come back as
+        `shapes()` describes, which the caller has to account for: `K_pad` rows
+        always, and an FFN width that is `inter` unless it had to be padded. A
+        GEMV over the padding is bit-identical to one without it, since the
+        weights are zero there -- provided the activation is zero out to
+        `K_pad`.
 
         Raises where the weights are not shared; there is no device view to
         give, and silently handing back a host array would be worse.
@@ -348,85 +408,113 @@ class FusedMLP:
         return tuple(b.torch() for b in w)
 
     def shapes(self):
-        """`(K_pad, HID_pad, D_pad)` -- what `device_weights` is padded to."""
-        return self.K_pad, self.HID_pad, self.D_pad
+        """`(K_pad, HID, D_pad)` -- what `device_weights` is shaped to."""
+        return self.K_pad, self.HID, self.D_pad
 
     # ---- chain ----
+    #: Where the fixed operands sit in the combined-arg list. The split
+    #: contraction's partials and its running sums follow, so those indices are
+    #: derived rather than named -- see `_down_slots`.
+    A_I, BG_I, CG_I, BU_I, CU_I, H_I, BD_I, OUT_I = range(8)
+
+    def _down_slots(self):
+        """`(partials, sums)` -- the buffer indices the split `down` needs.
+
+        One partial per piece of the contraction, then the running sums that
+        fold them: the last fold writes `OUT_I`, so there are two fewer sums
+        than partials. An unsplit `down` writes `OUT_I` directly and needs
+        neither.
+        """
+        n = self.HID // self.down_chunk
+        if n == 1:
+            return (), ()
+        base = self.OUT_I + 1
+        return tuple(range(base, base + n)), tuple(range(base + n, base + 2 * n - 2))
+
     def _get_chain(self, M):
         if M in self._chains:
             return self._chains[M]
         from triton.backends.amd_triton_npu.multilaunch import NPUChain
 
-        K_pad, HID_pad, D_pad = self.K_pad, self.HID_pad, self.D_pad
-        # gate/up contract K_pad, down contracts HID_pad. On a wide layer the
-        # latter is 16384, which caps down's program at a quarter of the chain's
-        # row tile -- so down runs a 4-step grid over the same rows.
-        gu_m, dn_m = _row_tile(M, K_pad), _row_tile(M, HID_pad)
+        K_pad, HID, D_pad = self.K_pad, self.HID, self.D_pad
+        chunk = self.down_chunk
+        n_down = HID // chunk
+        partials, sums = self._down_slots()
+        gu_m, dn_m = _row_tile(M, K_pad), _row_tile(M, chunk)
 
         # Shape-representative placeholders; only shapes and dtypes drive the
         # warmup lowering, never the values.
         tA = torch.zeros((M, K_pad), dtype=torch.bfloat16)
-        tBg = torch.zeros((K_pad, HID_pad), dtype=torch.bfloat16)
-        tCg = torch.zeros((M, HID_pad), dtype=torch.float32)
-        tBu = torch.zeros((K_pad, HID_pad), dtype=torch.bfloat16)
-        tCu = torch.zeros((M, HID_pad), dtype=torch.float32)
-        tCgf = torch.zeros(M * HID_pad, dtype=torch.float32)
-        tCuf = torch.zeros(M * HID_pad, dtype=torch.float32)
-        tH = torch.zeros(M * HID_pad, dtype=torch.bfloat16)
-        tHm = torch.zeros((M, HID_pad), dtype=torch.bfloat16)
-        tBd = torch.zeros((HID_pad, D_pad), dtype=torch.bfloat16)
+        tBg = torch.zeros((K_pad, HID), dtype=torch.bfloat16)
+        tC = torch.zeros((M, HID), dtype=torch.float32)
+        tCf = torch.zeros(M * HID, dtype=torch.float32)
+        tH = torch.zeros(M * HID, dtype=torch.bfloat16)
+        tHm = torch.zeros((M, HID), dtype=torch.bfloat16)
+        tBd = torch.zeros((HID, D_pad), dtype=torch.bfloat16)
         tOut = torch.zeros((M, D_pad), dtype=torch.float32)
+        tOutf = torch.zeros(M * D_pad, dtype=torch.float32)
 
         mm_script = script(MATMUL_SCRIPT)
         chain = NPUChain(f"q4nx_mlp_{self.H}_m{M}")
-        # op0 gate: Cg(2) = A(0) @ Bg(1)
-        chain.add(
-            _mm_kernel,
-            grid=(M // gu_m, HID_pad // BLOCK_N),
-            arg_map={0: 0, 1: 1, 2: 2},
-            args=(tA, tBg, tCg, M, HID_pad, K_pad, K_pad, 1, HID_pad, 1, HID_pad, 1),
-            constexprs={
-                "BLOCK_SIZE_M": gu_m,
-                "BLOCK_SIZE_N": BLOCK_N,
-                "BLOCK_SIZE_K": K_pad,
-            },
-            transform_script=mm_script,
-        )
-        # op1 up: Cu(4) = A(0) @ Bu(3) -- shares the input buffer with op0.
-        chain.add(
-            _mm_kernel,
-            grid=(M // gu_m, HID_pad // BLOCK_N),
-            arg_map={0: 0, 1: 3, 2: 4},
-            args=(tA, tBu, tCu, M, HID_pad, K_pad, K_pad, 1, HID_pad, 1, HID_pad, 1),
-            constexprs={
-                "BLOCK_SIZE_M": gu_m,
-                "BLOCK_SIZE_N": BLOCK_N,
-                "BLOCK_SIZE_K": K_pad,
-            },
-            transform_script=mm_script,
-        )
-        # op2 merge: H(5) = gelu_tanh(Cg(2)) * Cu(4)
+        for src, dst in ((self.BG_I, self.CG_I), (self.BU_I, self.CU_I)):
+            # gate, then up -- the same GEMM against the same activation, so
+            # they differ only in which weight they read and where they land.
+            chain.add(
+                _mm_kernel,
+                grid=(M // gu_m, HID // BLOCK_N),
+                arg_map={0: self.A_I, 1: src, 2: dst},
+                args=(tA, tBg, tC, M, HID, K_pad, K_pad, 1, HID, 1, HID, 1),
+                constexprs={
+                    "BLOCK_SIZE_M": gu_m,
+                    "BLOCK_SIZE_N": BLOCK_N,
+                    "BLOCK_SIZE_K": K_pad,
+                },
+                transform_script=mm_script,
+            )
+        # merge: H = gelu_tanh(Cg) * Cu
         chain.add(
             _geglu_f32in,
-            grid=((M * HID_pad) // MERGE_BLOCK,),
-            arg_map={0: 2, 1: 4, 2: 5},
-            args=(tCgf, tCuf, tH, _GELU_2C, _GELU_K, M * HID_pad),
+            grid=((M * HID) // MERGE_BLOCK,),
+            arg_map={0: self.CG_I, 1: self.CU_I, 2: self.H_I},
+            args=(tCf, tCf, tH, _GELU_2C, _GELU_K, M * HID),
             constexprs={"BLOCK_SIZE": MERGE_BLOCK},
             transform_script=script(MERGE_SCRIPT),
         )
-        # op3 down: OUT(7) = H(5) @ Bd(6)
-        chain.add(
-            _mm_kernel,
-            grid=(M // dn_m, D_pad // BLOCK_N),
-            arg_map={0: 5, 1: 6, 2: 7},
-            args=(tHm, tBd, tOut, M, D_pad, HID_pad, HID_pad, 1, D_pad, 1, D_pad, 1),
-            constexprs={
-                "BLOCK_SIZE_M": dn_m,
-                "BLOCK_SIZE_N": BLOCK_N,
-                "BLOCK_SIZE_K": HID_pad,
-            },
-            transform_script=mm_script,
-        )
+        # down, in `n_down` pieces of the contraction. Each takes its own slice
+        # of H's columns and of Bd's rows through the kernel's constant
+        # offsets, because a chain's arg_map names whole buffers.
+        for i in range(n_down):
+            chain.add(
+                _mm_kernel,
+                grid=(M // dn_m, D_pad // BLOCK_N),
+                arg_map={
+                    0: self.H_I,
+                    1: self.BD_I,
+                    2: partials[i] if partials else self.OUT_I,
+                },
+                args=(tHm, tBd, tOut, M, D_pad, chunk, HID, 1, D_pad, 1, D_pad, 1),
+                constexprs={
+                    "BLOCK_SIZE_M": dn_m,
+                    "BLOCK_SIZE_N": BLOCK_N,
+                    "BLOCK_SIZE_K": chunk,
+                    "aoff": i * chunk,
+                    "boff": i * chunk * D_pad,
+                },
+                transform_script=mm_script,
+            )
+        # and fold the pieces back together.
+        acc = partials[0] if partials else None
+        for i in range(1, n_down):
+            dst = self.OUT_I if i == n_down - 1 else sums[i - 1]
+            chain.add(
+                _add_f32,
+                grid=((M * D_pad) // ADD_BLOCK,),
+                arg_map={0: acc, 1: partials[i], 2: dst},
+                args=(tOutf, tOutf, tOutf, M * D_pad),
+                constexprs={"BLOCK_SIZE": ADD_BLOCK},
+                transform_script=script(ADD_SCRIPT),
+            )
+            acc = dst
         self._chains[M] = chain
         return chain
 
@@ -436,18 +524,17 @@ class FusedMLP:
 
         Returns f32, matching what `_matmul` returns on the unfused path.
 
-        Rows are tiled at one of `kernels.ROW_TIERS` and dispatched per tile,
-        so a
-        handful of ELFs serve every prompt length -- the same bargain
+        Rows are tiled at one of `kernels.ROW_TIERS` and dispatched per tile, so
+        a handful of ELFs serve every prompt length -- the same bargain
         `triton_matmul` makes, and the reason no tier follows the prompt.
         """
         from ml_dtypes import bfloat16
 
-        D, K_pad, HID_pad, D_pad = self.D, self.K_pad, self.HID_pad, self.D_pad
+        D, K_pad, HID, D_pad = self.D, self.K_pad, self.HID, self.D_pad
         Bg, Bu, Bd = self._weights[layer_idx]
-        bound = {
-            i: _bo(w) for i, w in ((1, Bg), (3, Bu), (6, Bd)) if _bo(w) is not None
-        } or None
+        static = {self.BG_I: Bg, self.BU_I: Bu, self.BD_I: Bd}
+        bound = {i: _bo(w) for i, w in static.items() if _bo(w) is not None} or None
+        partials, sums = self._down_slots()
 
         h2d = h.reshape(-1, D).to(torch.float32).cpu().numpy()
         N = h2d.shape[0]
@@ -469,23 +556,31 @@ class FusedMLP:
                 A[:rows, :D] = h2d[m0 : m0 + rows].astype(bfloat16)
                 # Chain intermediates and the output are fully written by their
                 # producing kernel, so np.empty avoids a per-call memset.
-                Cg = np.empty((M, HID_pad), dtype=np.float32)
-                Cu = np.empty((M, HID_pad), dtype=np.float32)
-                H = np.empty(M * HID_pad, dtype=bfloat16)
-                OUT = np.empty((M, D_pad), dtype=np.float32)
+                args = [None] * (self.OUT_I + 1 + len(partials) + len(sums))
+                args[self.A_I] = A
+                args[self.BG_I] = _host(Bg)
+                args[self.BU_I] = _host(Bu)
+                args[self.BD_I] = _host(Bd)
+                args[self.CG_I] = np.empty((M, HID), dtype=np.float32)
+                args[self.CU_I] = np.empty((M, HID), dtype=np.float32)
+                args[self.H_I] = np.empty(M * HID, dtype=bfloat16)
+                for i in (self.OUT_I, *partials, *sums):
+                    args[i] = np.empty((M, D_pad), dtype=np.float32)
                 # The weights are bound where they are shared, so the chain
                 # dispatches on the pages they already occupy instead of
                 # staging a BO of its own. `static_indices` still names them:
                 # bound or not, they carry no new host data per call.
                 got = chain.run(
-                    [A, _host(Bg), Cg, _host(Bu), Cu, H, _host(Bd), OUT],
+                    args,
                     bo_key=f"q4nx_mlp_{self.H}_L{layer_idx}",
-                    static_indices={1, 3, 6},
-                    intermediate_indices={2, 4, 5},
-                    output_indices={7},
+                    static_indices=set(static),
+                    intermediate_indices={self.CG_I, self.CU_I, self.H_I}
+                    | set(partials)
+                    | set(sums),
+                    output_indices={self.OUT_I},
                     bound_buffers=bound,
                 )
-                out[m0 : m0 + rows] = got[7].astype(np.float32)[:rows, :D]
+                out[m0 : m0 + rows] = got[self.OUT_I].astype(np.float32)[:rows, :D]
 
         return torch.from_numpy(out).reshape(*h.shape[:-1], D)
 
