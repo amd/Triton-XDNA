@@ -102,6 +102,7 @@ from kernels import (
     _GELU_2C,
     _GELU_K,
     _npu_driver,
+    matmul_script,
     row_tier,
     script,
 )
@@ -109,7 +110,6 @@ from kernels import (
 #: Elementwise tile for the merge, as every other flat kernel here uses.
 MERGE_BLOCK = 1024
 
-MATMUL_SCRIPT = "gpt2/transform_matmul_aie2p.mlir"
 #: Qwen's, unmodified. See the module docstring.
 MERGE_SCRIPT = "qwen2_5/transform_swiglu_f32in_aie2p.mlir"
 #: The f32 variant: these operands are produced on-device by the GEMMs before
@@ -441,6 +441,10 @@ class FusedMLP:
         n_down = HID // chunk
         partials, sums = self._down_slots()
         gu_m, dn_m = _row_tile(M, K_pad), _row_tile(M, chunk)
+        # Per op, not per chain: `_row_tile` can put `down` on a narrower tile
+        # than `gate`/`up`, and a schedule only places on the tile it was
+        # generated for.
+        gu_script, dn_script = matmul_script(gu_m), matmul_script(dn_m)
 
         # Shape-representative placeholders; only shapes and dtypes drive the
         # warmup lowering, never the values.
@@ -454,7 +458,6 @@ class FusedMLP:
         tOut = torch.zeros((M, D_pad), dtype=torch.float32)
         tOutf = torch.zeros(M * D_pad, dtype=torch.float32)
 
-        mm_script = script(MATMUL_SCRIPT)
         chain = NPUChain(f"q4nx_mlp_{self.H}_m{M}")
         for src, dst in ((self.BG_I, self.CG_I), (self.BU_I, self.CU_I)):
             # gate, then up -- the same GEMM against the same activation, so
@@ -469,7 +472,7 @@ class FusedMLP:
                     "BLOCK_SIZE_N": BLOCK_N,
                     "BLOCK_SIZE_K": K_pad,
                 },
-                transform_script=mm_script,
+                transform_script=gu_script,
             )
         # merge: H = gelu_tanh(Cg) * Cu
         chain.add(
@@ -500,7 +503,7 @@ class FusedMLP:
                     "aoff": i * chunk,
                     "boff": i * chunk * D_pad,
                 },
-                transform_script=mm_script,
+                transform_script=dn_script,
             )
         # and fold the pieces back together.
         acc = partials[0] if partials else None

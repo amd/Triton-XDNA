@@ -180,11 +180,44 @@ AIE_COLS, AIE_ROWS = 8, 4
 BLOCK_M = 128  # the matmul transform script's herd tiling assumes >= 128
 BLOCK_N = L1 * AIE_ROWS
 
-#: The row tile that covers every column, and the tiers between it and
-#: `BLOCK_M`. Both ends exist because a tile is computed in full whether or not
-#: the rows fill it, so the widest is not the fastest at every prompt length.
+#: Row tiles a GEMM may be compiled for, widest first. A tile is computed in
+#: full whether or not the rows fill it, so the widest is not the fastest at
+#: every prompt length -- `row_tier` chooses. The top of the range is not the
+#: array's width: `L1 * AIE_COLS` is the narrowest block that reaches all eight
+#: columns, and going past it to 1024 keeps the same herd while halving how
+#: often the weight is re-read, which measured faster on every GEMM the prefill
+#: issues. 2048 does not build -- see `matmul_script`.
 WIDE_M = L1 * AIE_COLS
-ROW_TIERS = (WIDE_M, 256, BLOCK_M)
+ROW_TIERS = (2 * WIDE_M, WIDE_M, 256, BLOCK_M)
+
+#: The matmul schedule, by the L1 row tile it was generated for. A herd is
+#: `(block_m/l1_m, block_n/l1_n)`, so `l1_m` cannot simply be `L1`: a 1024-row
+#: block at `l1_m=64` asks for sixteen columns and fails to place.
+#:
+#: It does not follow the block downwards, though, and that is measured rather
+#: than assumed. Holding the herd at eight columns by shrinking `l1_m` is
+#: SLOWER than letting the herd shrink: on one wide-layer `gate`, a 256-row
+#: block runs 79.6 ms at `l1_m=32` (eight columns) against 73.9 at `l1_m=64`
+#: (four), and a 128-row block 128.1 at 16 against 124.1 at 64. Below 512 rows
+#: there are not enough of them to give every column a tile worth having.
+_MATMUL_SCRIPTS = {
+    64: "gpt2/transform_matmul_aie2p.mlir",
+    128: "llm_q4nx/transform_matmul_m128_aie2p.mlir",
+}
+
+#: `triton_matmul`'s default: pick the schedule from the row tile. Distinct
+#: from `None`, which means "let the driver generate one" and is what
+#: `qwen25_prefill` passes for the shape these schedules reject.
+BY_BLOCK = "<chosen from block_m>"
+
+
+def matmul_script(block_m):
+    """The schedule to lower a `block_m`-row GEMM tile with.
+
+    `l1_m` is the largest tile that still covers all eight columns, floored at
+    `L1` -- see `_MATMUL_SCRIPTS` for why the floor is there and not lower.
+    """
+    return script(_MATMUL_SCRIPTS[max(L1, block_m // AIE_COLS)])
 
 
 def row_tier(n_rows, tiers=ROW_TIERS, cap=None):
@@ -372,7 +405,7 @@ MAX_TILE_NUMEL = 4194304
 MATMUL_SCRIPT = "gpt2/transform_matmul_aie2p.mlir"
 
 
-def triton_matmul(x, w, block_m=None, block_n=BLOCK_N, transform_script=MATMUL_SCRIPT):
+def triton_matmul(x, w, block_m=None, block_n=BLOCK_N, transform_script=BY_BLOCK):
     """x: [M, K] float32/bf16, w: [K, N] bf16 -> [M, N] float32, on the NPU.
 
     `block_m` defaults to whatever `row_tier` thinks these rows are worth: a
@@ -381,11 +414,11 @@ def triton_matmul(x, w, block_m=None, block_n=BLOCK_N, transform_script=MATMUL_S
     few and fixed rather than tracking the prompt.
 
     `transform_script` is the schedule to lower with, as an `examples`-relative
-    path, or None to let the driver generate one. The default is the shared
-    hand-written schedule; it is not universal, and the one shape here that it
-    rejects is recorded at the call site that passes None
-    (`qwen25_prefill._layer`), because a shape it rejects fails loudly in
-    aiecc rather than silently.
+    path; `BY_BLOCK` picks one to match `block_m`, and None lets the driver
+    generate its own. The shared hand-written schedules are not universal, and
+    the one shape here that they reject is recorded at the call site that
+    passes None (`qwen25_prefill._layer`), because a shape they reject fails
+    loudly in aiecc rather than silently.
     """
     M, K = x.shape
     Kw, N = w.shape
@@ -410,6 +443,8 @@ def triton_matmul(x, w, block_m=None, block_n=BLOCK_N, transform_script=MATMUL_S
     # explicit `block_m` is honoured as given.
     if block_m is None:
         block_m = row_tier(M, cap=MAX_TILE_NUMEL // Kp)
+    if transform_script is BY_BLOCK:
+        transform_script = matmul_script(block_m)
     Mp = math.ceil(M / block_m) * block_m
     Np = math.ceil(N / block_n) * block_n
     if isinstance(w, ResidentWeight):
@@ -444,7 +479,9 @@ def triton_matmul(x, w, block_m=None, block_n=BLOCK_N, transform_script=MATMUL_S
             Kp,
             Np,
             Np,
-            transform_script=(script(transform_script) if transform_script else None),
+            transform_script=(
+                script(transform_script) if isinstance(transform_script, str) else None
+            ),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=Kp,
