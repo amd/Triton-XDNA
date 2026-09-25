@@ -744,6 +744,16 @@ def _attn_prefill_kernel(
     )
 
 
+#: Launch shape for `_attn_prefill_kernel`, which Triton would otherwise pick
+#: for itself and picks badly. The kernel carries the whole running softmax
+#: state in registers across a key loop that the mask bounds keep short, so
+#: extra pipeline stages buy no overlap and cost occupancy; and a `BLOCK_M` of
+#: 16 or 32 is too few rows to spread over four warps, let alone eight. Swept
+#: at both of Gemma4's head widths. The result differs from the default only by
+#: float reassociation -- nothing here changes what is computed.
+ATTN_WARPS, ATTN_STAGES = 2, 1
+
+
 def _attn_blocks(dh):
     """Query/key tiles that fit 64 KB of LDS at this head width.
 
@@ -794,5 +804,7 @@ def attn_prefill(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=_pow2(dh),
+        num_warps=ATTN_WARPS,
+        num_stages=ATTN_STAGES,
     )
     return out
