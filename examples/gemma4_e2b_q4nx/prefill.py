@@ -106,12 +106,24 @@ def main(argv=None):
         # declares what it owns (`WEIGHT_ATTRS`) and this asks for all of it.
         ref.share_weights_from(m)
         ref.prefill(ids)
-        # Only the layers that own a cache. The 20 from FIRST_KV_SHARED up
-        # hold `None` rather than an array of zeros -- see
-        # `Gemma4Prefill.__init__` for why.
+        # Only the layers that own a cache: from FIRST_KV_SHARED up a layer
+        # attends `kv_source_layer(L)`, so comparing it would re-check a lower
+        # layer under a higher layer's name.
+        #
+        # Through `kv_view`, not the raw arrays. This model keeps its cache in
+        # the decode's slab layout and has no `kv_k`/`kv_v` at all; `kv_view`
+        # is what returns the prompt's rows in the plain [N, dh] shape both
+        # sides can be differenced in, on every model here.
+        #
+        # The slab is bf16, so these deltas bottom out at an ulp of the values
+        # in them rather than at zero -- which is the precision the decode
+        # actually reads, and the reason to report the difference of the cache
+        # rather than of some f32 copy of it.
         for L in range(min(args.n_layers, config.FIRST_KV_SHARED)):
-            dk = np.abs(m.kv_k[L] - ref.kv_k[L]).max()
-            dv = np.abs(m.kv_v[L] - ref.kv_v[L]).max()
+            gk, gv = m.kv_view(L)
+            rk, rv = ref.kv_view(L)
+            dk = np.abs(np.asarray(gk) - np.asarray(rk)).max()
+            dv = np.abs(np.asarray(gv) - np.asarray(rv)).max()
             print(f"[compare] layer {L:2d}  dK {dk:.4f}  dV {dv:.4f}")
 
     return 0 if verdict == "PASS" else 1
