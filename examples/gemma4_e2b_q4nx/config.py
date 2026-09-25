@@ -162,6 +162,11 @@ EXPECT_IDS = [9079, 236761]
 #: running. Closing it means teaching the harness about the stop token, which
 #: belongs with the first decode run on this model rather than ahead of it.
 
+#: Stop tokens for the GPU decode loop. mlir-air's own gate requires the run
+#: to stop on 106 (<end_of_turn>) after EXPECT_IDS; the NPU path leaves that to
+#: its driver, and the GPU path here honours it directly.
+EOS_IDS = (106, 1)  # <end_of_turn>, <eos>
+
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Gemma4-E2B-IT-NPU2")
 
 

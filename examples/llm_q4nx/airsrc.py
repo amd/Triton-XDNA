@@ -83,6 +83,55 @@ def add_air_paths(*packages):
             sys.path.insert(0, p)
 
 
+def decode_attn_maxl(engine="fused_decode", want=None, artifact_dir=None):
+    """The calibrated ATTN_MAXL a decode of reach `want` will resolve to.
+
+    For a prefill that wants to write mlir-air's device KV layout directly: the
+    slab's geometry is a function of ATTN_MAXL, so it has to be known before
+    the prefill runs -- but the decoder that fixes it is built afterwards, and
+    upstream picks the *smallest* window covering `P + n_tokens`, which the
+    prefill cannot know. A mismatch would not raise; it would place every row
+    at the wrong offset and decode to fluent nonsense.
+
+    So the two sides agree on a number that does not depend on the generation
+    length: `want` is the session's declared context bound (`--max-seq`), and
+    the decoder is then pinned to the window this returns rather than to the
+    one it would have chosen. A window LARGER than the prompt needs is always
+    correct -- a template built at ATTN_MAXL serves every L in [1, ATTN_MAXL] --
+    so the only cost of overshooting is speed, which is why `want` is honoured
+    rather than always taking the largest.
+
+    Falls back to the largest calibrated window when `want` exceeds every one
+    of them: that build simply cannot serve a context that long, and saying so
+    belongs at the prompt that asks for it, not here.
+
+    Resolved through mlir-air's own `DecodeInstsGen` rather than by globbing
+    for `decode_L*.xclbin`, so "calibrated" means what it means there (a pair
+    of same-ATTN_MAXL builds whose instruction streams differ by a constant
+    slope), not what a filename suggests.
+
+    Returns None when no calibrated template exists -- an ordinary state, not
+    an error: `--decode gpu` and `--prefill-only` never build one.
+    """
+    import sys as _sys
+
+    d = artifact_dir or fused_decode_dir(engine)
+    try:
+        if d not in _sys.path:
+            _sys.path.insert(0, str(air_llms_root().parent / "fused_decode"))
+        from decode_insts_gen import DecodeInstsGen
+
+        gen = DecodeInstsGen(str(d), None)
+        if want is not None:
+            try:
+                return int(gen.select(int(want)))
+            except KeyError:
+                pass  # nothing covers `want`; the largest is the best on offer
+        return int(gen.attn_maxl)
+    except Exception:  # noqa: BLE001 -- see the docstring
+        return None
+
+
 class DecodeArtifactError(RuntimeError):
     """Raised when the decode shape asked for is not one this example drives."""
 

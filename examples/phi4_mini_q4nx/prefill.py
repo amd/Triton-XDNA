@@ -36,12 +36,13 @@ from phi4_prefill import Phi4Prefill  # noqa: E402
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--backend", choices=("cpu", "npu"), default="npu")
+    ap.add_argument("--backend", choices=("cpu", "npu", "hetero"), default="npu")
     ap.add_argument(
         "--ops",
         default=None,
         help="NPU ops to enable: 'all', or a comma list of "
-        "matmul,rms_norm,swiglu (default: all)",
+        "matmul,rms_norm,swiglu (default: the model's own, "
+        "which is not necessarily all -- see its `DEFAULT_OPS`)",
     )
     ap.add_argument("--prompt", default=None, help="token ids, comma separated")
     ap.add_argument("--n-layers", type=int, default=config.N_LAYERS)
