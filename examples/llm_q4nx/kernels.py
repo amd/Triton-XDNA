@@ -165,8 +165,42 @@ def _matmul_kernel(
     tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :], tl.dot(a, b))
 
 
+#: One AIE core's output block under the matmul schedule -- its `l1_m`/`l1_n`.
+#: A `block_m x block_n` GEMM tile therefore asks for a herd of
+#: `(block_m/L1, block_n/L1)` cores, which is how a tile size becomes occupancy.
+L1 = 64
+
+#: npu2's compute array, and the reason `WIDE_M` and `BLOCK_N` differ.
+#: `air-to-aie` lays herd dimension 0 across COLUMNS and dimension 1 across
+#: ROWS, so the tile that covers the array is 8 cores wide in M and 4 in N.
+#: Taken the other way round it does not run slower, it fails to place: a herd
+#: needing five rows raises "row index (6) must be less than ... (6)".
+AIE_COLS, AIE_ROWS = 8, 4
+
 BLOCK_M = 128  # the matmul transform script's herd tiling assumes >= 128
-BLOCK_N = 256
+BLOCK_N = L1 * AIE_ROWS
+
+#: The row tile that covers every column, and the tiers between it and
+#: `BLOCK_M`. Both ends exist because a tile is computed in full whether or not
+#: the rows fill it, so the widest is not the fastest at every prompt length.
+WIDE_M = L1 * AIE_COLS
+ROW_TIERS = (WIDE_M, 256, BLOCK_M)
+
+
+def row_tier(n_rows, tiers=ROW_TIERS, cap=None):
+    """The row tile to run `n_rows` through: fewest dispatches, then smallest.
+
+    Fewest dispatches because a wider tile spreads over proportionally more
+    columns, so what it really buys is one dispatch instead of several;
+    smallest on a tie because two tiers needing the same number of dispatches
+    differ only in how much of the last one is padding.
+
+    `cap` bounds the tile where the caller has a ceiling of its own -- Triton's
+    tensor limit, which binds here as `block_m * Kp`.
+    """
+    ok = [t for t in tiers if cap is None or t <= cap] or [min(tiers)]
+    return min(ok, key=lambda t: (-(-n_rows // t), t))
+
 
 # Every wrapper below tiles the ROW (sequence) dimension on the host at this
 # granularity, so no kernel's grid or constexprs depend on the prompt length.
@@ -338,10 +372,13 @@ MAX_TILE_NUMEL = 4194304
 MATMUL_SCRIPT = "gpt2/transform_matmul_aie2p.mlir"
 
 
-def triton_matmul(
-    x, w, block_m=BLOCK_M, block_n=BLOCK_N, transform_script=MATMUL_SCRIPT
-):
+def triton_matmul(x, w, block_m=None, block_n=BLOCK_N, transform_script=MATMUL_SCRIPT):
     """x: [M, K] float32/bf16, w: [K, N] bf16 -> [M, N] float32, on the NPU.
+
+    `block_m` defaults to whatever `row_tier` thinks these rows are worth: a
+    tile is computed in full, so the widest one is the fastest only once the
+    rows fill it. Each distinct value compiles its own kernel, so the tiers are
+    few and fixed rather than tracking the prompt.
 
     `transform_script` is the schedule to lower with, as an `examples`-relative
     path, or None to let the driver generate one. The default is the shared
@@ -367,6 +404,12 @@ def triton_matmul(
                 f"maximum tensor size on its own; no block_n can fit."
             )
         block_n = MAX_TILE_NUMEL // Kp
+    # The same cap, on the other tile dimension, and the one that decides how
+    # many of the array's columns this GEMM lights up. `None` means "as wide as
+    # these rows are worth", which is what a caller almost always wants; an
+    # explicit `block_m` is honoured as given.
+    if block_m is None:
+        block_m = row_tier(M, cap=MAX_TILE_NUMEL // Kp)
     Mp = math.ceil(M / block_m) * block_m
     Np = math.ceil(N / block_n) * block_n
     if isinstance(w, ResidentWeight):
