@@ -75,6 +75,13 @@ _MOVED_KNOBS = {
     "DECODE_STACK": "stack_size",
 }
 
+#: Which slab each decode wave attends. Only the PLE fork has KV sharing, and
+#: only it reads this; the shared engine never looks at it. Unset is the
+#: IDENTITY map, so a model whose layers share a cache and does not name this
+#: builds a wave that reads its own empty slab -- `DecodeConfig` refuses the
+#: combination rather than letting it default.
+_PLE_ONLY = {"DECODE_KV_SRC": "kv_src"}
+
 
 class DecodeEngine:
     """One of mlir-air's fused-decode builders.
@@ -124,7 +131,7 @@ ENGINES = {
         name="ple",
         directory="fused_decode_ple",
         module="fused_decode_ple.py",
-        env={**_COMMON_ENV, **_MOVED_KNOBS},
+        env={**_COMMON_ENV, **_MOVED_KNOBS, **_PLE_ONLY},
         model_table={},
     ),
 }
@@ -167,6 +174,46 @@ def _check_model_table(builder, config):
 
 class DecodeConfigError(ValueError):
     """The requested decode configuration cannot be built."""
+
+
+def _normalize_kv_src(kv_src, engine, decode_waves):
+    """Validate a KV sharing map and return the builder's spelling of it.
+
+    The builder checks the same two things, but it checks them a minute into a
+    lowering and after the environment has been mutated, so they are checked
+    here too. `None` passes through: no map is the identity map.
+    """
+    if kv_src is None:
+        return None
+    if "DECODE_KV_SRC" not in ENGINES[engine].env:
+        raise DecodeConfigError(
+            f"engine={engine!r} does not read DECODE_KV_SRC, so a kv_src given "
+            f"here would be dropped and the build would use the identity map. "
+            f"A model that needs a sharing map needs an engine that reads one."
+        )
+    src = kv_src.split(",") if isinstance(kv_src, str) else list(kv_src)
+    try:
+        src = [int(s) for s in src]
+    except (TypeError, ValueError):
+        raise DecodeConfigError(f"kv_src must be ints, got {kv_src!r}") from None
+    if not src:
+        raise DecodeConfigError(
+            "kv_src is empty, which the builder reads as the identity map. "
+            "Pass None to mean that, so it cannot be an accident."
+        )
+    wrong = [(i, s) for i, s in enumerate(src) if not 0 <= s <= i]
+    if wrong:
+        raise DecodeConfigError(
+            f"kv_src names one source slab per wave, and a wave can only read "
+            f"a slab at or before its own. Out of range: "
+            f"{', '.join(f'wave {i} -> {s}' for i, s in wrong)}"
+        )
+    if decode_waves is not None and len(src) != int(decode_waves):
+        raise DecodeConfigError(
+            f"kv_src has {len(src)} entries but the template has "
+            f"{int(decode_waves)} decode waves. It names one source per wave."
+        )
+    return ",".join(str(s) for s in src)
 
 
 class DecodeConfig:
@@ -214,6 +261,15 @@ class DecodeConfig:
             one-BO limit. ``0`` disables it.
         stack_size: AIE core stack. ``None`` takes the builder's own, which is
             what every model but the 8B wants.
+        kv_src: ``DECODE_KV_SRC`` -- the slab each decode wave attends, as a
+            sequence of ints or a comma-separated string, one per wave. Needed
+            by a model whose later layers project no K/V and read an earlier
+            layer's cache. ``None`` leaves the builder's identity map, which is
+            correct only when no layer shares a cache: a wave pointed at its own
+            slab with nothing to write there attends a zero key at the current
+            position, which reads as a fluent opening that degrades into
+            repetition. Accepted only by an engine that reads it; see
+            `_PLE_ONLY`.
         proj_rc_cache: the builder's ``PROJ_RC_CACHE``, which selects the cached
             -- rather than recomputed -- reduction in ``proj_qmm.cc``. The
             builder and the kernel read it separately and must agree, so a model
@@ -237,6 +293,7 @@ class DecodeConfig:
         proj_rc_cache=None,
         engine=DEFAULT_ENGINE,
         decode_waves=None,
+        kv_src=None,
     ):
         if engine not in ENGINES:
             raise DecodeConfigError(
@@ -264,6 +321,7 @@ class DecodeConfig:
             )
         if int(vocab_chunk) < 1:
             raise DecodeConfigError(f"vocab_chunk must be >= 1, got {vocab_chunk}")
+        kv_src = _normalize_kv_src(kv_src, engine, decode_waves)
         self.model = str(model)
         self.model_type = str(model_type)
         self.context_length = int(context_length)
@@ -278,6 +336,10 @@ class DecodeConfig:
         self.proj_rc_cache = proj_rc_cache
         self.engine = engine
         self.decode_waves = decode_waves
+        #: Normalized to the builder's own comma-separated spelling, so `env()`
+        #: needs no per-field formatting and `fingerprint()` separates two
+        #: templates that differ only in their map.
+        self.kv_src = kv_src
 
     #: The context length the built artifact actually serves, which is rounded
     #: up to a multiple of 16. Two requests that round to the same value produce

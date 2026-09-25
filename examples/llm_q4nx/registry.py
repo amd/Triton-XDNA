@@ -141,8 +141,40 @@ class ModelSpec:
             stack_size=e.get("DECODE_STACK"),
             proj_rc_cache=e.get("PROJ_RC_CACHE"),
             decode_waves=e.get("DECODE_UNI_DEC"),
+            kv_src=self.kv_source_map(),
             engine=self.engine,
         )
+
+    def kv_source_map(self):
+        """Which slab each decode wave attends, or None when none is shared.
+
+        Read from the model's own `kv_source_layer` in mlir-air rather than
+        recorded above, unlike every other knob here. It is not a Makefile
+        constant: it follows from the layer-type pattern and the sharing
+        boundary, both of which the prefill and the reference already read from
+        that function, so a copy in this file would be a second definition free
+        to drift from the one the rest of the stack uses. mlir-air's own
+        Makefile derives it the same way.
+
+        Resolved on demand: it needs the air sources, which only a decode build
+        has, and `--prefill-only` runs without them.
+        """
+        import importlib
+
+        import airsrc
+
+        airsrc.add_air_paths(self.air_package)
+        try:
+            src = importlib.import_module(f"{self.air_package}_weights")
+            layer_of = src.kv_source_layer
+        except (ImportError, AttributeError):
+            return None  # no layer shares another's cache
+        waves = int(self.decode_env.get("DECODE_UNI_DEC") or self.decode_env["NLAYERS"])
+        smap = [int(layer_of(i)) for i in range(waves)]
+        # Every wave on its own slab is what no map means. Returning it as one
+        # would make an engine that cannot express a map refuse a model that
+        # does not need one.
+        return None if smap == list(range(waves)) else smap
 
 
 #: Two places where this spec deliberately does *not* match mlir-air's
