@@ -323,17 +323,30 @@ def _geglu_f32in(
     """gelu_tanh(gate) * up over two on-device f32 buffers -> bf16.
 
     Qwen's `_swiglu_f32in` with `kernels._geglu_kernel`'s activation. That
-    activation is exact, not an approximation: `tanh(z) = 2*sigmoid(2z) - 1`
-    turns gelu_pytorch_tanh into `x * sigmoid(2z)`, which is why `C2` is twice
-    sqrt(2/pi). mlir-air's decode runs gelu_tanh in `glu.cc`, so a fast-GELU
-    here would make this prefill and that decode disagree about the model.
+    activation is exact, not an approximation. mlir-air's decode runs gelu_tanh
+    in `glu.cc`, so a fast-GELU here would make this prefill and that decode
+    disagree about the model.
+
+    Written with tanh and not with the `x * sigmoid(2z)` it is equal to,
+    because AIE2P has exactly two vector transcendentals -- `exp2` and `tanh`,
+    in `aie2p_nlf_vector.h` -- and `inv` is in the scalar header. A sigmoid's
+    reciprocal therefore costs one call per lane: the divide form's inner loop
+    comes out with 17 `@llvm.aie2p.inv` against 2 `exp2`, where this one has 2
+    `@llvm.aie2p.tanh` and no scalar call at all. Measured at 1024x12288,
+    7.18 ms against 9.44, and closer to the reference besides (1.12e-02 mean
+    relative against 1.76e-02) because the hardware tanh beats an exp and a
+    reciprocal composed.
+
+    `C2` stays twice sqrt(2/pi) so the constant means the same thing on both
+    paths; the halving is here.
     """
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     g = tl.load(G + offsets[:])
     u = tl.load(U + offsets[:])
-    z = C2 * (g + K * g * g * g)
-    tl.store(Y + offsets[:], (g * tl.sigmoid(z) * u).to(tl.bfloat16))
+    y = (C2 * 0.5) * (g + K * g * g * g)
+    t = tl.extra.cuda.libdevice.tanh(y)
+    tl.store(Y + offsets[:], (0.5 * g * (1.0 + t) * u).to(tl.bfloat16))
 
 
 class FusedMLP:

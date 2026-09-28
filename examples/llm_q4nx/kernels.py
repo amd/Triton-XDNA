@@ -1005,30 +1005,28 @@ def _geglu_kernel(G, U, Y, C2: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexp
 
         0.5 * x * (1 + tanh(c * (x + 0.044715 * x^3))),  c = sqrt(2/pi)
 
-    written here with sigmoid instead of tanh. `tl.math.tanh` does not exist in
-    this Triton version, and substituting the usual `x * sigmoid(1.702x)` fast
-    GELU (which is what examples/gelu uses) would be a different function --
-    mlir-air's decode runs gelu_tanh in `glu.cc`, so an approximation here would
-    make the prefill and the decode disagree about the model.
+    and with a real tanh, because AIE2P has one and does not have a reciprocal.
+    Its two vector transcendentals are `exp2` and `tanh`
+    (`aie2p_nlf_vector.h`); `inv`, `invsqrt` and `sqrtf` are in the scalar
+    header. The `x * sigmoid(2z)` form this used to take -- exact, since
+    tanh(z) = 2*sigmoid(2z) - 1, which is why `C2` is *2*c -- therefore paid a
+    scalar call per lane for its divide.
 
-    No approximation is needed, because tanh(z) = 2*sigmoid(2z) - 1 turns the
-    expression above into an exact identity:
+    Substituting the usual `x * sigmoid(1.702x)` fast GELU (which is what
+    examples/gelu uses) is a different function and still ruled out: mlir-air's
+    decode runs gelu_tanh in `glu.cc`, so an approximation here would make the
+    prefill and the decode disagree about the model.
 
-        0.5 * x * (1 + 2*sigmoid(2z) - 1)  =  x * sigmoid(2z)
-
-    with z = c * (x + 0.044715 x^3). That is why `C2` is *2*c and not c.
-
-    The op set is the SwiGLU kernel's -- mul, add, sigmoid -- so it lowers under
-    the same transform script, which is what makes this a new kernel rather than
-    a new schedule. f32 for the polynomial and the sigmoid, as tl.sigmoid
-    requires, rounded back to bf16 before the multiply by `up`.
+    `tl.extra.cuda.libdevice.tanh` is not CUDA here. It emits
+    `tt.extern_elementwise` naming `__nv_tanhf`, triton-shared maps that symbol
+    to `math.tanh`, and `@cast_bf16_only_ops` then puts it on the hardware op.
     """
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     gate = tl.load(G + offs[:])
     up = tl.load(U + offs[:])
     g = gate.to(tl.float32)
-    z = C2 * (g + K * g * g * g)
-    gelu_gate = (g * tl.sigmoid(z)).to(gate.dtype)
+    y = (C2 * 0.5) * (g + K * g * g * g)
+    gelu_gate = (0.5 * g * (1.0 + tl.extra.cuda.libdevice.tanh(y))).to(gate.dtype)
     tl.store(Y + offs[:], gelu_gate * up)
 
 
