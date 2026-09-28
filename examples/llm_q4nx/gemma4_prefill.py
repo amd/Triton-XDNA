@@ -478,7 +478,10 @@ class Gemma4Prefill(LlamaPrefill):
             out = torch.zeros((N, self.n_layers, PLI_D), dtype=torch.float32)
             n = tbl.shape[0]
             for L in range(self.n_layers):
-                proj = self._matmul(x, self._w[L]["model_proj"]) * PLE_MODEL_PROJ_SCALE
+                proj = (
+                    self._matmul(x, self._w[L]["model_proj"], stage_key=f"mp_L{L}")
+                    * PLE_MODEL_PROJ_SCALE
+                )
                 proj = self._rms_norm(proj, self.ple_proj_norm, RMS_EPS)
                 out[:n, L] = (proj[:n] + tbl[:, L]) * PLE_INPUT_SCALE
                 out[n:, L] = proj[n:] * PLE_INPUT_SCALE
@@ -521,14 +524,20 @@ class Gemma4Prefill(LlamaPrefill):
         # work, and an NPU launch inside that scope would switch the active
         # driver and drop the GPU kernels' compiled cache -- the thing the
         # scope exists to keep.
+        # `stage_key` keeps this layer's weight on the device between calls.
+        # It is the weight's identity, not the shape's: the chain behind it is
+        # shared by everything of the same shape, and this is what gives each
+        # layer its own buffers on it. The two branches hold DIFFERENT weights
+        # under one name -- a KV-shared layer's is q alone -- so they land on
+        # two chains, which the shape in the key makes visible.
         if L < FIRST_KV_SHARED:
-            qkv = self._matmul(h, w["qkv"])
+            qkv = self._matmul(h, w["qkv"], stage_key=f"qkv_L{L}")
             q, k, v = qkv.split([dq, dkv, dkv], dim=1)
             src = None
         else:
             # A KV-shared layer projects q alone and attends the cache of
             # `kv_source_layer(L)`, which -- being lower -- has already run.
-            q = self._matmul(h, w["qkv"])
+            q = self._matmul(h, w["qkv"], stage_key=f"qkv_L{L}")
             k = v = None
             src = kv_source_layer(L)
 
@@ -558,7 +567,7 @@ class Gemma4Prefill(LlamaPrefill):
                 window=SLIDING_WINDOW if sliding else None,
                 scale=ATTN_SCALE,
             )
-        a = self._matmul(a, w["o"])  # o contracts dq -> D
+        a = self._matmul(a, w["o"], stage_key=f"o_L{L}")  # o contracts dq -> D
         x = residual + self._rms_norm(a, w["post_attn_norm"], RMS_EPS)
 
         # ---- MLP sublayer, norm-sandwiched the same way ----
@@ -580,8 +589,8 @@ class Gemma4Prefill(LlamaPrefill):
         # to D and added through the fifth norm. `_geglu` is the same operator:
         # gelu_tanh(gate) * other.
         residual = x
-        gate = self._geglu(self._matmul(x, w["inp_gate"]), pli)
-        p = self._matmul(gate, w["per_layer_projection"])
+        gate = self._geglu(self._matmul(x, w["inp_gate"], stage_key=f"ig_L{L}"), pli)
+        p = self._matmul(gate, w["per_layer_projection"], stage_key=f"plp_L{L}")
         x = residual + self._rms_norm(p, w["post_ple_norm"], RMS_EPS)
 
         # Per-layer output scale, a scalar. Missing it leaves every block

@@ -14,6 +14,7 @@ import os
 import subprocess
 import weakref
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -717,7 +718,98 @@ def tile_n(N, Kp):
     return min(col_tier(N), MAX_TILE_NUMEL // Kp, MAX_BLOCK_NUMEL // ROW_TIERS[0])
 
 
-def triton_matmul(x, w, block_m=None, block_n=None, transform_script=BY_BLOCK):
+def _np(t):
+    """`t` as a numpy array, bf16 included.
+
+    numpy has no bfloat16, so a bf16 tensor is reinterpreted through uint16
+    into `ml_dtypes`'. Nothing converts: the bytes are the same either way, and
+    a chain wants numpy because that is what its staging copies from.
+    """
+    if t.dtype is torch.bfloat16:
+        from ml_dtypes import bfloat16
+
+        return t.view(torch.uint16).numpy().view(bfloat16)
+    return t.numpy()
+
+
+#: Chains that hold a projection's weight on the device between calls, keyed by
+#: the compiled shape. One per shape and NOT one per weight: a chain owns an
+#: `hw_context` and the NPU runs out of those at around 35 (see `fused_mlp`),
+#: so a layer's identity is the `bo_key` instead, which is the same arrangement
+#: the FFN chain uses.
+_PROJ_CHAINS = {}
+
+
+@triton.jit
+def _stage_pad_kernel(A, B, C, BLOCK: tl.constexpr):
+    """A trivial second op, so the chain is never exactly one.
+
+    `NPUChain` documents that a one-op chain is correct on its first dispatch
+    and corrupt on every one after. Four KiB of addition costs nothing
+    measurable next to a projection and keeps the chain out of that case.
+
+    Three operands and not one because `_PAD_SCRIPT` promotes a BINARY
+    elementwise op; a one-in/one-out kernel meets it with "expected a single
+    payload op". All three indices are the same buffer at the call site.
+    """
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(C + offs[:], tl.load(A + offs[:]) + tl.load(B + offs[:]))
+
+
+def _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script):
+    """The chain that runs a `Mp x Kp @ Kp x Np` projection, built once.
+
+    The whole grid in one dispatch rather than the host's row-block loop, so
+    the weight is one operand of one op and `static_indices` can hold it.
+    """
+    key = (block_m, block_n, Mp, Np, Kp, a_stride, transform_script)
+    chain = _PROJ_CHAINS.get(key)
+    if chain is not None:
+        return chain
+    from triton.backends.amd_triton_npu.multilaunch import NPUChain
+
+    chain = NPUChain(f"proj_{Mp}x{Kp}x{Np}_{block_m}x{block_n}")
+    chain.add(
+        _matmul_kernel,
+        grid=(Mp // block_m, Np // block_n),
+        arg_map={0: 0, 1: 1, 2: 2},
+        args=(
+            torch.zeros((Mp, a_stride), dtype=torch.bfloat16),
+            torch.zeros((Kp, Np), dtype=torch.bfloat16),
+            torch.zeros((Mp, Np), dtype=torch.float32),
+            a_stride,
+            Np,
+            Np,
+        ),
+        constexprs={"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": Kp},
+        transform_script=(
+            script(transform_script) if isinstance(transform_script, str) else None
+        ),
+    )
+    chain.add(
+        _stage_pad_kernel,
+        grid=(1,),
+        arg_map={0: 3, 1: 3, 2: 3},
+        args=(
+            torch.zeros(1024, dtype=torch.float32),
+            torch.zeros(1024, dtype=torch.float32),
+            torch.zeros(1024, dtype=torch.float32),
+        ),
+        constexprs={"BLOCK": 1024},
+        transform_script=script(_PAD_SCRIPT),
+    )
+    _PROJ_CHAINS[key] = chain
+    return chain
+
+
+#: The padding op's schedule. Any elementwise one will do; this is the f32 add
+#: every model already builds.
+_PAD_SCRIPT = "gpt2/transform_add_f32_aie2p.mlir"
+
+
+def triton_matmul(
+    x, w, block_m=None, block_n=None, transform_script=BY_BLOCK, stage_key=None
+):
     """x: [M, K] float32/bf16, w: [K, N] bf16 -> [M, N] float32, on the NPU.
 
     Both block dimensions default to whatever `row_tier` and `tile_n` think
@@ -732,6 +824,14 @@ def triton_matmul(x, w, block_m=None, block_n=None, transform_script=BY_BLOCK):
     the one shape here that they reject is recorded at the call site that
     passes None (`qwen25_prefill._layer`), because a shape they reject fails
     loudly in aiecc rather than silently.
+
+    `stage_key` names a weight that does not change between calls -- a layer's
+    projection -- and dispatches through a chain that stages it once instead of
+    per launch. `launch` copies every pointer argument into a device BO on
+    every launch, so a 20 MiB weight is otherwise re-staged twice a layer for
+    35 layers. Measured at qkv's shape: 19.49 ms against 11.35. Pass a key that
+    identifies the WEIGHT (`f"qkv_L{i}"`), not the shape: the chain is shared
+    by shape and the key is what separates one layer's buffers from another's.
     """
     M, K = x.shape
     Kw, N = w.shape
@@ -773,6 +873,18 @@ def triton_matmul(x, w, block_m=None, block_n=None, transform_script=BY_BLOCK):
     a.zero_()
     a[:M, :K] = x.to(torch.bfloat16)
     c = shared_empty((Mp, Np), torch.float32)
+    if stage_key is not None:
+        chain = _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script)
+        pad = np.zeros(1024, dtype=np.float32)
+        with _npu_driver():
+            got = chain.run(
+                [_np(a), _np(b), _np(c), pad],
+                bo_key=stage_key,
+                static_indices={1},
+                intermediate_indices={3},
+                output_indices={2},
+            )
+        return torch.from_numpy(np.asarray(got[2])).reshape(Mp, Np)[:M, :N]
     # One block_m-row tile per dispatch: the grid is (1, N/block_n), which
     # depends on the weight alone and never on the prompt length.
     for m0 in range(0, Mp, block_m):
