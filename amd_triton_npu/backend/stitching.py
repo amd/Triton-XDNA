@@ -42,8 +42,23 @@ def _extract_private_funcs(mlir_text):
     return [l for l in mlir_text.split("\n") if "func.func private" in l]
 
 
-def _rename_all(text, prefix):
-    """Rename SSA values, affine maps, and symbols with a unique prefix."""
+def _extern_symbols(mlir_text):
+    """Names declared `func.func private` -- the externally linked kernels.
+
+    These are emitted once for the whole combined module, unrenamed, because
+    the symbol has to match what is inside the `link_with` object file. So
+    their call sites must not be renamed either.
+    """
+    return set(re.findall(r"func\.func private @([\w]+)", mlir_text))
+
+
+def _rename_all(text, prefix, extern=()):
+    """Rename SSA values, affine maps, and symbols with a unique prefix.
+
+    `extern` names are left alone: they resolve into a prebuilt object, not
+    into this module, so prefixing the call would leave it pointing at a
+    function that does not exist ("does not reference a valid function").
+    """
     # Affine attribute symbols: `#map...` and `#set...` (longest first).
     affine_names = set(re.findall(r"#map\d*", text)) | set(re.findall(r"#set\d*", text))
     for name in sorted(affine_names, key=len, reverse=True):
@@ -62,7 +77,10 @@ def _rename_all(text, prefix):
         text = re.sub(re.escape(name) + r"(?!\d)", f"%{prefix}_n{name[1:]}", text)
 
     # Symbol names but NOT extern functions
+    skip = {f"@{n}" for n in extern}
     for name in sorted(set(re.findall(r"@[\w]+", text)), key=len, reverse=True):
+        if name in skip:
+            continue
         text = text.replace(name, f"@{prefix}_{name[1:]}")
     return text
 

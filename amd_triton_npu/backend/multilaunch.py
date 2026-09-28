@@ -155,8 +155,9 @@ class MultiLaunchBuilder:
             ir = stitching._wrap_ir_in_launch(op.air_text)
             body = stitching._extract_between_func_and_return(ir)
             maps = stitching._extract_affine_maps(ir)
-            body = stitching._rename_all(body, op.prefix)
-            maps = [stitching._rename_all(m, op.prefix) for m in maps]
+            extern = stitching._extern_symbols(ir)
+            body = stitching._rename_all(body, op.prefix, extern)
+            maps = [stitching._rename_all(m, op.prefix, extern) for m in maps]
             body = stitching._fix_launch_func_args(body, op.prefix, op.arg_map)
             bodies.append(body)
             maps_all.extend(maps)
