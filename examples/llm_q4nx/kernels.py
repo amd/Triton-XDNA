@@ -965,13 +965,43 @@ def _swiglu_kernel(G, U, Y, BLOCK: tl.constexpr):
 SWIGLU_BLOCK = elem_block(None, 2 + 2 + 2)
 
 
+def glu_chunk(n, width, block):
+    """How much of a GLU's range one dispatch covers. A multiple of `block`.
+
+    The chunk is sized from the row WIDTH rather than the row count, so the
+    grid (`chunk // block`) never tracks the prompt length -- the AIR lowering
+    is cached on the grid, and one that followed P would recompile per prompt.
+
+    Width alone is not enough when the rows are narrow. Gemma4's PLE branch is
+    [P, 256]: `ROW_TILE * 256` is 32768, which rounds up to exactly ONE 65536
+    block, so a P=2040 range of 8 blocks went out as eight dispatches of a
+    single program each -- 280 for the prefill, every one staging its own
+    operands. One dispatch of eight programs is the same arithmetic and the
+    same tile, measured 3.409 -> 0.929 ms per layer and bit-identical.
+
+    So take the larger of the width chunk and the whole range, with the range
+    rounded DOWN to a power of two and capped. Rounding down keeps the set of
+    distinct grids small (1, 2, 4, 8 plus whatever the widths ask for) instead
+    of one per prompt length, and the cap stops a wide model's chunk from
+    shrinking: at width 12288 the width term is already 24 blocks, and 8 would
+    make it three times as many dispatches.
+    """
+    blocks = max(1, math.ceil(n / block))
+    span = block * (1 << min(blocks.bit_length() - 1, _GLU_MAX_POW2))
+    return max(math.ceil(ROW_TILE * width / block) * block, span)
+
+
+#: Largest power-of-two grid `glu_chunk` will reach for on range alone, as an
+#: exponent. Eight programs covers the PLE branch at every length this runs at
+#: and bounds the distinct grids; wider rows still get their width's chunk.
+_GLU_MAX_POW2 = 3
+
+
 def triton_swiglu(gate, up, block=SWIGLU_BLOCK):
     """silu(gate) * up over matching [M, N] tensors -> [M, N] float32."""
     shape = gate.shape
-    # Fixed-size chunks, so the grid never tracks the prompt length (ROW_TILE).
-    chunk = ROW_TILE * (shape[-1] if gate.ndim > 1 else block)
-    chunk = math.ceil(chunk / block) * block
     n = gate.numel()
+    chunk = glu_chunk(n, shape[-1] if gate.ndim > 1 else block, block)
     npad = math.ceil(n / chunk) * chunk
     # Pad once; each dispatch gets a contiguous slice, no per-chunk copy back.
     g = torch.nn.functional.pad(gate.reshape(-1).to(torch.bfloat16), (0, npad - n))
@@ -1034,12 +1064,11 @@ def triton_geglu(gate, up, block=SWIGLU_BLOCK):
     """gelu_tanh(gate) * up over matching [M, N] tensors -> [M, N] float32.
 
     The SwiGLU wrapper's chunking and padding, unchanged -- only the activation
-    differs -- so see `triton_swiglu` for why the chunk size is fixed.
+    differs -- so see `glu_chunk` for how the dispatch is sized.
     """
     shape = gate.shape
-    chunk = ROW_TILE * (shape[-1] if gate.ndim > 1 else block)
-    chunk = math.ceil(chunk / block) * block
     n = gate.numel()
+    chunk = glu_chunk(n, shape[-1] if gate.ndim > 1 else block, block)
     npad = math.ceil(n / chunk) * chunk
     g = torch.nn.functional.pad(gate.reshape(-1).to(torch.bfloat16), (0, npad - n))
     u = torch.nn.functional.pad(up.reshape(-1).to(torch.bfloat16), (0, npad - n))
