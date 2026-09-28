@@ -732,6 +732,39 @@ def _np(t):
     return t.numpy()
 
 
+#: Per-core L1 an elementwise tile's operands may occupy. The core has 64 KiB;
+#: 48 places and 96 does not -- measured, the failure is "'aie.tile' op
+#: allocated buffers exceeded available memory".
+ELEM_L1_BYTES = 48 * 1024
+
+
+def elem_block(n_elems, bytes_per_elem):
+    """The elementwise tile to cover `n_elems` with, or the cap if None.
+
+    Bounded by BYTES per core and not by a fixed element count, because that is
+    what the hardware bounds. `@flatten_tile_forall_aie2p` splits a block over
+    the 8 columns with `num_threads [8]`, so a core holds `block / 8` elements
+    of every operand at once and `bytes_per_elem` is their widths summed.
+
+    The tile is most of what an elementwise pass costs. Fitting
+    `t = a*elements + b*bytes` over a bf16 add at 12.58M elements gives 74 GB/s
+    of marginal bandwidth against a 5.7 Gelem/s fixed term -- two thirds of the
+    time is per-element, which is really per-TILE work charged against a fixed
+    tile length. Lengthening the tile amortises it, monotonically to the L1
+    bound: three bf16 streams run 3.25 ms at 16384 and 1.85 at 65536; three
+    f32 streams run 4.15 at 16384 and 3.46 at 32768, and 65536 does not place.
+
+    `n_elems` is the range to cover. The grid is `n_elems // block`, so a block
+    that does not divide the range truncates it and drops the tail with no
+    error -- the same trap `D_pad` carries against `BLOCK_N`. Taking the
+    largest power of two that divides makes it impossible instead of merely
+    unlikely, and `tl.arange` wants a power of two anyway. Pass None where the
+    caller sizes its own range around the block.
+    """
+    cap = 1 << ((AIE_COLS * ELEM_L1_BYTES) // bytes_per_elem).bit_length() - 1
+    return cap if n_elems is None else min(cap, n_elems & -n_elems)
+
+
 #: Chains that hold a projection's weight on the device between calls, keyed by
 #: the compiled shape. One per shape and NOT one per weight: a chain owns an
 #: `hw_context` and the NPU runs out of those at around 35 (see `fused_mlp`),
@@ -926,7 +959,10 @@ def _swiglu_kernel(G, U, Y, BLOCK: tl.constexpr):
     tl.store(Y + offs[:], silu_gate * up)
 
 
-SWIGLU_BLOCK = 1024
+#: Both pad to bf16 and write bf16, so three 2-byte streams. At the PLE
+#: branch's [2040, 256] this is 7.579 ms per layer at the old 1024 and 3.264 at
+#: the cap, with the error unchanged at 1.825e-02.
+SWIGLU_BLOCK = elem_block(None, 2 + 2 + 2)
 
 
 def triton_swiglu(gate, up, block=SWIGLU_BLOCK):

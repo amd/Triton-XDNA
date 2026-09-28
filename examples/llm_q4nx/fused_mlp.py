@@ -104,32 +104,13 @@ from kernels import (
     _GELU_K,
     _npu_driver,
     col_tier,
+    elem_block,
     fused_epilogue_script,
     matmul_script,
     row_tier,
     script,
     unaliased_stride,
 )
-
-#: The most elements one elementwise program may take. The merge is DMA-bound
-#: and a small tile spends it on transfer setup: at the chain's own shape --
-#: 1024 x 12288, 120 MiB moved -- 1024 elements runs 25.07 ms and 16384 runs
-#: 14.53, monotonically, and 32768 does not build. A program then moves 64 KiB
-#: of each f32 operand instead of 4.
-MAX_ELEM_BLOCK = 16384
-
-
-def elem_block(n_elems):
-    """The elementwise tile to cover `n_elems` with.
-
-    The grid is `n_elems // block`, so a block that does not divide the range
-    truncates it and drops the tail with no error -- the same trap `D_pad`
-    carries against `BLOCK_N`. Taking the largest power of two that divides
-    makes it impossible instead of merely unlikely, and `tl.arange` wants a
-    power of two anyway.
-    """
-    return min(MAX_ELEM_BLOCK, n_elems & -n_elems)
-
 
 #: Qwen's, unmodified. See the module docstring.
 MERGE_SCRIPT = "qwen2_5/transform_swiglu_f32in_aie2p.mlir"
@@ -623,7 +604,9 @@ class FusedMLP:
             )
         # merge: H = gelu_tanh(Cg) * Cu, or just the multiply where the gate
         # GEMM's drain already did the activation.
-        merge_block = elem_block(M * HID)
+        # gate + up + H. The gate is bf16 where its GEMM's drain applied the
+        # activation and f32 where the merge still has to.
+        merge_block = elem_block(M * HID, (2 if gate_script is not None else 4) + 4 + 2)
         chain.add(
             _mul_bf16_f32in if gate_script is not None else _geglu_f32in,
             grid=((M * HID) // merge_block,),
@@ -662,7 +645,7 @@ class FusedMLP:
             )
         # and fold the pieces back together.
         acc = partials[0] if partials else None
-        add_block = elem_block(M * D_pad)
+        add_block = elem_block(M * D_pad, 4 + 4 + 4)  # three f32 streams
         for i in range(1, n_down):
             dst = self.OUT_I if i == n_down - 1 else sums[i - 1]
             chain.add(
