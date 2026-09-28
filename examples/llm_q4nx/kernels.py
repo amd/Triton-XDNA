@@ -11,6 +11,7 @@ transform scripts assume and slice back afterwards.
 import ctypes
 import math
 import os
+import subprocess
 import weakref
 
 import torch
@@ -165,59 +166,315 @@ def _matmul_kernel(
     tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :], tl.dot(a, b))
 
 
-#: One AIE core's output block under the matmul schedule -- its `l1_m`/`l1_n`.
-#: A `block_m x block_n` GEMM tile therefore asks for a herd of
-#: `(block_m/L1, block_n/L1)` cores, which is how a tile size becomes occupancy.
+#: The smallest output block one AIE core is given under these schedules --
+#: their `l1_m`/`l1_n` floor. A `block_m x block_n` GEMM tile asks for a herd
+#: of `(block_m/l1_m, block_n/l1_n)` cores, which is how a tile becomes
+#: occupancy.
 L1 = 64
 
-#: npu2's compute array, and the reason `WIDE_M` and `BLOCK_N` differ.
-#: `air-to-aie` lays herd dimension 0 across COLUMNS and dimension 1 across
-#: ROWS, so the tile that covers the array is 8 cores wide in M and 4 in N.
-#: Taken the other way round it does not run slower, it fails to place: a herd
-#: needing five rows raises "row index (6) must be less than ... (6)".
+#: npu2's compute array. `air-to-aie` lays herd dimension 0 across COLUMNS and
+#: dimension 1 across ROWS, so a block that covers the array is 8 cores wide in
+#: M and 4 in N. Taken the other way round it does not run slower, it fails to
+#: place: a herd needing five rows raises "row index (6) must be less than
+#: ... (6)".
 AIE_COLS, AIE_ROWS = 8, 4
 
 BLOCK_M = 128  # the matmul transform script's herd tiling assumes >= 128
-BLOCK_N = L1 * AIE_ROWS
+
+#: The largest core tile these schedules can drain. One L1->L2 output copy is
+#: `l1_m * l1_n` 32-bit words and a DMA buffer descriptor carries at most
+#: 16383, so 128x128 misses by a single word and 8192 is the ceiling.
+MAX_L1_NUMEL = 8192
+
+#: ...which, over the whole array, bounds the block itself. This is what stops
+#: both tile dimensions from growing at once: 1024x256 and 512x512 are both
+#: exactly at it, and 1024x512 is twice over.
+MAX_BLOCK_NUMEL = AIE_COLS * AIE_ROWS * MAX_L1_NUMEL
 
 #: Row tiles a GEMM may be compiled for, widest first. A tile is computed in
 #: full whether or not the rows fill it, so the widest is not the fastest at
-#: every prompt length -- `row_tier` chooses. The top of the range is not the
+#: every prompt length -- `row_tier` chooses. The top of the range is past the
 #: array's width: `L1 * AIE_COLS` is the narrowest block that reaches all eight
-#: columns, and going past it to 1024 keeps the same herd while halving how
-#: often the weight is re-read, which measured faster on every GEMM the prefill
-#: issues. 2048 does not build -- see `matmul_script`.
+#: columns, and doubling it keeps the same herd while halving how often the
+#: weight is re-read. Whether it is reachable depends on `block_n`, through
+#: `MAX_BLOCK_NUMEL`.
 WIDE_M = L1 * AIE_COLS
 ROW_TIERS = (2 * WIDE_M, WIDE_M, 256, BLOCK_M)
 
-#: The matmul schedule, by the L1 row tile it was generated for. A herd is
-#: `(block_m/l1_m, block_n/l1_n)`, so `l1_m` cannot simply be `L1`: a 1024-row
-#: block at `l1_m=64` asks for sixteen columns and fails to place.
-#:
-#: It does not follow the block downwards, though, and that is measured rather
-#: than assumed. Holding the herd at eight columns by shrinking `l1_m` is
-#: SLOWER than letting the herd shrink: on one wide-layer `gate`, a 256-row
+#: Column tiles, the same way. A GEMM re-reads the whole of A once per column
+#: tile, so the widest tile the weight can fill moves the fewest bytes -- at
+#: the same core count, since `MAX_BLOCK_NUMEL` then takes it back out of the
+#: rows. Which of the two axes should give way is the caller's cost model, not
+#: a property of the array: see `tile_n` for the dispatch-per-row-block path
+#: and `fused_mlp` for the chained one. `col_tier` chooses the tile itself; a
+#: narrow projection takes the small one rather than padding to a tile it
+#: cannot fill.
+COL_TIERS = (2 * L1 * AIE_ROWS, L1 * AIE_ROWS)
+
+#: The matmul schedules, by the core tile `(l1_m, l1_n)` they were generated
+#: for. The tile does not simply track the block, and that is measured rather
+#: than assumed: holding the herd at eight columns by shrinking `l1_m` is
+#: SLOWER than letting the herd shrink. On one wide-layer `gate`, a 256-row
 #: block runs 79.6 ms at `l1_m=32` (eight columns) against 73.9 at `l1_m=64`
 #: (four), and a 128-row block 128.1 at 16 against 124.1 at 64. Below 512 rows
 #: there are not enough of them to give every column a tile worth having.
 _MATMUL_SCRIPTS = {
-    64: "gpt2/transform_matmul_aie2p.mlir",
-    128: "llm_q4nx/transform_matmul_m128_aie2p.mlir",
+    (64, 64): "gpt2/transform_matmul_aie2p.mlir",
+    (128, 64): "llm_q4nx/transform_matmul_m128_aie2p.mlir",
+    (64, 128): "llm_q4nx/transform_matmul_n128_aie2p.mlir",
 }
 
-#: `triton_matmul`'s default: pick the schedule from the row tile. Distinct
+#: The K depth every checked-in schedule was generated for, and the tile
+#: `mm_object` has to bake into the microkernel to match one.
+L2_K = 64
+
+#: mlir-air's hand-tuned GEMM microkernel. Compiled per core tile and linked
+#: into the compute herd instead of generating its inner loop, which at the
+#: shipped 512x512 block is 1.57x on a wide `gate` -- the generated loop issues
+#: about a third of the MACs per instruction bundle that this does. The two
+#: agree bit for bit.
+#:
+#: Vendored by `utils/fetch_mlir_air_src.py`; absent in a source tree that has
+#: never fetched it, which is why every caller tolerates None.
+_MM_SRC = os.path.join(
+    os.path.dirname(_EXAMPLES),
+    "third_party/mlir-air-src/programming_examples",
+    "matrix_multiplication/bf16_in_fp32_out/mm_aie2p.cc",
+)
+
+#: Peano flags, as mlir-air's own `compile_gemm_mm` passes them. BFP16
+#: emulation stays on for the reason it is on there: it is the validated aie2p
+#: path, and the native bf16 branch of that file lays `C_block` out differently
+#: and gives wrong results at these tiles.
+_MM_FLAGS = [
+    "-O2",
+    "-std=c++20",
+    "--target=aie2p-none-unknown-elf",
+    "-DNDEBUG",
+    "-D__AIE_API_AIE_ADF_HPP__",
+    "-DBIT_WIDTH=8",
+    "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+    "-Wno-parentheses",
+    "-Wno-attributes",
+    "-Wno-macro-redefined",
+    "-Wno-empty-body",
+]
+
+
+def _cache_dir():
+    """Where generated schedules and microkernel objects live.
+
+    Beside the AIR project, so everything a compile produced is in one place,
+    and absolute: aircc resolves a relative `link_with` against its own working
+    directory, which is not this process's.
+    """
+    from triton.backends.amd_triton_npu.config import npu_config
+
+    d = os.path.abspath(os.path.join(npu_config.air_project_path, "microkernels"))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+#: What `mm_aie2p.cc` calls its entry point before `SYM_SUFFIX` is pasted on.
+_MM_SYM = "op_has_no_registered_library_name"
+
+
+def mm_symbol(l1_m, l1_n, l2_k=L2_K):
+    """The entry point `mm_object` builds for this tile.
+
+    One name per tile, because a chain can hold GEMMs at more than one of them
+    and they are stitched into a single module: two tiles both exporting the
+    bare name collide there ("redefinition of symbol named ...") and, if they
+    did not, the link would silently take one object for both. mlir-air's
+    source anticipates this -- `SYM_SUFFIX` exists in `mm_aie2p.cc` for it.
+    """
+    return f"{_MM_SYM}_{l1_m}x{l1_n}x{l2_k}"
+
+
+def mm_object(l1_m, l1_n, l2_k=L2_K):
+    """The microkernel compiled for this core tile, or None if it cannot be.
+
+    `DIM_M`/`DIM_N`/`DIM_K` are compile-time constants in `mm_aie2p.cc`, so the
+    object is only valid for the tile it was built for and each one gets its
+    own file. Built once and cached on disk.
+
+    None rather than an exception on every way this can be unavailable -- no
+    vendored source, no Peano, not npu2, a compiler error -- because the
+    generated inner loop is a correct fallback for all of them, and a prefill
+    that runs slower is a better outcome than one that does not run.
+    """
+    from triton.backends.amd_triton_npu.driver import (
+        detect_npu_version,
+        find_peano_root,
+    )
+
+    # `--target=aie2p` and `mm_aie2p.cc` are both npu2-only; npu1 wants the
+    # other source and the other triple. `npu_config.target` is None until
+    # something resolves it, so ask the resolver rather than the setting.
+    if not os.path.exists(_MM_SRC) or detect_npu_version() != "npu2":
+        return None
+    out = os.path.join(_cache_dir(), f"mmk_{l1_m}x{l1_n}x{l2_k}.o")
+    if os.path.exists(out):
+        return out
+    peano = find_peano_root()
+    aie = os.environ.get("MLIR_AIE_INSTALL_DIR", "")
+    if not peano or not aie:
+        return None
+    cmd = (
+        [os.path.join(peano, "bin", "clang++")]
+        + _MM_FLAGS
+        + [
+            f"-I{os.path.join(aie, 'include')}",
+            f"-DDIM_M={l1_m}",
+            f"-DDIM_N={l1_n}",
+            f"-DDIM_K={l2_k}",
+            f"-DDIM_M_DIV_4={l1_m // 4}",
+            f"-DDIM_N_DIV_4={l1_n // 4}",
+            f"-DDIM_M_DIV_8={l1_m // 8}",
+            f"-DDIM_N_DIV_8={l1_n // 8}",
+            f"-DSYM_SUFFIX={mm_symbol(l1_m, l1_n, l2_k)[len(_MM_SYM):]}",
+            "-c",
+            _MM_SRC,
+            "-o",
+            out,
+        ]
+    )
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        if os.environ.get("AMD_TRITON_NPU_DEBUG"):
+            print(
+                f"[kernels] no microkernel for {l1_m}x{l1_n}x{l2_k}: "
+                f"{r.stderr.strip().splitlines()[-1:]}",
+                flush=True,
+            )
+        return None
+    return out
+
+
+#: `triton_matmul`'s default: pick the schedule from the block shape. Distinct
 #: from `None`, which means "let the driver generate one" and is what
 #: `qwen25_prefill` passes for the shape these schedules reject.
-BY_BLOCK = "<chosen from block_m>"
+BY_BLOCK = "<chosen from the block shape>"
 
 
-def matmul_script(block_m):
-    """The schedule to lower a `block_m`-row GEMM tile with.
+def matmul_script(block_m, block_n):
+    """The schedule to lower a `block_m x block_n` GEMM tile with.
 
-    `l1_m` is the largest tile that still covers all eight columns, floored at
-    `L1` -- see `_MATMUL_SCRIPTS` for why the floor is there and not lower.
+    The core tile is the largest that still spreads the block over the whole
+    array, floored at `L1` -- see `_MATMUL_SCRIPTS` for why the floor is there
+    and not lower.
+
+    Where `mm_object` can build the microkernel for that tile, the schedule is
+    generated to call it instead of generating the inner loop. The checked-in
+    scripts are the same generator's output without it, so the two differ in
+    the three phases that exist to feed aievec and nowhere else.
     """
-    return script(_MATMUL_SCRIPTS[max(L1, block_m // AIE_COLS)])
+    l1 = (max(L1, block_m // AIE_COLS), max(L1, block_n // AIE_ROWS))
+    if l1 not in _MATMUL_SCRIPTS:
+        raise ValueError(
+            f"a {block_m}x{block_n} block wants an l1 tile of {l1[0]}x{l1[1]}, "
+            f"which has no schedule; blocks are bounded by MAX_BLOCK_NUMEL "
+            f"({MAX_BLOCK_NUMEL}) and this one is {block_m * block_n}"
+        )
+    obj = mm_object(*l1)
+    return _library_call_script(*l1, obj) if obj else script(_MATMUL_SCRIPTS[l1])
+
+
+#: The core tile the drain-fused epilogue runs at. The drain holds the f32
+#: accumulator, A, B and a bf16 output tile at once --
+#: `l1_m*l1_n*4 + l1_m*L2_K*2 + L2_K*l1_n*2 + l1_m*l1_n*2` -- so the plain
+#: 64x128 tile's 72 KiB does not fit in 64. Which axis gives way is a choice,
+#: and it is not free either way: measured on the gate's own shape against the
+#: 512x512 block, halving the columns costs 1.33x and halving the rows 1.14x.
+#: mlir-air halves the rows too -- its drain method forces tile_m=32 where its
+#: fused-cast uses 64 -- and this is 44 KiB.
+FUSED_L1 = (32, 128)
+
+#: ...and a narrower K tile than the plain schedules use. A and B are both
+#: ping-ponged, so at 64 they cost 40 KiB of the 64 between them and the tile
+#: lands on exactly 64.00 with the stack still to place. Halving K halves both:
+#: 16 accumulator + 8 drain + 4 A + 16 B = 44.
+#:
+#: This is one knob where mlir-air has two. Its gemma4 spends 32 on the L1 tile
+#: and 64-256 on the L3->L2 one, so it pays the small tile's L1 price without
+#: the transfer count; `generate_matmul_transform` cannot separate them today.
+FUSED_L2_K = 32
+
+#: ...and the block that tile covers the array as. A GEMM whose block is not
+#: exactly this cannot take the fused path.
+FUSED_BLOCK = (FUSED_L1[0] * AIE_COLS, FUSED_L1[1] * AIE_ROWS)
+
+#: Opt-in, because the fused schedule needs two fixes that are not upstream
+#: yet: AIE2P's aievec rejects the n-D native-lane-count vectors a packed
+#: accumulator produces, and `air-shrink-memref-sizes-by-access` mis-sizes an
+#: accumulator whose only users are vector accesses. Against a released
+#: MLIR-AIE/AIR the fused gate GEMM does not compile at all, so this defaults
+#: off and every gate keeps running the unfused chain.
+FUSED_EPILOGUE = os.environ.get("LLM_Q4NX_FUSED_EPILOGUE") == "1"
+
+
+def fused_epilogue_script(block_m, block_n):
+    """The drain-fused matmul schedule for this block, or None if there is none.
+
+    None rather than an exception: a caller falls back to running the
+    activation as its own pass, which is correct, just slower.
+    """
+    if not FUSED_EPILOGUE or (block_m, block_n) != FUSED_BLOCK:
+        return None
+    from triton.backends.amd_triton_npu.matmul_transform import (
+        generate_matmul_transform,
+    )
+
+    l1_m, l1_n = FUSED_L1
+    # The two are independent -- the microkernel is the compute herd's inner
+    # loop and the activation is the epilogue herd's -- and taking the
+    # activation without it would be a bad trade: mlir-air's mm_aie2p.cc is
+    # worth 1.57x on the GEMM, which is more than moving the activation saves.
+    obj = mm_object(l1_m, l1_n, FUSED_L2_K)
+    tag = "mmo" if obj else "vec"
+    path = os.path.join(
+        _cache_dir(),
+        f"transform_mm_gelu_{tag}_{l1_m}x{l1_n}x{FUSED_L2_K}.mlir",
+    )
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(
+                generate_matmul_transform(
+                    l1_m=l1_m,
+                    l1_n=l1_n,
+                    l2_k=FUSED_L2_K,
+                    library_call=obj,
+                    library_call_symbol=mm_symbol(l1_m, l1_n, FUSED_L2_K),
+                    contract_input_type=None if obj else "bf16",
+                    fused_epilogue=True,
+                )
+            )
+    return path
+
+
+def _library_call_script(l1_m, l1_n, obj):
+    """Generate, once, the schedule that links this tile against `obj`.
+
+    Written beside the object rather than into `examples/`: it names an
+    absolute path that only means anything on the machine that built it.
+    """
+    from triton.backends.amd_triton_npu.matmul_transform import (
+        generate_matmul_transform,
+    )
+
+    path = os.path.join(_cache_dir(), f"transform_mm_{l1_m}x{l1_n}x{L2_K}.mlir")
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(
+                generate_matmul_transform(
+                    l1_m=l1_m,
+                    l1_n=l1_n,
+                    l2_k=L2_K,
+                    library_call=obj,
+                    library_call_symbol=mm_symbol(l1_m, l1_n),
+                )
+            )
+    return path
 
 
 def row_tier(n_rows, tiers=ROW_TIERS, cap=None):
@@ -229,10 +486,20 @@ def row_tier(n_rows, tiers=ROW_TIERS, cap=None):
     differ only in how much of the last one is padding.
 
     `cap` bounds the tile where the caller has a ceiling of its own -- Triton's
-    tensor limit, which binds here as `block_m * Kp`.
+    tensor limit, which binds here as `block_m * Kp`, and `MAX_BLOCK_NUMEL`.
     """
     ok = [t for t in tiers if cap is None or t <= cap] or [min(tiers)]
     return min(ok, key=lambda t: (-(-n_rows // t), t))
+
+
+def col_tier(n_cols):
+    """The column tile for an `n_cols`-wide GEMM. `row_tier`'s rule, one axis over.
+
+    The same trade and so the same rule: fewest tiles, because A is re-read
+    once per tile, and the narrower one on a tie, because then the tiers differ
+    only in padding.
+    """
+    return row_tier(n_cols, tiers=COL_TIERS)
 
 
 # Every wrapper below tiles the ROW (sequence) dimension on the host at this
@@ -366,10 +633,12 @@ class ResidentWeight:
         return (self.K, self.N)
 
 
-def resident_weight(w, block_n=BLOCK_N):
+def resident_weight(w, block_n=None):
     """Pad `w` for the NPU now, returning a handle that does not reference it."""
     K, N = w.shape
-    Kp, Np = _pow2(K), math.ceil(N / block_n) * block_n
+    Kp = _pow2(K)
+    block_n = tile_n(N, Kp) if block_n is None else block_n
+    Np = math.ceil(N / block_n) * block_n
     padded = _resident_copy(_pad2d(w.to(torch.bfloat16), Kp, Np).contiguous())
     return ResidentWeight(padded, K, N)
 
@@ -390,6 +659,22 @@ def _padded_weight(w, Kp, Np):
     return b
 
 
+def unaliased_stride(n_elems):
+    """A row stride of at least `n_elems` that is not a power of two.
+
+    DDR interleaves its banks on a power-of-two byte boundary, so a row stride
+    that is itself a power of two puts every row of a tile in the same bank.
+    It is not a small effect: on mlir-air's GEMM with everything else held
+    fixed, a K=2048 contraction costs 48% more per K step than K=1920 or 2112,
+    and `tl.arange` makes every contraction here a power of two.
+
+    The *extent* has to stay one; the stride does not. One L1 tile of slack
+    buys the rows back and costs one column block that nothing reads. Strides
+    that are already off the boundary are returned unchanged.
+    """
+    return n_elems + L1 if n_elems and not n_elems & (n_elems - 1) else n_elems
+
+
 #: Triton's own cap on the element count of one tile (`tl.load` of
 #: `[BLOCK_K, BLOCK_N]`). Not a device limit and not tunable -- the frontend
 #: refuses to build the tensor. It binds here because `BLOCK_K` is the *whole*
@@ -405,16 +690,44 @@ MAX_TILE_NUMEL = 4194304
 MATMUL_SCRIPT = "gpt2/transform_matmul_aie2p.mlir"
 
 
-def triton_matmul(x, w, block_m=None, block_n=BLOCK_N, transform_script=BY_BLOCK):
+def tile_n(N, Kp):
+    """The column tile for an `N`-wide weight contracted over `Kp`.
+
+    One rule for `triton_matmul` and `resident_weight` both, because a weight
+    padded under a different one is a buffer shaped for someone else's grid --
+    which is also why it cannot depend on the prompt: the padding is fixed at
+    load time and the rows are not known until the call.
+
+    So the rows get first claim on `MAX_BLOCK_NUMEL` and the columns take what
+    is left. That is the right way round *here* and only here: this path issues
+    one dispatch per row block, each costing its own fixed overhead whatever it
+    contains, so it always wants the widest row tier. `fused_mlp` chooses the
+    other way round because a chain carries its row blocks in the grid and pays
+    nothing for them.
+
+    The remaining cap is Triton's, not the device's: the tile is
+    `Kp x block_n` elements and the frontend refuses to build a larger tensor.
+    Qwen2.5-7B's `down` (Kp=32768) is the only shape here that it narrows.
+    """
+    if Kp > MAX_TILE_NUMEL:
+        raise ValueError(
+            f"K pads to {Kp}, which exceeds Triton's {MAX_TILE_NUMEL} maximum "
+            f"tensor size on its own; no block_n can fit."
+        )
+    return min(col_tier(N), MAX_TILE_NUMEL // Kp, MAX_BLOCK_NUMEL // ROW_TIERS[0])
+
+
+def triton_matmul(x, w, block_m=None, block_n=None, transform_script=BY_BLOCK):
     """x: [M, K] float32/bf16, w: [K, N] bf16 -> [M, N] float32, on the NPU.
 
-    `block_m` defaults to whatever `row_tier` thinks these rows are worth: a
-    tile is computed in full, so the widest one is the fastest only once the
-    rows fill it. Each distinct value compiles its own kernel, so the tiers are
-    few and fixed rather than tracking the prompt.
+    Both block dimensions default to whatever `row_tier` and `tile_n` think
+    this shape is worth: a tile is computed in full, so the widest one is the
+    fastest only once the rows and columns fill it. Each distinct value
+    compiles its own kernel, so the tiers are few and fixed rather than
+    tracking the prompt.
 
     `transform_script` is the schedule to lower with, as an `examples`-relative
-    path; `BY_BLOCK` picks one to match `block_m`, and None lets the driver
+    path; `BY_BLOCK` picks one to match the block, and None lets the driver
     generate its own. The shared hand-written schedules are not universal, and
     the one shape here that they reject is recorded at the call site that
     passes None (`qwen25_prefill._layer`), because a shape they reject fails
@@ -424,27 +737,17 @@ def triton_matmul(x, w, block_m=None, block_n=BLOCK_N, transform_script=BY_BLOCK
     Kw, N = w.shape
     assert K == Kw, (x.shape, w.shape)
     Kp = _pow2(K)  # tl.arange needs a power of two
-    # Narrow the tile until it fits Triton's cap, rather than asking each model
-    # to know its own largest legal `block_n`. The bound is exact -- the tile is
-    # Kp x block_n elements and the cap is a constant -- so this is derived, not
-    # guessed, and a model that does not need it is not affected: at Kp <= 16384
-    # the default 256 already fits. Qwen2.5-7B's `down` (Kp=32768) is the only
-    # shape here that moves, to 128.
-    if Kp * block_n > MAX_TILE_NUMEL:
-        if Kp > MAX_TILE_NUMEL:
-            raise ValueError(
-                f"K={K} pads to {Kp}, which exceeds Triton's {MAX_TILE_NUMEL} "
-                f"maximum tensor size on its own; no block_n can fit."
-            )
-        block_n = MAX_TILE_NUMEL // Kp
-    # The same cap, on the other tile dimension, and the one that decides how
-    # many of the array's columns this GEMM lights up. `None` means "as wide as
-    # these rows are worth", which is what a caller almost always wants; an
-    # explicit `block_m` is honoured as given.
+    # `None` on either block dimension means "as wide as this shape is worth",
+    # which is what a caller almost always wants; an explicit one is honoured
+    # as given. Both caps are derived rather than declared per model: Triton's
+    # tensor limit on each tile, and `MAX_BLOCK_NUMEL` between them, so the two
+    # cannot both widen into a block that has no schedule.
+    if block_n is None:
+        block_n = tile_n(N, Kp)
     if block_m is None:
-        block_m = row_tier(M, cap=MAX_TILE_NUMEL // Kp)
+        block_m = row_tier(M, cap=min(MAX_TILE_NUMEL // Kp, MAX_BLOCK_NUMEL // block_n))
     if transform_script is BY_BLOCK:
-        transform_script = matmul_script(block_m)
+        transform_script = matmul_script(block_m, block_n)
     Mp = math.ceil(M / block_m) * block_m
     Np = math.ceil(N / block_n) * block_n
     if isinstance(w, ResidentWeight):
@@ -463,7 +766,10 @@ def triton_matmul(x, w, block_m=None, block_n=BLOCK_N, transform_script=BY_BLOCK
     # Pad input and output ONCE, then hand each dispatch a contiguous row slice
     # of them. Allocating per tile and copying the result back instead cost
     # more than the dispatch: an [128, 16384] f32 copy per GEMM, 64 GEMMs deep.
-    a = shared_empty((Mp, Kp), torch.bfloat16)
+    # `Kp` is the extent the kernel contracts; `a_stride` is how far apart the
+    # rows sit, and they are deliberately not the same number.
+    a_stride = unaliased_stride(Kp)
+    a = shared_empty((Mp, a_stride), torch.bfloat16)
     a.zero_()
     a[:M, :K] = x.to(torch.bfloat16)
     c = shared_empty((Mp, Np), torch.float32)
@@ -476,7 +782,7 @@ def triton_matmul(x, w, block_m=None, block_n=BLOCK_N, transform_script=BY_BLOCK
             a[m0 : m0 + block_m],
             b,
             c[m0 : m0 + block_m],
-            Kp,
+            a_stride,
             Np,
             Np,
             transform_script=(

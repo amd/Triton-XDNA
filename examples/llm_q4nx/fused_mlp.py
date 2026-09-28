@@ -96,31 +96,53 @@ import triton.language as tl
 # projection, so a second opinion here would be a second opinion about the
 # hardware.
 from kernels import (
-    BLOCK_N,
+    FUSED_BLOCK,
+    MAX_BLOCK_NUMEL,
     MAX_TILE_NUMEL,
     WIDE_M,
     _GELU_2C,
     _GELU_K,
     _npu_driver,
+    col_tier,
+    fused_epilogue_script,
     matmul_script,
     row_tier,
     script,
+    unaliased_stride,
 )
 
-#: Elementwise tile for the merge, as every other flat kernel here uses.
-MERGE_BLOCK = 1024
+#: The most elements one elementwise program may take. The merge is DMA-bound
+#: and a small tile spends it on transfer setup: at the chain's own shape --
+#: 1024 x 12288, 120 MiB moved -- 1024 elements runs 25.07 ms and 16384 runs
+#: 14.53, monotonically, and 32768 does not build. A program then moves 64 KiB
+#: of each f32 operand instead of 4.
+MAX_ELEM_BLOCK = 16384
+
+
+def elem_block(n_elems):
+    """The elementwise tile to cover `n_elems` with.
+
+    The grid is `n_elems // block`, so a block that does not divide the range
+    truncates it and drops the tail with no error -- the same trap `D_pad`
+    carries against `BLOCK_N`. Taking the largest power of two that divides
+    makes it impossible instead of merely unlikely, and `tl.arange` wants a
+    power of two anyway.
+    """
+    return min(MAX_ELEM_BLOCK, n_elems & -n_elems)
+
 
 #: Qwen's, unmodified. See the module docstring.
 MERGE_SCRIPT = "qwen2_5/transform_swiglu_f32in_aie2p.mlir"
+#: ...and the one for when the gate GEMM already applied the activation, so the
+#: merge is a bare multiply over a bf16 gate and an f32 up. Same script but for
+#: the promote sequence, which pads each operand with its own element type.
+MERGE_SCRIPT_BF16_GATE = "llm_q4nx/transform_mul_bf16f32in_aie2p.mlir"
 #: The f32 variant: these operands are produced on-device by the GEMMs before
 #: it and never touch the host, so they are still f32 rather than bf16.
 #: It splits the range over four of npu2's eight columns. Widening it to eight
 #: was tried and is slower at this size -- the extra L2 split costs more than
 #: the idle columns do.
 ADD_SCRIPT = "gpt2/transform_add_f32_aie2p.mlir"
-
-#: Elementwise tile for the fold, as `MERGE_BLOCK` is for the merge.
-ADD_BLOCK = 1024
 
 #: How many pieces `down`'s contraction may be cut into before padding the FFN
 #: width is the better deal. Each piece is a GEMM op and all but the first also
@@ -164,14 +186,16 @@ def _plan_down(inter):
     return _pow2(inter), min(_pow2(inter), cap)
 
 
-def _row_tile(rows, k):
+def _row_tile(rows, k, block_n):
     """Rows one `_mm_kernel` program may take when it contracts `k` in one tile.
 
-    The chain's own `rows` where Triton's tensor cap allows it, halved until it
-    does. The op then covers all of `rows` in `rows // _row_tile(rows, k)` grid
-    steps, so every op still spans the same rows -- only its herd gets smaller.
+    The chain's own `rows` where Triton's tensor cap and the array allow it,
+    halved until they do. The op then covers all of `rows` in
+    `rows // _row_tile(...)` grid steps, so every op still spans the same rows
+    -- only its herd gets smaller.
     """
-    return min(rows, 1 << (MAX_TILE_NUMEL // k).bit_length() - 1)
+    cap = min(MAX_TILE_NUMEL // k, MAX_BLOCK_NUMEL // block_n)
+    return min(rows, 1 << cap.bit_length() - 1)
 
 
 def _as_torch_bf16(a):
@@ -228,6 +252,73 @@ def _mm_kernel(
     a = tl.load(A + aoff + offs_m[:, None] * sam + offs_k[None, :] * sak)
     b = tl.load(B + boff + offs_k[:, None] * sbk + offs_n[None, :] * sbn)
     tl.store(C + offs_m[:, None] * scm + offs_n[None, :] * scn, tl.dot(a, b))
+
+
+@triton.jit
+def _mm_gelu_kernel(
+    A,
+    B,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    sam: tl.constexpr,
+    sak: tl.constexpr,
+    sbk: tl.constexpr,
+    sbn: tl.constexpr,
+    scm: tl.constexpr,
+    scn: tl.constexpr,
+    C2: tl.constexpr,
+    KC: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """`_mm_kernel` with `gelu_tanh` applied, writing bf16.
+
+    The activation has to be in the same module as the matmul for a transform
+    to fuse it, so it is written here rather than left to the merge. Lowered
+    with `kernels.fused_epilogue_script`, it runs on the 32 cores the schedule
+    already builds to copy the accumulator out, and `Cg` never exists in DDR as
+    f32 -- which is both the traffic saved and, since the drain is the only
+    consumer, why the output is bf16.
+
+    Same activation as `_geglu_f32in`, minus the `* up` that has no operand
+    here; see its docstring for why `C2` is twice sqrt(2/pi).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a = tl.load(A + offs_m[:, None] * sam + offs_k[None, :] * sak)
+    b = tl.load(B + offs_k[:, None] * sbk + offs_n[None, :] * sbn)
+    g = tl.dot(a, b)
+    z = C2 * (g + KC * g * g * g)
+    tl.store(
+        C + offs_m[:, None] * scm + offs_n[None, :] * scn,
+        (g * tl.sigmoid(z)).to(tl.bfloat16),
+    )
+
+
+@triton.jit
+def _mul_bf16_f32in(
+    G,
+    U,
+    Y,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """`Y = G * U` where the gate arrives bf16 and already activated.
+
+    What is left of the merge once `_mm_gelu_kernel` has done the activation in
+    the gate GEMM's drain. Reading `G` as bf16 rather than f32 is half of this
+    pass's DDR traffic on that side.
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    g = tl.load(G + offsets[:]).to(tl.float32)
+    tl.store(Y + offsets[:], (g * tl.load(U + offsets[:])).to(tl.bfloat16))
 
 
 @triton.jit
@@ -300,12 +391,20 @@ class FusedMLP:
         self.D = d_model
         self.H = inter
         self.K_pad = _pow2(d_model)
+        # The activation's row stride, held off the power of two `K_pad` always
+        # is -- see `kernels.unaliased_stride`. The contraction still spans
+        # `K_pad`; only the distance between rows changes.
+        self.K_stride = unaliased_stride(self.K_pad)
         self.HID, self.down_chunk = _plan_down(inter)
-        # `down`'s N. A multiple of BLOCK_N or the grid truncates and silently
-        # drops output columns; Gemma4's D=1536 already is, but derive it rather
-        # than rely on that.
-        self.D_pad = math.ceil(d_model / BLOCK_N) * BLOCK_N
+        # The column tile each GEMM runs at, and `down`'s N. A multiple of its
+        # own tile or the grid truncates and silently drops output columns;
+        # Gemma4's D=1536 already is, but derive it rather than rely on that.
+        self.gu_n, self.dn_n = col_tier(self.HID), col_tier(d_model)
+        self.D_pad = math.ceil(d_model / self.dn_n) * self.dn_n
         self._chains = {}  # rows -> NPUChain
+        #: rows -> whether that chain's gate GEMM carries its own
+        #: activation, which decides `Cg`'s element type.
+        self._gate_fused = {}
         self._weights = {}  # layer_idx -> (Bg, Bu, Bd)
 
     # ---- weights ----
@@ -440,18 +539,34 @@ class FusedMLP:
         chunk = self.down_chunk
         n_down = HID // chunk
         partials, sums = self._down_slots()
-        gu_m, dn_m = _row_tile(M, K_pad), _row_tile(M, chunk)
-        # Per op, not per chain: `_row_tile` can put `down` on a narrower tile
-        # than `gate`/`up`, and a schedule only places on the tile it was
-        # generated for.
-        gu_script, dn_script = matmul_script(gu_m), matmul_script(dn_m)
+        gu_n, dn_n = self.gu_n, self.dn_n
+        gu_m, dn_m = _row_tile(M, K_pad, gu_n), _row_tile(M, chunk, dn_n)
+        # Per op, not per chain: the two can land on different blocks -- `down`
+        # contracts a wider K and writes a narrower N -- and a schedule only
+        # places on the block it was generated for.
+        gu_script = matmul_script(gu_m, gu_n)
+        dn_script = matmul_script(dn_m, dn_n)
+        # The gate alone may take the drain-fused schedule, which is generated
+        # for one block and one only. It runs at a narrower column tile than
+        # `up` does, so the two stop being the same GEMM; that is the price of
+        # the block the drain fits in.
+        gate_m, gate_n = FUSED_BLOCK
+        gate_script = (
+            fused_epilogue_script(gate_m, gate_n)
+            if M % gate_m == 0 and HID % gate_n == 0
+            else None
+        )
 
         # Shape-representative placeholders; only shapes and dtypes drive the
         # warmup lowering, never the values.
-        tA = torch.zeros((M, K_pad), dtype=torch.bfloat16)
+        tA = torch.zeros((M, self.K_stride), dtype=torch.bfloat16)
         tBg = torch.zeros((K_pad, HID), dtype=torch.bfloat16)
         tC = torch.zeros((M, HID), dtype=torch.float32)
         tCf = torch.zeros(M * HID, dtype=torch.float32)
+        # The gate's output, where the drain-fused schedule writes it: bf16,
+        # because the drain is its only consumer.
+        tCg = torch.zeros((M, HID), dtype=torch.bfloat16)
+        tCgf = torch.zeros(M * HID, dtype=torch.bfloat16)
         tH = torch.zeros(M * HID, dtype=torch.bfloat16)
         tHm = torch.zeros((M, HID), dtype=torch.bfloat16)
         tBd = torch.zeros((HID, D_pad), dtype=torch.bfloat16)
@@ -459,29 +574,69 @@ class FusedMLP:
         tOutf = torch.zeros(M * D_pad, dtype=torch.float32)
 
         chain = NPUChain(f"q4nx_mlp_{self.H}_m{M}")
-        for src, dst in ((self.BG_I, self.CG_I), (self.BU_I, self.CU_I)):
+        if gate_script is not None:
+            # gate, with its activation in the GEMM's own drain herd
+            chain.add(
+                _mm_gelu_kernel,
+                grid=(M // gate_m, HID // gate_n),
+                arg_map={0: self.A_I, 1: self.BG_I, 2: self.CG_I},
+                args=(
+                    tA,
+                    tBg,
+                    tCg,
+                    M,
+                    HID,
+                    K_pad,
+                    self.K_stride,
+                    1,
+                    HID,
+                    1,
+                    HID,
+                    1,
+                    _GELU_2C,
+                    _GELU_K,
+                ),
+                constexprs={
+                    "BLOCK_SIZE_M": gate_m,
+                    "BLOCK_SIZE_N": gate_n,
+                    "BLOCK_SIZE_K": K_pad,
+                },
+                transform_script=gate_script,
+            )
+            gemms = ((self.BU_I, self.CU_I),)
+        else:
+            gemms = ((self.BG_I, self.CG_I), (self.BU_I, self.CU_I))
+        for src, dst in gemms:
             # gate, then up -- the same GEMM against the same activation, so
             # they differ only in which weight they read and where they land.
             chain.add(
                 _mm_kernel,
-                grid=(M // gu_m, HID // BLOCK_N),
+                grid=(M // gu_m, HID // gu_n),
                 arg_map={0: self.A_I, 1: src, 2: dst},
-                args=(tA, tBg, tC, M, HID, K_pad, K_pad, 1, HID, 1, HID, 1),
+                args=(tA, tBg, tC, M, HID, K_pad, self.K_stride, 1, HID, 1, HID, 1),
                 constexprs={
                     "BLOCK_SIZE_M": gu_m,
-                    "BLOCK_SIZE_N": BLOCK_N,
+                    "BLOCK_SIZE_N": gu_n,
                     "BLOCK_SIZE_K": K_pad,
                 },
                 transform_script=gu_script,
             )
-        # merge: H = gelu_tanh(Cg) * Cu
+        # merge: H = gelu_tanh(Cg) * Cu, or just the multiply where the gate
+        # GEMM's drain already did the activation.
+        merge_block = elem_block(M * HID)
         chain.add(
-            _geglu_f32in,
-            grid=((M * HID) // MERGE_BLOCK,),
+            _mul_bf16_f32in if gate_script is not None else _geglu_f32in,
+            grid=((M * HID) // merge_block,),
             arg_map={0: self.CG_I, 1: self.CU_I, 2: self.H_I},
-            args=(tCf, tCf, tH, _GELU_2C, _GELU_K, M * HID),
-            constexprs={"BLOCK_SIZE": MERGE_BLOCK},
-            transform_script=script(MERGE_SCRIPT),
+            args=(
+                (tCgf, tCf, tH, M * HID)
+                if gate_script is not None
+                else (tCf, tCf, tH, _GELU_2C, _GELU_K, M * HID)
+            ),
+            constexprs={"BLOCK_SIZE": merge_block},
+            transform_script=script(
+                MERGE_SCRIPT_BF16_GATE if gate_script is not None else MERGE_SCRIPT
+            ),
         )
         # down, in `n_down` pieces of the contraction. Each takes its own slice
         # of H's columns and of Bd's rows through the kernel's constant
@@ -489,7 +644,7 @@ class FusedMLP:
         for i in range(n_down):
             chain.add(
                 _mm_kernel,
-                grid=(M // dn_m, D_pad // BLOCK_N),
+                grid=(M // dn_m, D_pad // dn_n),
                 arg_map={
                     0: self.H_I,
                     1: self.BD_I,
@@ -498,7 +653,7 @@ class FusedMLP:
                 args=(tHm, tBd, tOut, M, D_pad, chunk, HID, 1, D_pad, 1, D_pad, 1),
                 constexprs={
                     "BLOCK_SIZE_M": dn_m,
-                    "BLOCK_SIZE_N": BLOCK_N,
+                    "BLOCK_SIZE_N": dn_n,
                     "BLOCK_SIZE_K": chunk,
                     "aoff": i * chunk,
                     "boff": i * chunk * D_pad,
@@ -507,18 +662,20 @@ class FusedMLP:
             )
         # and fold the pieces back together.
         acc = partials[0] if partials else None
+        add_block = elem_block(M * D_pad)
         for i in range(1, n_down):
             dst = self.OUT_I if i == n_down - 1 else sums[i - 1]
             chain.add(
                 _add_f32,
-                grid=((M * D_pad) // ADD_BLOCK,),
+                grid=((M * D_pad) // add_block,),
                 arg_map={0: acc, 1: partials[i], 2: dst},
                 args=(tOutf, tOutf, tOutf, M * D_pad),
-                constexprs={"BLOCK_SIZE": ADD_BLOCK},
+                constexprs={"BLOCK_SIZE": add_block},
                 transform_script=script(ADD_SCRIPT),
             )
             acc = dst
         self._chains[M] = chain
+        self._gate_fused[M] = gate_script is not None
         return chain
 
     # ---- dispatch ----
@@ -555,7 +712,7 @@ class FusedMLP:
                 # Zeroed, not empty: the gate/up GEMMs contract over all K_pad
                 # columns, so the padding past D has to be 0 rather than
                 # whatever the last tile left there.
-                A = np.zeros((M, K_pad), dtype=bfloat16)
+                A = np.zeros((M, self.K_stride), dtype=bfloat16)
                 A[:rows, :D] = h2d[m0 : m0 + rows].astype(bfloat16)
                 # Chain intermediates and the output are fully written by their
                 # producing kernel, so np.empty avoids a per-call memset.
@@ -564,7 +721,11 @@ class FusedMLP:
                 args[self.BG_I] = _host(Bg)
                 args[self.BU_I] = _host(Bu)
                 args[self.BD_I] = _host(Bd)
-                args[self.CG_I] = np.empty((M, HID), dtype=np.float32)
+                # The gate's output is bf16 where its drain herd applied the
+                # activation, and f32 where the merge still has to.
+                args[self.CG_I] = np.empty(
+                    (M, HID), dtype=bfloat16 if self._gate_fused[M] else np.float32
+                )
                 args[self.CU_I] = np.empty((M, HID), dtype=np.float32)
                 args[self.H_I] = np.empty(M * HID, dtype=bfloat16)
                 for i in (self.OUT_I, *partials, *sums):
