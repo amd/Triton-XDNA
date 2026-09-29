@@ -227,6 +227,13 @@ class LlamaPrefill:
         """Scatter K/V into the sink's region-major layout, ngrp K then ngrp V."""
         s = self._kv_sink
         rw, ng, rs, lreg = s["region_w"], s["ngrp"], s["region_stride"], s["lreg"]
+        # A region holds rs/rw rows; a longer prompt would scatter past it into
+        # the next region (which the later per-step budget cannot catch).
+        if keep * rw > rs:
+            raise ValueError(
+                f"prompt of {keep} exceeds the decode window {rs // rw}; "
+                "rebuild the decode at a larger ATTN_MAXL or shorten the prompt"
+            )
         # uint16 view: a bit copy, since torch and ml_dtypes bf16 would else convert.
         buf = s["buf"].view(np.uint16)
         kb = k[:keep].to(torch.bfloat16).view(torch.uint16).cpu().numpy()

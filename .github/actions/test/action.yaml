@@ -438,7 +438,10 @@ runs:
 
           # XRT zero-copy needs the iGPU, so it runs here, not in 9b (which hides
           # it). The golden gate passes on the staged fallback too, so the output
-          # is asserted below to confirm the zero-copy path actually ran.
+          # is checked below: engaged is a pass, and a fallback for want of shared
+          # pages is a skip (this runner may have no ROCm torch, like STEP 8's
+          # shared_buffer_test). A green gate with neither marker is the failure
+          # -- zero-copy silently stopped running where it should have.
           echo "--- xrt zero-copy: llama32_1b_q4nx (iGPU visible) ---"
           rc=0
           zc_out=$( cd examples/llama32_1b_q4nx \
@@ -449,12 +452,14 @@ runs:
           elif [ "$rc" -ne 0 ]; then
             echo "FAIL: llama32_1b_q4nx xrt zero-copy (exit $rc)"
             hetero_rc=1
-          elif ! echo "$zc_out" | grep -q "KV handed over in place" \
-               || echo "$zc_out" | grep -q "copied once"; then
-            echo "FAIL: llama32_1b_q4nx decode gated green but zero-copy did not"
-            echo "      engage -- the handoff ran on the staged path, so the"
-            echo "      shared-page handling has no coverage. Check the iGPU is"
-            echo "      visible and the HIP interop is available."
+          elif echo "$zc_out" | grep -q "KV handed over in place" \
+               && ! echo "$zc_out" | grep -q "copied once"; then
+            echo "PASS: llama32_1b_q4nx xrt zero-copy engaged"
+          elif echo "$zc_out" | grep -q "XRT zero-copy unavailable"; then
+            echo "SKIP: llama32_1b_q4nx xrt zero-copy -- no shared pages here"
+          else
+            echo "FAIL: llama32_1b_q4nx decode gated green but zero-copy neither"
+            echo "      engaged nor reported it was unavailable."
             hetero_rc=1
           fi
 

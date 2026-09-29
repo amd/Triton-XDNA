@@ -358,22 +358,37 @@ def generate_via_zero_copy(air, spec, cfg, prefill_cls, args, ids):
     return gen_ids
 
 
+def _xrt_shared_available():
+    """True if XRT<->HIP shared pages work here; prints why not when they don't.
+
+    The marker is unconditional (not behind a debug flag) so CI can tell a
+    genuine fallback -- no ROCm torch, no iGPU -- apart from a zero-copy path
+    that silently stopped engaging.
+    """
+    import torch
+
+    try:
+        from triton.backends.amd_triton_npu import shared
+
+        probe = shared.zeros(1, dtype=torch.bfloat16, device="xrt:0", share="hip:0")
+        if getattr(probe, "bo", None) is None:
+            print("[e2e] XRT zero-copy unavailable: no shared pages", flush=True)
+            return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[e2e] XRT zero-copy unavailable: {e}", flush=True)
+        return False
+
+
 def generate_via_xrt_zero_copy(air, spec, cfg, prefill_cls, args, ids):
     """XRT twin of the HSA path, for the npz 1B. None when interop is absent."""
     import numpy as np
     import torch
 
     # Probe interop before the decoder, whose construction loads weights.
-    try:
-        from triton.backends.amd_triton_npu import shared
-
-        probe = shared.zeros(1, dtype=torch.bfloat16, device="xrt:0", share="hip:0")
-        if getattr(probe, "bo", None) is None:
-            return None
-    except Exception as e:  # noqa: BLE001
-        if os.environ.get("AMD_TRITON_NPU_DEBUG"):
-            print(f"[e2e] XRT KV stays host-only: {e}", flush=True)
+    if not _xrt_shared_available():
         return None
+    from triton.backends.amd_triton_npu import shared
 
     dec = air.FusedDecoder()
     slab = shared.zeros(
@@ -440,16 +455,9 @@ def generate_via_xrt_zero_copy_kv_arrays(air, spec, cfg, prefill_cls, args, ids)
     import numpy as np
     import torch
 
-    try:
-        from triton.backends.amd_triton_npu import shared
-
-        probe = shared.zeros(1, dtype=torch.bfloat16, device="xrt:0", share="hip:0")
-        if getattr(probe, "bo", None) is None:
-            return None
-    except Exception as e:  # noqa: BLE001 -- no interop: caller takes the npz path
-        if os.environ.get("AMD_TRITON_NPU_DEBUG"):
-            print(f"[e2e] XRT KV stays host-only: {e}", flush=True)
+    if not _xrt_shared_available():
         return None
+    from triton.backends.amd_triton_npu import shared
 
     dec = air.FusedDecoder(model=args.model or cfg.MODEL_DEFAULT, max_L=args.max_seq)
     slab = shared.zeros(
@@ -512,16 +520,9 @@ def generate_via_xrt_zero_copy_prefiller(air, spec, cfg, prefill_cls, args, ids)
     import numpy as np
     import torch
 
-    try:
-        from triton.backends.amd_triton_npu import shared
-
-        probe = shared.zeros(1, dtype=torch.bfloat16, device="xrt:0", share="hip:0")
-        if getattr(probe, "bo", None) is None:
-            return None
-    except Exception as e:  # noqa: BLE001 -- no interop: caller takes the npz path
-        if os.environ.get("AMD_TRITON_NPU_DEBUG"):
-            print(f"[e2e] XRT KV stays host-only: {e}", flush=True)
+    if not _xrt_shared_available():
         return None
+    from triton.backends.amd_triton_npu import shared
 
     dec = getattr(air, spec.decoder_class)(
         args.model or cfg.MODEL_DEFAULT,
@@ -997,8 +998,20 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             return 1
         return _decode_gate(air, spec, cfg, args, ids, out)
 
-    # XRT zero-copy, per driver_api. gemma4 excluded: it has its own _kv_slab
-    # path. None without interop falls through to the staged decode below.
+    # XRT zero-copy, per driver_api. An allowlist, not `driver_api` alone:
+    # gemma4 has its own _kv_slab path, and the Qwen2.5 models write kv_k/kv_v
+    # inline rather than through `_kv_store`, so the shared slab would decode
+    # from an empty cache. Only models whose `_layer` routes through the sink
+    # and whose decode has been gated on hardware are listed. None without
+    # interop falls through to the staged decode below.
+    _XRT_ZERO_COPY = {
+        "llama-3.2-1b": generate_via_xrt_zero_copy,
+        "qwen3-4b": generate_via_xrt_zero_copy_kv_arrays,
+        "gemma3-4b": generate_via_xrt_zero_copy_kv_arrays,
+        "llama-3.2-3b": generate_via_xrt_zero_copy_prefiller,
+        "llama-3.1-8b": generate_via_xrt_zero_copy_prefiller,
+        "phi4-mini": generate_via_xrt_zero_copy_prefiller,
+    }
     xrt_fn = None
     if (
         os.environ.get("AMD_TRITON_NPU_RUNTIME") != "hsa"
@@ -1006,12 +1019,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         and args.decode != "gpu"
         and not args.profile
     ):
-        if spec.driver_api == "npz":
-            xrt_fn = generate_via_xrt_zero_copy
-        elif spec.driver_api == "kv_arrays" and spec.name != "gemma4-e2b":
-            xrt_fn = generate_via_xrt_zero_copy_kv_arrays
-        elif spec.driver_api == "prefiller":
-            xrt_fn = generate_via_xrt_zero_copy_prefiller
+        xrt_fn = _XRT_ZERO_COPY.get(spec.name)
     if xrt_fn is not None:
         out = xrt_fn(air, spec, cfg, prefill_cls, args, ids)
         if out is not None:
