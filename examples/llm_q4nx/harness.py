@@ -314,6 +314,10 @@ def generate_via_zero_copy(air, spec, cfg, prefill_cls, args, ids):
             airsrc.fused_decode_dir(spec.engine),
             model_type=spec.model_type,
         )
+    elif spec.driver_api == "kv_arrays":
+        # The model the prefill uses; a custom --model would otherwise decode
+        # against different weights. `max_L` is left to the build's own stamp.
+        dec = decoder_cls(model=args.model or cfg.MODEL_DEFAULT)
     else:
         dec = decoder_cls()
     if not hasattr(dec, "kv_sink"):
@@ -1018,6 +1022,9 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         and air is not None
         and args.decode != "gpu"
         and not args.profile
+        # These loops sample with argmax; a non-greedy run stays on the staged
+        # driver, which honours its own sampler.
+        and args.greedy
     ):
         xrt_fn = _XRT_ZERO_COPY.get(spec.name)
     if xrt_fn is not None:
