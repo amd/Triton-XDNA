@@ -170,7 +170,7 @@ def _plan_down(inter):
 
 
 def _exact_k_ttshared(chain, rows, k, n, block_m, block_n, a_stride, script,
-                      k_capture=None):
+                      k_capture=None, kernel=None, tail=(), c_dtype=None):
     """`_mm_kernel`'s ttsharedir, restated to contract exactly `k`.
 
     Two frontend rules stop a kernel from asking for the reduction a model
@@ -190,11 +190,11 @@ def _exact_k_ttshared(chain, rows, k, n, block_m, block_n, a_stride, script,
     kp = k_capture if k_capture is not None else _pow2(k)
     tA = torch.zeros((rows, a_stride), dtype=torch.bfloat16)
     tB = torch.zeros((kp, n), dtype=torch.bfloat16)
-    tC = torch.zeros((rows, n), dtype=torch.float32)
+    tC = torch.zeros((rows, n), dtype=c_dtype or torch.float32)
     grid = (rows // block_m, n // block_n)
     src = chain._capture_ttshared(
-        _mm_kernel, grid,
-        (tA, tB, tC, rows, n, kp, a_stride, 1, n, 1, n, 1),
+        kernel or _mm_kernel, grid,
+        (tA, tB, tC, rows, n, kp, a_stride, 1, n, 1, n, 1) + tuple(tail),
         {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": kp},
     )
     if isinstance(src, bytes):
@@ -600,14 +600,15 @@ class FusedMLP:
         # `up` does, so the two stop being the same GEMM; that is the price of
         # the block the drain fits in.
         gate_m, gate_n = FUSED_BLOCK
-        # ...and only where the frontend can still express the contraction:
-        # the drain-fused gate is a `@triton.jit` kernel, so its K has to be a
-        # power of two. At an unpadded D it is not, and the plain op -- which
-        # arrives as MLIR -- is both correct and, at 1.34x from the narrower
-        # contraction, faster than the drain was worth (1.02x).
+        # Off by default, and measured worse: with an exact K the plain gate
+        # is cheap enough that the 256x512 block the drain's L1 budget forces
+        # costs more than the f32 `Cg` write it saves. FFN 1544 -> 1587 ms at
+        # P=2040. The capability is kept because it no longer carries a stale
+        # limitation -- the fused gate can state an unpadded K like every other
+        # op -- not because it is worth turning on.
         gate_script = (
             fused_epilogue_script(gate_m, gate_n)
-            if M % gate_m == 0 and HID % gate_n == 0 and K_exact == self.K_pad
+            if M % gate_m == 0 and HID % gate_n == 0
             else None
         )
 
@@ -630,31 +631,16 @@ class FusedMLP:
         chain = NPUChain(f"q4nx_mlp_{self.H}_m{M}")
         if gate_script is not None:
             # gate, with its activation in the GEMM's own drain herd
+            gate_src = _exact_k_ttshared(
+                chain, M, K_exact, HID, gate_m, gate_n, self.K_stride,
+                gate_script, kernel=_mm_gelu_kernel,
+                tail=(_GELU_2C, _GELU_K), c_dtype=torch.bfloat16,
+            )
             chain.add(
-                _mm_gelu_kernel,
+                gate_src,
                 grid=(M // gate_m, HID // gate_n),
                 arg_map={0: self.A_I, 1: self.BG_I, 2: self.CG_I},
-                args=(
-                    tA,
-                    tBg,
-                    tCg,
-                    M,
-                    HID,
-                    K_pad,
-                    self.K_stride,
-                    1,
-                    HID,
-                    1,
-                    HID,
-                    1,
-                    _GELU_2C,
-                    _GELU_K,
-                ),
-                constexprs={
-                    "BLOCK_SIZE_M": gate_m,
-                    "BLOCK_SIZE_N": gate_n,
-                    "BLOCK_SIZE_K": K_pad,
-                },
+                args=(),
                 transform_script=gate_script,
             )
             gemms = ((self.BU_I, self.CU_I),)
