@@ -130,6 +130,10 @@ ADD_SCRIPT = "gpt2/transform_add_f32_aie2p.mlir"
 #: width is the better deal. Each piece is a GEMM op and all but the first also
 #: an add, so the chain grows by two ops per piece -- cheap next to the
 #: arithmetic a padded width would add, but not without limit.
+class SharedBufferUnavailable(RuntimeError):
+    """Raised inside `_io_pages` to take its fallback path."""
+
+
 MAX_DOWN_SPLIT = 4
 
 #: The K a `down` capture is taken at. Any legal one will do -- the extent is
@@ -447,6 +451,10 @@ class FusedMLP:
         self.gu_n, self.dn_n = col_tier(self.HID), col_tier(d_model)
         self.D_pad = math.ceil(d_model / self.dn_n) * self.dn_n
         self._chains = {}  # rows -> NPUChain
+        #: rows -> (A, OUT) shared pages. The chain dispatches ON these rather
+        #: than staging a copy of them, so they are allocated once per row tier
+        #: and reused, not built per call.
+        self._io = {}
         #: rows -> whether that chain's gate GEMM carries its own
         #: activation, which decides `Cg`'s element type.
         self._gate_fused = {}
@@ -481,6 +489,42 @@ class FusedMLP:
         _host(Bu)[:D, :H] = gu[:, H:].astype(bfloat16)
         _host(Bd)[:H, :D] = dn.astype(bfloat16)
         return Bg, Bu, Bd
+
+    def _io_pages(self, M):
+        """`(A, OUT)` for this row tier as device pages, or `None`.
+
+        `bound_buffers` lets the chain dispatch on a buffer the caller already
+        owns, skipping the host->device staging copy entirely -- the mechanism
+        the weights have used since they moved onto chains. The activation and
+        the result are the two that were still copied on EVERY dispatch: 3 MiB
+        in and 6 MiB out at M=1024, seventy times over a P=2040 prefill.
+
+        mlir-air keeps the whole layer's activations on the device this way
+        (`_A_NORMED2`, `_A_GATE`, `_A_UP`, `_A_ACT`). This is the same move for
+        the one hand-off we own both ends of.
+
+        `None` where the interop is unavailable, and `run` then stages as it
+        did before -- slower, identical results.
+        """
+        pages = self._io.get(M)
+        if pages is not None:
+            return pages
+        try:
+            from triton.backends.amd_triton_npu import shared
+
+            a = shared.zeros(
+                M, self.K_stride, dtype=torch.bfloat16, device="xrt:0"
+            )
+            out = shared.zeros(M, self.D_pad, dtype=torch.float32, device="xrt:0")
+            if a.bo is None or out.bo is None:
+                raise SharedBufferUnavailable
+            pages = (a, out)
+        except Exception as e:  # noqa: BLE001 -- see the docstring
+            if os.environ.get("AMD_TRITON_NPU_DEBUG"):
+                print(f"[fused_mlp] activations stay staged: {e}", flush=True)
+            pages = (None, None)
+        self._io[M] = pages
+        return pages
 
     def _alloc(self, rows, cols):
         """A zeroed `[rows, cols]` bf16 weight, shared with the iGPU if possible.
@@ -718,10 +762,11 @@ class FusedMLP:
         bound = {i: _bo(w) for i, w in static.items() if _bo(w) is not None} or None
         partials, sums = self._down_slots()
 
-        h2d = h.reshape(-1, D).to(torch.float32).cpu().numpy()
+        h2d = h.reshape(-1, D)
         N = h2d.shape[0]
         out = np.empty((N, D), dtype=np.float32)
         M = row_tier(N)
+        A_pg, OUT_pg = self._io_pages(M)
 
         # Scoped per call, not held: `kernels.launch` scopes the driver the same
         # way, and this runs inside a prefill that also issues torch ops. The
@@ -731,11 +776,25 @@ class FusedMLP:
             chain = self._get_chain(M)
             for m0 in range(0, N, M):
                 rows = min(M, N - m0)
-                # Zeroed, not empty: the gate/up GEMMs contract over all K_pad
-                # columns, so the padding past D has to be 0 rather than
-                # whatever the last tile left there.
-                A = np.zeros((M, self.K_stride), dtype=bfloat16)
-                A[:rows, :D] = h2d[m0 : m0 + rows].astype(bfloat16)
+                if A_pg is not None:
+                    # Written straight into the page the chain will dispatch
+                    # on -- one host store, where staging a private array cost
+                    # that store AND a copy of the whole thing to the device.
+                    # The columns past D are already zero from the allocation
+                    # and nothing ever writes them, so the contraction's
+                    # padding stays harmless without a per-call memset.
+                    A_pg.torch()[:rows, :D] = h2d[m0 : m0 + rows].to(
+                        torch.bfloat16
+                    )
+                    A = A_pg.numpy()
+                else:
+                    # Zeroed, not empty: the gate/up GEMMs contract over all
+                    # K_stride columns, so the padding past D has to be 0
+                    # rather than whatever the last tile left there.
+                    A = np.zeros((M, self.K_stride), dtype=bfloat16)
+                    A[:rows, :D] = (
+                        h2d[m0 : m0 + rows].to(torch.float32).cpu().numpy()
+                    ).astype(bfloat16)
                 # Chain intermediates and the output are fully written by their
                 # producing kernel, so np.empty avoids a per-call memset.
                 args = [None] * (self.OUT_I + 1 + len(partials) + len(sums))
@@ -752,10 +811,17 @@ class FusedMLP:
                 args[self.H_I] = np.empty(M * HID, dtype=bfloat16)
                 for i in (self.OUT_I, *partials, *sums):
                     args[i] = np.empty((M, D_pad), dtype=np.float32)
+                if OUT_pg is not None:
+                    args[self.OUT_I] = OUT_pg.numpy()
                 # The weights are bound where they are shared, so the chain
                 # dispatches on the pages they already occupy instead of
                 # staging a BO of its own. `static_indices` still names them:
                 # bound or not, they carry no new host data per call.
+                io_bound = dict(bound or {})
+                if A_pg is not None:
+                    io_bound[self.A_I] = A_pg.bo
+                if OUT_pg is not None:
+                    io_bound[self.OUT_I] = OUT_pg.bo
                 got = chain.run(
                     args,
                     bo_key=f"q4nx_mlp_{self.H}_L{layer_idx}",
@@ -764,9 +830,12 @@ class FusedMLP:
                     | set(partials)
                     | set(sums),
                     output_indices={self.OUT_I},
-                    bound_buffers=bound,
+                    bound_buffers=io_bound or None,
                 )
-                out[m0 : m0 + rows] = got[self.OUT_I].astype(np.float32)[:rows, :D]
+                # A bound output is read where it already is; an unbound one
+                # was copied back into `got` and is read from there.
+                res = OUT_pg.numpy() if OUT_pg is not None else got[self.OUT_I]
+                out[m0 : m0 + rows] = np.asarray(res, np.float32)[:rows, :D]
 
         return torch.from_numpy(out).reshape(*h.shape[:-1], D)
 

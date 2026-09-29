@@ -591,19 +591,55 @@ def shared_empty(shape, dtype):
     it is attached to the returned tensor so the pages are reclaimed only once
     nothing is looking at them.
     """
-    if os.environ.get("AMD_TRITON_NPU_RUNTIME") != "hsa":
-        return torch.empty(shape, dtype=dtype)
     try:
         from triton.backends.amd_triton_npu import shared
 
-        buf = shared.empty(tuple(shape), dtype=dtype, device="hsa:0")
+        dev = (
+            "hsa:0"
+            if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa"
+            else "xrt:0"
+        )
+        buf = shared.empty(tuple(shape), dtype=dtype, device=dev)
         t = buf.torch()
+        # The caller binds it (`shared_bo`); without that the pages are still
+        # staged and copied back like any other array, and the only thing this
+        # buys is the pooling.
         t._shared_buffer = buf
         return t
     except Exception as e:  # noqa: BLE001 -- an optimisation, never a blocker
         if os.environ.get("AMD_TRITON_NPU_DEBUG"):
             print(f"[kernels] activation stays staged: {e}", flush=True)
         return torch.empty(shape, dtype=dtype)
+
+
+#: `shared_empty` pages kept alive by shape, so a given `bo_key` always binds
+#: the SAME buffer. `shared.py` pools its allocations, so without this a second
+#: call under one key gets a different BO and the runner refuses it -- "already
+#: bound to a different buffer for arg 0". Keyed by shape and dtype only: the
+#: contents are overwritten before every dispatch, so two call sites at one
+#: shape can share the page.
+_IO_PAGES = {}
+
+
+def io_page(shape, dtype):
+    """A `shared_empty` tensor for this shape, allocated once and reused."""
+    key = (tuple(shape), dtype)
+    t = _IO_PAGES.get(key)
+    if t is None:
+        t = shared_empty(shape, dtype)
+        _IO_PAGES[key] = t
+    return t
+
+
+def shared_bo(t):
+    """The XRT buffer object behind a `shared_empty` tensor, or None.
+
+    `bound_buffers` takes these: the chain then dispatches on the caller's own
+    pages instead of staging a copy in and copying the result back out. At
+    qkv's shape that is 6 MiB in and 42 MiB out, on every one of 35 layers.
+    """
+    buf = getattr(t, "_shared_buffer", None)
+    return None if buf is None else buf.bo
 
 
 class ResidentWeight:
@@ -983,10 +1019,10 @@ def triton_matmul(
     # `Kp` is the extent the kernel contracts; `a_stride` is how far apart the
     # rows sit, and they are deliberately not the same number.
     a_stride = unaliased_stride(Kp)
-    a = shared_empty((Mp, a_stride), torch.bfloat16)
+    a = io_page((Mp, a_stride), torch.bfloat16)
     a.zero_()
     a[:M, :K] = x.to(torch.bfloat16)
-    c = shared_empty((Mp, Np), torch.float32)
+    c = io_page((Mp, Np), torch.float32)
     if via_chain:
         chain = _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script)
         pad = np.zeros(1024, dtype=np.float32)
@@ -995,6 +1031,9 @@ def triton_matmul(
         # The address does identify it; a caller with a real `stage_key` still
         # gets the stable name it chose.
         key = stage_key or f"mm_{b.data_ptr():x}_{Mp}x{Kp}x{Np}"
+        # The activation and the result are the caller's own pages where the
+        # interop allows it, so neither is staged in nor copied back.
+        io = {i: bo for i, bo in ((0, shared_bo(a)), (2, shared_bo(c))) if bo}
         with _npu_driver():
             got = chain.run(
                 [_np(a), _np(b), _np(c), pad],
@@ -1002,7 +1041,15 @@ def triton_matmul(
                 static_indices={1},
                 intermediate_indices={3},
                 output_indices={2},
+                bound_buffers=io or None,
             )
+        if 2 in io:
+            # Read where the kernel wrote it, then copied ONCE into a tensor
+            # of the caller's own: the page is reused by the next call at this
+            # shape, so a view into it would be overwritten under them. That
+            # trades a device->host copy of the whole padded buffer for a
+            # host->host copy of just the part asked for.
+            return c.reshape(Mp, Np)[:M, :N].clone()
         return torch.from_numpy(np.asarray(got[2])).reshape(Mp, Np)[:M, :N]
     # One block_m-row tile per dispatch: the grid is (1, N/block_n), which
     # depends on the weight alone and never on the prompt length.
