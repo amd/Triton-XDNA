@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 
 import numpy as np
 import torch
@@ -165,6 +166,44 @@ def _plan_down(inter):
     if min(chunk, cap) * MAX_DOWN_SPLIT >= inter:
         return inter, min(chunk, cap)
     return _pow2(inter), min(_pow2(inter), cap)
+
+
+def _exact_k_ttshared(chain, rows, k, n, block_m, block_n, a_stride, script):
+    """`_mm_kernel`'s ttsharedir, narrowed to contract exactly `k`.
+
+    `tl.arange` needs a power of two, so the kernel can only ASK for
+    `_pow2(k)`; `linalg.matmul` has no such rule and the schedule tiles K by
+    `l2_k`=64, which divides Gemma4's 1536 exactly. Capturing with the real
+    row stride leaves every offset right, so narrowing the four places the
+    padded extent appears is the whole of it.
+
+    Measured on the wide gate at M=1024, N=12288: 8.76 -> 6.54 ms, TFLOP/s
+    unchanged at 5.9 -- the same efficiency over 25% fewer bytes.
+    """
+    kp = _pow2(k)
+    tA = torch.zeros((rows, a_stride), dtype=torch.bfloat16)
+    tB = torch.zeros((kp, n), dtype=torch.bfloat16)
+    tC = torch.zeros((rows, n), dtype=torch.float32)
+    grid = (rows // block_m, n // block_n)
+    src = chain._capture_ttshared(
+        _mm_kernel, grid,
+        (tA, tB, tC, rows, n, kp, a_stride, 1, n, 1, n, 1),
+        {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": kp},
+    )
+    if isinstance(src, bytes):
+        src = src.decode()
+    if k == kp:
+        return src
+    for pat, rep in (
+        (rf"sizes: \[{block_m}, {kp}\]", f"sizes: [{block_m}, {k}]"),
+        (rf"sizes: \[{kp}, {block_n}\]", f"sizes: [{k}, {block_n}]"),
+        (rf"\b{block_m}x{kp}xbf16\b", f"{block_m}x{k}xbf16"),
+        (rf"\b{kp}x{block_n}xbf16\b", f"{k}x{block_n}xbf16"),
+    ):
+        src, hits = re.subn(pat, rep, src)
+        if not hits:
+            raise RuntimeError(f"exact-K rewrite matched nothing: {pat}")
+    return src
 
 
 def _row_tile(rows, k, block_n):
@@ -384,11 +423,16 @@ class FusedMLP:
     def __init__(self, d_model, inter):
         self.D = d_model
         self.H = inter
+        # `gate` and `up` contract D itself, not the power of two above it.
+        # The frontend cannot spell that (`tl.arange`), so their op arrives as
+        # MLIR -- see `_exact_k_ttshared`. `K_pad` stays as the fallback for a
+        # D that IS a power of two, where the two are the same number anyway.
         self.K_pad = _pow2(d_model)
-        # The activation's row stride, held off the power of two `K_pad` always
-        # is -- see `kernels.unaliased_stride`. The contraction still spans
-        # `K_pad`; only the distance between rows changes.
-        self.K_stride = unaliased_stride(self.K_pad)
+        self.K_exact = d_model
+        # The activation's row stride, held off a power of two so A's rows do
+        # not alias in DRAM -- `kernels.unaliased_stride`. At an unpadded
+        # D=1536 it is already not one, so it returns D unchanged.
+        self.K_stride = unaliased_stride(self.K_exact)
         self.HID, self.down_chunk = _plan_down(inter)
         # The column tile each GEMM runs at, and `down`'s N. A multiple of its
         # own tile or the grid truncates and silently drops output columns;
@@ -407,8 +451,8 @@ class FusedMLP:
 
         `gate_up` is `[D, 2*inter]` as `load_weights` concatenated it, so the
         halves are a plain column split -- done once here, never per dispatch.
-        The rows past `D` stay zero, which is what makes `K_pad` harmless: the
-        gate/up GEMMs contract them against the zeros `run` leaves in `A`.
+        `gate`/`up` contract D exactly, so their weights have D rows and there
+        is no padding to keep zero. `down` still pads its N to `D_pad`.
         """
         from ml_dtypes import bfloat16
 
@@ -422,8 +466,8 @@ class FusedMLP:
         gu = gate_up.to(torch.float32).cpu().numpy()
         dn = down.to(torch.float32).cpu().numpy()
         Bg, Bu, Bd = (
-            self._alloc(K_pad, HID),
-            self._alloc(K_pad, HID),
+            self._alloc(self.K_exact, HID),
+            self._alloc(self.K_exact, HID),
             self._alloc(HID, D_pad),
         )
         _host(Bg)[:D, :H] = gu[:, :H].astype(bfloat16)
@@ -501,8 +545,12 @@ class FusedMLP:
         return tuple(b.torch() for b in w)
 
     def shapes(self):
-        """`(K_pad, HID, D_pad)` -- what `device_weights` is shaped to."""
-        return self.K_pad, self.HID, self.D_pad
+        """`(K, HID, D_pad)` -- what `device_weights` is shaped to.
+
+        The first is `K_exact`: `gate`/`up` contract D itself now, so their
+        weights have D rows and not the power of two above it.
+        """
+        return self.K_exact, self.HID, self.D_pad
 
     # ---- chain ----
     #: Where the fixed operands sit in the combined-arg list. The split
@@ -529,12 +577,12 @@ class FusedMLP:
             return self._chains[M]
         from triton.backends.amd_triton_npu.multilaunch import NPUChain
 
-        K_pad, HID, D_pad = self.K_pad, self.HID, self.D_pad
+        K_exact, HID, D_pad = self.K_exact, self.HID, self.D_pad
         chunk = self.down_chunk
         n_down = HID // chunk
         partials, sums = self._down_slots()
         gu_n, dn_n = self.gu_n, self.dn_n
-        gu_m, dn_m = _row_tile(M, K_pad, gu_n), _row_tile(M, chunk, dn_n)
+        gu_m, dn_m = _row_tile(M, K_exact, gu_n), _row_tile(M, chunk, dn_n)
         # Per op, not per chain: the two can land on different blocks -- `down`
         # contracts a wider K and writes a narrower N -- and a schedule only
         # places on the block it was generated for.
@@ -545,16 +593,21 @@ class FusedMLP:
         # `up` does, so the two stop being the same GEMM; that is the price of
         # the block the drain fits in.
         gate_m, gate_n = FUSED_BLOCK
+        # ...and only where the frontend can still express the contraction:
+        # the drain-fused gate is a `@triton.jit` kernel, so its K has to be a
+        # power of two. At an unpadded D it is not, and the plain op -- which
+        # arrives as MLIR -- is both correct and, at 1.34x from the narrower
+        # contraction, faster than the drain was worth (1.02x).
         gate_script = (
             fused_epilogue_script(gate_m, gate_n)
-            if M % gate_m == 0 and HID % gate_n == 0
+            if M % gate_m == 0 and HID % gate_n == 0 and K_exact == self.K_pad
             else None
         )
 
         # Shape-representative placeholders; only shapes and dtypes drive the
         # warmup lowering, never the values.
         tA = torch.zeros((M, self.K_stride), dtype=torch.bfloat16)
-        tBg = torch.zeros((K_pad, HID), dtype=torch.bfloat16)
+        tBg = torch.zeros((K_exact, HID), dtype=torch.bfloat16)
         tC = torch.zeros((M, HID), dtype=torch.float32)
         tCf = torch.zeros(M * HID, dtype=torch.float32)
         # The gate's output, where the drain-fused schedule writes it: bf16,
@@ -600,19 +653,18 @@ class FusedMLP:
             gemms = ((self.BU_I, self.CU_I),)
         else:
             gemms = ((self.BG_I, self.CG_I), (self.BU_I, self.CU_I))
+        gu_src = _exact_k_ttshared(
+            chain, M, self.K_exact, HID, gu_m, gu_n, self.K_stride, gu_script
+        )
         for src, dst in gemms:
             # gate, then up -- the same GEMM against the same activation, so
-            # they differ only in which weight they read and where they land.
+            # they differ only in which weight they read and where they land,
+            # and one module serves both.
             chain.add(
-                _mm_kernel,
+                gu_src,
                 grid=(M // gu_m, HID // gu_n),
                 arg_map={0: self.A_I, 1: src, 2: dst},
-                args=(tA, tBg, tC, M, HID, K_pad, self.K_stride, 1, HID, 1, HID, 1),
-                constexprs={
-                    "BLOCK_SIZE_M": gu_m,
-                    "BLOCK_SIZE_N": gu_n,
-                    "BLOCK_SIZE_K": K_pad,
-                },
+                args=(),
                 transform_script=gu_script,
             )
         # merge: H = gelu_tanh(Cg) * Cu, or just the multiply where the gate

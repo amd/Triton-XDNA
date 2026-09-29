@@ -529,6 +529,14 @@ class NPUChain:
     def _capture_ttshared(self, kernel, grid, args, constexprs):
         """Warmup-compile the kernel to obtain its ttsharedir source.
 
+        A `str`/`bytes` `kernel` is taken to be that source already and passed
+        through. The chain's own ops all come from `@triton.jit`, but some
+        shapes cannot be reached from the frontend at all -- `tl.arange` needs
+        a power of two, so a GEMM kernel can only ask for K=2048 where the
+        real K is 1536 -- while `linalg.matmul` and every schedule below it are
+        happy with either. Letting an op arrive as MLIR is what makes those
+        reachable without a second lowering path.
+
         Forces the NPU driver active for the warmup so the kernel lowers through
         the NPU backend (whose binary_ext is ``ttsharedir``). Without this, in a
         hetero model the GPU driver may be active and ``asm`` would lack
@@ -541,6 +549,9 @@ class NPUChain:
         """
         import triton
         from .driver import NPUDriver
+
+        if isinstance(kernel, (str, bytes)):
+            return kernel
 
         prev = triton.runtime.driver.active
         triton.runtime.driver.set_active(NPUDriver())
