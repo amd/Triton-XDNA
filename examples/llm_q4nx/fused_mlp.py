@@ -132,6 +132,11 @@ ADD_SCRIPT = "gpt2/transform_add_f32_aie2p.mlir"
 #: arithmetic a padded width would add, but not without limit.
 MAX_DOWN_SPLIT = 4
 
+#: The K a `down` capture is taken at. Any legal one will do -- the extent is
+#: restated afterwards -- and this is small enough that `block_m * K` clears
+#: Triton's tensor cap at every row tier.
+_DOWN_CAPTURE_K = 1024
+
 
 def _host(w):
     """The numpy view of a weight, whether it is a shared buffer or an array."""
@@ -150,37 +155,39 @@ def _pow2(n):
 def _plan_down(inter):
     """`(HID, chunk)` -- the width the merge writes, and one `down` K tile.
 
-    `down` contracts the FFN width, and `_mm_kernel` does a whole contraction
-    in one tile: `tl.arange` wants a power of two and `rows * K` has to stay
-    under Triton's cap. Contracting in equal power-of-two pieces satisfies both
-    WITHOUT padding anything, whenever the width has a large enough power of
-    two in it -- 12288 is 3 x 4096 and 6144 is 3 x 2048, so Gemma4 pays no
-    padding at either width and every piece still gets a full-width herd.
+    Both are now the FFN width itself. `down` contracts that width, and the
+    two rules that used to forbid saying so -- `tl.arange` wants a power of
+    two, `rows * K` must clear Triton's tensor cap -- are the FRONTEND's, and
+    `down` no longer goes through it: its op is given to the chain as MLIR.
+    So no padding, no split into power-of-two pieces, and none of the adds
+    that folded them back.
 
-    A width with no such factor falls back to padding it to a power of two, as
-    this did throughout before: correct at any width, and the pieces are then
-    trivially powers of two as well.
+    Kept as a function because the split is what the buffer layout and
+    `_down_slots` are written against, and one width per model is still worth
+    naming.
     """
-    cap = 1 << (MAX_TILE_NUMEL // WIDE_M).bit_length() - 1
-    chunk = inter & -inter  # the largest power of two dividing it
-    if min(chunk, cap) * MAX_DOWN_SPLIT >= inter:
-        return inter, min(chunk, cap)
-    return _pow2(inter), min(_pow2(inter), cap)
+    return inter, inter
 
 
-def _exact_k_ttshared(chain, rows, k, n, block_m, block_n, a_stride, script):
-    """`_mm_kernel`'s ttsharedir, narrowed to contract exactly `k`.
+def _exact_k_ttshared(chain, rows, k, n, block_m, block_n, a_stride, script,
+                      k_capture=None):
+    """`_mm_kernel`'s ttsharedir, restated to contract exactly `k`.
 
-    `tl.arange` needs a power of two, so the kernel can only ASK for
-    `_pow2(k)`; `linalg.matmul` has no such rule and the schedule tiles K by
-    `l2_k`=64, which divides Gemma4's 1536 exactly. Capturing with the real
-    row stride leaves every offset right, so narrowing the four places the
-    padded extent appears is the whole of it.
+    Two frontend rules stop a kernel from asking for the reduction a model
+    actually has: `tl.arange` wants a power of two, and `block_m * K` has to
+    stay under Triton's tensor cap. `linalg.matmul` has neither, and the
+    schedules tile K by `l2_k`, so the capture only has to be LEGAL -- its K
+    need not be the one wanted, above or below. `k_capture` names a legal one
+    where the real K is too wide to ask for (`down` contracts 12288, and
+    512x16384 is twice the cap).
+
+    Both row strides are kernel constexprs, so a capture taken at the real
+    stride has every offset right and the K extent is the only edit.
 
     Measured on the wide gate at M=1024, N=12288: 8.76 -> 6.54 ms, TFLOP/s
     unchanged at 5.9 -- the same efficiency over 25% fewer bytes.
     """
-    kp = _pow2(k)
+    kp = k_capture if k_capture is not None else _pow2(k)
     tA = torch.zeros((rows, a_stride), dtype=torch.bfloat16)
     tB = torch.zeros((kp, n), dtype=torch.bfloat16)
     tC = torch.zeros((rows, n), dtype=torch.float32)
@@ -582,7 +589,7 @@ class FusedMLP:
         n_down = HID // chunk
         partials, sums = self._down_slots()
         gu_n, dn_n = self.gu_n, self.dn_n
-        gu_m, dn_m = _row_tile(M, K_exact, gu_n), _row_tile(M, chunk, dn_n)
+        gu_m, dn_m = _row_tile(M, K_exact, gu_n), _row_tile(M, _DOWN_CAPTURE_K, dn_n)
         # Per op, not per chain: the two can land on different blocks -- `down`
         # contracts a wider K and writes a narrower N -- and a schedule only
         # places on the block it was generated for.
@@ -686,42 +693,23 @@ class FusedMLP:
                 MERGE_SCRIPT_BF16_GATE if gate_script is not None else MERGE_SCRIPT
             ),
         )
-        # down, in `n_down` pieces of the contraction. Each takes its own slice
-        # of H's columns and of Bd's rows through the kernel's constant
-        # offsets, because a chain's arg_map names whole buffers.
-        for i in range(n_down):
-            chain.add(
-                _mm_kernel,
-                grid=(M // dn_m, D_pad // dn_n),
-                arg_map={
-                    0: self.H_I,
-                    1: self.BD_I,
-                    2: partials[i] if partials else self.OUT_I,
-                },
-                args=(tHm, tBd, tOut, M, D_pad, chunk, HID, 1, D_pad, 1, D_pad, 1),
-                constexprs={
-                    "BLOCK_SIZE_M": dn_m,
-                    "BLOCK_SIZE_N": dn_n,
-                    "BLOCK_SIZE_K": chunk,
-                    "aoff": i * chunk,
-                    "boff": i * chunk * D_pad,
-                },
-                transform_script=dn_script,
-            )
-        # and fold the pieces back together.
-        acc = partials[0] if partials else None
-        add_block = elem_block(M * D_pad, 4 + 4 + 4)  # three f32 streams
-        for i in range(1, n_down):
-            dst = self.OUT_I if i == n_down - 1 else sums[i - 1]
-            chain.add(
-                _add_f32,
-                grid=((M * D_pad) // add_block,),
-                arg_map={0: acc, 1: partials[i], 2: dst},
-                args=(tOutf, tOutf, tOutf, M * D_pad),
-                constexprs={"BLOCK_SIZE": add_block},
-                transform_script=script(ADD_SCRIPT),
-            )
-            acc = dst
+        # down, contracting the FFN width in ONE op. It used to go in
+        # `n_down` power-of-two pieces with adds folding them back, because a
+        # kernel cannot ask for a K of 12288 -- not a power of two, and
+        # `dn_m * 16384` is twice Triton's tensor cap. Stating it in the
+        # module costs neither: the pieces were 3 launches and 2 full-width
+        # f32 adds against this one, 54 MiB of output traffic against 6.
+        dn_src = _exact_k_ttshared(
+            chain, M, HID, D_pad, dn_m, dn_n, HID, dn_script,
+            k_capture=_DOWN_CAPTURE_K,
+        )
+        chain.add(
+            dn_src,
+            grid=(M // dn_m, D_pad // dn_n),
+            arg_map={0: self.H_I, 1: self.BD_I, 2: self.OUT_I},
+            args=(),
+            transform_script=dn_script,
+        )
         self._chains[M] = chain
         self._gate_fused[M] = gate_script is not None
         return chain
