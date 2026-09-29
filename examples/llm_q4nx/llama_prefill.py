@@ -496,6 +496,13 @@ class LlamaPrefill:
     #: they are.
     NPU_WEIGHTS = ("qkv", "o", "gate_up", "down")
 
+    #: Of those, the ones every call dispatches through a chain (`stage_key`).
+    #: Only these may be padded to their exact K: the others are also reached
+    #: by the unfused MLP path, which compiles a Triton kernel and so needs a
+    #: power-of-two reduction. `kernels.resident_weight` fixes the padding at
+    #: load time, so the choice cannot be deferred to the call.
+    CHAIN_WEIGHTS = ("qkv", "o")
+
     # ---- weights ----
     def make_npu_resident(self):
         """Pad every projection for the device now, and free the unpadded copy.
@@ -521,7 +528,9 @@ class LlamaPrefill:
         for w in self._w:
             for name in self.NPU_WEIGHTS:
                 if name in w:
-                    w[name] = kernels.resident_weight(w[name])
+                    w[name] = kernels.resident_weight(
+                        w[name], exact=name in self.CHAIN_WEIGHTS
+                    )
         return self
 
     def share_weights_from(self, other):

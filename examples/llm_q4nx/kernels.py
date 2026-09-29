@@ -10,6 +10,7 @@ transform scripts assume and slice back afterwards.
 
 import ctypes
 import math
+import re
 import os
 import subprocess
 import weakref
@@ -634,10 +635,17 @@ class ResidentWeight:
         return (self.K, self.N)
 
 
-def resident_weight(w, block_n=None):
-    """Pad `w` for the NPU now, returning a handle that does not reference it."""
+def resident_weight(w, block_n=None, exact=False):
+    """Pad `w` for the NPU now, returning a handle that does not reference it.
+
+    `exact` contracts K itself rather than the power of two above it, which
+    only the chain path can dispatch (`triton_matmul`'s `stage_key`): the
+    per-row-block loop compiles a `@triton.jit` kernel and `tl.arange` needs a
+    power of two. The padding is fixed here at load time, so the caller has to
+    know which way its consumer will dispatch -- see `CHAIN_WEIGHTS`.
+    """
     K, N = w.shape
-    Kp = _pow2(K)
+    Kp = exact_k(K) if exact else _pow2(K)
     block_n = tile_n(N, Kp) if block_n is None else block_n
     Np = math.ceil(N / block_n) * block_n
     padded = _resident_copy(_pad2d(w.to(torch.bfloat16), Kp, Np).contiguous())
@@ -689,6 +697,52 @@ MAX_TILE_NUMEL = 4194304
 #: The matmul schedule. Hand-written for gpt2 and reused by every model here.
 #: It does not lower at every shape -- see `triton_matmul`'s `transform_script`.
 MATMUL_SCRIPT = "gpt2/transform_matmul_aie2p.mlir"
+
+
+def narrow_k(src, k, kp, block_m, block_n):
+    """Narrow a captured GEMM module's contraction from `kp` down to `k`.
+
+    `tl.arange` requires a power of two, so a `@triton.jit` GEMM can only ask
+    for `kp` where the real reduction is `k` -- for every projection in a model
+    whose D is not a power of two, that is 33% of the weight traffic spent on
+    zeros. `linalg.matmul` carries no such rule and the schedules tile K by
+    `l2_k`, so a module stating `k` needs nothing else changed.
+
+    Only the K EXTENT is edited. Both row strides are kernel constexprs, so a
+    capture taken at the real stride already has every offset right, and these
+    four are all that is left: A is `[block_m, K]` and B is `[K, block_n]`.
+
+    Measured on Gemma4's wide gate, M=1024 N=12288: 8.76 -> 6.54 ms at an
+    unchanged 5.9 TFLOP/s -- the same efficiency over 25% fewer bytes.
+    """
+    if k == kp:
+        return src
+    if isinstance(src, bytes):
+        src = src.decode()
+    for pat, rep in (
+        (rf"sizes: \[{block_m}, {kp}\]", f"sizes: [{block_m}, {k}]"),
+        (rf"sizes: \[{kp}, {block_n}\]", f"sizes: [{k}, {block_n}]"),
+        (rf"\b{block_m}x{kp}xbf16\b", f"{block_m}x{k}xbf16"),
+        (rf"\b{kp}x{block_n}xbf16\b", f"{k}x{block_n}xbf16"),
+    ):
+        src, hits = re.subn(pat, rep, src)
+        if not hits:
+            raise RuntimeError(f"narrow_k matched nothing: {pat}")
+    return src
+
+
+#: A reduction is contracted exactly when it is a multiple of this. The
+#: schedules tile K by `l2_k`, at most 256 across the checked-in scripts, and a
+#: K that is not a multiple of its tile would leave a partial one the grid
+#: cannot express. Gemma4's 1536 clears it; a prime D would fall back to
+#: padding, which is still correct.
+K_EXACT_GRAIN = 256
+
+
+def exact_k(K):
+    """The reduction to contract for a weight with `K` rows: `K` or its pad."""
+    kp = _pow2(K)
+    return K if K != kp and K % K_EXACT_GRAIN == 0 else kp
 
 
 def tile_n(N, Kp):
@@ -802,22 +856,30 @@ def _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script):
     from triton.backends.amd_triton_npu.multilaunch import NPUChain
 
     chain = NPUChain(f"proj_{Mp}x{Kp}x{Np}_{block_m}x{block_n}")
-    chain.add(
+    # Captured at the power of two the frontend insists on, then narrowed to
+    # the reduction actually wanted -- see `narrow_k`. At a `Kp` that is
+    # already exact the capture is used unchanged.
+    kp = _pow2(Kp)
+    tscript = script(transform_script) if isinstance(transform_script, str) else None
+    src = chain._capture_ttshared(
         _matmul_kernel,
-        grid=(Mp // block_m, Np // block_n),
-        arg_map={0: 0, 1: 1, 2: 2},
-        args=(
+        (Mp // block_m, Np // block_n),
+        (
             torch.zeros((Mp, a_stride), dtype=torch.bfloat16),
-            torch.zeros((Kp, Np), dtype=torch.bfloat16),
+            torch.zeros((kp, Np), dtype=torch.bfloat16),
             torch.zeros((Mp, Np), dtype=torch.float32),
             a_stride,
             Np,
             Np,
         ),
-        constexprs={"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": Kp},
-        transform_script=(
-            script(transform_script) if isinstance(transform_script, str) else None
-        ),
+        {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": kp},
+    )
+    chain.add(
+        narrow_k(src, Kp, kp, block_m, block_n),
+        grid=(Mp // block_m, Np // block_n),
+        arg_map={0: 0, 1: 1, 2: 2},
+        args=(),
+        transform_script=tscript,
     )
     chain.add(
         _stage_pad_kernel,
@@ -869,7 +931,26 @@ def triton_matmul(
     M, K = x.shape
     Kw, N = w.shape
     assert K == Kw, (x.shape, w.shape)
-    Kp = _pow2(K)  # tl.arange needs a power of two
+    # The chain path hands the op to AIR as MLIR, so it can contract K itself;
+    # the loop below still compiles a `@triton.jit` kernel, whose `tl.arange`
+    # needs a power of two. Both have to agree, because `a`, `b` and the
+    # schedule are built once from this number.
+    # The chain path hands the op to AIR as MLIR, so it can contract K itself;
+    # the dispatch loop below still compiles a `@triton.jit` kernel, whose
+    # `tl.arange` needs a power of two. A resident weight was padded at load
+    # time and is authoritative -- its row count IS the reduction, and a
+    # caller that cannot run it says so here rather than dying inside the
+    # frontend on an arange.
+    if isinstance(w, ResidentWeight):
+        Kp = w.padded.shape[0]
+    else:
+        Kp = exact_k(K) if stage_key is not None else _pow2(K)
+    # An exact K can only be dispatched through the chain, which hands AIR the
+    # module as MLIR; the per-row-block loop below compiles a `@triton.jit`
+    # kernel and `tl.arange` needs a power of two. A resident weight fixed its
+    # padding at load time and may reach a call site that passes no
+    # `stage_key`, so the reduction decides the path, not the caller.
+    via_chain = stage_key is not None or Kp != _pow2(Kp)
     # `None` on either block dimension means "as wide as this shape is worth",
     # which is what a caller almost always wants; an explicit one is honoured
     # as given. Both caps are derived rather than declared per model: Triton's
@@ -906,13 +987,18 @@ def triton_matmul(
     a.zero_()
     a[:M, :K] = x.to(torch.bfloat16)
     c = shared_empty((Mp, Np), torch.float32)
-    if stage_key is not None:
+    if via_chain:
         chain = _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script)
         pad = np.zeros(1024, dtype=np.float32)
+        # `static_indices` holds one weight per key, so a key that does not
+        # identify the WEIGHT would hand the next call the last one's buffer.
+        # The address does identify it; a caller with a real `stage_key` still
+        # gets the stable name it chose.
+        key = stage_key or f"mm_{b.data_ptr():x}_{Mp}x{Kp}x{Np}"
         with _npu_driver():
             got = chain.run(
                 [_np(a), _np(b), _np(c), pad],
-                bo_key=stage_key,
+                bo_key=key,
                 static_indices={1},
                 intermediate_indices={3},
                 output_indices={2},
