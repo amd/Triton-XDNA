@@ -435,6 +435,29 @@ runs:
               hetero_rc=1
             fi
           done
+
+          # XRT zero-copy needs the iGPU, so it runs here, not in 9b (which hides
+          # it). The golden gate passes on the staged fallback too, so the output
+          # is asserted below to confirm the zero-copy path actually ran.
+          echo "--- xrt zero-copy: llama32_1b_q4nx (iGPU visible) ---"
+          rc=0
+          zc_out=$( cd examples/llama32_1b_q4nx \
+            && python llama32_1b_q4nx_inference.py --max-tokens 8 --greedy 2>&1 ) || rc=$?
+          echo "$zc_out"
+          if [ "$rc" -eq 77 ]; then
+            echo "SKIP: llama32_1b_q4nx xrt zero-copy (exit 77)"
+          elif [ "$rc" -ne 0 ]; then
+            echo "FAIL: llama32_1b_q4nx xrt zero-copy (exit $rc)"
+            hetero_rc=1
+          elif ! echo "$zc_out" | grep -q "KV handed over in place" \
+               || echo "$zc_out" | grep -q "copied once"; then
+            echo "FAIL: llama32_1b_q4nx decode gated green but zero-copy did not"
+            echo "      engage -- the handoff ran on the staged path, so the"
+            echo "      shared-page handling has no coverage. Check the iGPU is"
+            echo "      visible and the HIP interop is available."
+            hetero_rc=1
+          fi
+
           exit $hetero_rc
         else
           echo "Skipping hetero run: gpt2/qwen are npu2-only (device=$DEVICE)."
