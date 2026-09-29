@@ -39,6 +39,12 @@ import weakref
 import numpy as np
 
 
+def _bfloat16():
+    from ml_dtypes import bfloat16
+
+    return bfloat16
+
+
 class HsaDecodeError(RuntimeError):
     pass
 
@@ -200,8 +206,8 @@ class InstsForL:
         return out
 
 
-def make_hsa_decoder_class(air, artifact_dir):
-    """mlir-air's FusedDecoder with the dispatch moved onto HSA.
+def make_hsa_decoder_class(air, artifact_dir, decoder_class="FusedDecoder"):
+    """mlir-air's fused decoder with the dispatch moved onto HSA.
 
     Everything host-side stays theirs -- weight load, the region-major KV
     layout, `seed_kv`, sampling. Only `dispatch` changes: instead of handing
@@ -211,9 +217,22 @@ def make_hsa_decoder_class(air, artifact_dir):
     Their `__init__` still runs, so the XRT BOs it builds exist and go unused.
     That costs the weight allocation twice. Worth fixing before this is more
     than a demonstration; not worth forking their setup to avoid today.
-    """
 
-    class HsaFusedDecoder(air.FusedDecoder):
+    `decoder_class` names the base to wrap (3B/8B are not `FusedDecoder`).
+    """
+    base = getattr(air, decoder_class)
+
+    class HsaFusedDecoder(base):
+        def _g(self, name):
+            # Geometry is on the decoder (1B/4B) or its `fd` module (3B/8B).
+            v = getattr(self, name, None)
+            if v is not None:
+                return v
+            fd = getattr(self, "fd", None)
+            if fd is not None:
+                return getattr(fd, name)
+            raise AttributeError(name)
+
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
             pdi = os.path.join(artifact_dir, f"decode_L{self.ATTN_MAXL}.pdi")
@@ -235,22 +254,20 @@ def make_hsa_decoder_class(air, artifact_dir):
             # it is 67 MB and the kernel appends to it in place, and the small
             # three because once the big two are in place they are what is
             # left. Staging any of them costs more than the dispatch.
-            self._x = shared_array(lib, (self.K,), self.bf16)
-            self._w = shared_array(lib, self.Wv16.shape, self.Wv16.dtype)
-            self._w[:] = self.Wv16
-            _rms = np.concatenate(
-                [self.rms_slabs, np.zeros(self.DH, self.bf16), self.final_norm]
-            )
-            self._r = shared_array(lib, _rms.shape, _rms.dtype)
-            self._r[:] = _rms
-            self._rms_lut_off = int(self.rms_slabs.size)
-            self._y = shared_array(lib, (self.ny,), self.bf16)
-            self._kv = shared_array(lib, (self.KV.size,), self.bf16)
+            self._bf16 = getattr(self, "bf16", None) or _bfloat16()
+            self._x = shared_array(lib, (self.K,), self._bf16)
+            self._build_w_buffer(lib)
+            self._build_r_buffer(lib)
+            self._y = shared_array(lib, (self.ny,), self._bf16)
+            # From geometry, not self.KV: 3B/8B keep no host KV mirror.
+            self._kv = shared_array(lib, (self._n_layers() * self.LREG,), self._bf16)
             # The two big ones are written here (and, for the KV cache, in
             # seed_kv) and belong to the device afterwards, so they carry their
             # own coherency rather than being flushed per token. The small three
             # are exchanged every dispatch and stay ordinary.
             mark_resident(lib, self._w)
+            for b in self._w_tail:
+                mark_resident(lib, b)
             mark_resident(lib, self._kv)
             print(
                 f"[hsa-decode] ONE PDI + patched insts: ATTN_MAXL={self.ATTN_MAXL}, "
@@ -258,28 +275,123 @@ def make_hsa_decoder_class(air, artifact_dir):
                 flush=True,
             )
 
-        def seed_kv(self, fk, fv, P):
-            super().seed_kv(fk, fv, P)
-            self._kv[:] = np.ascontiguousarray(self.KV).reshape(-1)
-            # The KV cache is resident, so the dispatch that follows would
-            # declare a token span and flush nothing. Nothing would fail loudly:
-            # the device would read whatever part of the prompt's K/V had
-            # already been evicted.
+        def seed_kv(self, *a, **kw):
+            # Staged fallback (variadic: base arities differ); zero-copy uses seed_direct.
+            super().seed_kv(*a, **kw)
+            kv = getattr(self, "KV", None)
+            if kv is not None:
+                self._kv[:] = np.ascontiguousarray(kv).reshape(-1)
+            else:
+                # 3B/8B have no host mirror; read it back off the device BO.
+                self._kv[:] = self._bo_words(self.kvc).view(self._bf16)
+            mark_dirty(self._prog.lib, self._kv)  # resident: nothing else flushes it
+
+        def _n_layers(self):
+            for attr in ("UNI_DEC", "N_LAYERS"):
+                n = getattr(self, attr, None)
+                if n:
+                    return int(n)
+            fd = getattr(self, "fd", None)
+            if fd is not None and getattr(fd, "UNI_DEC", None):
+                return int(fd.UNI_DEC)
+            return 16  # 1B hardcodes 16, defines no UNI_DEC
+
+        #: Base carries per-layer rope slabs (Qwen3/Gemma3), not the 1B's LUT.
+        def _per_layer_rope(self):
+            return hasattr(self, "_rope_base") and hasattr(self, "_rope_slab")
+
+        def _bo_words(self, bo):
+            # 3B/8B keep no host mirror; read the host-only BO back exactly.
+            return np.frombuffer(bo.map(), dtype=np.int16).copy()
+
+        def _build_w_buffer(self, lib):
+            """Fill `_w` (+ `_w_tail` for the 8B's split weights) from the base."""
+            self._w_tail = []
+            if getattr(self, "_wsplit", False) and getattr(self, "w_bos", None):
+                bufs = []
+                for bo in self.w_bos:
+                    w = self._bo_words(bo)
+                    b = shared_array(lib, w.shape, w.dtype)
+                    b[:] = w
+                    bufs.append(b)
+                self._w, self._w_tail = bufs[0], bufs[1:]
+                return
+            w16 = getattr(self, "Wv16", None)
+            if w16 is not None:
+                self._w = shared_array(lib, w16.shape, w16.dtype)
+                self._w[:] = w16
+                return
+            # No host mirror: read it back from the single weights BO.
+            w = self._bo_words(self.w_bo)
+            self._w = shared_array(lib, w.shape, w.dtype)
+            self._w[:] = w
+
+        def _build_r_buffer(self, lib):
+            """Fill `_r`: [rms_slabs | per-token rope gap | final_norm]."""
+            if getattr(self, "rms_slabs", None) is None:
+                r = self._bo_words(self.r_bo).view(self._bf16)
+                self._r = shared_array(lib, r.shape, self._bf16)
+                self._r[:] = r
+                self._rms_lut_off = int(self.rms_lut_off)
+                return
+            if self._per_layer_rope():
+                gap = self._n_layers() * self.ROPE_W_LEN
+            else:
+                gap = self.DH
+                self._rms_lut_off = int(self.rms_slabs.size)
+            _rms = np.concatenate(
+                [self.rms_slabs, np.zeros(gap, self._bf16), self.final_norm]
+            )
+            self._r = shared_array(lib, _rms.shape, _rms.dtype)
+            self._r[:] = _rms
+
+        def _write_rms_rope(self, p):
+            """Write position p's rope into `_r` (the slabs are already there)."""
+            if self._per_layer_rope():
+                rope = self._rope_slab(p)
+                off = self._rope_base
+                self._r[off : off + rope.size] = rope
+            else:
+                half = self.DH // 2
+                off = self._rms_lut_off
+                self._r[off : off + half] = self.rope_cos[p][:half].astype(self._bf16)
+                self._r[off + half : off + self.DH] = self.rope_sin[p][:half].astype(
+                    self._bf16
+                )
+
+        def kv_sink(self):
+            """The resident KV buffer + geometry, for a producer to fill in place.
+
+            K group g, pos p : L*lreg + g*region_stride + p*region_w
+            V group g, pos p : L*lreg + (ngrp+g)*region_stride + p*region_w
+            """
+            region_w = self._g("REGION_W")
+            return dict(
+                buf=self._kv,
+                n_layers=self._n_layers(),
+                lreg=self.LREG,
+                region_stride=self.cur_maxl * region_w,
+                region_w=region_w,
+                ngrp=self._g("NGRP"),
+                dtype=self._bf16,
+            )
+
+        def seed_direct(self, P):
+            """Mark KV a producer wrote via `kv_sink`; the scatter is already done."""
+            self.current_seed_P = P
             mark_dirty(self._prog.lib, self._kv)
 
         def dispatch(self, tok, p):
             L = p + 1
             # The context length, into the stream the packet already points at.
             self._prog.patch_insts(self._gen.lo, self._gen.slice_for(L))
-            self._x[:] = np.asarray(self.embed[tok], self.bf16)
-            half = self.DH // 2
-            off = self._rms_lut_off
-            self._r[off : off + half] = self.rope_cos[p][:half].astype(self.bf16)
-            self._r[off + half : off + self.DH] = self.rope_sin[p][:half].astype(
-                self.bf16
+            self._x[:] = np.asarray(self.embed[tok], self._bf16)
+            self._write_rms_rope(p)
+            # 8B split-weight tail follows the fixed five (base's w_bos[1:] order).
+            self._prog.dispatch(
+                [self._x, self._w, self._r, self._y, self._kv, *self._w_tail]
             )
-            self._prog.dispatch([self._x, self._w, self._r, self._y, self._kv])
-            voc = self._y[self.decode_y : self.decode_y + self.UNI_LM * self.VP]
+            voc = self._y[self.decode_y : self.decode_y + self._g("UNI_LM") * self.VP]
             return voc[: self.VOCAB_SIZE].astype(np.float32)
 
     return HsaFusedDecoder
