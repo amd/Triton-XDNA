@@ -21,7 +21,7 @@ module attributes {transform.with_named_sequence} {
     // Purpose: Allocates the result buffer in memory space 1 (shared/L2), required for AIR/AIE memory hierarchy.
     // Assumption: The result of the fill op will be written to L2/shared memory.
         %buffer_res_shared, %new_fill = transform.structured.bufferize_to_allocation %fill
-          {memory_space = 1, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
     // Step 2.5: Tile memory copy operations using for loops.
     // Purpose: Tiling the memcpy using for loops provides hints on how big the L2 memory footprint shall be,
@@ -103,7 +103,7 @@ module attributes {transform.with_named_sequence} {
     // Purpose: Moves result buffer to fast local memory for efficient AIE execution.
     // Assumption: The result fits in local memory and can be promoted.
         %buffer_c, %new_c = transform.structured.bufferize_to_allocation %pack_c
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
     // Step 11: Tile the reduction loop.
     // Purpose: Enables vectorized reduction and efficient computation.
@@ -124,9 +124,9 @@ module attributes {transform.with_named_sequence} {
     // Purpose: Moves input operands to fast local memory for efficient AIE execution.
     // Assumption: The operands are suitable for promotion and local memory is available.
         %buffer_a, %new_a = transform.structured.bufferize_to_allocation %fused_pack_a
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         %buffer_b, %new_b = transform.structured.bufferize_to_allocation %fused_pack_b
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
     // Step 14: Run canonicalization and CSE again.
     // Purpose: Cleans up after bufferization and promotion, merges redundant allocs/copies.

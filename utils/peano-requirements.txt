@@ -9,4 +9,4 @@
 # Peano grew the AIE core stack frame past the device default, which presented
 # as NaN rather than as an error (mlir-air #1980).
 -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
-llvm-aie==22.0.0.2026090201+a36c62b9
+llvm-aie==22.0.0.2026092101+0006955e

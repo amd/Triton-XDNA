@@ -36,7 +36,7 @@ module attributes {transform.with_named_sequence} {
 
     // PHASE 3: L2 alloc for output, tile, fuse backward
     %ob, %on = transform.structured.bufferize_to_allocation %output_generic
-        {memory_space = 1, bufferize_destination_only, emit_dealloc} : !transform.any_op
+        <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
     %tiled_output, %forall = transform.structured.tile_using_forall %output_generic tile_sizes [1]
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
 
@@ -56,7 +56,7 @@ module attributes {transform.with_named_sequence} {
     // PHASE 5: L1 alloc for fills + intermediate ops
     %fills_2 = transform.structured.match ops{["linalg.fill"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %fb, %fn = transform.structured.bufferize_to_allocation %fills_2
-        {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+        <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
     // Re-match: 2 generics (sq, output) + 1 reduce after tiling.
     %generics2 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
@@ -69,11 +69,11 @@ module attributes {transform.with_named_sequence} {
 
     // L1 alloc for intermediate outputs
     %g1b, %g1n = transform.structured.bufferize_to_allocation %tiled_generic1
-        {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+        <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
     %rb, %rn = transform.structured.bufferize_to_allocation %reduces2
-        {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+        <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
     %g2b, %g2n = transform.structured.bufferize_to_allocation %tiled_generic2
-        {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+        <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
     // PHASE 6: canonicalize
     %func5 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
@@ -125,13 +125,13 @@ module attributes {transform.with_named_sequence} {
         transform.apply_patterns.vector.cast_away_vector_leading_one_dim
     } : !transform.any_op
 
-    %vh2 = transform.air.broadcast_before_unary %func4 {op_name = "math.rsqrt"} : (!transform.any_op) -> !transform.any_op
+    %vh2 = transform.air.broadcast_before_unary %func4 <{op_name = "math.rsqrt"}> : (!transform.any_op) -> !transform.any_op
 
     %vector_reductions = transform.structured.match ops{["vector.multi_reduction"]} in %vh2 : (!transform.any_op) -> !transform.any_op
-    %r1 = transform.air.vector_type_cast %vector_reductions {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+    %r1 = transform.air.vector_type_cast %vector_reductions <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
 
     %vector_muls = transform.structured.match ops{["arith.mulf"]} in %vh2 : (!transform.any_op) -> !transform.any_op
-    %r2 = transform.air.vector_type_cast %vector_muls {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+    %r2 = transform.air.vector_type_cast %vector_muls <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
 
     %func7 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %func7t = transform.air.convert_size1_vector_to_scalar %func7 : (!transform.any_op) -> !transform.any_op

@@ -8,7 +8,7 @@ module attributes {transform.with_named_sequence} {
 
         // Bufferize result to shared (L2) memory allocation
         %buffer_res_shared, %new_fill = transform.structured.bufferize_to_allocation %fill
-          {memory_space = 1, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         // Find the copy operations to tile using for.
         %func_1 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
@@ -71,7 +71,7 @@ module attributes {transform.with_named_sequence} {
 
         // Bufferize result to local memory allocation
         %buffer_c, %new_c = transform.structured.bufferize_to_allocation %pack_c
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         // Tile the reduction loop.
         %tiled_reduction, %for_loop =
@@ -86,9 +86,9 @@ module attributes {transform.with_named_sequence} {
 
         // Promote the inputs to local memory.
         %buffer_a, %new_a = transform.structured.bufferize_to_allocation %fused_pack_a
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         %buffer_b, %new_b = transform.structured.bufferize_to_allocation %fused_pack_b
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         // Run canonicalization
         %func_3 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op

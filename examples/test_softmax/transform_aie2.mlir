@@ -109,7 +109,7 @@ module attributes {transform.with_named_sequence} {
 
         // Bufferize the final operation to L2 memory (memory_space = 1)
         %truncf_output_buf, %new_truncf = transform.structured.bufferize_to_allocation %truncf_op
-          {memory_space = 1, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         // Tile the final operation with tile size [1] - batch dimension tiling
         %tiled_truncf, %forall_7 =
@@ -145,7 +145,7 @@ module attributes {transform.with_named_sequence} {
         // Allocate fill operations to L1 memory
         %fills_2 = transform.structured.match ops{["linalg.fill"]} in %arg1  : (!transform.any_op) -> !transform.any_op
         %fill1_buffer, %fill1_new = transform.structured.bufferize_to_allocation %fills_2
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         // Re-split the fused generic operations for individual L1 allocation
         %generics2 = transform.structured.match ops{["linalg.generic"]} in %arg1  : (!transform.any_op) -> !transform.any_op
@@ -162,19 +162,19 @@ module attributes {transform.with_named_sequence} {
         %generics3 = transform.structured.match ops{["linalg.generic"]} in %arg1  : (!transform.any_op) -> !transform.any_op
         %tiled_generic2_1, %tiled_reduce2_2, %tiled_generic2_3, %tiled_generic2_4, %tiled_generic2_5, %tiled_generic2_6, %tiled_generic2_7, %tiled_generic2_8 = transform.split_handle %generics3 : (!transform.any_op<"linalg.generic">) -> (!transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">)
         %tiled_generic1_out1_buffer, %tiled_generic1_out1_new = transform.structured.bufferize_to_allocation %tiled_generic2_1
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         %tiled_generic3_out1_buffer, %tiled_generic3_out1_new = transform.structured.bufferize_to_allocation %tiled_generic2_3
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         %tiled_generic4_out1_buffer, %tiled_generic4_out1_new = transform.structured.bufferize_to_allocation %tiled_generic2_4
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         %tiled_generic5_out1_buffer, %tiled_generic5_out1_new = transform.structured.bufferize_to_allocation %tiled_generic2_5
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         %tiled_generic6_out1_buffer, %tiled_generic6_out1_new = transform.structured.bufferize_to_allocation %tiled_generic2_6
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         %tiled_generic7_out1_buffer, %tiled_generic7_out1_new = transform.structured.bufferize_to_allocation %tiled_generic2_7
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         %tiled_generic8_out1_buffer, %tiled_generic8_out1_new = transform.structured.bufferize_to_allocation %tiled_generic2_8
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         // //===================================================================
         // PHASE 6: Final Canonicalization and Bufferization
@@ -215,20 +215,15 @@ module attributes {transform.with_named_sequence} {
 
         %linalg_generics = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
         %linalg_generic1, %linalg_reduce2, %linalg_generic2, %linalg_generic3, %linalg_generic4, %linalg_generic5, %linalg_generic6, %linalg_generic7 = transform.split_handle %linalg_generics : (!transform.any_op<"linalg.generic">) -> (!transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">, !transform.any_op<"linalg.generic">)
-        %linalg_generic2_specialized = transform.structured.specialize %linalg_generic2 : (!transform.any_op) -> !transform.any_op
-        %linalg_generic3_specialized = transform.structured.specialize %linalg_generic3 : (!transform.any_op) -> !transform.any_op
-        %linalg_generic4_specialized = transform.structured.specialize %linalg_generic4 : (!transform.any_op) -> !transform.any_op
-        %linalg_generic5_specialized = transform.structured.specialize %linalg_generic5 : (!transform.any_op) -> !transform.any_op
-        %linalg_generic6_specialized = transform.structured.specialize %linalg_generic6 : (!transform.any_op) -> !transform.any_op
 
         // Bcast: 16-lane vector intrinsic
-        %linalg_broadcasts = transform.structured.match ops{["linalg.broadcast"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %linalg_broadcasts = transform.merge_handles %linalg_generic2, %linalg_generic5 : !transform.any_op<"linalg.generic">
         %inner_most_bcasts, %vec_loops_bcasts:1 =
           transform.structured.tile_using_for %linalg_broadcasts tile_sizes [0, 16]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         
         // Div: scalar
-        %linalg_divs = transform.structured.match ops{["linalg.div"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %linalg_divs = transform.merge_handles %linalg_generic6 : !transform.any_op<"linalg.generic">
         %linalg_divs_loops = transform.structured.convert_to_loops %linalg_divs : (!transform.any_op) -> !transform.any_op
 
         // Extf: 16-lane vector intrinsic
@@ -237,7 +232,7 @@ module attributes {transform.with_named_sequence} {
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         
         // Sub: 16-lane vector intrinsic
-        %linalg_subs = transform.structured.match ops{["linalg.sub"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %linalg_subs = transform.merge_handles %linalg_generic3 : !transform.any_op<"linalg.generic">
         %inner_most_subs, %vec_loops_subs:1 =
           transform.structured.tile_using_for %linalg_subs tile_sizes [0, 16]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
@@ -247,7 +242,7 @@ module attributes {transform.with_named_sequence} {
         %inner_most_fills = transform.structured.convert_to_loops %linalg_fills : (!transform.any_op) -> !transform.any_op
         
         // Exp: 16-lane vector intrinsic
-        %linalg_exps = transform.structured.match ops{["linalg.exp"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %linalg_exps = transform.merge_handles %linalg_generic4 : !transform.any_op<"linalg.generic">
         %inner_most_exps, %vec_loops_exps:1 =
           transform.structured.tile_using_for %linalg_exps tile_sizes [0, 16]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
@@ -277,7 +272,7 @@ module attributes {transform.with_named_sequence} {
         %linalg_copies_in_herd = transform.structured.match ops{["linalg.copy"]} in %herd : (!transform.any_op) -> !transform.any_op
         %memref_copies_in_herd = transform.structured.match ops{["memref.copy"]} in %herd : (!transform.any_op) -> !transform.any_op
         %memref_copies_from_linalg_copies = transform.structured.linalg_copy_to_memref %linalg_copies_in_herd : (!transform.any_op) -> !transform.any_op
-        %all_copies = transform.merge_handles %memref_copies_in_herd, %memref_copies_from_linalg_copies { deduplicate } : !transform.any_op
+        %all_copies = transform.merge_handles deduplicate %memref_copies_in_herd, %memref_copies_from_linalg_copies : !transform.any_op
         %dmas_from_copies = transform.air.copy_to_dma %all_copies : (!transform.any_op) -> !transform.any_op
         
         // Apply vectorization to optimize for AIE vector units
@@ -285,11 +280,11 @@ module attributes {transform.with_named_sequence} {
 
         // Cast vector reduce (max) to use bf16 (to map to AIE vectorized reduction intrinsic)
         %vector_reductions_in_herd = transform.structured.match ops{["vector.multi_reduction"]} in %vectorized_herd : (!transform.any_op) -> !transform.any_op
-        %result10 = transform.air.vector_type_cast %vector_reductions_in_herd {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+        %result10 = transform.air.vector_type_cast %vector_reductions_in_herd <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
 
         // Cast vector exp to use bf16 (to map to AIE vectorized exp intrinsic)
         %vector_exps_in_herd = transform.structured.match ops{["math.exp"]} in %vectorized_herd : (!transform.any_op) -> !transform.any_op
-        %result11 = transform.air.vector_type_cast %vector_exps_in_herd {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+        %result11 = transform.air.vector_type_cast %vector_exps_in_herd <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
 
         transform.include @post_vectorize_reduce_cleanup failures(propagate)
             (%arg1) : (!transform.any_op) -> ()

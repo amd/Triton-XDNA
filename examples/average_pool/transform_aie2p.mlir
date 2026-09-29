@@ -32,7 +32,7 @@ module attributes {transform.with_named_sequence} {
     %fill = transform.structured.match ops{["linalg.fill"]} in %arg1 : (!transform.any_op) -> !transform.any_op
 
     // L2 output alloc
-    %ob, %nb = transform.structured.bufferize_to_allocation %out {memory_space = 1, bufferize_destination_only, emit_dealloc} : !transform.any_op
+    %ob, %nb = transform.structured.bufferize_to_allocation %out <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
     // Tile at [1] on row dim (same as rms_norm)
     %t, %fl = transform.structured.tile_using_forall %out tile_sizes [1] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     // Fuse all into forall
@@ -42,7 +42,7 @@ module attributes {transform.with_named_sequence} {
     // L1 for fills only (destination-only)
     %fills3 = transform.structured.match ops{["linalg.fill"]} in %fl2 : (!transform.any_op) -> !transform.any_op
     %fill_buf, %fill_new = transform.structured.bufferize_to_allocation %fills3
-        {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+        <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
     // Canonicalize + bufferize
     %f2c = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
@@ -61,8 +61,8 @@ module attributes {transform.with_named_sequence} {
     %forall_op = transform.structured.match ops{["scf.forall"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %gens_f = transform.structured.match ops{["linalg.generic"]} in %forall_op : (!transform.any_op) -> !transform.any_op
     %reds_f = transform.structured.match ops{["linalg.reduce"]} in %forall_op : (!transform.any_op) -> !transform.any_op
-    %all_linalg_f = transform.merge_handles %reds_f, %gens_f { deduplicate } : !transform.any_op
-    %promoted = transform.air.linalg_promote %all_linalg_f {memory_space = "L1"} : (!transform.any_op) -> !transform.any_op
+    %all_linalg_f = transform.merge_handles deduplicate %reds_f, %gens_f : !transform.any_op
+    %promoted = transform.air.linalg_promote %all_linalg_f <{memory_space = "L1"}> : (!transform.any_op) -> !transform.any_op
 
     // Post-promote cleanup
     %f_pp = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
@@ -78,7 +78,7 @@ module attributes {transform.with_named_sequence} {
     %lc2 = transform.structured.match ops{["linalg.copy"]} in %h : (!transform.any_op) -> !transform.any_op
     %mc2 = transform.structured.match ops{["memref.copy"]} in %h : (!transform.any_op) -> !transform.any_op
     %mc3 = transform.structured.linalg_copy_to_memref %lc2 : (!transform.any_op) -> !transform.any_op
-    %ac = transform.merge_handles %mc2, %mc3 { deduplicate } : !transform.any_op
+    %ac = transform.merge_handles deduplicate %mc2, %mc3 : !transform.any_op
     %dm = transform.air.copy_to_dma %ac : (!transform.any_op) -> !transform.any_op
 
     // Vectorization (same as rms_norm)
@@ -105,9 +105,9 @@ module attributes {transform.with_named_sequence} {
     // AIE2P type casts: mulf/addf/subf bf16-only, divf f32-only
     %vh2 = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %vector_adds = transform.structured.match ops{["arith.addf"]} in %vh2 : (!transform.any_op) -> !transform.any_op
-    %add_cast = transform.air.vector_type_cast %vector_adds {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+    %add_cast = transform.air.vector_type_cast %vector_adds <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
     %vector_subs = transform.structured.match ops{["arith.subf"]} in %vh2 : (!transform.any_op) -> !transform.any_op
-    %sub_cast = transform.air.vector_type_cast %vector_subs {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+    %sub_cast = transform.air.vector_type_cast %vector_subs <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
     %func_s1 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %func_s1_done = transform.air.convert_size1_vector_to_scalar %func_s1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %func_s1_done {

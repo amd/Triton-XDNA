@@ -18,7 +18,7 @@ transform.named_sequence @match_bf16_only_op(
 // Action: cast a matched op's vector types to bf16.
 transform.named_sequence @action_cast_to_bf16(
     %op: !transform.any_op {transform.consumed}) {
-  %cast = transform.air.vector_type_cast %op {target_element_type = bf16}
+  %cast = transform.air.vector_type_cast %op <{target_element_type = bf16}>
       : (!transform.any_op) -> !transform.any_op
   transform.yield
 }
@@ -34,7 +34,7 @@ transform.named_sequence @match_cmpf(
 transform.named_sequence @action_cast_cmpf_to_bf16(
     %op: !transform.any_op {transform.consumed}) {
   %cast = transform.air.vector_type_cast %op
-      {target_element_type = bf16, input_indices = [0, 1]}
+      <{target_element_type = bf16, input_indices = [0, 1]}>
       : (!transform.any_op) -> !transform.any_op
   transform.yield
 }
@@ -50,7 +50,7 @@ transform.named_sequence @match_select(
 transform.named_sequence @action_cast_select_to_bf16(
     %op: !transform.any_op {transform.consumed}) {
   %cast = transform.air.vector_type_cast %op
-      {target_element_type = bf16, input_indices = [1, 2], output_indices = [0]}
+      <{target_element_type = bf16, input_indices = [1, 2], output_indices = [0]}>
       : (!transform.any_op) -> !transform.any_op
   transform.yield
 }

@@ -51,7 +51,7 @@ module attributes {transform.with_named_sequence} {
     // memory_space = 1 corresponds to L2 (shared memory).
         %result_l2 = transform.structured.match ops{["linalg.fill"]} in %arg1 : (!transform.any_op) -> !transform.any_op
         %result_l2_buffer, %result_t2_new = transform.structured.bufferize_to_allocation %result_l2
-            {memory_space = 1, bufferize_destination_only, mempcy = "linalg.copy", emit_dealloc} : !transform.any_op
+            <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
     //==========================================================================
     // PHASE 3: PACK MATMUL FOR VECTORIZED COMPUTATION
@@ -99,7 +99,7 @@ module attributes {transform.with_named_sequence} {
     // Purpose: Allocate L1 buffer for C matrix tiles during computation.
     // memory_space = 2 corresponds to L1 (AIE local memory).
         %output_l1_pack_op_source_buffer, %output_l1_pack_op_new = transform.structured.bufferize_to_allocation %pack_c
-            {memory_space = 2, bufferize_destination_only, memcpy_op = "linalg.copy", emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, memcpy_op = "linalg.copy", emit_dealloc}> : !transform.any_op
 
     //==========================================================================
     // PHASE 4: TILE REDUCTION AND FUSE PACK OPERATIONS
@@ -157,9 +157,9 @@ module attributes {transform.with_named_sequence} {
     // Purpose: Allocates L1 buffers for fast access during computation.
     // memory_space = 2 corresponds to L1 (AIE local memory).
         %buffer_a, %new_a = transform.structured.bufferize_to_allocation %fused_lhs_l1_pack2
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         %buffer_b, %new_b = transform.structured.bufferize_to_allocation %fused_rhs_l1_pack2
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
     // Step 15: Create tiled prologue (fill operation).
     // Purpose: Initializes output buffers in parallel across cores.
@@ -258,8 +258,8 @@ module attributes {transform.with_named_sequence} {
         %inner_most_matmul_to_unroll, %vec_loops_to_unroll:2 =
           transform.structured.tile_using_for %inner_most_generics tile_sizes [1, 1, 0, 0, 0, 0]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)  
-        transform.loop.unroll %vec_loops_to_unroll#1 {factor = 2} : !transform.any_op
-        transform.loop.unroll %vec_loops_to_unroll#0 {factor = 2} : !transform.any_op  
+        transform.loop.unroll %vec_loops_to_unroll#1 factor = 2 : !transform.any_op
+        transform.loop.unroll %vec_loops_to_unroll#0 factor = 2 : !transform.any_op  
 
     // Step 23: Tile linalg.generic (fill) for vectorized initialization.
     // Purpose: Creates vector-sized tiles for efficient zero-initialization.
@@ -321,12 +321,12 @@ module attributes {transform.with_named_sequence} {
 
     // Step 29: Identify the innermost loop for hoisting.
         %scf_fors_1 = transform.structured.match ops{["scf.for"]} in %herd2_1 : (!transform.any_op) -> !transform.any_op
-        %innermost_for, %outer_fors = transform.split_handle %scf_fors_1 {overflow_result = 1} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+        %innermost_for, %outer_fors = transform.split_handle %scf_fors_1 overflow_result = 1 : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         
     // Step 31: Cast vector types for correct accumulation precision.
     // Purpose: Ensures vector.contract uses F32 for accumulation (BF16 inputs -> F32 output).
         %vector_contracts = transform.structured.match ops{["vector.contract"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %result11 = transform.air.vector_type_cast %vector_contracts {target_element_type = f32, input_indices = [2], output_indices = [0]} : (!transform.any_op) -> !transform.any_op
+        %result11 = transform.air.vector_type_cast %vector_contracts <{target_element_type = f32, input_indices = [2], output_indices = [0]}> : (!transform.any_op) -> !transform.any_op
         
     // Step 32: Hoist all accumulator transfer pairs from innermost loop.
         %innermost_for_updated_3 = transform.air.hoist_loop_invariant_transfers %herd2_1, %innermost_for : (!transform.any_op, !transform.any_op) -> !transform.any_op
