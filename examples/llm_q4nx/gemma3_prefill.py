@@ -145,8 +145,7 @@ class Gemma3Prefill(LlamaPrefill):
         # The decode's handoff: roped K, raw V, head-major within a position.
         # Roped with *this layer's* table -- the cache is per layer, so the
         # local and global layers hold differently-rotated K.
-        self.kv_k[L][:keep] = k[:keep].to(torch.float32).numpy()
-        self.kv_v[L][:keep] = v[:keep].to(torch.float32).numpy()
+        self._kv_store(L, k, v, keep)
 
         a = self._attention(
             q,

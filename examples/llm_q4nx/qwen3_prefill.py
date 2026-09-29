@@ -105,8 +105,7 @@ class Qwen3Prefill(LlamaPrefill):
 
         # The decode's handoff: roped K, raw V, head-major within a position.
         # V is *not* qk-normed -- only q and k are.
-        self.kv_k[L][:keep] = k[:keep].to(torch.float32).numpy()
-        self.kv_v[L][:keep] = v[:keep].to(torch.float32).numpy()
+        self._kv_store(L, k, v, keep)
 
         a = self._attention(q, k, v, N_Q_HEADS, N_KV_HEADS, DH)  # [N, DQ]
         x = x + self._matmul(a, w["o"])  # o contracts DQ -> D

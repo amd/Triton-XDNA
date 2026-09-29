@@ -303,6 +303,291 @@ def make_session_class(air, prefill_cls, cfg, backend, ops, model):
     return TritonSession
 
 
+def generate_via_zero_copy(air, spec, cfg, prefill_cls, args, ids):
+    """HSA generation with the prefill writing the decode's resident KV in place."""
+    import numpy as np
+
+    decoder_cls = getattr(air, spec.decoder_class or "FusedDecoder")
+    if spec.driver_api == "prefiller":
+        dec = decoder_cls(
+            args.model or cfg.MODEL_DEFAULT,
+            airsrc.fused_decode_dir(spec.engine),
+            model_type=spec.model_type,
+        )
+    elif spec.driver_api == "kv_arrays":
+        # The model the prefill uses; a custom --model would otherwise decode
+        # against different weights. `max_L` is left to the build's own stamp.
+        dec = decoder_cls(model=args.model or cfg.MODEL_DEFAULT)
+    else:
+        dec = decoder_cls()
+    if not hasattr(dec, "kv_sink"):
+        raise ExampleUnavailable(
+            f"{spec.name}: the HSA decoder exposes no kv_sink; zero-copy needs it"
+        )
+    prefiller = prefill_cls(
+        backend=args.backend,
+        ops=args.ops,
+        n_layers=cfg.N_LAYERS,
+        max_seq=args.max_seq,
+        model=args.model,
+        expect_model=cfg.MODEL_NAME,
+    )
+    load_prefill_weights(prefiller, args.backend)
+    prefiller.bind_kv_sink(dec.kv_sink())
+
+    dec._kv[:] = 0
+    prefiller.clear_context()
+    logits = np.asarray(prefiller.prefill(list(ids)), np.float32)
+    first = int(logits.argmax())
+    P = prefiller.current_context_length
+    dec.seed_direct(P)
+
+    n_eff = min(args.max_tokens, dec.ATTN_MAXL - P)
+    tokens = list(ids) + [first]
+    gen_ids = [first]
+    t0 = time.time()
+    for p in range(P, P + n_eff):
+        lg = dec.dispatch(tokens[p], p)
+        pred = int(np.asarray(lg).argmax())
+        gen_ids.append(pred)
+        if p + 1 >= len(tokens):
+            tokens.append(pred)
+    t_dec = time.time() - t0
+    n_gen = len(gen_ids) - 1
+    if n_gen > 0:
+        print(
+            f"Generated {n_gen} tokens in {t_dec:.2f}s ({n_gen / t_dec:.2f} tok/s)",
+            flush=True,
+        )
+    return gen_ids
+
+
+def _xrt_shared_available():
+    """True if XRT<->HIP shared pages work here; prints why not when they don't.
+
+    The marker is unconditional (not behind a debug flag) so CI can tell a
+    genuine fallback -- no ROCm torch, no iGPU -- apart from a zero-copy path
+    that silently stopped engaging.
+    """
+    import torch
+
+    try:
+        from triton.backends.amd_triton_npu import shared
+
+        probe = shared.zeros(1, dtype=torch.bfloat16, device="xrt:0", share="hip:0")
+        if getattr(probe, "bo", None) is None:
+            print("[e2e] XRT zero-copy unavailable: no shared pages", flush=True)
+            return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[e2e] XRT zero-copy unavailable: {e}", flush=True)
+        return False
+
+
+def generate_via_xrt_zero_copy(air, spec, cfg, prefill_cls, args, ids):
+    """XRT twin of the HSA path, for the npz 1B. None when interop is absent."""
+    import numpy as np
+    import torch
+
+    # Probe interop before the decoder, whose construction loads weights.
+    if not _xrt_shared_available():
+        return None
+    from triton.backends.amd_triton_npu import shared
+
+    dec = air.FusedDecoder()
+    slab = shared.zeros(
+        16, dec.LREG, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
+    )
+    host = slab.numpy()
+    dec.kvc = slab.bo
+    dec.KV = host
+
+    prefiller = prefill_cls(
+        backend=args.backend,
+        ops=args.ops,
+        n_layers=cfg.N_LAYERS,
+        max_seq=args.max_seq,
+        model=args.model,
+        expect_model=cfg.MODEL_NAME,
+    )
+    load_prefill_weights(prefiller, args.backend)
+    prefiller.bind_kv_sink(
+        {
+            "buf": host.reshape(-1),
+            "region_w": dec.REGION_W,
+            "ngrp": dec.NGRP,
+            # seed_kv's own stride; the module REGION_STRIDE can differ.
+            "region_stride": dec.ATTN_MAXL * dec.REGION_W,
+            "lreg": dec.LREG,
+        }
+    )
+
+    host[:] = 0
+    prefiller.clear_context()
+    logits = np.asarray(prefiller.prefill(list(ids)), np.float32)
+    first = int(logits.argmax())
+    P = prefiller.current_context_length
+    print(
+        f"[e2e] KV handed over in place: {P} rows already in the decode's "
+        f"layout, nothing to rearrange",
+        flush=True,
+    )
+
+    # `_kv_dirty` stays True: the first dispatch syncs the slab, seed_kv never runs.
+    n_eff = min(args.max_tokens, dec.ATTN_MAXL - P)
+    tokens = list(ids) + [first]
+    gen_ids = [first]
+    t0 = time.time()
+    for p in range(P, P + n_eff):
+        lg = dec.dispatch(tokens[p], p)
+        pred = int(np.asarray(lg).argmax())
+        gen_ids.append(pred)
+        if p + 1 >= len(tokens):
+            tokens.append(pred)
+    t_dec = time.time() - t0
+    n_gen = len(gen_ids) - 1
+    if n_gen > 0:
+        print(
+            f"Generated {n_gen} tokens in {t_dec:.2f}s ({n_gen / t_dec:.2f} tok/s)",
+            flush=True,
+        )
+    return gen_ids
+
+
+def generate_via_xrt_zero_copy_kv_arrays(air, spec, cfg, prefill_cls, args, ids):
+    """XRT zero-copy for the kv_arrays models (Qwen3-4B, Gemma3-4B)."""
+    import numpy as np
+    import torch
+
+    if not _xrt_shared_available():
+        return None
+    from triton.backends.amd_triton_npu import shared
+
+    dec = air.FusedDecoder(model=args.model or cfg.MODEL_DEFAULT, max_L=args.max_seq)
+    slab = shared.zeros(
+        dec.UNI_DEC, dec.LREG, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
+    )
+    host = slab.numpy()
+    dec.kvc = slab.bo
+    dec.KV = host
+
+    prefiller = prefill_cls(
+        backend=args.backend,
+        ops=args.ops,
+        n_layers=cfg.N_LAYERS,
+        max_seq=args.max_seq,
+        model=args.model,
+        expect_model=cfg.MODEL_NAME,
+    )
+    load_prefill_weights(prefiller, args.backend)
+    prefiller.bind_kv_sink(
+        {
+            "buf": host.reshape(-1),
+            "region_w": dec.REGION_W,
+            "ngrp": dec.NGRP,
+            "region_stride": dec.ATTN_MAXL * dec.REGION_W,
+            "lreg": dec.LREG,
+        }
+    )
+
+    host[:] = 0
+    prefiller.clear_context()
+    logits = np.asarray(prefiller.prefill(list(ids)), np.float32)
+    first = int(logits.argmax())
+    P = prefiller.current_context_length
+    print(
+        f"[e2e] KV handed over in place: {P} rows already in the decode's "
+        f"layout, nothing to rearrange",
+        flush=True,
+    )
+
+    n_eff = min(args.max_tokens, dec.ATTN_MAXL - P)
+    tokens = list(ids) + [first]
+    gen_ids = [first]
+    t0 = time.time()
+    for p in range(P, P + n_eff):
+        lg = dec.dispatch(tokens[p], p)
+        pred = int(np.asarray(lg).argmax())
+        gen_ids.append(pred)
+        if p + 1 >= len(tokens):
+            tokens.append(pred)
+    t_dec = time.time() - t0
+    n_gen = len(gen_ids) - 1
+    if n_gen > 0:
+        # Scraped by bench/extract_perf.py; their bypassed generate() prints it.
+        print(f"Tokens/second: {n_gen / t_dec:.2f}", flush=True)
+    return gen_ids
+
+
+def generate_via_xrt_zero_copy_prefiller(air, spec, cfg, prefill_cls, args, ids):
+    """XRT zero-copy for the prefiller models (Llama-3.2-3B/8B, Phi-4)."""
+    import numpy as np
+    import torch
+
+    if not _xrt_shared_available():
+        return None
+    from triton.backends.amd_triton_npu import shared
+
+    dec = getattr(air, spec.decoder_class)(
+        args.model or cfg.MODEL_DEFAULT,
+        airsrc.fused_decode_dir(spec.engine),
+        model_type=spec.model_type,
+    )
+    slab = shared.zeros(
+        dec.N_LAYERS, dec.LREG, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
+    )
+    host = slab.numpy()
+    dec.kvc = slab.bo
+
+    prefiller = prefill_cls(
+        backend=args.backend,
+        ops=args.ops,
+        n_layers=cfg.N_LAYERS,
+        max_seq=args.max_seq,
+        model=args.model,
+        expect_model=cfg.MODEL_NAME,
+    )
+    load_prefill_weights(prefiller, args.backend)
+    prefiller.bind_kv_sink(
+        {
+            "buf": host.reshape(-1),
+            "region_w": dec.fd.REGION_W,
+            "ngrp": dec.fd.NGRP,
+            "region_stride": dec.ATTN_MAXL * dec.fd.REGION_W,
+            "lreg": dec.LREG,
+        }
+    )
+
+    host[:] = 0
+    prefiller.clear_context()
+    logits = np.asarray(prefiller.prefill(list(ids)), np.float32)
+    first = int(logits.argmax())
+    P = prefiller.current_context_length
+    # `seed_kv` would have synced the cache to the device; it never runs here.
+    dec.kvc.sync(dec.TO)
+    print(
+        f"[e2e] KV handed over in place: {P} rows already in the decode's "
+        f"layout, nothing to rearrange",
+        flush=True,
+    )
+
+    n_eff = min(args.max_tokens, dec.ATTN_MAXL - P)
+    tokens = list(ids) + [first]
+    gen_ids = [first]
+    t0 = time.time()
+    for p in range(P, P + n_eff):
+        lg = dec.dispatch(tokens[p], p)
+        pred = int(np.asarray(lg).argmax())
+        gen_ids.append(pred)
+        if p + 1 >= len(tokens):
+            tokens.append(pred)
+    t_dec = time.time() - t0
+    n_gen = len(gen_ids) - 1
+    if n_gen > 0:
+        print(f"Tokens/second: {n_gen / t_dec:.2f}", flush=True)
+    return gen_ids
+
+
 def generate_via_prefiller(air, spec, cfg, args, ids, prefiller):
     """Generation for drivers that take the prefill object rather than a file.
 
@@ -643,8 +928,12 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and air is not None:
         from hsa_decode import make_hsa_decoder_class
 
-        air.FusedDecoder = make_hsa_decoder_class(
-            air, airsrc.fused_decode_dir(spec.engine)
+        # Wrap whichever decoder this driver names (3B/8B are not FusedDecoder).
+        dc = spec.decoder_class or "FusedDecoder"
+        setattr(
+            air,
+            dc,
+            make_hsa_decoder_class(air, airsrc.fused_decode_dir(spec.engine), dc),
         )
 
     if args.interactive:
@@ -697,6 +986,54 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         if ids != list(cfg.PROMPT):
             return 0
         return 0 if gate(first) else 1
+
+    # HSA zero-copy fuses prefill and decode; no separate run_prefill/handoff.
+    zero_copy = (
+        os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa"
+        and spec.supports_hsa
+        and air is not None
+        and args.decode != "gpu"
+        and not args.profile
+    )
+    if zero_copy:
+        out = generate_via_zero_copy(air, spec, cfg, prefill_cls, args, ids)
+        print(f"[e2e] ids {out}", flush=True)
+        if ids == list(cfg.PROMPT) and not gate(out[0]):
+            return 1
+        return _decode_gate(air, spec, cfg, args, ids, out)
+
+    # XRT zero-copy, per driver_api. An allowlist, not `driver_api` alone:
+    # gemma4 has its own _kv_slab path, and the Qwen2.5 models write kv_k/kv_v
+    # inline rather than through `_kv_store`, so the shared slab would decode
+    # from an empty cache. Only models whose `_layer` routes through the sink
+    # and whose decode has been gated on hardware are listed. None without
+    # interop falls through to the staged decode below.
+    _XRT_ZERO_COPY = {
+        "llama-3.2-1b": generate_via_xrt_zero_copy,
+        "qwen3-4b": generate_via_xrt_zero_copy_kv_arrays,
+        "gemma3-4b": generate_via_xrt_zero_copy_kv_arrays,
+        "llama-3.2-3b": generate_via_xrt_zero_copy_prefiller,
+        "llama-3.1-8b": generate_via_xrt_zero_copy_prefiller,
+        "phi4-mini": generate_via_xrt_zero_copy_prefiller,
+    }
+    xrt_fn = None
+    if (
+        os.environ.get("AMD_TRITON_NPU_RUNTIME") != "hsa"
+        and air is not None
+        and args.decode != "gpu"
+        and not args.profile
+        # These loops sample with argmax; a non-greedy run stays on the staged
+        # driver, which honours its own sampler.
+        and args.greedy
+    ):
+        xrt_fn = _XRT_ZERO_COPY.get(spec.name)
+    if xrt_fn is not None:
+        out = xrt_fn(air, spec, cfg, prefill_cls, args, ids)
+        if out is not None:
+            print(f"[e2e] ids {out}", flush=True)
+            if ids == list(cfg.PROMPT) and not gate(out[0]):
+                return 1
+            return _decode_gate(air, spec, cfg, args, ids, out)
 
     # Only the npz drivers read a handoff file. Writing one for the others
     # would be a large K/V dump nothing opens -- [N_LAYERS, P, DK] per tensor.
@@ -754,32 +1091,43 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         # first-token check cannot see the builder environment, -DMODEL_TYPE,
         # GLU_SLICE, the core stack, or which driver API was used, because all
         # of those live in the artifact this generation just ran.
-        golden = getattr(cfg, "EXPECT_IDS", None)
-        if golden and args.greedy and ids == list(cfg.PROMPT):
-            got = list(out)[: len(golden)]
-            if got != list(golden):
-                print(
-                    f"[e2e] decode MISMATCH for {cfg.MODEL_NAME}\n"
-                    f"  expected {list(golden)}\n"
-                    f"  got      {got}",
-                    flush=True,
-                )
-                return 1
-            print(
-                f"[e2e] decode ids match the recorded {len(golden)} for "
-                f"{cfg.MODEL_NAME} -- PASS",
-                flush=True,
-            )
-        try:
-            from transformers import AutoTokenizer
-
-            tk = AutoTokenizer.from_pretrained(tokenizer_dir(air, spec))
-            print(f"[e2e] {tk.decode(ids)!r} ->  {tk.decode(out)!r}", flush=True)
-        except Exception as e:  # tokenizer is a convenience, not the gate
-            print(f"[e2e] (no tokenizer: {e})", flush=True)
+        rc = _decode_gate(air, spec, cfg, args, ids, out)
     finally:
         if kv_path is not None:
             os.unlink(kv_path)
+    return rc
+
+
+def _decode_gate(air, spec, cfg, args, ids, out):
+    """Gate a generated sequence against the recorded continuation.
+
+    Factored out so the zero-copy path, which runs prefill and decode together
+    and cannot reach the npz block above, gates the same way. Returns the
+    process exit code (0 pass / 1 mismatch).
+    """
+    golden = getattr(cfg, "EXPECT_IDS", None)
+    if golden and args.greedy and ids == list(cfg.PROMPT):
+        got = list(out)[: len(golden)]
+        if got != list(golden):
+            print(
+                f"[e2e] decode MISMATCH for {cfg.MODEL_NAME}\n"
+                f"  expected {list(golden)}\n"
+                f"  got      {got}",
+                flush=True,
+            )
+            return 1
+        print(
+            f"[e2e] decode ids match the recorded {len(golden)} for "
+            f"{cfg.MODEL_NAME} -- PASS",
+            flush=True,
+        )
+    try:
+        from transformers import AutoTokenizer
+
+        tk = AutoTokenizer.from_pretrained(tokenizer_dir(air, spec))
+        print(f"[e2e] {tk.decode(ids)!r} ->  {tk.decode(out)!r}", flush=True)
+    except Exception as e:  # tokenizer is a convenience, not the gate
+        print(f"[e2e] (no tokenizer: {e})", flush=True)
     return 0
 
 

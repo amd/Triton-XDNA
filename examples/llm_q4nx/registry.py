@@ -248,6 +248,7 @@ LLAMA_3_2_3B = ModelSpec(
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",
     decoder_class="FusedDecode3B",
+    supports_hsa=True,
 )
 
 
@@ -337,10 +338,7 @@ QWEN3_4B = ModelSpec(
     # resident at once.
     min_host_gib=14.0,
     extra_packages=("qwen3_8b_q4nx", "qwen3_4b"),
-    # Its driver *does* name its decoder `FusedDecoder`, so the adapter would
-    # import -- but nothing here has run it on hardware, and the ELF route it
-    # wants is still blocked. False records "untested", not "cannot".
-    supports_hsa=False,
+    supports_hsa=True,
 )
 
 
@@ -383,7 +381,7 @@ GEMMA3_4B = ModelSpec(
     # because its 262208-row LM head is a separate tensor where Qwen3-4B's is
     # tied.
     min_host_gib=17.0,
-    supports_hsa=False,
+    supports_hsa=True,
 )
 
 #: `DECODE_ENV` in `fused_decode_ple/Makefile` -- the ENGINE's, not the model's:

@@ -199,6 +199,7 @@ class LlamaPrefill:
         self.current_context_length = 0
         self._alloc_base_kv(n_layers, max_seq)
         self._w = None
+        self._kv_sink = None
 
     #: Per-layer KV cache: roped K and raw V, `[max_seq, 512]`, head-major.
     #:
@@ -209,6 +210,40 @@ class LlamaPrefill:
     def _alloc_base_kv(self, n_layers, max_seq):
         self.kv_k = [np.zeros((max_seq, DK), np.float32) for _ in range(n_layers)]
         self.kv_v = [np.zeros((max_seq, DV), np.float32) for _ in range(n_layers)]
+
+    def bind_kv_sink(self, sink):
+        """Divert `_kv_store` into `sink` (a decoder's region-major KV buffer)."""
+        self._kv_sink = sink
+
+    def _kv_store(self, L, k, v, keep):
+        """Write the layer's KV to the host cache, or the bound sink."""
+        if self._kv_sink is not None:
+            self._kv_store_direct(L, k, v, keep)
+            return
+        self.kv_k[L][:keep] = k[:keep].to(torch.float32).cpu().numpy()
+        self.kv_v[L][:keep] = v[:keep].to(torch.float32).cpu().numpy()
+
+    def _kv_store_direct(self, L, k, v, keep):
+        """Scatter K/V into the sink's region-major layout, ngrp K then ngrp V."""
+        s = self._kv_sink
+        rw, ng, rs, lreg = s["region_w"], s["ngrp"], s["region_stride"], s["lreg"]
+        # A region holds rs/rw rows; a longer prompt would scatter past it into
+        # the next region (which the later per-step budget cannot catch).
+        if keep * rw > rs:
+            raise ValueError(
+                f"prompt of {keep} exceeds the decode window {rs // rw}; "
+                "rebuild the decode at a larger ATTN_MAXL or shorten the prompt"
+            )
+        # uint16 view: a bit copy, since torch and ml_dtypes bf16 would else convert.
+        buf = s["buf"].view(np.uint16)
+        kb = k[:keep].to(torch.bfloat16).view(torch.uint16).cpu().numpy()
+        vb = v[:keep].to(torch.bfloat16).view(torch.uint16).cpu().numpy()
+        base = L * lreg
+        for g in range(ng):
+            ko = base + g * rs
+            buf[ko : ko + keep * rw].reshape(keep, rw)[:] = kb[:, g * rw : (g + 1) * rw]
+            vo = base + (ng + g) * rs
+            buf[vo : vo + keep * rw].reshape(keep, rw)[:] = vb[:, g * rw : (g + 1) * rw]
 
     #: What `--ops` selects when nothing is asked for. `None` means every
     #: operator with an NPU kernel, which is right wherever the NPU is faster
@@ -573,8 +608,7 @@ class LlamaPrefill:
         k = self._rope(k, self._lut[:N], N_KV_HEADS)
 
         # The decode's handoff: roped K, raw V, head-major within a position.
-        self.kv_k[L][:keep] = k[:keep].to(torch.float32).numpy()
-        self.kv_v[L][:keep] = v[:keep].to(torch.float32).numpy()
+        self._kv_store(L, k, v, keep)
 
         a = self._attention(q, k, v, N_Q_HEADS, N_KV_HEADS, DH)  # [N, 2048]
         x = x + self._matmul(a, w["o"])

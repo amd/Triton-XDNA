@@ -435,6 +435,34 @@ runs:
               hetero_rc=1
             fi
           done
+
+          # XRT zero-copy needs the iGPU, so it runs here, not in 9b (which hides
+          # it). The golden gate passes on the staged fallback too, so the output
+          # is checked below: engaged is a pass, and a fallback for want of shared
+          # pages is a skip (this runner may have no ROCm torch, like STEP 8's
+          # shared_buffer_test). A green gate with neither marker is the failure
+          # -- zero-copy silently stopped running where it should have.
+          echo "--- xrt zero-copy: llama32_1b_q4nx (iGPU visible) ---"
+          rc=0
+          zc_out=$( cd examples/llama32_1b_q4nx \
+            && python llama32_1b_q4nx_inference.py --max-tokens 8 --greedy 2>&1 ) || rc=$?
+          echo "$zc_out"
+          if [ "$rc" -eq 77 ]; then
+            echo "SKIP: llama32_1b_q4nx xrt zero-copy (exit 77)"
+          elif [ "$rc" -ne 0 ]; then
+            echo "FAIL: llama32_1b_q4nx xrt zero-copy (exit $rc)"
+            hetero_rc=1
+          elif echo "$zc_out" | grep -q "KV handed over in place" \
+               && ! echo "$zc_out" | grep -q "copied once"; then
+            echo "PASS: llama32_1b_q4nx xrt zero-copy engaged"
+          elif echo "$zc_out" | grep -q "XRT zero-copy unavailable"; then
+            echo "SKIP: llama32_1b_q4nx xrt zero-copy -- no shared pages here"
+          else
+            echo "FAIL: llama32_1b_q4nx decode gated green but zero-copy neither"
+            echo "      engaged nor reported it was unavailable."
+            hetero_rc=1
+          fi
+
           exit $hetero_rc
         else
           echo "Skipping hetero run: gpt2/qwen are npu2-only (device=$DEVICE)."
