@@ -1048,6 +1048,10 @@ class Gemma4GpuDecode:
         rather than the NPU one that a preceding prefill leaves active. See
         `gpu_kernels.gpu_driver`.
         """
+        if not 0 <= pos < self.max_L:
+            raise ValueError(
+                f"position {pos} is outside the decode's {self.max_L} rows"
+            )
         with gpu_kernels.gpu_driver():
             return self._step(token, pos)
 

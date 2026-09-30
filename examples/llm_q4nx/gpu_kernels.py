@@ -461,8 +461,17 @@ def _q4nx_split(nbj):
     row; splitting it 4 or 8 ways took `down` from 30-37 to 38-39 GB/s. The
     other shapes gained under 0.05 ms or lost, once the zeroing launch the
     atomics need is paid for.
+
+    Always a divisor of `nbj`: each split takes `nbj // split` chunks, so any
+    remainder would be chunks no program reads. This model's `down` has 24 or
+    48 and keeps its 4 and 8; a K of 6400 (25 chunks) does not split at all.
     """
-    return min(8, nbj // 6) if nbj >= 24 else 1
+    if nbj < 24:
+        return 1
+    split = min(8, nbj // 6)
+    while nbj % split:
+        split -= 1
+    return split
 
 
 def gemv_q4nx(x, w, glu_in=False):
@@ -790,6 +799,11 @@ def qkv_post(qkv, q_norm, k_norm, lut_row, n_q, dh, eps, kv=None):
         slab, fan, pos, region_stride = kv
         if slab.stride(1) != 1:
             raise ValueError("the KV slab's rows must be contiguous")
+        # The kernel writes row `pos` by raw offset, so a row past the region
+        # would land in the V region or the next layer rather than fault.
+        attn_maxl = region_stride // REGION_W
+        if not 0 <= pos < attn_maxl:
+            raise ValueError(f"KV row {pos} is outside the slab's {attn_maxl} rows")
         args = (slab, fan, fan.numel(), pos, eps, slab.stride(0), region_stride)
     else:
         args = (q, q, 0, 0, eps, 0, 0)

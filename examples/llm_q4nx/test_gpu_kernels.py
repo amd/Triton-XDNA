@@ -116,6 +116,10 @@ def _gemv_q4nx(G, dev):
         (N_Q_HEADS * DH_GLOBAL, D),  # o, full layer
         (D, 2 * 12288),  # gate_up, wide FFN
         (12288, D),  # down, wide
+        # Not this model's: chunk counts the split-K heuristic does not divide
+        # (25 -> no split, 39 -> 3). Both once dropped their trailing chunks.
+        (6400, D),
+        (9984, D),
         (D, 262144),  # lm_head
     ):
         w = _random_q4nx(G, N, K, dev)
@@ -134,16 +138,18 @@ def _gemv_q4nx(G, dev):
     # Codec K: the kernel against the torch decoding of the same bytes, and the
     # re-encoding against the Codec B it came from -- the latter in units of
     # the 4-bit step, since the loss is meant to be small next to it.
+    #
+    # Encoded on the host, as `Gemma4GpuDecode._packed` does: the encoder's
+    # torch ops reset the iGPU under `HSA_OVERRIDE`. Only the result moves.
     for K, N in ((D, 2048), (12288, D), (D, 262144)):
-        wb = _random_q4nx(G, N, K, dev)
-        wk = wb.to_codec_k()
+        wk = _random_q4nx(G, N, K, "cpu").to_codec_k().to(dev)
         x = torch.randn(1, K, device=dev)
         n = min(N, 4096)
         head = G.Q4NXWeight(wk.data[: n // 32 * (K // 256) * wk.chunk_bytes], n, K, "k")
         ref = x.to(torch.bfloat16).float() @ G.dequant_q4nx(head)
         got = G.gemv_q4nx(x, wk)[:, :n]
         ok &= check(f"codec K  K={K} N={N}", got, ref, tol=1e-4)
-    wb = _random_q4nx(G, 2048, D, dev)
+    wb = _random_q4nx(G, 2048, D, "cpu")
     wk = wb.to_codec_k()
     sc_b, _ = wb._scales_mins()
     step = sc_b.mean().item()
