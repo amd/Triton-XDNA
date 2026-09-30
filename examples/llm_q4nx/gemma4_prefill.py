@@ -983,7 +983,9 @@ class Gemma4GpuDecode:
         both with a grid barrier was measured and rejected -- see
         IGPU_DECODE_PERF.md, "Persistent megakernel".
         """
-        if isinstance(w["down"], gpu_kernels.Q4NXWeight):
+        # `.get`: in `bf16` mode with the NPU chain resident, `__init__` pops
+        # `gate_up`/`down` so `_mlp` reads the chain's shared pages instead.
+        if isinstance(w.get("down"), gpu_kernels.Q4NXWeight):
             gu = self._mm(h, w["gate_up"])
             return gpu_kernels.gemv_q4nx(gu, w["down"], glu_in=True)
         return self._mlp(h, L, w)
