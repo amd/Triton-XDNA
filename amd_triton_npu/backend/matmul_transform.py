@@ -213,7 +213,7 @@ def generate_matmul_transform(
         # now, not the f32 accumulator Phase 2 gave one to. Re-match after,
         # because bufferize_to_allocation replaces the op.
         unpack_match += """        %unpack_l2_buf, %unpack_l2 = transform.structured.bufferize_to_allocation %unpack_op
-            {memory_space = 1, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         %unpack_re = transform.structured.match ops{["linalg.unpack"]} in %arg1 : (!transform.any_op) -> !transform.any_op
 """
         unpack_target = "%unpack_re"
@@ -223,7 +223,7 @@ def generate_matmul_transform(
         act_fuse = """        %act_re = transform.structured.match ops{["linalg.generic"]} attributes{epilogue_act} in %arg1 : (!transform.any_op) -> !transform.any_op
         %fused_act, %act_loop = transform.structured.fuse_into_containing_op %act_re into %epilogue_forall : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
         %act_l1_buf, %act_l1 = transform.structured.bufferize_to_allocation %fused_act
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 """
         # Left whole, the activation vectorizes to the full core tile and asks
         # aievec for shapes no instruction has. [1, 1, 2, 0] and not the
@@ -261,7 +261,7 @@ def generate_matmul_transform(
         // Cast vector.contract inputs 0,1 to {contract_input_type}
         // (matches hardware MAC unit native input type)
         %vector_contracts_2 = transform.structured.match ops{{["vector.contract"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %result11b = transform.air.vector_type_cast %vector_contracts_2 <{{target_element_type = {contract_input_type}, input_indices = [0, 1], output_indices = []}} : (!transform.any_op) -> !transform.any_op
+        %result11b = transform.air.vector_type_cast %vector_contracts_2 <{{target_element_type = {contract_input_type}, input_indices = [0, 1], output_indices = []}}> : (!transform.any_op) -> !transform.any_op
 """
 
     # The compute herd's inner loop: generated and vectorized for aievec, or
@@ -309,8 +309,8 @@ def generate_matmul_transform(
         %inner_most_matmul_to_unroll, %vec_loops_to_unroll:2 =
           transform.structured.tile_using_for %inner_most_generics tile_sizes [1, 1, 0, 0, 0, 0]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
-        transform.loop.unroll %vec_loops_to_unroll#1 {factor = 2} : !transform.any_op
-        transform.loop.unroll %vec_loops_to_unroll#0 {factor = 2} : !transform.any_op
+        transform.loop.unroll %vec_loops_to_unroll#1 factor = 2 : !transform.any_op
+        transform.loop.unroll %vec_loops_to_unroll#0 factor = 2 : !transform.any_op
 
 """
         herd_vectorize_filter = ""
@@ -325,7 +325,7 @@ def generate_matmul_transform(
 
         // Cast accumulator (input[2]) and output[0] to {accum_type}
         %vector_contracts = transform.structured.match ops{{["vector.contract"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %result11 = transform.air.vector_type_cast %vector_contracts <{{target_element_type = {accum_type}, input_indices = [2], output_indices = [0]}} : (!transform.any_op) -> !transform.any_op
+        %result11 = transform.air.vector_type_cast %vector_contracts <{{target_element_type = {accum_type}, input_indices = [2], output_indices = [0]}}> : (!transform.any_op) -> !transform.any_op
 {input_cast}\
 
         %innermost_for_updated_3 = transform.air.hoist_loop_invariant_transfers %herd2_1, %innermost_for : (!transform.any_op, !transform.any_op) -> !transform.any_op
