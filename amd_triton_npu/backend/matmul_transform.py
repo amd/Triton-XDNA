@@ -213,6 +213,16 @@ module attributes {{transform.with_named_sequence}} {{
   transform.named_sequence @__transform_main(%arg1: !transform.any_op {{transform.readonly}}) {{
 
     //==========================================================================
+    // PHASE 0: FOLD A TRAILING ADD INTO THE CONTRACTION'S ACCUMULATOR
+    // A `tt.dot` that carries a live accumulator arrives as a contraction into
+    // a zero fill plus a separate add; every phase below assumes the folded
+    // form. A no-op otherwise. See transform_library/fold_add.mlir.
+    //==========================================================================
+
+        transform.include @fold_add_into_matmul_init failures(propagate) (%arg1)
+          : (!transform.any_op) -> ()
+
+    //==========================================================================
     // PHASE 1: TILE L3->L2 MEMORY COPIES
     // Tile memref copies for streaming data from DDR (L3) to MemTile (L2).
     //==========================================================================
