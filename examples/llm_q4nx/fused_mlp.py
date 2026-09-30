@@ -97,16 +97,13 @@ import triton.language as tl
 # projection, so a second opinion here would be a second opinion about the
 # hardware.
 from kernels import (
-    FUSED_BLOCK,
     MAX_BLOCK_NUMEL,
     MAX_TILE_NUMEL,
-    WIDE_M,
     _GELU_2C,
     _GELU_K,
     _npu_driver,
     col_tier,
     elem_block,
-    fused_epilogue_script,
     matmul_script,
     row_tier,
     script,
@@ -115,10 +112,6 @@ from kernels import (
 
 #: Qwen's, unmodified. See the module docstring.
 MERGE_SCRIPT = "qwen2_5/transform_swiglu_f32in_aie2p.mlir"
-#: ...and the one for when the gate GEMM already applied the activation, so the
-#: merge is a bare multiply over a bf16 gate and an f32 up. Same script but for
-#: the promote sequence, which pads each operand with its own element type.
-MERGE_SCRIPT_BF16_GATE = "llm_q4nx/transform_mul_bf16f32in_aie2p.mlir"
 #: The f32 variant: these operands are produced on-device by the GEMMs before
 #: it and never touch the host, so they are still f32 rather than bf16.
 #: It splits the range over four of npu2's eight columns. Widening it to eight
@@ -134,7 +127,6 @@ class SharedBufferUnavailable(RuntimeError):
     """Raised inside `_io_pages` to take its fallback path."""
 
 
-MAX_DOWN_SPLIT = 4
 
 #: The K a `down` capture is taken at. Any legal one will do -- the extent is
 #: restated afterwards -- and this is small enough that `block_m * K` clears
@@ -174,7 +166,7 @@ def _plan_down(inter):
 
 
 def _exact_k_ttshared(chain, rows, k, n, block_m, block_n, a_stride, script,
-                      k_capture=None, kernel=None, tail=(), c_dtype=None):
+                      k_capture=None):
     """`_mm_kernel`'s ttsharedir, restated to contract exactly `k`.
 
     Two frontend rules stop a kernel from asking for the reduction a model
@@ -194,11 +186,11 @@ def _exact_k_ttshared(chain, rows, k, n, block_m, block_n, a_stride, script,
     kp = k_capture if k_capture is not None else _pow2(k)
     tA = torch.zeros((rows, a_stride), dtype=torch.bfloat16)
     tB = torch.zeros((kp, n), dtype=torch.bfloat16)
-    tC = torch.zeros((rows, n), dtype=c_dtype or torch.float32)
+    tC = torch.zeros((rows, n), dtype=torch.float32)
     grid = (rows // block_m, n // block_n)
     src = chain._capture_ttshared(
-        kernel or _mm_kernel, grid,
-        (tA, tB, tC, rows, n, kp, a_stride, 1, n, 1, n, 1) + tuple(tail),
+        _mm_kernel, grid,
+        (tA, tB, tC, rows, n, kp, a_stride, 1, n, 1, n, 1),
         {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": kp},
     )
     if isinstance(src, bytes):
@@ -283,73 +275,6 @@ def _mm_kernel(
     a = tl.load(A + aoff + offs_m[:, None] * sam + offs_k[None, :] * sak)
     b = tl.load(B + boff + offs_k[:, None] * sbk + offs_n[None, :] * sbn)
     tl.store(C + offs_m[:, None] * scm + offs_n[None, :] * scn, tl.dot(a, b))
-
-
-@triton.jit
-def _mm_gelu_kernel(
-    A,
-    B,
-    C,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    sam: tl.constexpr,
-    sak: tl.constexpr,
-    sbk: tl.constexpr,
-    sbn: tl.constexpr,
-    scm: tl.constexpr,
-    scn: tl.constexpr,
-    C2: tl.constexpr,
-    KC: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    """`_mm_kernel` with `gelu_tanh` applied, writing bf16.
-
-    The activation has to be in the same module as the matmul for a transform
-    to fuse it, so it is written here rather than left to the merge. Lowered
-    with `kernels.fused_epilogue_script`, it runs on the 32 cores the schedule
-    already builds to copy the accumulator out, and `Cg` never exists in DDR as
-    f32 -- which is both the traffic saved and, since the drain is the only
-    consumer, why the output is bf16.
-
-    Same activation as `_geglu_f32in`, minus the `* up` that has no operand
-    here; see its docstring for why `C2` is twice sqrt(2/pi).
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a = tl.load(A + offs_m[:, None] * sam + offs_k[None, :] * sak)
-    b = tl.load(B + offs_k[:, None] * sbk + offs_n[None, :] * sbn)
-    g = tl.dot(a, b)
-    z = C2 * (g + KC * g * g * g)
-    tl.store(
-        C + offs_m[:, None] * scm + offs_n[None, :] * scn,
-        (g * tl.sigmoid(z)).to(tl.bfloat16),
-    )
-
-
-@triton.jit
-def _mul_bf16_f32in(
-    G,
-    U,
-    Y,
-    n_elements: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """`Y = G * U` where the gate arrives bf16 and already activated.
-
-    What is left of the merge once `_mm_gelu_kernel` has done the activation in
-    the gate GEMM's drain. Reading `G` as bf16 rather than f32 is half of this
-    pass's DDR traffic on that side.
-    """
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    g = tl.load(G + offsets[:]).to(tl.float32)
-    tl.store(Y + offsets[:], (g * tl.load(U + offsets[:])).to(tl.bfloat16))
 
 
 @triton.jit
@@ -457,7 +382,6 @@ class FusedMLP:
         self._io = {}
         #: rows -> whether that chain's gate GEMM carries its own
         #: activation, which decides `Cg`'s element type.
-        self._gate_fused = {}
         self._weights = {}  # layer_idx -> (Bg, Bu, Bd)
 
     # ---- weights ----
@@ -639,22 +563,6 @@ class FusedMLP:
         # places on the block it was generated for.
         gu_script = matmul_script(gu_m, gu_n)
         dn_script = matmul_script(dn_m, dn_n)
-        # The gate alone may take the drain-fused schedule, which is generated
-        # for one block and one only. It runs at a narrower column tile than
-        # `up` does, so the two stop being the same GEMM; that is the price of
-        # the block the drain fits in.
-        gate_m, gate_n = FUSED_BLOCK
-        # Off by default, and measured worse: with an exact K the plain gate
-        # is cheap enough that the 256x512 block the drain's L1 budget forces
-        # costs more than the f32 `Cg` write it saves. FFN 1544 -> 1587 ms at
-        # P=2040. The capability is kept because it no longer carries a stale
-        # limitation -- the fused gate can state an unpadded K like every other
-        # op -- not because it is worth turning on.
-        gate_script = (
-            fused_epilogue_script(gate_m, gate_n)
-            if M % gate_m == 0 and HID % gate_n == 0
-            else None
-        )
 
         # Shape-representative placeholders; only shapes and dtypes drive the
         # warmup lowering, never the values.
@@ -662,10 +570,6 @@ class FusedMLP:
         tBg = torch.zeros((K_exact, HID), dtype=torch.bfloat16)
         tC = torch.zeros((M, HID), dtype=torch.float32)
         tCf = torch.zeros(M * HID, dtype=torch.float32)
-        # The gate's output, where the drain-fused schedule writes it: bf16,
-        # because the drain is its only consumer.
-        tCg = torch.zeros((M, HID), dtype=torch.bfloat16)
-        tCgf = torch.zeros(M * HID, dtype=torch.bfloat16)
         tH = torch.zeros(M * HID, dtype=torch.bfloat16)
         tHm = torch.zeros((M, HID), dtype=torch.bfloat16)
         tBd = torch.zeros((HID, D_pad), dtype=torch.bfloat16)
@@ -673,23 +577,7 @@ class FusedMLP:
         tOutf = torch.zeros(M * D_pad, dtype=torch.float32)
 
         chain = NPUChain(f"q4nx_mlp_{self.H}_m{M}")
-        if gate_script is not None:
-            # gate, with its activation in the GEMM's own drain herd
-            gate_src = _exact_k_ttshared(
-                chain, M, K_exact, HID, gate_m, gate_n, self.K_stride,
-                gate_script, kernel=_mm_gelu_kernel,
-                tail=(_GELU_2C, _GELU_K), c_dtype=torch.bfloat16,
-            )
-            chain.add(
-                gate_src,
-                grid=(M // gate_m, HID // gate_n),
-                arg_map={0: self.A_I, 1: self.BG_I, 2: self.CG_I},
-                args=(),
-                transform_script=gate_script,
-            )
-            gemms = ((self.BU_I, self.CU_I),)
-        else:
-            gemms = ((self.BG_I, self.CG_I), (self.BU_I, self.CU_I))
+        gemms = ((self.BG_I, self.CG_I), (self.BU_I, self.CU_I))
         gu_src = _exact_k_ttshared(
             chain, M, self.K_exact, HID, gu_m, gu_n, self.K_stride, gu_script
         )
@@ -708,20 +596,14 @@ class FusedMLP:
         # GEMM's drain already did the activation.
         # gate + up + H. The gate is bf16 where its GEMM's drain applied the
         # activation and f32 where the merge still has to.
-        merge_block = elem_block(M * HID, (2 if gate_script is not None else 4) + 4 + 2)
+        merge_block = elem_block(M * HID, 4 + 4 + 2)
         chain.add(
-            _mul_bf16_f32in if gate_script is not None else _geglu_f32in,
+            _geglu_f32in,
             grid=((M * HID) // merge_block,),
             arg_map={0: self.CG_I, 1: self.CU_I, 2: self.H_I},
-            args=(
-                (tCgf, tCf, tH, M * HID)
-                if gate_script is not None
-                else (tCf, tCf, tH, _GELU_2C, _GELU_K, M * HID)
-            ),
+            args=(tCf, tCf, tH, _GELU_2C, _GELU_K, M * HID),
             constexprs={"BLOCK_SIZE": merge_block},
-            transform_script=script(
-                MERGE_SCRIPT_BF16_GATE if gate_script is not None else MERGE_SCRIPT
-            ),
+            transform_script=script(MERGE_SCRIPT),
         )
         # down, contracting the FFN width in ONE op. It used to go in
         # `n_down` power-of-two pieces with adds folding them back, because a
@@ -741,7 +623,6 @@ class FusedMLP:
             transform_script=dn_script,
         )
         self._chains[M] = chain
-        self._gate_fused[M] = gate_script is not None
         return chain
 
     # ---- dispatch ----
@@ -805,7 +686,7 @@ class FusedMLP:
                 # The gate's output is bf16 where its drain herd applied the
                 # activation, and f32 where the merge still has to.
                 args[self.CG_I] = np.empty(
-                    (M, HID), dtype=bfloat16 if self._gate_fused[M] else np.float32
+                    (M, HID), dtype=np.float32
                 )
                 args[self.CU_I] = np.empty((M, HID), dtype=np.float32)
                 args[self.H_I] = np.empty(M * HID, dtype=bfloat16)
