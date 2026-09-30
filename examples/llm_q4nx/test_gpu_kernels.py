@@ -83,6 +83,146 @@ def _phi4_partial_rope(dev):
     return check(f"N={N} heads={nh} dh={dh} rot={R}", gpu, host)
 
 
+def _random_q4nx(G, N, K, dev):
+    """A Codec B matrix of random nibbles with realistic scales and mins.
+
+    Random bytes throughout would put NaN and inf in the bf16 scale fields.
+    Scales positive and mins negative, as every one in the real bundle is --
+    which Codec K relies on.
+    """
+    nb = (N // G.Q4NX_ROWS) * (K // G.Q4NX_COLS)
+    data = torch.randint(0, 256, (nb, G.Q4NX_CHUNK_BYTES), dtype=torch.uint8)
+    sc = torch.rand(nb, 256) * 0.05 + 0.001
+    mn = -sc * (torch.rand(nb, 256) * 12 + 1)
+    sm = torch.cat([sc, mn], 1).to(torch.bfloat16)
+    data[:, :1024] = sm.view(torch.uint8)
+    return G.Q4NXWeight(data.reshape(-1), N, K).to(dev)
+
+
+def _gemv_q4nx(G, dev):
+    """The W4A16 GEMV, against the torch dequantization and against mlir-air's.
+
+    Two references because they catch different things. `dequant_q4nx` is the
+    same reading of the layout written a second way, so it catches a kernel
+    bug. mlir-air's `Q4nxModel.dequant` is the reading every other path in this
+    stack uses, so it catches `dequant_q4nx` and the kernel sharing one wrong
+    idea of where a nibble lives -- which the first check cannot see.
+    """
+    print("\ngemv_q4nx  [1,K] @ Codec B [N,K]^T")
+    ok = True
+    for K, N in (
+        (D, N_Q_HEADS * DH_GLOBAL + 2 * DH_GLOBAL),  # qkv, full layer
+        (D, N_Q_HEADS * DH_SLIDING),  # q alone, KV-shared sliding layer
+        (N_Q_HEADS * DH_GLOBAL, D),  # o, full layer
+        (D, 2 * 12288),  # gate_up, wide FFN
+        (12288, D),  # down, wide
+        (D, 262144),  # lm_head
+    ):
+        w = _random_q4nx(G, N, K, dev)
+        x = torch.randn(1, K, device=dev)
+        # The reference is checked on at most the first 4096 rows: a full f32
+        # dequantization of the head is 1.6 GB before its intermediates, more
+        # than this iGPU has free. Chunks are block-major, so a row prefix is
+        # a chunk prefix.
+        n = min(N, 4096)
+        head = G.Q4NXWeight(w.data[: n // 32 * (K // 256) * 5120], n, K)
+        ref = x.to(torch.bfloat16).float() @ G.dequant_q4nx(head)
+        # f32 on both sides, so the tolerance is summation order, not rounding.
+        got = G.gemv_q4nx(x, w)[:, :n]
+        ok &= check(f"K={K} N={N}", got, ref, tol=1e-4)
+
+    # Codec K: the kernel against the torch decoding of the same bytes, and the
+    # re-encoding against the Codec B it came from -- the latter in units of
+    # the 4-bit step, since the loss is meant to be small next to it.
+    for K, N in ((D, 2048), (12288, D), (D, 262144)):
+        wb = _random_q4nx(G, N, K, dev)
+        wk = wb.to_codec_k()
+        x = torch.randn(1, K, device=dev)
+        n = min(N, 4096)
+        head = G.Q4NXWeight(wk.data[: n // 32 * (K // 256) * wk.chunk_bytes], n, K, "k")
+        ref = x.to(torch.bfloat16).float() @ G.dequant_q4nx(head)
+        got = G.gemv_q4nx(x, wk)[:, :n]
+        ok &= check(f"codec K  K={K} N={N}", got, ref, tol=1e-4)
+    wb = _random_q4nx(G, 2048, D, dev)
+    wk = wb.to_codec_k()
+    sc_b, _ = wb._scales_mins()
+    step = sc_b.mean().item()
+    err = (G.dequant_q4nx(wk) - G.dequant_q4nx(wb)).pow(2).mean().sqrt().item()
+    rel = err / (step / 12**0.5)
+    print(f"  codec K re-encoding error          {rel:.3f} x the 4-bit noise")
+    ok &= rel < 0.5
+
+    # The GeGLU fused into `down`'s activation load, against the launch it
+    # replaces -- at both FFN widths, the wide one being the split-K path.
+    for inter in (6144, 12288):
+        gu = torch.randn(1, 2 * inter, device=dev)
+        down = _random_q4nx(G, D, inter, dev)
+        ref = G.gemv_q4nx(G.geglu(gu[:, :inter], gu[:, inter:]), down)
+        got = G.gemv_q4nx(gu, down, glu_in=True)
+        ok &= check(f"geglu -> down K={inter} fused", got, ref, tol=1e-4)
+
+    # Through `airsrc`, not the example's `config`: binding a `config` here
+    # would shadow the one `_phi4_partial_rope` needs.
+    try:
+        import numpy as np
+
+        import airsrc
+
+        airsrc.add_air_paths("gemma4_e2b_q4nx")
+        import gemma4_e2b_q4nx_weights as gw
+    except (ImportError, RuntimeError) as e:
+        print(f"  SKIP mlir-air layout cross-check: {e}")
+        return ok
+    N, K = 64, 512
+    w = _random_q4nx(G, N, K, "cpu")
+    qm = gw.Q4nxModel.__new__(gw.Q4nxModel)
+    qm._hdr = {"t": {"shape": [(N // 32) * (K // 256)]}}
+    qm._raw = lambda name, dtype: w.data.numpy().view(dtype)
+    theirs = torch.from_numpy(qm.dequant("t", N, K).astype(np.float32))
+    ok &= check("dequant_q4nx vs mlir-air dequant", G.dequant_q4nx(w).T, theirs, 1e-6)
+    return ok
+
+
+def _qkv_post(G, dev):
+    """`qkv_post` against the separate norm / rope / scatter it fuses."""
+    import kv_layout
+
+    print("\nqkv_post  head norms + rope + KV append")
+    ok = True
+    maxl, pos, fan = 16, 5, [0, 2, 3]
+    for dh, owns in ((256, True), (512, True), (256, False)):
+        n = N_Q_HEADS * dh + (2 * dh if owns else 0)
+        qkv = torch.randn(1, n, device=dev)
+        qn, kn = torch.randn(dh, device=dev), torch.randn(dh, device=dev)
+        row = torch.randn(dh, device=dev)
+        slab = torch.zeros(
+            kv_layout.slab_shape(4, maxl), dtype=torch.bfloat16, device=dev
+        )
+        kv = None
+        if owns:
+            fan_t = torch.tensor(fan, dtype=torch.int32, device=dev)
+            kv = (slab, fan_t, pos, kv_layout.region_stride(maxl))
+        q = G.qkv_post(qkv, qn, kn if owns else None, row, N_Q_HEADS, dh, RMS_EPS, kv)
+
+        def normed_roped(x, w, heads):
+            y = G.rmsnorm(x.reshape(heads, dh), w, RMS_EPS).reshape(1, -1)
+            return G.rope(y, row, heads, dh)
+
+        qd = N_Q_HEADS * dh
+        ok &= check(f"q  dh={dh} owns={owns}", q, normed_roped(qkv[:, :qd], qn, 8))
+        if not owns:
+            continue
+        k = normed_roped(qkv[:, qd : qd + dh], kn, 1)
+        v = G.rmsnorm(qkv[:, qd + dh :], None, RMS_EPS)
+        want = torch.zeros_like(slab)
+        for L in fan:
+            for region, t in ((kv_layout.K_REGION, k), (kv_layout.V_REGION, v)):
+                view = kv_layout.region_view(want, L, region, maxl)
+                kv_layout.scatter_rows(view[pos : pos + 1], t.to(torch.bfloat16), dh)
+        ok &= check(f"kv slab dh={dh}", slab.float(), want.float(), tol=1e-6)
+    return ok
+
+
 def main():
     if not torch.cuda.is_available():
         print("SKIP: no ROCm device visible to torch")
@@ -124,6 +264,19 @@ def main():
     ref = (x.to(torch.bfloat16) @ wt).to(torch.float32)
     ok &= check(f"K={K} N={N} transposed", G.gemv(x, wt), ref)
 
+    # The PLE pair: `inp_gate` split over K, its partials summed and the GeGLU
+    # applied as `per_layer_projection` loads them.
+    x = torch.randn(1, D, device=dev)
+    wg = (torch.randn(D, 256, device=dev) * 0.05).to(torch.bfloat16)
+    wp = (torch.randn(256, D, device=dev) * 0.05).to(torch.bfloat16)
+    u = torch.randn(1, 256, device=dev)
+    ref = G.gemv(G.geglu(G.gemv(x, wg), u), wp)
+    got = G.gemv(G.gemv(x, wg, split_k=4), wp, glu_up=u)
+    ok &= check("split-K -> GeGLU-on-load (PLE pair)", got, ref, tol=1e-4)
+
+    ok &= _gemv_q4nx(G, dev)
+    ok &= _qkv_post(G, dev)
+
     # --- rmsnorm, weighted and weightless ---
     print("\nrmsnorm")
     for rows, N, has_w in ((1, D, True), (1, 256, True), (1, DH_GLOBAL, False)):
@@ -146,6 +299,23 @@ def main():
             G.rmsnorm_residual(x, w, RMS_EPS, r, scale),
             ref,
         )
+        w2 = torch.randn(N, device=dev)
+        y, h = G.rmsnorm_residual(x, w, RMS_EPS, r, scale, next_norm=w2)
+        ok &= check(f"N={N} scale={scale} +next_norm (y)", y, ref)
+        ok &= check(
+            f"N={N} scale={scale} +next_norm (h)", h, G.rmsnorm(ref, w2, RMS_EPS)
+        )
+
+    # --- the per-layer inputs, all 35 layers in one launch ---
+    print("\nple_combine  (rmsnorm(p*s_in)*w + t) * s_out, per layer")
+    L, n, s_in, s_out = 35, 256, D**-0.5, 2**-0.5
+    p = torch.randn(1, L * n, device=dev)
+    w = torch.randn(n, device=dev)
+    t = torch.randn(L, n, device=dev)
+    ps = p.reshape(L, n) * s_in
+    inv = torch.rsqrt(ps.pow(2).mean(-1, keepdim=True) + RMS_EPS)
+    ref = (ps * inv * w + t) * s_out
+    ok &= check(f"L={L} n={n}", G.ple_combine(p, w, t, s_in, s_out, RMS_EPS), ref)
 
     # --- rope ---
     print("\nrope")
