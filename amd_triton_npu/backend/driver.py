@@ -1366,6 +1366,12 @@ def _detect_matmul(asm_src_text):
     exactly one ``linalg.matmul`` and no linalg compute ops other than
     ``fill`` (fused epilogues are out of scope). Returns None otherwise, in
     which case the caller keeps the built-in default tiling.
+
+    A ``tt.dot`` carrying a live accumulator is declined: it lowers to a
+    contraction plus a ``linalg.generic`` add, which fails the subset test
+    above. ``@fold_add_into_matmul_init`` removes that generic, but schedules
+    are selected after this runs, so such a kernel needs an explicit
+    ``transform_script``.
     """
     import re
 
@@ -1507,7 +1513,10 @@ def _get_transform_ir_string(matmul_info=None):
         from .matmul_transform import generate_matmul_transform
 
         logger.debug("Auto-generating matmul transform with params: %s", matmul_info)
-        script = generate_matmul_transform(**matmul_info)
+        # The generated schedule opens with a transform.include, so it needs
+        # the same library inlining a user script gets. Without it the parse
+        # fails on an unresolved symbol.
+        script = _inject_transform_library(generate_matmul_transform(**matmul_info))
         try:
             air_proj_path = npu_config.air_project_path
             os.makedirs(air_proj_path, exist_ok=True)
