@@ -292,7 +292,7 @@ def generate_matmul_transform(
     //==========================================================================
 
         %mm = transform.structured.match ops{{["linalg.generic"]}} attributes{{matmul_compute}} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %mm_call = transform.air.linalg_to_library_call %mm {{function_name = "{library_call_symbol}", link_with = "{library_call}"}} : (!transform.any_op) -> !transform.any_op
+        %mm_call = transform.air.linalg_to_library_call %mm <{{function_name = "{library_call_symbol}", link_with = "{library_call}"}}> : (!transform.any_op) -> !transform.any_op
 
     //==========================================================================
     // PHASE 12: FINAL LOOP OPTIMIZATIONS
