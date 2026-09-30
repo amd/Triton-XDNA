@@ -47,7 +47,7 @@ module attributes {transform.with_named_sequence} {
         // PHASE 3: Batch-Level Tiling and Producer-Consumer Fusion
         //===================================================================
         %output_buf, %new_output = transform.structured.bufferize_to_allocation %output_generic
-          {memory_space = 1, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         %tiled_output, %forall_4 =
         transform.structured.tile_using_forall %output_generic tile_sizes [1]  : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
@@ -67,7 +67,7 @@ module attributes {transform.with_named_sequence} {
         //===================================================================
         %fills_2 = transform.structured.match ops{["linalg.fill"]} in %arg1  : (!transform.any_op) -> !transform.any_op
         %fill1_buffer, %fill1_new = transform.structured.bufferize_to_allocation %fills_2
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         // After fusion there are 2 generics (x*x feeding reduce, and the final
         // rsqrt*x output) plus 1 reduce. Split the two generics; reduce is single.
@@ -81,13 +81,13 @@ module attributes {transform.with_named_sequence} {
         transform.structured.promote_tensor to 2 %op0 : !transform.any_value
 
         %gen1_in_buffer, %gen1_in_new = transform.structured.bufferize_to_allocation %tiled_generic1
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         %red1_in_buffer, %red1_in_new = transform.structured.bufferize_to_allocation %reduces2
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         %gen2_in_buffer, %gen2_in_new = transform.structured.bufferize_to_allocation %tiled_generic2
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         //===================================================================
         // PHASE 6: Final Canonicalization
@@ -141,13 +141,13 @@ module attributes {transform.with_named_sequence} {
             transform.apply_patterns.vector.cast_away_vector_leading_one_dim
         } : !transform.any_op
 
-        %vectorized_herd_updated = transform.air.broadcast_before_unary %func4 {op_name = "math.rsqrt"} : (!transform.any_op) -> !transform.any_op
+        %vectorized_herd_updated = transform.air.broadcast_before_unary %func4 <{op_name = "math.rsqrt"}> : (!transform.any_op) -> !transform.any_op
 
         %vector_reductions_in_herd = transform.structured.match ops{["vector.multi_reduction"]} in %vectorized_herd_updated : (!transform.any_op) -> !transform.any_op
-        %result10 = transform.air.vector_type_cast %vector_reductions_in_herd {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+        %result10 = transform.air.vector_type_cast %vector_reductions_in_herd <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
 
         %vector_muls_in_herd = transform.structured.match ops{["arith.mulf"]} in %vectorized_herd_updated : (!transform.any_op) -> !transform.any_op
-        %result11 = transform.air.vector_type_cast %vector_muls_in_herd {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+        %result11 = transform.air.vector_type_cast %vector_muls_in_herd <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
 
         %func7 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
         %func7_transformed = transform.air.convert_size1_vector_to_scalar %func7 : (!transform.any_op) -> !transform.any_op

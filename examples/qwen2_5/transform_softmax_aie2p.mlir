@@ -120,7 +120,7 @@ module attributes {transform.with_named_sequence} {
 
         // Bufferize the final operation to L2 memory (memory_space = 1)
         %generic3_output_buf, %new_generic3 = transform.structured.bufferize_to_allocation %generic3
-          {memory_space = 1, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         // Tile the final operation with tile size [1] for batch dimension
         %tiled_generic_3, %forall_5 =
@@ -151,7 +151,7 @@ module attributes {transform.with_named_sequence} {
         // Allocate fill operations to L1 memory for reduction accumulation
         %fills_2 = transform.structured.match ops{["linalg.fill"]} in %arg1  : (!transform.any_op) -> !transform.any_op
         %fill1_buffer, %fill1_new = transform.structured.bufferize_to_allocation %fills_2
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         // Split generic operations after tiling for individual L1 buffer allocation
         // Each tiled generic operation will have its output allocated in L1
@@ -165,13 +165,13 @@ module attributes {transform.with_named_sequence} {
 
         // Allocate output buffers in L1 for each tiled generic operation
         %gen1_in_buffer, %gen1_in_new = transform.structured.bufferize_to_allocation %tiled_generic1
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         
         %gen2_in_buffer, %gen2_in_new = transform.structured.bufferize_to_allocation %tiled_generic2
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
         
         %gen3_in_buffer, %gen3_in_new = transform.structured.bufferize_to_allocation %tiled_generic3
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         //===================================================================
         // PHASE 6: Pre-Bufferization Canonicalization
@@ -239,11 +239,11 @@ module attributes {transform.with_named_sequence} {
 
         // Cast vector reduce to use bf16 (to map to AIE vectorized reduction intrinsic)
         %vector_reductions_in_herd = transform.structured.match ops{["vector.multi_reduction"]} in %vectorized_herd : (!transform.any_op) -> !transform.any_op
-        %result10 = transform.air.vector_type_cast %vector_reductions_in_herd {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+        %result10 = transform.air.vector_type_cast %vector_reductions_in_herd <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
 
         // Cast vector exp to use bf16 (to map to AIE vectorized exp intrinsic)
         %vector_exps_in_herd = transform.structured.match ops{["math.exp"]} in %vectorized_herd : (!transform.any_op) -> !transform.any_op
-        %result11 = transform.air.vector_type_cast %vector_exps_in_herd {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+        %result11 = transform.air.vector_type_cast %vector_exps_in_herd <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
 
         transform.include @post_vectorize_reduce_cleanup failures(propagate)
             (%arg1) : (!transform.any_op) -> ()

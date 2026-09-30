@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: MIT
 """Locating mlir-air's LLM sources, and choosing who dispatches the decode.
 
-Model-agnostic: every example under `examples/*_q4nx/` needs mlir-air's
-`programming_examples/` on `sys.path` (the wheel ships no `programming_examples`)
-and needs mlir-air's decoder kept off its own dispatch path. Neither depends on
-which model is being run, so both live here rather than in each model's config.
+Model-agnostic: every example under `examples/*_q4nx/` needs to reach mlir-air's
+`programming_examples/` (the wheel ships no `programming_examples`) and needs
+mlir-air's decoder kept off its own dispatch path. Neither depends on which
+model is being run, so both live here rather than in each model's config.
 """
 
 import os
 import sys
+import types
 from pathlib import Path
 
 #: Where mlir-air's sources may be, in priority order. The first is a
@@ -65,20 +66,38 @@ def fused_decode_dir(engine="fused_decode"):
     return str(air_llms_root().parent / ENGINES[engine].directory)
 
 
+def register_air_examples():
+    """Publish mlir-air's `programming_examples/` as the `air_examples` package.
+
+    mlir-air `2b09ca0a` stopped putting `programming_examples/` and `llms/` on
+    `sys.path` and reaches across directories as `air_examples.*` instead:
+    both are directories of short generic names, so on `sys.path` they make
+    `shared`, `verify`, `bottleneck` and friends top-level module names for the
+    whole interpreter -- `bottleneck` being one pandas probes for as an optional
+    dependency and then chokes on.
+
+    Its modules register the package themselves, from their own location, so
+    this is not needed for them to import. It is here so that we do not put
+    those two directories back on `sys.path` to make them importable, which
+    would re-create exactly what upstream removed.
+    """
+    mod = sys.modules.setdefault("air_examples", types.ModuleType("air_examples"))
+    mod.__path__ = [str(air_llms_root().parent)]
+    return mod
+
+
 def add_air_paths(*packages):
     """Put mlir-air's llms packages on sys.path.
 
     `packages` are subdirectories of `llms/` this model needs -- its own q4nx
     package and whatever base package it borrows its config and RoPE table
-    from. `llms/` itself and `programming_examples/` (for `shared.*`) are always
-    added.
+    from. Only those: a model's own directory on `sys.path` is what running any
+    script there would do, and it publishes only that model's file names.
+    Anything reaching across directories goes through `air_examples`.
     """
+    register_air_examples()
     llms = air_llms_root()
-    for p in (
-        str(llms),
-        *(str(llms / pkg) for pkg in packages),
-        str(llms.parent),  # programming_examples, for `shared.*`
-    ):
+    for p in (str(llms / pkg) for pkg in packages):
         if p not in sys.path:
             sys.path.insert(0, p)
 
