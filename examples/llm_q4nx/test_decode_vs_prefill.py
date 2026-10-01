@@ -10,6 +10,12 @@ The oracle is the prefill itself, re-run over the growing prefix a token at a
 time. Slow, since that is N prefills for N tokens, and trustworthy, since the
 prefill is what CI already gates.
 
+It also runs the iGPU prefill (`Gemma4GpuDecode.prefill`) over each prompt
+and checks that the decode continues from it as from the host prefill: the
+same greedy tokens, and K/V in the same slab rows. Its int8 activations make
+its logits close to the host prefill's rather than equal, so those are the
+checks, not the logits.
+
 Run it by hand; `llm_q4nx` is excluded from the `run_tests.py` sweep as a
 library. Exits 77 without an iGPU, the decode under test being the GPU one.
 
@@ -29,6 +35,7 @@ import argparse
 import os
 import sys
 
+import numpy as np
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -101,6 +108,7 @@ def main():
         logits = torch.as_tensor(m.prefill(ids))
         assert not torch.isnan(logits).any(), f"prefill produced NaN at P={len(ids)}"
         dec = Gemma4GpuDecode(m, max_L=len(ids) + a.tokens + 2)
+        host_kv = dec._slab_t.clone()  # the host prefill's K/V, before decoding
         # No `first`: the decoder takes the prefiller's own last prediction and
         # context length, so it decodes the prefill that actually ran. The
         # oracle above left the KV on an extended prefix; passing a token from
@@ -115,6 +123,30 @@ def main():
         print(f"prompt (P={len(ids)}) {ids if len(ids) <= 8 else ids[:8] + ['...']}")
         print(f"  prefill oracle : {oracle}")
         print(f"  gpu decode     : {got}   {'ok' if match else 'MISMATCH'}")
+
+        dec.prefill(ids)
+        kv = dec._slab_t
+        diff = (kv.float() - host_kv.float()).norm() / host_kv.float().norm()
+        lanes = ((kv != 0) == (host_kv != 0)).float().mean().item() > 0.9999
+        mirrored = dec._slab_shared or torch.equal(
+            torch.from_numpy(m._kv_host.view(np.int16)), kv.view(torch.int16).cpu()
+        )
+        got = dec.generate(n_tokens=a.tokens, eos=())[: len(oracle)]
+        good = got == oracle and lanes and diff.item() < 5e-2 and mirrored
+        ok &= good
+        print(
+            f"  gpu prefill    : {got}   KV rel {diff.item():.1e}, same lanes "
+            f"{lanes}, host slab in sync {mirrored}   {'ok' if good else 'MISMATCH'}"
+        )
+
+    # A prompt longer than the slab or the RoPE tables (`max_seq`) must be
+    # refused before it writes anything.
+    try:
+        dec.prefill([2] * (m.max_seq + 1))
+        print("prompt past max_seq: accepted   FAIL")
+        ok = False
+    except ValueError:
+        print("prompt past max_seq: refused   ok")
 
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

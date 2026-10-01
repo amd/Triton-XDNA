@@ -911,6 +911,7 @@ class Gemma4GpuDecode:
                 torch.from_numpy(host.view(np.int16)).view(torch.bfloat16).to(device)
             )
         self._slab_t = slab_t
+        self._slab_shared = hasattr(slab, "torch")
         self.k = [
             kv_layout.region_view(slab_t, L, kv_layout.K_REGION, self.attn_maxl)
             for L in range(pf.n_layers)
@@ -1039,6 +1040,140 @@ class Gemma4GpuDecode:
             PLE_INPUT_SCALE,
             RMS_EPS,
         )
+
+    def prefill(self, ids):
+        """The prompt, on the iGPU, into the same KV slab. Returns its logits.
+
+        The same forward as `Gemma4Prefill._layer`, run on this decoder's
+        device-resident weights so the model is not held twice. The numerics
+        differ from the host prefill's: the projections quantize activations
+        to int8 (`gpu_kernels.gemm_w4a8`) and attention takes fp16 operands,
+        so the logits are close to the host's, not equal.
+
+        K/V go through the batched `qkv_post`, the kernel each decode step
+        appends with, into `kv_layout`'s shared slab, so a decoder on either
+        device continues from it as it would from the host prefill. Leaves
+        `current_context_length` and `last_first_token` on the prefiller,
+        which is what `generate` and the NPU decode read.
+        """
+        if not isinstance(self.w[0]["qkv"], gpu_kernels.Q4NXWeight):
+            raise ValueError("the iGPU prefill reads packed weights: q4k or q4nx")
+        pf = self.pf
+        N = len(ids)
+        if N > self.attn_maxl:
+            raise ValueError(
+                f"a {N}-token prompt needs {N} KV rows; ATTN_MAXL={self.attn_maxl}"
+            )
+        # The RoPE tables have `max_seq` rows, and the slab may have more.
+        if N > pf.max_seq:
+            raise ValueError(f"a {N}-token prompt exceeds max_seq={pf.max_seq}")
+        with gpu_kernels.gpu_driver():
+            logits = self._prefill(list(ids))
+            if not self._slab_shared:
+                # Without interop the device slab is a copy; the host one is
+                # what `kv_stack` and the NPU decode read.
+                pf._kv_host.view(np.int16)[...] = (
+                    self._slab_t.view(torch.int16).cpu().numpy()
+                )
+        pf._ids = list(ids)
+        pf.current_context_length = N
+        pf.last_first_token = int(torch.argmax(logits))
+        return logits
+
+    def _prefill(self, ids):
+        N, n = len(ids), self.pf.n_layers
+        dev = self.dev
+        # The slab's padded lanes and the rows past the prompt must read as
+        # zero -- the reason `Gemma4Prefill._zero_slab` zeroes all of it.
+        self._slab_t.zero_()
+        tok = torch.tensor(ids, device=dev)
+        x = self.embed[tok].to(torch.float32)  # [N, D]
+
+        # Per-layer inputs for every token and layer at once: one GEMM for
+        # every layer's `model_proj`, one `ple_combine` over all N * n rows.
+        tbl = _t(self.pf._ple_rows(ids)).to(dev)[:, :n]  # [N, n, PLI_D]
+        proj = gpu_kernels.matmul(x, self._model_proj_all)  # [N, n * PLI_D]
+        pli = gpu_kernels.ple_combine(
+            proj,
+            self.ple_proj_norm,
+            tbl.reshape(N * n, PLI_D),
+            PLE_MODEL_PROJ_SCALE,
+            PLE_INPUT_SCALE,
+            RMS_EPS,
+        )
+        pli = pli.view(N, n, PLI_D).transpose(0, 1).contiguous()  # [n, N, PLI_D]
+
+        dense = {}  # owning layer -> its dense fp16 K/V, for itself and sharers
+        h = gpu_kernels.rmsnorm(x, self.w[0]["attn_norm"], RMS_EPS)
+        for L in range(n):
+            w = self.w[L]
+            dh = head_dim(L)
+            residual = x
+            qkv = gpu_kernels.gemm_w4a8(h, w["qkv"])
+            if L < FIRST_KV_SHARED:
+                q, kd, vd = gpu_kernels.qkv_post(
+                    qkv,
+                    w["q_norm"],
+                    w["k_norm"],
+                    self.lut[L][:N],
+                    N_Q_HEADS,
+                    dh,
+                    RMS_EPS,
+                    kv=(self._slab_t, self._fan[L], 0, self._region_stride),
+                    dense_kv=True,
+                    out_dtype=torch.float16,
+                )
+                dense[L] = (kd, vd)
+            else:
+                q = gpu_kernels.qkv_post(
+                    qkv,
+                    w["q_norm"],
+                    None,
+                    self.lut[L][:N],
+                    N_Q_HEADS,
+                    dh,
+                    RMS_EPS,
+                    out_dtype=torch.float16,
+                )
+                kd, vd = dense[kv_source_layer(L)]
+            a = gpu_kernels.attn_prefill_fa(
+                q,
+                kd,
+                vd,
+                N_Q_HEADS,
+                dh,
+                window=SLIDING_WINDOW if is_sliding(L) else None,
+                scale=ATTN_SCALE,
+            )
+            a = gpu_kernels.gemm_w4a8(a, w["o"])
+            x, h = gpu_kernels.rmsnorm_residual(
+                a, w["post_attn_norm"], RMS_EPS, residual, next_norm=w["ffn_norm"]
+            )
+
+            residual = x
+            # gate|up, GeGLU and the down GEMM's int8 input in one kernel.
+            gq = gpu_kernels.gemm_w4a8_glu_q8(h, w["gate_up"])
+            d = gpu_kernels.gemm_w4a8(gq, w["down"])
+            x = gpu_kernels.rmsnorm_residual(d, w["post_ffn_norm"], RMS_EPS, residual)
+
+            residual = x
+            g = gpu_kernels.geglu(gpu_kernels.matmul(x, w["inp_gate"]), pli[L])
+            pr = gpu_kernels.matmul(g.view(N, PLI_D), w["per_layer_projection"])
+            nxt = self.w[L + 1]["attn_norm"] if L + 1 < n else self.final_norm
+            x, h = gpu_kernels.rmsnorm_residual(
+                pr,
+                w["post_ple_norm"],
+                RMS_EPS,
+                residual,
+                scale=w["out_scale"],
+                next_norm=nxt,
+            )
+
+        # Only the last position's logits: the head is a GEMV, as in a step.
+        logits = self._mm(h[N - 1 : N], self.lm_head)[0]
+        if FINAL_LOGIT_SOFTCAP:
+            logits = gpu_kernels.logit_softcap(logits, FINAL_LOGIT_SOFTCAP)
+        return logits
 
     def step(self, token, pos):
         """One token through all 35 layers. Returns its logits, [VOCAB].
