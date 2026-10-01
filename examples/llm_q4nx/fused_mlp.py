@@ -94,6 +94,8 @@ import triton.language as tl
 # projection, so a second opinion here would be a second opinion about the
 # hardware.
 from kernels import (
+    DEEP_L2_K,
+    L2_K,
     MAX_BLOCK_NUMEL,
     MAX_TILE_NUMEL,
     _GELU_2C,
@@ -556,7 +558,12 @@ class FusedMLP:
         # contracts a wider K and writes a narrower N -- and a schedule only
         # places on the block it was generated for.
         gu_script = matmul_script(gu_m, gu_n)
-        dn_script = matmul_script(dn_m, dn_n)
+        # `down` reduces over the whole FFN width, so it is the one GEMM here
+        # long enough in K for the deep L2 tile to pay -- and narrow enough in
+        # N (D_pad) for its DMA stride to fit. See `kernels.DEEP_L2_K`.
+        dn_script = matmul_script(
+            dn_m, dn_n, l2_k=DEEP_L2_K if HID % DEEP_L2_K == 0 else L2_K
+        )
 
         # Shape-representative placeholders; only shapes and dtypes drive the
         # warmup lowering, never the values.

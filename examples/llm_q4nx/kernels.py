@@ -227,6 +227,22 @@ _MATMUL_SCRIPTS = {
 #: The K depth every checked-in schedule was generated for.
 L2_K = 64
 
+#: The same core tiles staged 256 deep in L2 instead, still reducing 64 at a
+#: time in L1 (`l1_k`). Every L3->L2 round costs a fixed setup whatever it
+#: carries, and a long reduction pays it K / l2_k times: Gemma4's `down`
+#: contracts 12288, so 192 rounds at 64 and 48 at 256 -- mlir-air's own
+#: `tile_k_l2` for that GEMM. 7.49 -> 5.43 ms on the wide `down` at M=1024,
+#: bit-identical, since each core still reduces in the same order.
+#:
+#: Not the default, because the weight walk's DMA stride is `l2_k * N` and
+#: npu2 caps a BD stride at 2^20 words: at the FFN width of `gate`/`up`
+#: (12288) 256 is three times over and aiecc rejects it. A caller with a long
+#: K and a narrow N asks for it by name.
+DEEP_L2_K = 256
+_DEEP_K_SCRIPTS = {
+    (64, 128): "llm_q4nx/transform_matmul_n128_k256_aie2p.mlir",
+}
+
 
 #: `triton_matmul`'s default: pick the schedule from the block shape. Distinct
 #: from `None`, which means "let the driver generate one" and is what
@@ -234,14 +250,18 @@ L2_K = 64
 BY_BLOCK = "<chosen from the block shape>"
 
 
-def matmul_script(block_m, block_n):
+def matmul_script(block_m, block_n, l2_k=L2_K):
     """The schedule to lower a `block_m x block_n` GEMM tile with.
 
     The core tile is the largest that still spreads the block over the whole
     array, floored at `L1` -- see `_MATMUL_SCRIPTS` for why the floor is there
-    and not lower.
+    and not lower. `l2_k` is `L2_K` or `DEEP_L2_K`; see the latter for when.
     """
     l1 = (max(L1, block_m // AIE_COLS), max(L1, block_n // AIE_ROWS))
+    if l2_k == DEEP_L2_K and l1 in _DEEP_K_SCRIPTS:
+        return script(_DEEP_K_SCRIPTS[l1])
+    if l2_k != L2_K:
+        raise ValueError(f"no {l1[0]}x{l1[1]} schedule with l2_k={l2_k}")
     if l1 not in _MATMUL_SCRIPTS:
         raise ValueError(
             f"a {block_m}x{block_n} block wants an l1 tile of {l1[0]}x{l1[1]}, "
