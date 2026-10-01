@@ -55,24 +55,21 @@ reading both column halves at a row stride; every spelling of that failed --
 script hangs the device, and a 1D linear-index form (`row = offs // INTER`)
 fails in aircc.
 
-The contraction, and why it is split
-------------------------------------
+The contraction: exact K, restated in MLIR
+------------------------------------------
 `_mm_kernel` contracts the whole of K in one tile, which asks two things of K
 at once: `tl.arange` wants a power of two, and `rows * K` has to stay under
-Triton's tensor cap. `down` contracts the FFN width, so both used to bind on it
--- 12288 padded to 16384, and then a row tile of 256 where the rest of the
-chain runs 512, which is half the array.
+Triton's tensor cap. Those are the FRONTEND's rules, not `linalg.matmul`'s, so
+every GEMM here is captured at a K the frontend accepts and then restated to
+contract the real one (`_exact_k_ttshared`): `gate`/`up` contract D=1536, not
+2048, and `down` contracts the FFN width in one op, captured at
+`_DOWN_CAPTURE_K` and widened to 6144 or 12288. Nothing is padded in K and
+nothing is split, so no partial sums and no adds to fold them back.
 
-Cutting the contraction into equal power-of-two pieces answers both without
-padding anything, whenever the width has a large enough power of two in it:
-12288 is 3 x 4096 and 6144 is 3 x 2048. Each piece is its own GEMM over a slice
-of `H`'s columns and `Bd`'s rows, and the pieces are added back. `_plan_down`
-picks the piece, and falls back to padding the width where no such factor
-exists.
-
-`K_pad` is the same constraint on `gate`/`up`, and stays: D is 1536, which has
-no factor above 512, so splitting it would cost more ops than the padding
-costs arithmetic.
+This replaced two earlier arrangements -- padding K to a power of two, and
+cutting `down` into power-of-two pieces summed back by adds -- and both are
+strictly worse: a third more bytes on `gate`/`up` (2048 rows for 1536), and
+on `down` three launches plus two full-width f32 adds where this is one.
 
 Tiling
 ------
@@ -334,15 +331,17 @@ class FusedMLP:
 
     Combined-arg layout, which `run` indexes with::
 
-        0 A    bf16 (rows, K_pad)   caller's activation, per dispatch
-        1 Bg   bf16 (K_pad, HID)    static
-        2 Cg    f32 (rows, HID)     intermediate
-        3 Bu   bf16 (K_pad, HID)    static
-        4 Cu    f32 (rows, HID)     intermediate
-        5 H    bf16 (rows * HID)    intermediate
-        6 Bd   bf16 (HID, D_pad)    static
-        7 OUT   f32 (rows, D_pad)   output
-        8..     f32 (rows, D_pad)   the split contraction's partials and sums
+        0 A    bf16 (rows, K_stride)  caller's activation, per dispatch
+        1 Bg   bf16 (K_exact, HID)    static
+        2 Cg    f32 (rows, HID)       intermediate
+        3 Bu   bf16 (K_exact, HID)    static
+        4 Cu    f32 (rows, HID)       intermediate
+        5 H    bf16 (rows * HID)      intermediate
+        6 Bd   bf16 (HID, D_pad)      static
+        7 OUT   f32 (rows, D_pad)     output
+
+    `K_exact` is D; `K_stride` is A's row stride, at least D and held off a
+    power of two (`kernels.unaliased_stride`).
 
     More than one op, so the single-op chain corruption defect documented on
     `NPUChain` does not apply.
@@ -498,11 +497,10 @@ class FusedMLP:
 
         The point of allocating them shared: a GPU decode reads exactly what
         the NPU dispatches on, so the model exists once. They come back as
-        `shapes()` describes, which the caller has to account for: `K_pad` rows
-        always, and an FFN width that is `inter` unless it had to be padded. A
-        GEMV over the padding is bit-identical to one without it, since the
-        weights are zero there -- provided the activation is zero out to
-        `K_pad`.
+        `shapes()` describes: `gate`/`up` are `(K_exact, HID)`, D rows exactly
+        with no padding to account for, so the activation is D wide too. Only
+        `down` is padded, in its columns to `D_pad`; a GEMV over that padding
+        is bit-identical to one without it, since the weights are zero there.
 
         Raises where the weights are not shared; there is no device view to
         give, and silently handing back a host array would be worse.

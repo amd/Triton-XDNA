@@ -728,17 +728,15 @@ def triton_matmul(
     projection -- and dispatches through a chain that stages it once instead of
     per launch. `launch` copies every pointer argument into a device BO on
     every launch, so a 20 MiB weight is otherwise re-staged twice a layer for
-    35 layers. Measured at qkv's shape: 19.49 ms against 11.35. Pass a key that
-    identifies the WEIGHT (`f"qkv_L{i}"`), not the shape: the chain is shared
-    by shape and the key is what separates one layer's buffers from another's.
+    35 layers. Measured at qkv's shape: 19.49 ms against 11.35. Name the weight
+    (`f"qkv_L{i}"`); the BO set is keyed on that AND the padded buffer's
+    address, so two models of one shape in a process cannot share a weight.
+    The address is only stable if `w` is: pass the same tensor every call, not
+    one rebuilt per call, or each call stages a fresh copy.
     """
     M, K = x.shape
     Kw, N = w.shape
     assert K == Kw, (x.shape, w.shape)
-    # The chain path hands the op to AIR as MLIR, so it can contract K itself;
-    # the loop below still compiles a `@triton.jit` kernel, whose `tl.arange`
-    # needs a power of two. Both have to agree, because `a`, `b` and the
-    # schedule are built once from this number.
     # The chain path hands the op to AIR as MLIR, so it can contract K itself;
     # the dispatch loop below still compiles a `@triton.jit` kernel, whose
     # `tl.arange` needs a power of two. A resident weight was padded at load
@@ -790,15 +788,24 @@ def triton_matmul(
     a = io_page((Mp, a_stride), torch.bfloat16)
     a.zero_()
     a[:M, :K] = x.to(torch.bfloat16)
-    c = io_page((Mp, Np), torch.float32)
+    # The chain binds `c` by `bo_key`, so it must be the same page every call
+    # and is copied out below. The dispatch loop returns `c` itself, so it gets
+    # a page of its own: a pooled one would be overwritten by the next call at
+    # this shape, under a caller still holding the result.
+    c = (
+        io_page((Mp, Np), torch.float32)
+        if via_chain
+        else shared_empty((Mp, Np), torch.float32)
+    )
     if via_chain:
         chain = _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script)
         pad = np.zeros(1024, dtype=np.float32)
         # `static_indices` holds one weight per key, so a key that does not
         # identify the WEIGHT would hand the next call the last one's buffer.
-        # The address does identify it; a caller with a real `stage_key` still
-        # gets the stable name it chose.
-        key = stage_key or f"mm_{b.data_ptr():x}_{Mp}x{Kp}x{Np}"
+        # The address does identify it. A `stage_key` alone does not: chains
+        # are process-global and shared by shape, so a second model of the
+        # same shape would reuse the first's `qkv_L0` -- the name only labels.
+        key = f"{stage_key or 'mm'}_{b.data_ptr():x}_{Mp}x{Kp}x{Np}"
         # The activation and the result are the caller's own pages where the
         # interop allows it, so neither is staged in nor copied back.
         io = {i: bo for i, bo in ((0, shared_bo(a)), (2, shared_bo(c))) if bo}
@@ -818,7 +825,9 @@ def triton_matmul(
             # trades a device->host copy of the whole padded buffer for a
             # host->host copy of just the part asked for.
             return c.reshape(Mp, Np)[:M, :N].clone()
-        return torch.from_numpy(np.asarray(got[2])).reshape(Mp, Np)[:M, :N]
+        # Unbound, `got[2]` is a view of the runner's own BO for this key, which
+        # the next dispatch under it overwrites -- the same lifetime as above.
+        return torch.from_numpy(np.asarray(got[2])).reshape(Mp, Np)[:M, :N].clone()
     # One block_m-row tile per dispatch: the grid is (1, N/block_n), which
     # depends on the weight alone and never on the prompt length.
     for m0 in range(0, Mp, block_m):
