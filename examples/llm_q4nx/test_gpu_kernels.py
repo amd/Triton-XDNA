@@ -226,6 +226,109 @@ def _qkv_post(G, dev):
                 view = kv_layout.region_view(want, L, region, maxl)
                 kv_layout.scatter_rows(view[pos : pos + 1], t.to(torch.bfloat16), dh)
         ok &= check(f"kv slab dh={dh}", slab.float(), want.float(), tol=1e-6)
+
+    # The prefill's form: T tokens in one launch, rows pos .. pos + T - 1, and
+    # the dense K/V its attention reads. Must equal T single-token calls.
+    T, pos0 = 5, 3
+    fan_t = torch.tensor(fan, dtype=torch.int32, device=dev)
+    for dh in (256, 512):
+        n = N_Q_HEADS * dh + 2 * dh
+        qkv = torch.randn(T, n, device=dev)
+        qn, kn = torch.randn(dh, device=dev), torch.randn(dh, device=dev)
+        rows = torch.randn(T, dh, device=dev)
+        slab = torch.zeros(
+            kv_layout.slab_shape(4, maxl), dtype=torch.bfloat16, device=dev
+        )
+        kv = (slab, fan_t, pos0, kv_layout.region_stride(maxl))
+        q, kd, vd = G.qkv_post(
+            qkv, qn, kn, rows, N_Q_HEADS, dh, RMS_EPS, kv, dense_kv=True
+        )
+        one = torch.zeros_like(slab)
+        q1 = []
+        for t in range(T):
+            kv1 = (one, fan_t, pos0 + t, kv_layout.region_stride(maxl))
+            q1.append(
+                G.qkv_post(qkv[t : t + 1], qn, kn, rows[t], N_Q_HEADS, dh, RMS_EPS, kv1)
+            )
+        ok &= check(f"T={T} q  dh={dh}", q, torch.cat(q1), tol=1e-6)
+        ok &= check(f"T={T} kv slab dh={dh}", slab.float(), one.float(), tol=1e-6)
+        qd = N_Q_HEADS * dh
+        kn_rows = G.rmsnorm(qkv[:, qd : qd + dh], kn, RMS_EPS)
+        k_ref = torch.cat(
+            [G.rope(kn_rows[t : t + 1], rows[t], 1, dh) for t in range(T)]
+        )
+        ok &= check(f"T={T} dense K dh={dh}", kd, k_ref, tol=1e-5)
+        v_ref = G.rmsnorm(qkv[:, qd + dh :], None, RMS_EPS)
+        ok &= check(f"T={T} dense V dh={dh}", vd, v_ref, tol=1e-5)
+    try:
+        G.qkv_post(
+            qkv,
+            qn,
+            kn,
+            rows,
+            N_Q_HEADS,
+            dh,
+            RMS_EPS,
+            (slab, fan_t, maxl - 2, kv_layout.region_stride(maxl)),
+        )
+        print("  rows past the slab: no error  FAIL")
+        ok = False
+    except ValueError:
+        print("  rows past the slab: ValueError  ok")
+    return ok
+
+
+def _gemm_w4a8(G, dev):
+    """The prefill's W4A8 GEMM, its q8 activations, and the fused gate|up.
+
+    Two references for the GEMM: the dequantized q8 activation against the
+    f32 dequantized weights, where only summation order differs, and the f32
+    activation, which measures what the int8 rounding costs.
+    """
+    print("\nquant_q8 / gemm_w4a8  q8 [M,K] @ Codec B/K [N,K]^T")
+    ok = True
+    x = torch.randn(37, D, device=dev)
+    xq, dx, xs = G.quant_q8(x)
+    xr = (xq.float().view(37, -1, 32) * dx[:, :, None]).view(37, D)
+    ok &= check("quant_q8 round trip", xr, x, tol=1e-2)
+    ok &= check(
+        "quant_q8 scaled sum", xs, dx * xq.float().view(37, -1, 32).sum(-1), 1e-6
+    )
+    for K, N in (
+        (D, N_Q_HEADS * DH_SLIDING + 2 * DH_SLIDING),  # qkv, sliding layer
+        (N_Q_HEADS * DH_GLOBAL, D),  # o, full layer
+        (6144, D),  # down, narrow
+    ):
+        wb = _random_q4nx(G, N, K, "cpu")
+        # Codec K is encoded on the host, as `Gemma4GpuDecode._packed` does.
+        for codec, w in (("B", wb.to(dev)), ("K", wb.to_codec_k().to(dev))):
+            wf = G.dequant_q4nx(w)
+            for M in (1, 37, 128):
+                x = torch.randn(M, K, device=dev)
+                xq, dx, xs = G.quant_q8(x)
+                xr = (xq.float().view(M, -1, 32) * dx[:, :, None]).view(M, K)
+                got = G.gemm_w4a8(x, w)
+                name = f"{codec} K={K} N={N} M={M}"
+                ok &= check(f"{name} vs q8 x", got, xr @ wf, tol=1e-4)
+                ok &= check(f"{name} vs f32 x", got, x @ wf)
+
+    print("\ngemm_w4a8_glu_q8  quant_q8(gelu(gate) * up), fused into gate|up")
+    for inter in (2048, 6144):
+        wb = _random_q4nx(G, 2 * inter, D, "cpu")
+        for codec, w in (("B", wb.to(dev)), ("K", wb.to_codec_k().to(dev))):
+            for M in (1, 37, 128):
+                x = torch.randn(M, D, device=dev)
+                gu = G.gemm_w4a8(x, w)
+                act = G.geglu(gu[:, :inter], gu[:, inter:]).view(M, inter)
+                want = G.quant_q8(act)
+                got = G.gemm_w4a8_glu_q8(x, w)
+                name = f"{codec} inter={inter} M={M}"
+                diff = (got[0].int() - want[0].int()).abs().max().item()
+                print(
+                    f"  {name:<34} codes max |diff| {diff}  {'ok' if diff <= 1 else 'FAIL'}"
+                )
+                ok &= diff <= 1
+                ok &= check(f"{name} scales", got[1], want[1], tol=1e-5)
     return ok
 
 
@@ -282,6 +385,7 @@ def main():
 
     ok &= _gemv_q4nx(G, dev)
     ok &= _qkv_post(G, dev)
+    ok &= _gemm_w4a8(G, dev)
 
     # --- rmsnorm, weighted and weightless ---
     print("\nrmsnorm")
@@ -293,24 +397,20 @@ def main():
         ok &= check(f"rows={rows} N={N} w={has_w}", G.rmsnorm(x, w, RMS_EPS), ref)
 
     # --- the fused sublayer tail, including the per-layer out_scale ---
+    # One row is a decode step; the prefill passes the whole prompt.
     print("\nrmsnorm_residual  (residual + norm(x)*w) * scale")
-    for N, scale in ((D, 1.0), (D, 1.37)):
-        x = torch.randn(1, N, device=dev)
+    for rows, N, scale in ((1, D, 1.0), (1, D, 1.37), (37, D, 1.37)):
+        x = torch.randn(rows, N, device=dev)
         w = torch.randn(N, device=dev)
-        r = torch.randn(1, N, device=dev)
+        r = torch.randn(rows, N, device=dev)
         inv = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + RMS_EPS)
         ref = (r + x * inv * w) * scale
-        ok &= check(
-            f"N={N} scale={scale}",
-            G.rmsnorm_residual(x, w, RMS_EPS, r, scale),
-            ref,
-        )
+        name = f"rows={rows} N={N} scale={scale}"
+        ok &= check(name, G.rmsnorm_residual(x, w, RMS_EPS, r, scale), ref)
         w2 = torch.randn(N, device=dev)
         y, h = G.rmsnorm_residual(x, w, RMS_EPS, r, scale, next_norm=w2)
-        ok &= check(f"N={N} scale={scale} +next_norm (y)", y, ref)
-        ok &= check(
-            f"N={N} scale={scale} +next_norm (h)", h, G.rmsnorm(ref, w2, RMS_EPS)
-        )
+        ok &= check(f"{name} +next_norm (y)", y, ref)
+        ok &= check(f"{name} +next_norm (h)", h, G.rmsnorm(ref, w2, RMS_EPS))
 
     # --- the per-layer inputs, all 35 layers in one launch ---
     print("\nple_combine  (rmsnorm(p*s_in)*w + t) * s_out, per layer")
@@ -447,7 +547,7 @@ def main():
     # entirely outside it leaves every score masked, which is where the softmax
     # produced NaN until the running maximum was guarded. Non-powers of two on
     # purpose: the tiles are fixed, so the masked tail is the interesting part.
-    print("\nattn_prefill  (prefill; causal GQA, windowed and not)")
+    print("\nattn_prefill, attn_prefill_fa  (prefill; causal GQA, windowed and not)")
     for N, dh, win in (
         (6, DH_SLIDING, 512),
         (37, DH_SLIDING, None),
@@ -467,12 +567,17 @@ def main():
             mask = mask + torch.full((N, N), float("-inf"), device=dev).tril(-win)
         ref = torch.softmax((qh @ kh.transpose(1, 2)) * 1.0 + mask, -1) @ vh
         ref = ref.transpose(0, 1).reshape(N, N_Q_HEADS * dh)
-        got = G.attn_prefill(q, k, v, N_Q_HEADS, 1, dh, win, 1.0)
-        if torch.isnan(got).any():
-            print(f"  N={N} dh={dh} win={win}  NaN  FAIL")
-            ok = False
-            continue
-        ok &= check(f"N={N} dh={dh} win={win}", got, ref)
+        # The fp16 kernel is checked on the same cases; its operands are
+        # rounded to fp16, so it gets the default tolerance, not a tighter one.
+        for name, got in (
+            ("f32", G.attn_prefill(q, k, v, N_Q_HEADS, 1, dh, win, 1.0)),
+            ("fa ", G.attn_prefill_fa(q, k, v, N_Q_HEADS, dh, win, 1.0)),
+        ):
+            if torch.isnan(got).any():
+                print(f"  {name} N={N} dh={dh} win={win}  NaN  FAIL")
+                ok = False
+                continue
+            ok &= check(f"{name} N={N} dh={dh} win={win}", got, ref)
 
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

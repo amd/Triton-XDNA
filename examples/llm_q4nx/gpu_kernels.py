@@ -508,6 +508,292 @@ def gemv_q4nx(x, w, glu_in=False):
     return out.reshape(1, w.N)
 
 
+@triton.jit
+def _q8_groups(x):
+    """Quantize each row of `[R, 32]` f32 as llama.cpp's q8_1 does. Returns
+    the rounded codes (still f32), `d = max|x| / 127` and `d * sum(codes)`."""
+    d = tl.max(tl.abs(x), axis=1) / 127.0
+    v = x * tl.where(d > 0, 1.0 / d, 0.0)[:, None]
+    q = tl.where(v >= 0, tl.floor(v + 0.5), tl.ceil(v - 0.5))
+    return q, d, d * tl.sum(q, axis=1)
+
+
+@triton.jit
+def _quant_q8_kernel(X, XQ, DX, XS, K, stride_xm, BLOCK: tl.constexpr):
+    """`BLOCK` columns of one row to int8, plus each 32-group's scale and
+    scaled sum. The scaled sum is what a Q4NX min gets multiplied by."""
+    m = tl.program_id(0)
+    kb = tl.program_id(1)
+    NG: tl.constexpr = BLOCK // 32
+    offs = kb * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(X + m * stride_xm + offs).to(tl.float32)
+    q, d, xs = _q8_groups(tl.reshape(x, (NG, 32)))
+    g = kb * NG + tl.arange(0, NG)
+    tl.store(XQ + m * K + tl.reshape(offs, (NG, 32)), q.to(tl.int8))
+    tl.store(DX + m * (K // 32) + g, d)
+    tl.store(XS + m * (K // 32) + g, xs)
+
+
+def quant_q8(x):
+    """`[M, K]` -> `(xq, dx, xs)`: int8 `[M, K]`, and f32 `[M, K / 32]` with
+    each group's scale and its scale times the sum of its codes."""
+    M = x.shape[0]
+    x = x.reshape(M, -1)
+    if x.stride(1) != 1:
+        x = x.contiguous()
+    K = x.shape[1]
+    xq = torch.empty((M, K), dtype=torch.int8, device=x.device)
+    dx = torch.empty((M, K // 32), dtype=torch.float32, device=x.device)
+    xs = torch.empty_like(dx)
+    _quant_q8_kernel[(M, K // 256)](x, xq, dx, xs, K, x.stride(0), BLOCK=256)
+    return xq, dx, xs
+
+
+@triton.jit
+def _w4a8_group(W, rb0, NBJ, k0, RB: tl.constexpr, CODEC_K: tl.constexpr):
+    """Read one 32-wide K group of `RB` 32-row blocks, starting at block `rb0`.
+
+    Returns the 4-bit codes as the int8 `[32, RB * 32]` operand of `tl.dot`,
+    and the scale and min of each of the `RB * 32` rows. The nibble bytes are
+    loaded column-major as `[32, RB, 2, 8]`, so `join(lo, hi)` reshapes to
+    `[32, rows]` without a permute; row `32 rb + 16 g + 2 k + bit` is the
+    chunk's own row order.
+    """
+    BN: tl.constexpr = RB * 32
+    CHUNK: tl.constexpr = 4608 if CODEC_K else 5120
+    NIB: tl.constexpr = 512 if CODEC_K else 1024
+    j = k0 // 256
+    c0 = k0 % 256
+    c = tl.arange(0, 32)[:, None, None, None]
+    rb = tl.arange(0, RB)[None, :, None, None]
+    g = tl.arange(0, 2)[None, None, :, None]
+    k = tl.arange(0, 8)[None, None, None, :]
+    n = tl.arange(0, BN)
+    rr = n % 32
+    base = W + ((rb0 + rb) * NBJ + j).to(tl.int64) * CHUNK
+    b = tl.load(base + NIB + g * 2048 + (c0 + c) * 8 + k)  # [32, RB, 2, 8]
+    q = tl.reshape(tl.join(b & 0xF, b >> 4), (32, BN)).to(tl.int8)
+    rbase = W + ((rb0 + n // 32) * NBJ + j).to(tl.int64) * CHUNK
+    v = (c0 // 32) * 32 + rr
+    if CODEC_K:
+        e = tl.load((rbase + rr * 4).to(tl.pointer_type(tl.uint32)))
+        s_lo = (e & 0xFF).to(tl.float32) / 16 - 16.0
+        s_st = (((e >> 8) & 0xFF).to(tl.float32) / 16 - 16.0 - s_lo) / 63
+        r_lo = ((e >> 16) & 0xFF).to(tl.float32) / 16 - 8.0
+        r_st = ((e >> 24).to(tl.float32) / 16 - 8.0 - r_lo) / 63
+        hi = (tl.load(rbase + 384 + v // 2) >> ((v % 2) * 4)) & 0xF
+        code = tl.load(rbase + 128 + v).to(tl.int32) | (hi.to(tl.int32) << 8)
+        s = tl.exp2(s_lo + (code & 63).to(tl.float32) * s_st)
+        mn = -s * tl.exp2(r_lo + (code >> 6).to(tl.float32) * r_st)
+    else:
+        sp = rbase.to(tl.pointer_type(tl.bfloat16))
+        s = tl.load(sp + v).to(tl.float32)
+        mn = tl.load(sp + 256 + v).to(tl.float32)
+    return q, s, mn
+
+
+@triton.jit
+def _w4a8_step(
+    acc, xq, dx, xs, W, rb0, NBJ, k0, RB: tl.constexpr, CODEC_K: tl.constexpr
+):
+    """`acc += dx * s * (xq @ q) + xs * mn` for one 32-wide K group."""
+    q, s, mn = _w4a8_group(W, rb0, NBJ, k0, RB, CODEC_K)
+    isum = tl.dot(xq, q).to(tl.float32)
+    return acc + isum * dx[:, None] * s[None, :] + xs[:, None] * mn[None, :]
+
+
+# `M` is the prompt length: it must not specialize.
+@triton.jit(do_not_specialize=["M"])
+def _gemm_w4a8_kernel(
+    XQ,
+    DX,
+    XS,
+    W,
+    C,
+    M,
+    NBJ,
+    stride_cm,
+    BM: tl.constexpr,
+    RB: tl.constexpr,
+    CODEC_K: tl.constexpr,
+):
+    """`q8 [M, K] @ Codec B/K [N, K]^T -> [M, N]` without dequantizing.
+
+    This is how llama.cpp's Vulkan backend multiplies q4_K in a prefill
+    (`mul_mmq.comp`). Per 32-wide K group, the 4-bit codes are dotted with the
+    int8 activation and the scale and min are applied once:
+
+        out += dx * s * sum(q * xq)  +  (dx * sum(xq)) * mn
+
+    For `w = q * s + mn` this is exact apart from the activation's rounding.
+    Q4NX stores one scale and one min per row per 32 columns, so the identity
+    applies directly. The int8 `tl.dot` lowers to `v_wmma_i32_16x16x16_iu8`
+    on gfx11.
+
+    A program covers `BM` tokens and `RB` 32-row blocks, one K group per step.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    mask_m = offs_m < M
+    BN: tl.constexpr = RB * 32
+    KT = NBJ * 256
+    KG = NBJ * 8
+    xk = tl.arange(0, 32)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, KT, 32):
+        xq = tl.load(
+            XQ + offs_m[:, None] * KT + k0 + xk[None, :], mask=mask_m[:, None], other=0
+        )
+        dx = tl.load(DX + offs_m * KG + k0 // 32, mask=mask_m, other=0.0)
+        xs = tl.load(XS + offs_m * KG + k0 // 32, mask=mask_m, other=0.0)
+        acc = _w4a8_step(acc, xq, dx, xs, W, pid_n * RB, NBJ, k0, RB, CODEC_K)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    tl.store(
+        C + offs_m[:, None] * stride_cm + offs_n[None, :], acc, mask=mask_m[:, None]
+    )
+
+
+# `M` is the prompt length: it must not specialize.
+@triton.jit(do_not_specialize=["M"])
+def _gemm_w4a8_glu_q8_kernel(
+    XQ,
+    DX,
+    XS,
+    W,
+    OQ,
+    ODX,
+    OXS,
+    M,
+    NBJ,
+    UP_RB,
+    C2,
+    KC,
+    BM: tl.constexpr,
+    RB: tl.constexpr,
+    CODEC_K: tl.constexpr,
+):
+    """The FFN's gate|up GEMM, its GeGLU, and the q8 input of the down GEMM.
+
+    Without this, gate|up writes `[M, 2 * inter]` f32 and a separate pass
+    reads it back for `gelu_tanh(gate) * up` and the quantization. Here each
+    program computes the same `RB` row blocks of both halves (gate at block
+    `pid_n * RB`, up `UP_RB` blocks further), so it has gate and up for the
+    same output columns and writes the int8 result directly. Each 32-row
+    block becomes one q8 group of the output.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    mask_m = offs_m < M
+    BN: tl.constexpr = RB * 32
+    KT = NBJ * 256
+    KG = NBJ * 8
+    xk = tl.arange(0, 32)
+    acc_g = tl.zeros((BM, BN), tl.float32)
+    acc_u = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, KT, 32):
+        xq = tl.load(
+            XQ + offs_m[:, None] * KT + k0 + xk[None, :], mask=mask_m[:, None], other=0
+        )
+        dx = tl.load(DX + offs_m * KG + k0 // 32, mask=mask_m, other=0.0)
+        xs = tl.load(XS + offs_m * KG + k0 // 32, mask=mask_m, other=0.0)
+        acc_g = _w4a8_step(acc_g, xq, dx, xs, W, pid_n * RB, NBJ, k0, RB, CODEC_K)
+        acc_u = _w4a8_step(
+            acc_u, xq, dx, xs, W, UP_RB + pid_n * RB, NBJ, k0, RB, CODEC_K
+        )
+    a = acc_g * tl.sigmoid(C2 * (acc_g + KC * acc_g * acc_g * acc_g)) * acc_u
+    q, d, xsum = _q8_groups(tl.reshape(a, (BM * RB, 32)))
+    inter = UP_RB * 32
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    tl.store(
+        OQ + offs_m[:, None] * inter + offs_n[None, :],
+        tl.reshape(q, (BM, BN)).to(tl.int8),
+        mask=mask_m[:, None],
+    )
+    grp = pid_n * RB + tl.arange(0, RB)
+    tl.store(
+        ODX + offs_m[:, None] * UP_RB + grp[None, :],
+        tl.reshape(d, (BM, RB)),
+        mask=mask_m[:, None],
+    )
+    tl.store(
+        OXS + offs_m[:, None] * UP_RB + grp[None, :],
+        tl.reshape(xsum, (BM, RB)),
+        mask=mask_m[:, None],
+    )
+
+
+def gemm_w4a8(x, w):
+    """x: [M, K] -> [M, N] f32 against a `Q4NXWeight`. The prefill's GEMM.
+
+    The activation is quantized to int8 per 32 columns (`quant_q8`) before
+    the multiply, as llama.cpp does, so the result is not bit-equal to a bf16
+    GEMM on the dequantized weights. `x` may also be an already quantized
+    `(xq, dx, xs)`, which is what `gemm_w4a8_glu_q8` returns.
+    """
+    xq, dx, xs = x if isinstance(x, tuple) else quant_q8(x)
+    if xq.shape[1] != w.K:
+        raise ValueError(f"activation is {tuple(xq.shape)}, weight K is {w.K}")
+    M = xq.shape[0]
+    # Tiles swept on gfx1103 over this model's shapes at M = 512.
+    BM = min(64, max(16, _pow2(M)))
+    RB = 4 if w.N % 128 == 0 else (2 if w.N % 64 == 0 else 1)
+    out = torch.empty((M, w.N), dtype=torch.float32, device=xq.device)
+    _gemm_w4a8_kernel[(triton.cdiv(M, BM), w.N // (32 * RB))](
+        xq,
+        dx,
+        xs,
+        w.data,
+        out,
+        M,
+        w.K // Q4NX_COLS,
+        out.stride(0),
+        BM=BM,
+        RB=RB,
+        CODEC_K=w.codec == "k",
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
+def gemm_w4a8_glu_q8(x, w):
+    """`quant_q8(gelu_tanh(gate) * up)` for x: [M, K] against a stacked
+    gate|up `Q4NXWeight` `[2 * inter, K]`, as `(xq, dx, xs)` ready for the
+    down GEMM. The f32 gate|up is never written to memory."""
+    xq, dx, xs = quant_q8(x)
+    M = xq.shape[0]
+    inter = w.N // 2
+    # Smaller than `gemm_w4a8`'s tile: with two accumulators that one spills.
+    # Swept on gfx1103 at M = 512.
+    BM = min(32, max(16, _pow2(M)))
+    RB = 2 if inter % 64 == 0 else 1
+    oq = torch.empty((M, inter), dtype=torch.int8, device=xq.device)
+    odx = torch.empty((M, inter // 32), dtype=torch.float32, device=xq.device)
+    oxs = torch.empty_like(odx)
+    _gemm_w4a8_glu_q8_kernel[(triton.cdiv(M, BM), inter // (32 * RB))](
+        xq,
+        dx,
+        xs,
+        w.data,
+        oq,
+        odx,
+        oxs,
+        M,
+        w.K // Q4NX_COLS,
+        inter // 32,
+        _GELU_2C,
+        _GELU_K,
+        BM=BM,
+        RB=RB,
+        CODEC_K=w.codec == "k",
+        num_warps=2,
+        num_stages=1,
+    )
+    return oq, odx, oxs
+
+
 def dequant_q4nx(w):
     """A `Q4NXWeight` as float32 `[K, N]`, in torch -- the reference for tests."""
     N, K = w.N, w.K
@@ -584,7 +870,7 @@ def _rmsnorm_residual_kernel(
     BLOCK_N: tl.constexpr,
     HAS_NEXT: tl.constexpr,
 ):
-    """`(residual + rmsnorm(x) * weight) * scale`, one row, one launch.
+    """`(residual + rmsnorm(x) * weight) * scale`, one program per row.
 
     The Gemma4 block closes each of its three sublayers this way, so fusing it
     turns nine launches per layer into three. `scale` is the per-layer
@@ -601,31 +887,34 @@ def _rmsnorm_residual_kernel(
     """
     offs = tl.arange(0, BLOCK_N)
     mask = offs < N
-    x = tl.load(X + offs, mask=mask, other=0.0).to(tl.float32)
+    row = tl.program_id(0).to(tl.int64) * N
+    x = tl.load(X + row + offs, mask=mask, other=0.0).to(tl.float32)
     inv = 1.0 / tl.sqrt(tl.sum(x * x) / N + eps)
     w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
-    r = tl.load(R + offs, mask=mask, other=0.0).to(tl.float32)
+    r = tl.load(R + row + offs, mask=mask, other=0.0).to(tl.float32)
     y = (r + x * inv * w) * scale
-    tl.store(Y + offs, y, mask=mask)
+    tl.store(Y + row + offs, y, mask=mask)
     if HAS_NEXT:
         inv2 = 1.0 / tl.sqrt(tl.sum(y * y) / N + eps)
         w2 = tl.load(W2 + offs, mask=mask, other=0.0).to(tl.float32)
-        tl.store(Y2 + offs, y * inv2 * w2, mask=mask)
+        tl.store(Y2 + row + offs, y * inv2 * w2, mask=mask)
 
 
 def rmsnorm_residual(x, weight, eps, residual, scale=1.0, next_norm=None):
-    """`(residual + rmsnorm(x) * weight) * scale` over one row, f32.
+    """`(residual + rmsnorm(x) * weight) * scale` per row of `[rows, N]`, f32.
 
-    With `next_norm`, returns `(result, rmsnorm(result) * next_norm)`.
+    With `next_norm`, returns `(result, rmsnorm(result) * next_norm)`. One row
+    is the decode; the prefill passes the whole prompt.
     """
-    x = x.reshape(-1).contiguous()
-    N = x.numel()
-    out = torch.empty(N, dtype=torch.float32, device=x.device)
+    N = weight.numel()
+    x = x.reshape(-1, N).contiguous()
+    rows = x.shape[0]
+    out = torch.empty((rows, N), dtype=torch.float32, device=x.device)
     nxt = torch.empty_like(out) if next_norm is not None else out
-    _rmsnorm_residual_kernel[(1,)](
+    _rmsnorm_residual_kernel[(rows,)](
         x,
         weight.contiguous(),
-        residual.reshape(-1).contiguous(),
+        residual.reshape(rows, N).contiguous(),
         out,
         next_norm.contiguous() if next_norm is not None else out,
         nxt,
@@ -636,8 +925,8 @@ def rmsnorm_residual(x, weight, eps, residual, scale=1.0, next_norm=None):
         HAS_NEXT=next_norm is not None,
     )
     if next_norm is None:
-        return out.reshape(1, N)
-    return out.reshape(1, N), nxt.reshape(1, N)
+        return out
+    return out, nxt
 
 
 @triton.jit
@@ -717,11 +1006,15 @@ def _qkv_post_kernel(
     QOUT,
     SLAB,
     FAN,
+    KOUT,
+    VOUT,
     n_fan,
     pos,
     eps,
     layer_stride,
     region_stride,
+    stride_qkv,
+    stride_row,
     NQ: tl.constexpr,
     HALF: tl.constexpr,
     LANE_SHIFT: tl.constexpr,
@@ -729,8 +1022,9 @@ def _qkv_post_kernel(
     DH_A: tl.constexpr,
     N_CU: tl.constexpr,
     HAS_KV: tl.constexpr,
+    DENSE_KV: tl.constexpr,
 ):
-    """Everything between the QKV projection and attention, for one token.
+    """Everything between the QKV projection and attention, per token.
 
     Program `h < NQ` is query head `h`: RMSNorm with `QN`, then half-split
     RoPE against the position's table row -- the same arithmetic, in the same
@@ -739,8 +1033,18 @@ def _qkv_post_kernel(
     and both are rounded to bf16 and written to row `pos` of every slab in
     `FAN`, at both attention CUs' copies and the padded-head lane map of
     `kv_layout` -- what `Gemma4GpuDecode._append_kv` did with ~9 launches.
+
+    Grid axis 1 is the token, written to row `pos + t`: one token for a
+    decode step, the whole prompt for a prefill. With `DENSE_KV` the roped K
+    and normed V are also stored densely as `[tokens, dh]` in the dtype of
+    `KOUT`/`VOUT`; the prefill's attention reads those instead of the slab.
     """
     h = tl.program_id(0)
+    t = tl.program_id(1)
+    QKV += t * stride_qkv
+    QOUT += t * NQ * 2 * HALF
+    ROW += t * stride_row
+    pos += t
     o = tl.arange(0, HALF)
     cos = tl.load(ROW + o).to(tl.float32)
     sin = tl.load(ROW + HALF + o).to(tl.float32)
@@ -760,14 +1064,24 @@ def _qkv_post_kernel(
         inv = 1.0 / tl.sqrt((tl.sum(x1 * x1) + tl.sum(x2 * x2)) / (2 * HALF) + eps)
         y1 = x1 * inv * tl.load(KN + o).to(tl.float32)
         y2 = x2 * inv * tl.load(KN + HALF + o).to(tl.float32)
-        k1 = (y1 * cos - y2 * sin).to(tl.bfloat16)
-        k2 = (y1 * sin + y2 * cos).to(tl.bfloat16)
+        k1 = y1 * cos - y2 * sin
+        k2 = y1 * sin + y2 * cos
         vb = kb + 2 * HALF
         v1 = tl.load(QKV + vb + o).to(tl.float32)
         v2 = tl.load(QKV + vb + HALF + o).to(tl.float32)
         inv = 1.0 / tl.sqrt((tl.sum(v1 * v1) + tl.sum(v2 * v2)) / (2 * HALF) + eps)
-        v1 = (v1 * inv).to(tl.bfloat16)
-        v2 = (v2 * inv).to(tl.bfloat16)
+        v1 = v1 * inv
+        v2 = v2 * inv
+        if DENSE_KV:
+            d = t * 2 * HALF
+            tl.store(KOUT + d + o, k1)
+            tl.store(KOUT + d + HALF + o, k2)
+            tl.store(VOUT + d + o, v1)
+            tl.store(VOUT + d + HALF + o, v2)
+        k1 = k1.to(tl.bfloat16)
+        k2 = k2.to(tl.bfloat16)
+        v1 = v1.to(tl.bfloat16)
+        v2 = v2.to(tl.bfloat16)
         for f in range(0, n_fan):
             row = SLAB + tl.load(FAN + f).to(tl.int64) * layer_stride + pos * REGION_W
             for cu in tl.static_range(N_CU):
@@ -779,41 +1093,71 @@ def _qkv_post_kernel(
                 tl.store(hi + region_stride, v2)
 
 
-def qkv_post(qkv, q_norm, k_norm, lut_row, n_q, dh, eps, kv=None):
+def qkv_post(
+    qkv,
+    q_norm,
+    k_norm,
+    lut_rows,
+    n_q,
+    dh,
+    eps,
+    kv=None,
+    dense_kv=False,
+    out_dtype=torch.float32,
+):
     """Head norms, RoPE and the KV-cache append, in one launch.
 
-    `qkv` is the projection's `[1, (n_q + 2) * dh]` output, or `[1, n_q * dh]`
-    on a KV-shared layer, which has no k or v. Returns the rotated q,
-    `[1, n_q * dh]` f32.
+    `qkv` is the projection's `[T, (n_q + 2) * dh]` output, or `[T, n_q * dh]`
+    on a KV-shared layer, which has no k or v: one row for a decode step, the
+    prompt for a prefill. `lut_rows` is the RoPE table's `[T, dh]` rows for
+    those positions (a single `[dh]` row for T = 1). Returns the rotated q,
+    `[T, n_q * dh]` -- and with `dense_kv`, also the roped K and normed V
+    as `[T, dh]`.
 
     `kv`, where the layer owns its cache, is `(slab, fan, pos, region_stride)`:
     the `[n_layers, layer_elems]` bf16 slab, a device int32 tensor of the
-    layers whose slabs take this row (`kv_layout`'s fan-out), the row, and
-    the K-to-V region offset in elements.
+    layers whose slabs take these rows (`kv_layout`'s fan-out), the first row,
+    and the K-to-V region offset in elements. Token `t` lands in row `pos + t`.
+
+    `out_dtype` is the dtype of q and of the dense K/V. The prefill passes
+    fp16, which `attn_prefill_fa` takes; the slab is bf16 either way.
     """
     from kv_layout import DH_A, N_ATTN_CU, REGION_W
 
-    qkv = qkv.reshape(-1).contiguous()
-    q = torch.empty(n_q * dh, dtype=torch.float32, device=qkv.device)
+    lut_rows = lut_rows.reshape(-1, dh)
+    T = lut_rows.shape[0]
+    qkv = qkv.reshape(T, -1)
+    if qkv.stride(1) != 1 or lut_rows.stride(1) != 1:
+        qkv, lut_rows = qkv.contiguous(), lut_rows.contiguous()
+    q = torch.empty((T, n_q * dh), dtype=out_dtype, device=qkv.device)
+    if dense_kv and kv is None:
+        raise ValueError("dense K/V needs a layer that owns its K/V")
+    kd = torch.empty((T, dh), dtype=out_dtype, device=qkv.device) if dense_kv else q
+    vd = torch.empty_like(kd) if dense_kv else q
     if kv is not None:
         slab, fan, pos, region_stride = kv
         if slab.stride(1) != 1:
             raise ValueError("the KV slab's rows must be contiguous")
-        # The kernel writes row `pos` by raw offset, so a row past the region
-        # would land in the V region or the next layer rather than fault.
+        # The kernel writes rows `pos .. pos + T - 1` by raw offset, so a row
+        # past the region would land in the V region or the next layer rather
+        # than fault.
         attn_maxl = region_stride // REGION_W
-        if not 0 <= pos < attn_maxl:
-            raise ValueError(f"KV row {pos} is outside the slab's {attn_maxl} rows")
-        args = (slab, fan, fan.numel(), pos, eps, slab.stride(0), region_stride)
+        if not (0 <= pos and pos + T <= attn_maxl):
+            raise ValueError(
+                f"KV rows {pos}..{pos + T - 1} are outside the slab's {attn_maxl} rows"
+            )
+        args = (slab, fan, kd, vd, fan.numel(), pos, eps, slab.stride(0), region_stride)
     else:
-        args = (q, q, 0, 0, eps, 0, 0)
-    _qkv_post_kernel[(n_q + (kv is not None),)](
+        args = (q, q, q, q, 0, 0, eps, 0, 0)
+    _qkv_post_kernel[(n_q + (kv is not None), T)](
         qkv,
         q_norm.contiguous(),
         k_norm.contiguous() if k_norm is not None else q_norm,
-        lut_row.contiguous(),
+        lut_rows,
         q,
         *args,
+        qkv.stride(0),
+        lut_rows.stride(0),
         NQ=n_q,
         HALF=dh // 2,
         LANE_SHIFT=DH_A // 2 - dh // 2,
@@ -821,8 +1165,9 @@ def qkv_post(qkv, q_norm, k_norm, lut_row, n_q, dh, eps, kv=None):
         DH_A=DH_A,
         N_CU=N_ATTN_CU,
         HAS_KV=kv is not None,
+        DENSE_KV=dense_kv,
     )
-    return q.reshape(1, n_q * dh)
+    return (q, kd, vd) if dense_kv else q
 
 
 # ---------------------------------------------------------------------------
@@ -1263,6 +1608,129 @@ def _attn_prefill_kernel(
         out,
         mask=mask_m[:, None] & mask_d[None, :],
     )
+
+
+@triton.jit
+def _fa_qk_slice(q_row, K, j, mask_t, mask_j, c0, dc, DH: tl.constexpr, s):
+    """`s += q[:, c0:c0+DC] @ k[:, c0:c0+DC]^T`, both slices read from memory."""
+    q = tl.load(q_row + c0 + dc[None, :], mask=mask_t[:, None], other=0.0)
+    k = tl.load(K + j[:, None] * DH + c0 + dc[None, :], mask=mask_j[:, None], other=0.0)
+    return tl.dot(q, tl.trans(k), acc=s)
+
+
+# `N` is the prompt length: it must not specialize.
+@triton.jit(do_not_specialize=["N"])
+def _attn_prefill_fa_kernel(
+    Q,
+    K,
+    V,
+    OUT,
+    N,
+    scale,
+    window,
+    NQ: tl.constexpr,
+    DH: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    DC: tl.constexpr,
+    HAS_WINDOW: tl.constexpr,
+):
+    """Causal, optionally windowed attention for one head and `BM` query rows.
+
+    Laid out like llama.cpp's scalar Vulkan flash attention (`flash_attn.comp`):
+
+    * One program per (query block, head). The eight query heads share the
+      single K/V head through L2 rather than within a program.
+    * The whole head dim in one program, so QK^T is computed once even for
+      the 512-wide heads.
+    * fp16 operands with f32 accumulation, as llama.cpp uses. bf16 operands
+      lose too much on Gemma4's scores, which are large (RMS-normed q and k,
+      scale 1).
+    * Q is not kept in registers. In WMMA operand layout a whole Q block
+      takes 128 (dh 256) or 256 (dh 512) VGPRs and spills; llama.cpp keeps
+      it in shared memory instead. Here each `DC`-wide slice is re-read from
+      L2 per key block, in a loop that must stay rolled: unrolled, the
+      compiler hoists every slice's loads and spills again.
+
+    Q, K and V are fp16; the output is f32.
+    """
+    pid_m = tl.program_id(0)
+    h = tl.program_id(1)
+    t = pid_m * BM + tl.arange(0, BM)
+    mask_t = t < N
+    d = tl.arange(0, DH)
+    dc = tl.arange(0, DC)
+    q_row = Q + t[:, None] * (NQ * DH) + h * DH
+    m_i = tl.full((BM,), float("-inf"), tl.float32)
+    l_i = tl.zeros((BM,), tl.float32)
+    acc = tl.zeros((BM, DH), tl.float32)
+    t0 = pid_m * BM
+    hi = tl.minimum(N, t0 + BM)  # causal: no key past the block's last row
+    lo = 0
+    if HAS_WINDOW:
+        lo = (tl.maximum(0, t0 - window + 1) // BN) * BN
+    for j0 in range(lo, hi, BN):
+        j = j0 + tl.arange(0, BN)
+        mask_j = j < N
+        s = tl.zeros((BM, BN), tl.float32)
+        for c0 in tl.range(0, DH, DC, loop_unroll_factor=1):
+            s = _fa_qk_slice(q_row, K, j, mask_t, mask_j, c0, dc, DH, s)
+        s = s * scale
+        keep = mask_j[None, :] & (j[None, :] <= t[:, None])
+        if HAS_WINDOW:
+            keep = keep & (t[:, None] - j[None, :] < window)
+        s = tl.where(keep, s, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        # See `_attn_prefill_kernel`: a fully masked block leaves m_new at
+        # -inf, and a finite stand-in keeps exp() from producing NaN.
+        m_exp = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_exp)
+        p = tl.exp(s - m_exp[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        v = tl.load(V + j[:, None] * DH + d[None, :], mask=mask_j[:, None], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
+        m_i = m_new
+    tl.store(
+        OUT + t[:, None] * (NQ * DH) + h * DH + d[None, :],
+        acc / l_i[:, None],
+        mask=mask_t[:, None],
+    )
+
+
+#: (query rows, head-dim slice) per program, by head width, with 32-key
+#: blocks and 4 warps. Swept on gfx1103 at N = 512.
+_FA_TILE = {256: (32, 64), 512: (32, 32)}
+
+
+def attn_prefill_fa(q, k, v, n_q, dh, window=None, scale=None):
+    """q: [N, n_q*dh], k/v: [N, dh] (one KV head) -> [N, n_q*dh], f32.
+
+    Causal, windowed where `window` is given. Inputs should be fp16; others
+    are converted here at the cost of extra launches.
+    """
+    N = q.shape[0]
+    scale = dh**-0.5 if scale is None else scale
+    q, k, v = (x.to(torch.float16).contiguous() for x in (q, k, v))
+    out = torch.empty((N, n_q * dh), dtype=torch.float32, device=q.device)
+    BM, DC = _FA_TILE.get(dh, (32, 32))
+    _attn_prefill_fa_kernel[(triton.cdiv(N, BM), n_q)](
+        q,
+        k,
+        v,
+        out,
+        N,
+        float(scale),
+        window if window is not None else 0,
+        NQ=n_q,
+        DH=dh,
+        BM=BM,
+        BN=32,
+        DC=DC,
+        HAS_WINDOW=window is not None,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
 
 
 def _attn_blocks(dh):
