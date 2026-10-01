@@ -41,6 +41,9 @@ Thumbs.db
 air_project/
 *.mlir.tmp
 tt.shared.mlir
+# written into the working directory by every launch / autotune run
+params.txt
+data.txt
 xrt-dev/
 
 # llvm windows prebuilt images

@@ -10,9 +10,11 @@ transform scripts assume and slice back afterwards.
 
 import ctypes
 import math
+import re
 import os
 import weakref
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -165,8 +167,134 @@ def _matmul_kernel(
     tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :], tl.dot(a, b))
 
 
+#: The smallest output block one AIE core is given under these schedules --
+#: their `l1_m`/`l1_n` floor. A `block_m x block_n` GEMM tile asks for a herd
+#: of `(block_m/l1_m, block_n/l1_n)` cores, which is how a tile becomes
+#: occupancy.
+L1 = 64
+
+#: npu2's compute array. `air-to-aie` lays herd dimension 0 across COLUMNS and
+#: dimension 1 across ROWS, so a block that covers the array is 8 cores wide in
+#: M and 4 in N. Taken the other way round it does not run slower, it fails to
+#: place: a herd needing five rows raises "row index (6) must be less than
+#: ... (6)".
+AIE_COLS, AIE_ROWS = 8, 4
+
 BLOCK_M = 128  # the matmul transform script's herd tiling assumes >= 128
-BLOCK_N = 256
+
+#: The largest core tile these schedules can drain. One L1->L2 output copy is
+#: `l1_m * l1_n` 32-bit words and a DMA buffer descriptor carries at most
+#: 16383, so 128x128 misses by a single word and 8192 is the ceiling.
+MAX_L1_NUMEL = 8192
+
+#: ...which, over the whole array, bounds the block itself. This is what stops
+#: both tile dimensions from growing at once: 1024x256 and 512x512 are both
+#: exactly at it, and 1024x512 is twice over.
+MAX_BLOCK_NUMEL = AIE_COLS * AIE_ROWS * MAX_L1_NUMEL
+
+#: Row tiles a GEMM may be compiled for, widest first. A tile is computed in
+#: full whether or not the rows fill it, so the widest is not the fastest at
+#: every prompt length -- `row_tier` chooses. The top of the range is past the
+#: array's width: `L1 * AIE_COLS` is the narrowest block that reaches all eight
+#: columns, and doubling it keeps the same herd while halving how often the
+#: weight is re-read. Whether it is reachable depends on `block_n`, through
+#: `MAX_BLOCK_NUMEL`.
+WIDE_M = L1 * AIE_COLS
+ROW_TIERS = (2 * WIDE_M, WIDE_M, 256, BLOCK_M)
+
+#: Column tiles, the same way. A GEMM re-reads the whole of A once per column
+#: tile, so the widest tile the weight can fill moves the fewest bytes -- at
+#: the same core count, since `MAX_BLOCK_NUMEL` then takes it back out of the
+#: rows. Which of the two axes should give way is the caller's cost model, not
+#: a property of the array: see `tile_n` for the dispatch-per-row-block path
+#: and `fused_mlp` for the chained one. `col_tier` chooses the tile itself; a
+#: narrow projection takes the small one rather than padding to a tile it
+#: cannot fill.
+COL_TIERS = (2 * L1 * AIE_ROWS, L1 * AIE_ROWS)
+
+#: The matmul schedules, by the core tile `(l1_m, l1_n)` they were generated
+#: for. The tile does not simply track the block, and that is measured rather
+#: than assumed: holding the herd at eight columns by shrinking `l1_m` is
+#: slower than letting the herd shrink, at both 256 and 128 rows. Below 512
+#: rows there are not enough of them to give every column a tile worth
+#: having.
+_MATMUL_SCRIPTS = {
+    (64, 64): "gpt2/transform_matmul_aie2p.mlir",
+    (128, 64): "llm_q4nx/transform_matmul_m128_aie2p.mlir",
+    (64, 128): "llm_q4nx/transform_matmul_n128_aie2p.mlir",
+}
+
+#: The K depth every checked-in schedule was generated for.
+L2_K = 64
+
+#: The same core tiles staged 256 deep in L2 instead, still reducing 64 at a
+#: time in L1 (`l1_k`). Every L3->L2 round costs a fixed setup whatever it
+#: carries, and a long reduction pays it K / l2_k times: Gemma4's `down`
+#: contracts 12288, so 192 rounds at 64 and 48 at 256 -- mlir-air's own
+#: `tile_k_l2` for that GEMM. 7.49 -> 5.43 ms on the wide `down` at M=1024,
+#: bit-identical, since each core still reduces in the same order.
+#:
+#: Not the default, because the weight walk's DMA stride is `l2_k * N` and
+#: npu2 caps a BD stride at 2^20 words: at the FFN width of `gate`/`up`
+#: (12288) 256 is three times over and aiecc rejects it. A caller with a long
+#: K and a narrow N asks for it by name.
+DEEP_L2_K = 256
+_DEEP_K_SCRIPTS = {
+    (64, 128): "llm_q4nx/transform_matmul_n128_k256_aie2p.mlir",
+}
+
+
+#: `triton_matmul`'s default: pick the schedule from the block shape. Distinct
+#: from `None`, which means "let the driver generate one" and is what
+#: `qwen25_prefill` passes for the shape these schedules reject.
+BY_BLOCK = "<chosen from the block shape>"
+
+
+def matmul_script(block_m, block_n, l2_k=L2_K):
+    """The schedule to lower a `block_m x block_n` GEMM tile with.
+
+    The core tile is the largest that still spreads the block over the whole
+    array, floored at `L1` -- see `_MATMUL_SCRIPTS` for why the floor is there
+    and not lower. `l2_k` is `L2_K` or `DEEP_L2_K`; see the latter for when.
+    """
+    l1 = (max(L1, block_m // AIE_COLS), max(L1, block_n // AIE_ROWS))
+    if l2_k == DEEP_L2_K and l1 in _DEEP_K_SCRIPTS:
+        return script(_DEEP_K_SCRIPTS[l1])
+    if l2_k != L2_K:
+        raise ValueError(f"no {l1[0]}x{l1[1]} schedule with l2_k={l2_k}")
+    if l1 not in _MATMUL_SCRIPTS:
+        raise ValueError(
+            f"a {block_m}x{block_n} block wants an l1 tile of {l1[0]}x{l1[1]}, "
+            f"which has no schedule; blocks are bounded by MAX_BLOCK_NUMEL "
+            f"({MAX_BLOCK_NUMEL}) and this one is {block_m * block_n}"
+        )
+    return script(_MATMUL_SCRIPTS[l1])
+
+
+def row_tier(n_rows, tiers=ROW_TIERS, cap=None):
+    """The row tile to run `n_rows` through: fewest dispatches, then smallest.
+
+    Fewest dispatches because a wider tile spreads over proportionally more
+    columns, so what it really buys is one dispatch instead of several;
+    smallest on a tie because two tiers needing the same number of dispatches
+    differ only in how much of the last one is padding.
+
+    `cap` bounds the tile where the caller has a ceiling of its own -- Triton's
+    tensor limit, which binds here as `block_m * Kp`, and `MAX_BLOCK_NUMEL`.
+    """
+    ok = [t for t in tiers if cap is None or t <= cap] or [min(tiers)]
+    return min(ok, key=lambda t: (-(-n_rows // t), t))
+
+
+def col_tier(n_cols):
+    """The column tile for an `n_cols`-wide GEMM. `row_tier`'s rule, one axis over.
+
+    The same trade and so the same rule: fewest tiles, because A is re-read
+    once per tile, and the narrower one on a tie, because then the tiers differ
+    only in padding.
+    """
+    return row_tier(n_cols, tiers=COL_TIERS)
+
 
 # Every wrapper below tiles the ROW (sequence) dimension on the host at this
 # granularity, so no kernel's grid or constexprs depend on the prompt length.
@@ -255,19 +383,51 @@ def shared_empty(shape, dtype):
     it is attached to the returned tensor so the pages are reclaimed only once
     nothing is looking at them.
     """
-    if os.environ.get("AMD_TRITON_NPU_RUNTIME") != "hsa":
-        return torch.empty(shape, dtype=dtype)
     try:
         from triton.backends.amd_triton_npu import shared
 
-        buf = shared.empty(tuple(shape), dtype=dtype, device="hsa:0")
+        dev = "hsa:0" if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" else "xrt:0"
+        buf = shared.empty(tuple(shape), dtype=dtype, device=dev)
         t = buf.torch()
+        # The caller binds it (`shared_bo`); without that the pages are still
+        # staged and copied back like any other array, and the only thing this
+        # buys is the pooling.
         t._shared_buffer = buf
         return t
     except Exception as e:  # noqa: BLE001 -- an optimisation, never a blocker
         if os.environ.get("AMD_TRITON_NPU_DEBUG"):
             print(f"[kernels] activation stays staged: {e}", flush=True)
         return torch.empty(shape, dtype=dtype)
+
+
+#: `shared_empty` pages kept alive by shape, so a given `bo_key` always binds
+#: the SAME buffer. `shared.py` pools its allocations, so without this a second
+#: call under one key gets a different BO and the runner refuses it -- "already
+#: bound to a different buffer for arg 0". Keyed by shape and dtype only: the
+#: contents are overwritten before every dispatch, so two call sites at one
+#: shape can share the page.
+_IO_PAGES = {}
+
+
+def io_page(shape, dtype):
+    """A `shared_empty` tensor for this shape, allocated once and reused."""
+    key = (tuple(shape), dtype)
+    t = _IO_PAGES.get(key)
+    if t is None:
+        t = shared_empty(shape, dtype)
+        _IO_PAGES[key] = t
+    return t
+
+
+def shared_bo(t):
+    """The XRT buffer object behind a `shared_empty` tensor, or None.
+
+    `bound_buffers` takes these: the chain then dispatches on the caller's own
+    pages instead of staging a copy in and copying the result back out. At
+    qkv's shape that is 6 MiB in and 42 MiB out, on every one of 35 layers.
+    """
+    buf = getattr(t, "_shared_buffer", None)
+    return None if buf is None else buf.bo
 
 
 class ResidentWeight:
@@ -299,10 +459,19 @@ class ResidentWeight:
         return (self.K, self.N)
 
 
-def resident_weight(w, block_n=BLOCK_N):
-    """Pad `w` for the NPU now, returning a handle that does not reference it."""
+def resident_weight(w, block_n=None, exact=False):
+    """Pad `w` for the NPU now, returning a handle that does not reference it.
+
+    `exact` contracts K itself rather than the power of two above it, which
+    only the chain path can dispatch (`triton_matmul`'s `stage_key`): the
+    per-row-block loop compiles a `@triton.jit` kernel and `tl.arange` needs a
+    power of two. The padding is fixed here at load time, so the caller has to
+    know which way its consumer will dispatch -- see `CHAIN_WEIGHTS`.
+    """
     K, N = w.shape
-    Kp, Np = _pow2(K), math.ceil(N / block_n) * block_n
+    Kp = exact_k(K) if exact else _pow2(K)
+    block_n = tile_n(N, Kp) if block_n is None else block_n
+    Np = math.ceil(N / block_n) * block_n
     padded = _resident_copy(_pad2d(w.to(torch.bfloat16), Kp, Np).contiguous())
     return ResidentWeight(padded, K, N)
 
@@ -323,6 +492,22 @@ def _padded_weight(w, Kp, Np):
     return b
 
 
+def unaliased_stride(n_elems):
+    """A row stride of at least `n_elems` that is not a power of two.
+
+    DDR interleaves its banks on a power-of-two byte boundary, so a row stride
+    that is itself a power of two puts every row of a tile in the same bank.
+    It is not a small effect: on mlir-air's GEMM with everything else held
+    fixed, a K=2048 contraction costs 48% more per K step than K=1920 or 2112,
+    and `tl.arange` makes every contraction here a power of two.
+
+    The *extent* has to stay one; the stride does not. One L1 tile of slack
+    buys the rows back and costs one column block that nothing reads. Strides
+    that are already off the boundary are returned unchanged.
+    """
+    return n_elems + L1 if n_elems and not n_elems & (n_elems - 1) else n_elems
+
+
 #: Triton's own cap on the element count of one tile (`tl.load` of
 #: `[BLOCK_K, BLOCK_N]`). Not a device limit and not tunable -- the frontend
 #: refuses to build the tensor. It binds here because `BLOCK_K` is the *whole*
@@ -338,35 +523,267 @@ MAX_TILE_NUMEL = 4194304
 MATMUL_SCRIPT = "gpt2/transform_matmul_aie2p.mlir"
 
 
+def narrow_k(src, k, kp, block_m, block_n):
+    """Narrow a captured GEMM module's contraction from `kp` down to `k`.
+
+    `tl.arange` requires a power of two, so a `@triton.jit` GEMM can only ask
+    for `kp` where the real reduction is `k` -- for every projection in a model
+    whose D is not a power of two, that is 33% of the weight traffic spent on
+    zeros. `linalg.matmul` carries no such rule and the schedules tile K by
+    `l2_k`, so a module stating `k` needs nothing else changed.
+
+    Only the K EXTENT is edited. Both row strides are kernel constexprs, so a
+    capture taken at the real stride already has every offset right, and these
+    four are all that is left: A is `[block_m, K]` and B is `[K, block_n]`.
+
+    Measured on Gemma4's wide gate, M=1024 N=12288: 8.76 -> 6.54 ms at an
+    unchanged 5.9 TFLOP/s -- the same efficiency over 25% fewer bytes.
+    """
+    if k == kp:
+        return src
+    if isinstance(src, bytes):
+        src = src.decode()
+    for pat, rep in (
+        (rf"sizes: \[{block_m}, {kp}\]", f"sizes: [{block_m}, {k}]"),
+        (rf"sizes: \[{kp}, {block_n}\]", f"sizes: [{k}, {block_n}]"),
+        (rf"\b{block_m}x{kp}xbf16\b", f"{block_m}x{k}xbf16"),
+        (rf"\b{kp}x{block_n}xbf16\b", f"{k}x{block_n}xbf16"),
+    ):
+        src, hits = re.subn(pat, rep, src)
+        if not hits:
+            raise RuntimeError(f"narrow_k matched nothing: {pat}")
+    return src
+
+
+#: A reduction is contracted exactly when it is a multiple of this. The
+#: schedules tile K by `l2_k`, at most 256 across the checked-in scripts, and a
+#: K that is not a multiple of its tile would leave a partial one the grid
+#: cannot express. Gemma4's 1536 clears it; a prime D would fall back to
+#: padding, which is still correct.
+K_EXACT_GRAIN = 256
+
+
+def exact_k(K):
+    """The reduction to contract for a weight with `K` rows: `K` or its pad."""
+    kp = _pow2(K)
+    return K if K != kp and K % K_EXACT_GRAIN == 0 else kp
+
+
+def tile_n(N, Kp):
+    """The column tile for an `N`-wide weight contracted over `Kp`.
+
+    One rule for `triton_matmul` and `resident_weight` both, because a weight
+    padded under a different one is a buffer shaped for someone else's grid --
+    which is also why it cannot depend on the prompt: the padding is fixed at
+    load time and the rows are not known until the call.
+
+    So the rows get first claim on `MAX_BLOCK_NUMEL` and the columns take what
+    is left. That is the right way round *here* and only here: this path issues
+    one dispatch per row block, each costing its own fixed overhead whatever it
+    contains, so it always wants the widest row tier. `fused_mlp` chooses the
+    other way round because a chain carries its row blocks in the grid and pays
+    nothing for them.
+
+    The remaining cap is Triton's, not the device's: the tile is
+    `Kp x block_n` elements and the frontend refuses to build a larger tensor.
+    Qwen2.5-7B's `down` (Kp=32768) is the only shape here that it narrows.
+    """
+    if Kp > MAX_TILE_NUMEL:
+        raise ValueError(
+            f"K pads to {Kp}, which exceeds Triton's {MAX_TILE_NUMEL} maximum "
+            f"tensor size on its own; no block_n can fit."
+        )
+    return min(col_tier(N), MAX_TILE_NUMEL // Kp, MAX_BLOCK_NUMEL // ROW_TIERS[0])
+
+
+def _np(t):
+    """`t` as a numpy array, bf16 included.
+
+    numpy has no bfloat16, so a bf16 tensor is reinterpreted through uint16
+    into `ml_dtypes`'. Nothing converts: the bytes are the same either way, and
+    a chain wants numpy because that is what its staging copies from.
+    """
+    if t.dtype is torch.bfloat16:
+        from ml_dtypes import bfloat16
+
+        return t.view(torch.uint16).numpy().view(bfloat16)
+    return t.numpy()
+
+
+#: Per-core L1 an elementwise tile's operands may occupy. The core has 64 KiB;
+#: 48 places and 96 does not -- measured, the failure is "'aie.tile' op
+#: allocated buffers exceeded available memory".
+ELEM_L1_BYTES = 48 * 1024
+
+
+def elem_block(n_elems, bytes_per_elem):
+    """The elementwise tile to cover `n_elems` with, or the cap if None.
+
+    Bounded by BYTES per core and not by a fixed element count, because that is
+    what the hardware bounds. `@flatten_tile_forall_aie2p` splits a block over
+    the 8 columns with `num_threads [8]`, so a core holds `block / 8` elements
+    of every operand at once and `bytes_per_elem` is their widths summed.
+
+    The tile is most of what an elementwise pass costs. Fitting
+    `t = a*elements + b*bytes` over a bf16 add at 12.58M elements gives 74 GB/s
+    of marginal bandwidth against a 5.7 Gelem/s fixed term -- two thirds of the
+    time is per-element, which is really per-TILE work charged against a fixed
+    tile length. Lengthening the tile amortises it, monotonically to the L1
+    bound: three bf16 streams run 3.25 ms at 16384 and 1.85 at 65536; three
+    f32 streams run 4.15 at 16384 and 3.46 at 32768, and 65536 does not place.
+
+    `n_elems` is the range to cover. The grid is `n_elems // block`, so a block
+    that does not divide the range truncates it and drops the tail with no
+    error -- the same trap `D_pad` carries against `BLOCK_N`. Taking the
+    largest power of two that divides makes it impossible instead of merely
+    unlikely, and `tl.arange` wants a power of two anyway. Pass None where the
+    caller sizes its own range around the block.
+    """
+    cap = 1 << ((AIE_COLS * ELEM_L1_BYTES) // bytes_per_elem).bit_length() - 1
+    return cap if n_elems is None else min(cap, n_elems & -n_elems)
+
+
+#: Chains that hold a projection's weight on the device between calls, keyed by
+#: the compiled shape. One per shape and NOT one per weight: a chain owns an
+#: `hw_context` and the NPU runs out of those at around 35 (see `fused_mlp`),
+#: so a layer's identity is the `bo_key` instead, which is the same arrangement
+#: the FFN chain uses.
+_PROJ_CHAINS = {}
+
+
+@triton.jit
+def _stage_pad_kernel(A, B, C, BLOCK: tl.constexpr):
+    """A trivial second op, so the chain is never exactly one.
+
+    `NPUChain` documents that a one-op chain is correct on its first dispatch
+    and corrupt on every one after. Four KiB of addition costs nothing
+    measurable next to a projection and keeps the chain out of that case.
+
+    Three operands and not one because `_PAD_SCRIPT` promotes a BINARY
+    elementwise op; a one-in/one-out kernel meets it with "expected a single
+    payload op". All three indices are the same buffer at the call site.
+    """
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(C + offs[:], tl.load(A + offs[:]) + tl.load(B + offs[:]))
+
+
+def _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script):
+    """The chain that runs a `Mp x Kp @ Kp x Np` projection, built once.
+
+    The whole grid in one dispatch rather than the host's row-block loop, so
+    the weight is one operand of one op and `static_indices` can hold it.
+    """
+    key = (block_m, block_n, Mp, Np, Kp, a_stride, transform_script)
+    chain = _PROJ_CHAINS.get(key)
+    if chain is not None:
+        return chain
+    from triton.backends.amd_triton_npu.multilaunch import NPUChain
+
+    chain = NPUChain(f"proj_{Mp}x{Kp}x{Np}_{block_m}x{block_n}")
+    # Captured at the power of two the frontend insists on, then narrowed to
+    # the reduction actually wanted -- see `narrow_k`. At a `Kp` that is
+    # already exact the capture is used unchanged.
+    kp = _pow2(Kp)
+    tscript = script(transform_script) if isinstance(transform_script, str) else None
+    src = chain._capture_ttshared(
+        _matmul_kernel,
+        (Mp // block_m, Np // block_n),
+        (
+            torch.zeros((Mp, a_stride), dtype=torch.bfloat16),
+            torch.zeros((kp, Np), dtype=torch.bfloat16),
+            torch.zeros((Mp, Np), dtype=torch.float32),
+            a_stride,
+            Np,
+            Np,
+        ),
+        {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": kp},
+    )
+    chain.add(
+        narrow_k(src, Kp, kp, block_m, block_n),
+        grid=(Mp // block_m, Np // block_n),
+        arg_map={0: 0, 1: 1, 2: 2},
+        args=(),
+        transform_script=tscript,
+    )
+    chain.add(
+        _stage_pad_kernel,
+        grid=(1,),
+        arg_map={0: 3, 1: 3, 2: 3},
+        args=(
+            torch.zeros(1024, dtype=torch.float32),
+            torch.zeros(1024, dtype=torch.float32),
+            torch.zeros(1024, dtype=torch.float32),
+        ),
+        constexprs={"BLOCK": 1024},
+        transform_script=script(_PAD_SCRIPT),
+    )
+    _PROJ_CHAINS[key] = chain
+    return chain
+
+
+#: The padding op's schedule. Any elementwise one will do; this is the f32 add
+#: every model already builds.
+_PAD_SCRIPT = "gpt2/transform_add_f32_aie2p.mlir"
+
+
 def triton_matmul(
-    x, w, block_m=BLOCK_M, block_n=BLOCK_N, transform_script=MATMUL_SCRIPT
+    x, w, block_m=None, block_n=None, transform_script=BY_BLOCK, stage_key=None
 ):
     """x: [M, K] float32/bf16, w: [K, N] bf16 -> [M, N] float32, on the NPU.
 
+    Both block dimensions default to whatever `row_tier` and `tile_n` think
+    this shape is worth: a tile is computed in full, so the widest one is the
+    fastest only once the rows and columns fill it. Each distinct value
+    compiles its own kernel, so the tiers are few and fixed rather than
+    tracking the prompt.
+
     `transform_script` is the schedule to lower with, as an `examples`-relative
-    path, or None to let the driver generate one. The default is the shared
-    hand-written schedule; it is not universal, and the one shape here that it
-    rejects is recorded at the call site that passes None
-    (`qwen25_prefill._layer`), because a shape it rejects fails loudly in
-    aiecc rather than silently.
+    path; `BY_BLOCK` picks one to match the block, and None lets the driver
+    generate its own. The shared hand-written schedules are not universal, and
+    the one shape here that they reject is recorded at the call site that
+    passes None (`qwen25_prefill._layer`), because a shape they reject fails
+    loudly in aiecc rather than silently.
+
+    `stage_key` names a weight that does not change between calls -- a layer's
+    projection -- and dispatches through a chain that stages it once instead of
+    per launch. `launch` copies every pointer argument into a device BO on
+    every launch, so a 20 MiB weight is otherwise re-staged twice a layer for
+    35 layers. Measured at qkv's shape: 19.49 ms against 11.35. Name the weight
+    (`f"qkv_L{i}"`); the BO set is keyed on that AND the padded buffer's
+    address, so two models of one shape in a process cannot share a weight.
+    The address is only stable if `w` is: pass the same tensor every call, not
+    one rebuilt per call, or each call stages a fresh copy.
     """
     M, K = x.shape
     Kw, N = w.shape
     assert K == Kw, (x.shape, w.shape)
-    Kp = _pow2(K)  # tl.arange needs a power of two
-    # Narrow the tile until it fits Triton's cap, rather than asking each model
-    # to know its own largest legal `block_n`. The bound is exact -- the tile is
-    # Kp x block_n elements and the cap is a constant -- so this is derived, not
-    # guessed, and a model that does not need it is not affected: at Kp <= 16384
-    # the default 256 already fits. Qwen2.5-7B's `down` (Kp=32768) is the only
-    # shape here that moves, to 128.
-    if Kp * block_n > MAX_TILE_NUMEL:
-        if Kp > MAX_TILE_NUMEL:
-            raise ValueError(
-                f"K={K} pads to {Kp}, which exceeds Triton's {MAX_TILE_NUMEL} "
-                f"maximum tensor size on its own; no block_n can fit."
-            )
-        block_n = MAX_TILE_NUMEL // Kp
+    # The chain path hands the op to AIR as MLIR, so it can contract K itself;
+    # the dispatch loop below still compiles a `@triton.jit` kernel, whose
+    # `tl.arange` needs a power of two. A resident weight was padded at load
+    # time and is authoritative -- its row count IS the reduction, and a
+    # caller that cannot run it says so here rather than dying inside the
+    # frontend on an arange.
+    if isinstance(w, ResidentWeight):
+        Kp = w.padded.shape[0]
+    else:
+        Kp = exact_k(K) if stage_key is not None else _pow2(K)
+    # An exact K can only be dispatched through the chain, which hands AIR the
+    # module as MLIR; the per-row-block loop below compiles a `@triton.jit`
+    # kernel and `tl.arange` needs a power of two. A resident weight fixed its
+    # padding at load time and may reach a call site that passes no
+    # `stage_key`, so the reduction decides the path, not the caller.
+    via_chain = stage_key is not None or Kp != _pow2(Kp)
+    # `None` on either block dimension means "as wide as this shape is worth",
+    # which is what a caller almost always wants; an explicit one is honoured
+    # as given. Both caps are derived rather than declared per model: Triton's
+    # tensor limit on each tile, and `MAX_BLOCK_NUMEL` between them, so the two
+    # cannot both widen into a block that has no schedule.
+    if block_n is None:
+        block_n = tile_n(N, Kp)
+    if block_m is None:
+        block_m = row_tier(M, cap=min(MAX_TILE_NUMEL // Kp, MAX_BLOCK_NUMEL // block_n))
+    if transform_script is BY_BLOCK:
+        transform_script = matmul_script(block_m, block_n)
     Mp = math.ceil(M / block_m) * block_m
     Np = math.ceil(N / block_n) * block_n
     if isinstance(w, ResidentWeight):
@@ -385,10 +802,52 @@ def triton_matmul(
     # Pad input and output ONCE, then hand each dispatch a contiguous row slice
     # of them. Allocating per tile and copying the result back instead cost
     # more than the dispatch: an [128, 16384] f32 copy per GEMM, 64 GEMMs deep.
-    a = shared_empty((Mp, Kp), torch.bfloat16)
+    # `Kp` is the extent the kernel contracts; `a_stride` is how far apart the
+    # rows sit, and they are deliberately not the same number.
+    a_stride = unaliased_stride(Kp)
+    a = io_page((Mp, a_stride), torch.bfloat16)
     a.zero_()
     a[:M, :K] = x.to(torch.bfloat16)
-    c = shared_empty((Mp, Np), torch.float32)
+    # The chain binds `c` by `bo_key`, so it must be the same page every call
+    # and is copied out below. The dispatch loop returns `c` itself, so it gets
+    # a page of its own: a pooled one would be overwritten by the next call at
+    # this shape, under a caller still holding the result.
+    c = (
+        io_page((Mp, Np), torch.float32)
+        if via_chain
+        else shared_empty((Mp, Np), torch.float32)
+    )
+    if via_chain:
+        chain = _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script)
+        pad = np.zeros(1024, dtype=np.float32)
+        # `static_indices` holds one weight per key, so a key that does not
+        # identify the WEIGHT would hand the next call the last one's buffer.
+        # The address does identify it. A `stage_key` alone does not: chains
+        # are process-global and shared by shape, so a second model of the
+        # same shape would reuse the first's `qkv_L0` -- the name only labels.
+        key = f"{stage_key or 'mm'}_{b.data_ptr():x}_{Mp}x{Kp}x{Np}"
+        # The activation and the result are the caller's own pages where the
+        # interop allows it, so neither is staged in nor copied back.
+        io = {i: bo for i, bo in ((0, shared_bo(a)), (2, shared_bo(c))) if bo}
+        with _npu_driver():
+            got = chain.run(
+                [_np(a), _np(b), _np(c), pad],
+                bo_key=key,
+                static_indices={1},
+                intermediate_indices={3},
+                output_indices={2},
+                bound_buffers=io or None,
+            )
+        if 2 in io:
+            # Read where the kernel wrote it, then copied ONCE into a tensor
+            # of the caller's own: the page is reused by the next call at this
+            # shape, so a view into it would be overwritten under them. That
+            # trades a device->host copy of the whole padded buffer for a
+            # host->host copy of just the part asked for.
+            return c.reshape(Mp, Np)[:M, :N].clone()
+        # Unbound, `got[2]` is a view of the runner's own BO for this key, which
+        # the next dispatch under it overwrites -- the same lifetime as above.
+        return torch.from_numpy(np.asarray(got[2])).reshape(Mp, Np)[:M, :N].clone()
     # One block_m-row tile per dispatch: the grid is (1, N/block_n), which
     # depends on the weight alone and never on the prompt length.
     for m0 in range(0, Mp, block_m):
@@ -398,10 +857,12 @@ def triton_matmul(
             a[m0 : m0 + block_m],
             b,
             c[m0 : m0 + block_m],
-            Kp,
+            a_stride,
             Np,
             Np,
-            transform_script=(script(transform_script) if transform_script else None),
+            transform_script=(
+                script(transform_script) if isinstance(transform_script, str) else None
+            ),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=Kp,
@@ -428,16 +889,49 @@ def _swiglu_kernel(G, U, Y, BLOCK: tl.constexpr):
     tl.store(Y + offs[:], silu_gate * up)
 
 
-SWIGLU_BLOCK = 1024
+#: Both pad to bf16 and write bf16, so three 2-byte streams. Worth about 2x
+#: per layer on the PLE branch's [2040, 256] against the 1024 it replaced,
+#: at an unchanged error.
+SWIGLU_BLOCK = elem_block(None, 2 + 2 + 2)
+
+
+def glu_chunk(n, width, block):
+    """How much of a GLU's range one dispatch covers. A multiple of `block`.
+
+    The chunk is sized from the row WIDTH rather than the row count, so the
+    grid (`chunk // block`) never tracks the prompt length -- the AIR lowering
+    is cached on the grid, and one that followed P would recompile per prompt.
+
+    Width alone is not enough when the rows are narrow. Gemma4's PLE branch is
+    [P, 256]: `ROW_TILE * 256` is 32768, which rounds up to exactly ONE 65536
+    block, so a P=2040 range of 8 blocks went out as eight dispatches of a
+    single program each -- 280 for the prefill, every one staging its own
+    operands. One dispatch of eight programs is the same arithmetic and the
+    same tile, measured 3.409 -> 0.929 ms per layer and bit-identical.
+
+    So take the larger of the width chunk and the whole range, with the range
+    rounded DOWN to a power of two and capped. Rounding down keeps the set of
+    distinct grids small (1, 2, 4, 8 plus whatever the widths ask for) instead
+    of one per prompt length, and the cap stops a wide model's chunk from
+    shrinking: at width 12288 the width term is already 24 blocks, and 8 would
+    make it three times as many dispatches.
+    """
+    blocks = max(1, math.ceil(n / block))
+    span = block * (1 << min(blocks.bit_length() - 1, _GLU_MAX_POW2))
+    return max(math.ceil(ROW_TILE * width / block) * block, span)
+
+
+#: Largest power-of-two grid `glu_chunk` will reach for on range alone, as an
+#: exponent. Eight programs covers the PLE branch at every length this runs at
+#: and bounds the distinct grids; wider rows still get their width's chunk.
+_GLU_MAX_POW2 = 3
 
 
 def triton_swiglu(gate, up, block=SWIGLU_BLOCK):
     """silu(gate) * up over matching [M, N] tensors -> [M, N] float32."""
     shape = gate.shape
-    # Fixed-size chunks, so the grid never tracks the prompt length (ROW_TILE).
-    chunk = ROW_TILE * (shape[-1] if gate.ndim > 1 else block)
-    chunk = math.ceil(chunk / block) * block
     n = gate.numel()
+    chunk = glu_chunk(n, shape[-1] if gate.ndim > 1 else block, block)
     npad = math.ceil(n / chunk) * chunk
     # Pad once; each dispatch gets a contiguous slice, no per-chunk copy back.
     g = torch.nn.functional.pad(gate.reshape(-1).to(torch.bfloat16), (0, npad - n))
@@ -471,30 +965,28 @@ def _geglu_kernel(G, U, Y, C2: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexp
 
         0.5 * x * (1 + tanh(c * (x + 0.044715 * x^3))),  c = sqrt(2/pi)
 
-    written here with sigmoid instead of tanh. `tl.math.tanh` does not exist in
-    this Triton version, and substituting the usual `x * sigmoid(1.702x)` fast
-    GELU (which is what examples/gelu uses) would be a different function --
-    mlir-air's decode runs gelu_tanh in `glu.cc`, so an approximation here would
-    make the prefill and the decode disagree about the model.
+    and with a real tanh, because AIE2P has one and does not have a reciprocal.
+    Its two vector transcendentals are `exp2` and `tanh`
+    (`aie2p_nlf_vector.h`); `inv`, `invsqrt` and `sqrtf` are in the scalar
+    header. The `x * sigmoid(2z)` form this used to take -- exact, since
+    tanh(z) = 2*sigmoid(2z) - 1, which is why `C2` is *2*c -- therefore paid a
+    scalar call per lane for its divide.
 
-    No approximation is needed, because tanh(z) = 2*sigmoid(2z) - 1 turns the
-    expression above into an exact identity:
+    Substituting the usual `x * sigmoid(1.702x)` fast GELU (which is what
+    examples/gelu uses) is a different function and still ruled out: mlir-air's
+    decode runs gelu_tanh in `glu.cc`, so an approximation here would make the
+    prefill and the decode disagree about the model.
 
-        0.5 * x * (1 + 2*sigmoid(2z) - 1)  =  x * sigmoid(2z)
-
-    with z = c * (x + 0.044715 x^3). That is why `C2` is *2*c and not c.
-
-    The op set is the SwiGLU kernel's -- mul, add, sigmoid -- so it lowers under
-    the same transform script, which is what makes this a new kernel rather than
-    a new schedule. f32 for the polynomial and the sigmoid, as tl.sigmoid
-    requires, rounded back to bf16 before the multiply by `up`.
+    `tl.extra.cuda.libdevice.tanh` is not CUDA here. It emits
+    `tt.extern_elementwise` naming `__nv_tanhf`, triton-shared maps that symbol
+    to `math.tanh`, and `@cast_bf16_only_ops` then puts it on the hardware op.
     """
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     gate = tl.load(G + offs[:])
     up = tl.load(U + offs[:])
     g = gate.to(tl.float32)
-    z = C2 * (g + K * g * g * g)
-    gelu_gate = (g * tl.sigmoid(z)).to(gate.dtype)
+    y = (C2 * 0.5) * (g + K * g * g * g)
+    gelu_gate = (0.5 * g * (1.0 + tl.extra.cuda.libdevice.tanh(y))).to(gate.dtype)
     tl.store(Y + offs[:], gelu_gate * up)
 
 
@@ -502,12 +994,11 @@ def triton_geglu(gate, up, block=SWIGLU_BLOCK):
     """gelu_tanh(gate) * up over matching [M, N] tensors -> [M, N] float32.
 
     The SwiGLU wrapper's chunking and padding, unchanged -- only the activation
-    differs -- so see `triton_swiglu` for why the chunk size is fixed.
+    differs -- so see `glu_chunk` for how the dispatch is sized.
     """
     shape = gate.shape
-    chunk = ROW_TILE * (shape[-1] if gate.ndim > 1 else block)
-    chunk = math.ceil(chunk / block) * block
     n = gate.numel()
+    chunk = glu_chunk(n, shape[-1] if gate.ndim > 1 else block, block)
     npad = math.ceil(n / chunk) * chunk
     g = torch.nn.functional.pad(gate.reshape(-1).to(torch.bfloat16), (0, npad - n))
     u = torch.nn.functional.pad(up.reshape(-1).to(torch.bfloat16), (0, npad - n))

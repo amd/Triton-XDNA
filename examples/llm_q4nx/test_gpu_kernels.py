@@ -455,6 +455,15 @@ def main():
         (163, DH_SLIDING, 512),
         (700, DH_SLIDING, 512),  # past the window: the NaN case
         (1024, DH_SLIDING, 512),
+        # The kernel skips key blocks the mask could only zero. These are the
+        # edges of that: a prompt several windows long, where most blocks are
+        # skipped; a window narrower than the default query tile, which forces
+        # the tile down; and a window of one, where only the diagonal survives.
+        (2040, DH_SLIDING, 512),
+        (2040, DH_GLOBAL, None),
+        (300, DH_SLIDING, 8),
+        (300, DH_SLIDING, 1),
+        (300, DH_SLIDING, 299),
     ):
         q = torch.randn(N, N_Q_HEADS * dh, device=dev)
         k = torch.randn(N, dh, device=dev)
