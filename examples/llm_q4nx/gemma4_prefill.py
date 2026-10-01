@@ -116,7 +116,7 @@ class Gemma4Prefill(LlamaPrefill):
     #: `geglu` in place of `swiglu`, as for Gemma3: the GLU activation is
     #: GELU-tanh, which is a different function rather than a different
     #: schedule. Named as its own operator so `--ops` can bisect it.
-    NPU_OPS = ("matmul", "rms_norm", "geglu")
+    NPU_OPS = ("matmul", "rms_norm", "geglu", "attention")
 
     #: `rms_norm` is not in the default. Its NPU kernel is correct, but this
     #: model issues one per sublayer plus the per-head q/k/v norms plus the PLE
@@ -128,7 +128,7 @@ class Gemma4Prefill(LlamaPrefill):
     #: `--ops all` puts it back, which is how that was measured. Re-measure
     #: before assuming it still holds: the answer turns on dispatch overhead,
     #: which is exactly what the XRT launcher work would change.
-    DEFAULT_OPS = ("matmul", "geglu")
+    DEFAULT_OPS = ("matmul", "geglu", "attention")
 
     #: Everything `load_weights` establishes. `_lut` is a LIST here, one table
     #: per layer, where the base class has a single tensor -- see
@@ -504,6 +504,32 @@ class Gemma4Prefill(LlamaPrefill):
             out = proj * PLE_INPUT_SCALE
             out[:n] = (proj[:n] + tbl[:, :nl]) * PLE_INPUT_SCALE
             return out
+
+    def _attention(self, q, k, v, n_q, n_kv, dh, window=None, scale=None, backend=None):
+        """The base class's causal attention, with its GEMMs on the NPU.
+
+        `attn_npu` runs Q.K^T and P.V on the array and keeps the masked
+        softmax on the host, over pages both sides address directly. Taken
+        only where it applies -- one KV head, which is every Gemma4 layer, and
+        no iGPU in play: under `hetero` the iGPU's flash kernel already does
+        the whole operator, and does it faster.
+        """
+        if (
+            n_kv != 1
+            or not self._on_npu("attention", backend)
+            or self._gpu_device(backend) is not None
+        ):
+            return super()._attention(
+                q, k, v, n_q, n_kv, dh, window=window, scale=scale, backend=backend
+            )
+        import attn_npu
+
+        with self.timer.track("attention"):
+            cache = self.__dict__.setdefault("_npu_attn", {})
+            att = cache.get((n_q, dh, window))
+            if att is None:
+                att = cache[(n_q, dh, window)] = attn_npu.NPUAttention(n_q, dh, window)
+            return att(q, k, v, scale=dh**-0.5 if scale is None else scale)
 
     def _gpu_scope(self):
         """Hold the GPU driver across a region, or do nothing on the host path."""
