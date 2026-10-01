@@ -542,6 +542,10 @@ def quant_q8(x):
     if x.stride(1) != 1:
         x = x.contiguous()
     K = x.shape[1]
+    # One program per 256 columns and no tail masking: Q4NX's K always is a
+    # multiple of 256.
+    if K % 256:
+        raise ValueError(f"quant_q8 needs K % 256 == 0, got K={K}")
     xq = torch.empty((M, K), dtype=torch.int8, device=x.device)
     dx = torch.empty((M, K // 32), dtype=torch.float32, device=x.device)
     xs = torch.empty_like(dx)
@@ -763,6 +767,8 @@ def gemm_w4a8_glu_q8(x, w):
     gate|up `Q4NXWeight` `[2 * inter, K]`, as `(xq, dx, xs)` ready for the
     down GEMM. The f32 gate|up is never written to memory."""
     xq, dx, xs = quant_q8(x)
+    if xq.shape[1] != w.K:
+        raise ValueError(f"activation is {tuple(xq.shape)}, weight K is {w.K}")
     M = xq.shape[0]
     inter = w.N // 2
     # Smaller than `gemm_w4a8`'s tile: with two accumulators that one spills.

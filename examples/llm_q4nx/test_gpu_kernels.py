@@ -329,6 +329,20 @@ def _gemm_w4a8(G, dev):
                 )
                 ok &= diff <= 1
                 ok &= check(f"{name} scales", got[1], want[1], tol=1e-5)
+    # Widths the kernels do not handle must raise, not read past the rows.
+    for name, bad in (
+        ("quant_q8 K=300", lambda: G.quant_q8(torch.randn(2, 300, device=dev))),
+        (
+            "glu_q8 wrong K",
+            lambda: G.gemm_w4a8_glu_q8(torch.randn(2, 512, device=dev), w),
+        ),
+    ):
+        try:
+            bad()
+            print(f"  {name}: no error  FAIL")
+            ok = False
+        except ValueError:
+            print(f"  {name}: ValueError  ok")
     return ok
 
 

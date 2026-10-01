@@ -911,6 +911,7 @@ class Gemma4GpuDecode:
                 torch.from_numpy(host.view(np.int16)).view(torch.bfloat16).to(device)
             )
         self._slab_t = slab_t
+        self._slab_shared = hasattr(slab, "torch")
         self.k = [
             kv_layout.region_view(slab_t, L, kv_layout.K_REGION, self.attn_maxl)
             for L in range(pf.n_layers)
@@ -1063,8 +1064,17 @@ class Gemma4GpuDecode:
             raise ValueError(
                 f"a {N}-token prompt needs {N} KV rows; ATTN_MAXL={self.attn_maxl}"
             )
+        # The RoPE tables have `max_seq` rows, and the slab may have more.
+        if N > pf.max_seq:
+            raise ValueError(f"a {N}-token prompt exceeds max_seq={pf.max_seq}")
         with gpu_kernels.gpu_driver():
             logits = self._prefill(list(ids))
+            if not self._slab_shared:
+                # Without interop the device slab is a copy; the host one is
+                # what `kv_stack` and the NPU decode read.
+                pf._kv_host.view(np.int16)[...] = (
+                    self._slab_t.view(torch.int16).cpu().numpy()
+                )
         pf._ids = list(ids)
         pf.current_context_length = N
         pf.last_first_token = int(torch.argmax(logits))
