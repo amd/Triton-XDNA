@@ -316,6 +316,67 @@ def load_q4nx(model=None):
     )
 
 
+def load_q4nx_packed(model=None):
+    """The Codec B projections as the bundle stores them, NOT dequantized.
+
+    For the iGPU decode's W4A16 GEMV, which reads them in place. Returns
+
+        layers: list of 35 dicts of (uint8 array, N, K), y = W x with W [N, K]:
+            qkv     -- q|k|v where the layer owns its k/v, q alone otherwise
+            o, gate_up, down
+        lm_head: (uint8 array, VOCAB, D)
+
+    The fusions match `Gemma4Prefill.load_weights` -- same members, same order
+    -- so a decode can swap these in for its bf16 weights key for key. They
+    cost nothing here: the chunks are block-major over (N/32, K/256), so
+    stacking along N is concatenating chunk arrays.
+
+    The PLE trio is absent on purpose. It ships as bf16, not Codec B, and it is
+    the one part of this model known to break under aggressive quantization.
+    """
+    import numpy as np
+
+    _add_air_paths()
+    import gemma4_e2b_q4nx_weights as gw
+
+    qm = gw.Q4nxModel(model or MODEL_DEFAULT)
+
+    def raw(name, N, K):
+        nb = qm._hdr[name]["shape"][0]
+        if nb != (N // 32) * (K // 256):
+            raise RuntimeError(f"{name}: {nb} chunks is not a {N}x{K} Codec B matrix")
+        return qm._raw(name, np.int16).view(np.uint8)
+
+    layers = []
+    for k in range(N_LAYERS):
+        dq, dkv, inter = N_Q_HEADS * head_dim(k), N_KV_HEADS * head_dim(k), mlp_inter(k)
+        p = f"model.layers.{k}."
+        qkv = [raw(p + "self_attn.q_proj.weight", dq, D)]
+        if owns_kv(k):
+            qkv += [
+                raw(p + "self_attn.k_proj.weight", dkv, D),
+                raw(p + "self_attn.v_proj.weight", dkv, D),
+            ]
+        layers.append(
+            dict(
+                qkv=(np.concatenate(qkv), dq + (2 * dkv if owns_kv(k) else 0), D),
+                o=(raw(p + "self_attn.o_proj.weight", D, dq), D, dq),
+                gate_up=(
+                    np.concatenate(
+                        [
+                            raw(p + "mlp.gate_proj.weight", inter, D),
+                            raw(p + "mlp.up_proj.weight", inter, D),
+                        ]
+                    ),
+                    2 * inter,
+                    D,
+                ),
+                down=(raw(p + "mlp.down_proj.weight", D, inter), D, inter),
+            )
+        )
+    return dict(layers=layers, lm_head=(raw("lm_head.weight", VOCAB, D), VOCAB, D))
+
+
 def rope_lut(seq_len, layer_idx, rope_freqs=None, dtype=None):
     """[seq_len, dh] = [cos_0..cos_{dh/2-1}, sin_0..sin_{dh/2-1}] per position.
 
