@@ -82,7 +82,6 @@ from __future__ import annotations
 
 import math
 import os
-import re
 
 import numpy as np
 import torch
@@ -104,6 +103,7 @@ from kernels import (
     col_tier,
     elem_block,
     matmul_script,
+    narrow_k,
     row_tier,
     script,
     unaliased_stride,
@@ -192,18 +192,7 @@ def _exact_k_ttshared(
     )
     if isinstance(src, bytes):
         src = src.decode()
-    if k == kp:
-        return src
-    for pat, rep in (
-        (rf"sizes: \[{block_m}, {kp}\]", f"sizes: [{block_m}, {k}]"),
-        (rf"sizes: \[{kp}, {block_n}\]", f"sizes: [{k}, {block_n}]"),
-        (rf"\b{block_m}x{kp}xbf16\b", f"{block_m}x{k}xbf16"),
-        (rf"\b{kp}x{block_n}xbf16\b", f"{k}x{block_n}xbf16"),
-    ):
-        src, hits = re.subn(pat, rep, src)
-        if not hits:
-            raise RuntimeError(f"exact-K rewrite matched nothing: {pat}")
-    return src
+    return narrow_k(src, k, kp, block_m, block_n)
 
 
 def _row_tile(rows, k, block_n):

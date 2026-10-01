@@ -543,9 +543,13 @@ def narrow_k(src, k, kp, block_m, block_n):
         return src
     if isinstance(src, bytes):
         src = src.decode()
+    # The two `sizes:` patterns are pinned to a bf16 operand's cast. C's cast
+    # reads `sizes: [block_m, block_n]`, which is textually B's pattern
+    # whenever block_m == kp (and A's whenever block_n == kp) -- and C is f32.
+    bf16_cast = r"(?=, strides: \[[^\]]*\] : memref<\*xbf16>)"
     for pat, rep in (
-        (rf"sizes: \[{block_m}, {kp}\]", f"sizes: [{block_m}, {k}]"),
-        (rf"sizes: \[{kp}, {block_n}\]", f"sizes: [{k}, {block_n}]"),
+        (rf"sizes: \[{block_m}, {kp}\]{bf16_cast}", f"sizes: [{block_m}, {k}]"),
+        (rf"sizes: \[{kp}, {block_n}\]{bf16_cast}", f"sizes: [{k}, {block_n}]"),
         (rf"\b{block_m}x{kp}xbf16\b", f"{block_m}x{k}xbf16"),
         (rf"\b{kp}x{block_n}xbf16\b", f"{k}x{block_n}xbf16"),
     ):
