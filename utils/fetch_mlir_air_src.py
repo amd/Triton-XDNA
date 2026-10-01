@@ -41,10 +41,6 @@ SPARSE_PATHS = (
     # -- so Gemma4's `make compile-decode` fails before it builds anything.
     "programming_examples/fused_decode_ple",
     "programming_examples/llms",
-    # `mm_aie2p.cc`, the GEMM microkernel `kernels.mm_object` compiles and the
-    # prefill's compute herd is linked against. Nothing here imports the
-    # example's Python; only that one file is read.
-    "programming_examples/matrix_multiplication/bf16_in_fp32_out",
 )
 
 

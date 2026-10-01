@@ -12,7 +12,6 @@ import ctypes
 import math
 import re
 import os
-import subprocess
 import weakref
 
 import numpy as np
@@ -226,131 +225,8 @@ _MATMUL_SCRIPTS = {
     (64, 128): "llm_q4nx/transform_matmul_n128_aie2p.mlir",
 }
 
-#: The K depth every checked-in schedule was generated for, and the tile
-#: `mm_object` has to bake into the microkernel to match one.
+#: The K depth every checked-in schedule was generated for.
 L2_K = 64
-
-#: mlir-air's hand-tuned GEMM microkernel. Compiled per core tile and linked
-#: into the compute herd instead of generating its inner loop, which at the
-#: shipped 512x512 block is 1.57x on a wide `gate` -- the generated loop issues
-#: about a third of the MACs per instruction bundle that this does. The two
-#: agree bit for bit.
-#:
-#: Vendored by `utils/fetch_mlir_air_src.py`; absent in a source tree that has
-#: never fetched it, which is why every caller tolerates None.
-_MM_SRC = os.path.join(
-    os.path.dirname(_EXAMPLES),
-    "third_party/mlir-air-src/programming_examples",
-    "matrix_multiplication/bf16_in_fp32_out/mm_aie2p.cc",
-)
-
-#: Peano flags, as mlir-air's own `compile_gemm_mm` passes them. BFP16
-#: emulation stays on for the reason it is on there: it is the validated aie2p
-#: path, and the native bf16 branch of that file lays `C_block` out differently
-#: and gives wrong results at these tiles.
-_MM_FLAGS = [
-    "-O2",
-    "-std=c++20",
-    "--target=aie2p-none-unknown-elf",
-    "-DNDEBUG",
-    "-D__AIE_API_AIE_ADF_HPP__",
-    "-DBIT_WIDTH=8",
-    "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
-    "-Wno-parentheses",
-    "-Wno-attributes",
-    "-Wno-macro-redefined",
-    "-Wno-empty-body",
-]
-
-
-def _cache_dir():
-    """Where generated schedules and microkernel objects live.
-
-    Beside the AIR project, so everything a compile produced is in one place,
-    and absolute: aircc resolves a relative `link_with` against its own working
-    directory, which is not this process's.
-    """
-    from triton.backends.amd_triton_npu.config import npu_config
-
-    d = os.path.abspath(os.path.join(npu_config.air_project_path, "microkernels"))
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-#: What `mm_aie2p.cc` calls its entry point before `SYM_SUFFIX` is pasted on.
-_MM_SYM = "op_has_no_registered_library_name"
-
-
-def mm_symbol(l1_m, l1_n, l2_k=L2_K):
-    """The entry point `mm_object` builds for this tile.
-
-    One name per tile, because a chain can hold GEMMs at more than one of them
-    and they are stitched into a single module: two tiles both exporting the
-    bare name collide there ("redefinition of symbol named ...") and, if they
-    did not, the link would silently take one object for both. mlir-air's
-    source anticipates this -- `SYM_SUFFIX` exists in `mm_aie2p.cc` for it.
-    """
-    return f"{_MM_SYM}_{l1_m}x{l1_n}x{l2_k}"
-
-
-def mm_object(l1_m, l1_n, l2_k=L2_K):
-    """The microkernel compiled for this core tile, or None if it cannot be.
-
-    `DIM_M`/`DIM_N`/`DIM_K` are compile-time constants in `mm_aie2p.cc`, so the
-    object is only valid for the tile it was built for and each one gets its
-    own file. Built once and cached on disk.
-
-    None rather than an exception on every way this can be unavailable -- no
-    vendored source, no Peano, not npu2, a compiler error -- because the
-    generated inner loop is a correct fallback for all of them, and a prefill
-    that runs slower is a better outcome than one that does not run.
-    """
-    from triton.backends.amd_triton_npu.driver import (
-        detect_npu_version,
-        find_peano_root,
-    )
-
-    # `--target=aie2p` and `mm_aie2p.cc` are both npu2-only; npu1 wants the
-    # other source and the other triple. `npu_config.target` is None until
-    # something resolves it, so ask the resolver rather than the setting.
-    if not os.path.exists(_MM_SRC) or detect_npu_version() != "npu2":
-        return None
-    out = os.path.join(_cache_dir(), f"mmk_{l1_m}x{l1_n}x{l2_k}.o")
-    if os.path.exists(out):
-        return out
-    peano = find_peano_root()
-    aie = os.environ.get("MLIR_AIE_INSTALL_DIR", "")
-    if not peano or not aie:
-        return None
-    cmd = (
-        [os.path.join(peano, "bin", "clang++")]
-        + _MM_FLAGS
-        + [
-            f"-I{os.path.join(aie, 'include')}",
-            f"-DDIM_M={l1_m}",
-            f"-DDIM_N={l1_n}",
-            f"-DDIM_K={l2_k}",
-            f"-DDIM_M_DIV_4={l1_m // 4}",
-            f"-DDIM_N_DIV_4={l1_n // 4}",
-            f"-DDIM_M_DIV_8={l1_m // 8}",
-            f"-DDIM_N_DIV_8={l1_n // 8}",
-            f"-DSYM_SUFFIX={mm_symbol(l1_m, l1_n, l2_k)[len(_MM_SYM):]}",
-            "-c",
-            _MM_SRC,
-            "-o",
-            out,
-        ]
-    )
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode:
-        if os.environ.get("AMD_TRITON_NPU_DEBUG"):
-            print(
-                f"[kernels] no microkernel for {l1_m}x{l1_n}x{l2_k}: "
-                f"{r.stderr.strip().splitlines()[-1:]}",
-                flush=True,
-            )
-        return None
-    return out
 
 
 #: `triton_matmul`'s default: pick the schedule from the block shape. Distinct
@@ -365,11 +241,6 @@ def matmul_script(block_m, block_n):
     The core tile is the largest that still spreads the block over the whole
     array, floored at `L1` -- see `_MATMUL_SCRIPTS` for why the floor is there
     and not lower.
-
-    Where `mm_object` can build the microkernel for that tile, the schedule is
-    generated to call it instead of generating the inner loop. The checked-in
-    scripts are the same generator's output without it, so the two differ in
-    the three phases that exist to feed aievec and nowhere else.
     """
     l1 = (max(L1, block_m // AIE_COLS), max(L1, block_n // AIE_ROWS))
     if l1 not in _MATMUL_SCRIPTS:
@@ -378,33 +249,7 @@ def matmul_script(block_m, block_n):
             f"which has no schedule; blocks are bounded by MAX_BLOCK_NUMEL "
             f"({MAX_BLOCK_NUMEL}) and this one is {block_m * block_n}"
         )
-    obj = mm_object(*l1)
-    return _library_call_script(*l1, obj) if obj else script(_MATMUL_SCRIPTS[l1])
-
-
-def _library_call_script(l1_m, l1_n, obj):
-    """Generate, once, the schedule that links this tile against `obj`.
-
-    Written beside the object rather than into `examples/`: it names an
-    absolute path that only means anything on the machine that built it.
-    """
-    from triton.backends.amd_triton_npu.matmul_transform import (
-        generate_matmul_transform,
-    )
-
-    path = os.path.join(_cache_dir(), f"transform_mm_{l1_m}x{l1_n}x{L2_K}.mlir")
-    if not os.path.exists(path):
-        with open(path, "w") as f:
-            f.write(
-                generate_matmul_transform(
-                    l1_m=l1_m,
-                    l1_n=l1_n,
-                    l2_k=L2_K,
-                    library_call=obj,
-                    library_call_symbol=mm_symbol(l1_m, l1_n),
-                )
-            )
-    return path
+    return script(_MATMUL_SCRIPTS[l1])
 
 
 def row_tier(n_rows, tiers=ROW_TIERS, cap=None):
@@ -522,11 +367,7 @@ def shared_empty(shape, dtype):
     try:
         from triton.backends.amd_triton_npu import shared
 
-        dev = (
-            "hsa:0"
-            if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa"
-            else "xrt:0"
-        )
+        dev = "hsa:0" if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" else "xrt:0"
         buf = shared.empty(tuple(shape), dtype=dtype, device=dev)
         t = buf.torch()
         # The caller binds it (`shared_bo`); without that the pages are still

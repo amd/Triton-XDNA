@@ -39,8 +39,6 @@ def generate_matmul_transform(
     l1_m: int = 64,
     l1_n: int = 64,
     l2_k: int = 64,
-    library_call: str = None,
-    library_call_symbol: str = "op_has_no_registered_library_name",
     pack_sizes: tuple = (8, 8, 8),
     accum_type: str = "f32",
     contract_input_type: str = None,
@@ -61,21 +59,6 @@ def generate_matmul_transform(
             two different values puts an extra loop level between Phase 3's
             packs and Phase 4's K loop, and the fusion there fails with
             "operations cannot be fused".
-        library_call: Object file to link the compute herd against, instead of
-            generating its inner loop. The object must define
-            `matmul_scalar_bf16_f32` for a tile of exactly
-            (l1_m, l1_n, l2_k) -- mlir-air's `mm_aie2p.cc` built with DIM_M /
-            DIM_N / DIM_K set to them. Phases 9, 11 and 12 exist only to shape
-            a `vector.contract` for aievec, so with a library call there is no
-            contract and they are replaced by
-            `transform.air.linalg_to_library_call`. An absolute path is
-            resolved wherever aircc runs; a bare name is resolved against its
-            working directory.
-        library_call_symbol: The entry point to call in that object. One
-            object per tile exports one name, and a chain holding GEMMs at two
-            tiles stitches both declarations into one module, so the name has
-            to distinguish them -- see `mm_aie2p.cc`'s `SYM_SUFFIX` and
-            `kernels.mm_symbol`.
         pack_sizes: Pack sizes for (M, N, K) dimensions matching the
             hardware MAC shape. Note the orderings differ: a MAC shape is
             written (M, K, N), so (4, 4, 8) here is a 4x8 x 8x4 -> 4x4 MAC.
@@ -144,25 +127,7 @@ def generate_matmul_transform(
     # which is what the generated compute herd wants; a library call needs its
     # own herd left alone, because Phase 11 matches the `linalg.generic` that
     # vectorizing would have destroyed.
-    if library_call:
-        matmul_vector_tiling = ""
-        herd_vectorize_filter = " attributes{prologue_herd}"
-        phase_11_12 = f"""\
-    //==========================================================================
-    // PHASE 11: CALL THE EXTERNAL MICROKERNEL
-    // Its tile dimensions were compiled in and must equal l1_m/l1_n/l2_k.
-    //==========================================================================
-
-        %mm = transform.structured.match ops{{["linalg.generic"]}} attributes{{matmul_compute}} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %mm_call = transform.air.linalg_to_library_call %mm <{{function_name = "{library_call_symbol}", link_with = "{library_call}"}}> : (!transform.any_op) -> !transform.any_op
-
-    //==========================================================================
-    // PHASE 12: FINAL LOOP OPTIMIZATIONS
-    //==========================================================================
-
-"""
-    else:
-        matmul_vector_tiling = """\
+    matmul_vector_tiling = """\
         %generic2 = transform.structured.match ops{["linalg.generic"]} attributes{matmul_compute} in %arg1 : (!transform.any_op) -> !transform.any_op
         %inner_most_generics, %vec_loops:3 =
           transform.structured.tile_using_for %generic2 tile_sizes [2, 2, 1, 0, 0, 0]
@@ -175,8 +140,8 @@ def generate_matmul_transform(
         transform.loop.unroll %vec_loops_to_unroll#0 factor = 2 : !transform.any_op
 
 """
-        herd_vectorize_filter = ""
-        phase_11_12 = f"""\
+    herd_vectorize_filter = ""
+    phase_11_12 = f"""\
     //==========================================================================
     // PHASE 11: HOIST LOOP-INVARIANT VECTOR TRANSFERS
     //==========================================================================
