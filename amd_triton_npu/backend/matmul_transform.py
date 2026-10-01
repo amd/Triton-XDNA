@@ -117,16 +117,10 @@ def generate_matmul_transform(
         %result11b = transform.air.vector_type_cast %vector_contracts_2 <{{target_element_type = {contract_input_type}, input_indices = [0, 1], output_indices = []}}> : (!transform.any_op) -> !transform.any_op
 """
 
-    # The compute herd's inner loop: generated and vectorized for aievec, or
-    # replaced wholesale by a call into a prebuilt object. Phases 9, 11 and 12
-    # exist only to shape a `vector.contract`; a library call leaves none for
-    # them to shape, and vectorizing that herd would rewrite the very body the
-    # call replaces. Built here, after `input_cast`, because the aievec form
+    # The compute herd's inner loop: 2x2 register blocking over the packed
+    # contraction, then both loops unrolled, so four `vector.contract` share
+    # their operand loads. Built here, after `input_cast`, because it
     # interpolates it.
-    # Which herds Phase 10 vectorizes. Left empty the match takes all of them,
-    # which is what the generated compute herd wants; a library call needs its
-    # own herd left alone, because Phase 11 matches the `linalg.generic` that
-    # vectorizing would have destroyed.
     matmul_vector_tiling = """\
         %generic2 = transform.structured.match ops{["linalg.generic"]} attributes{matmul_compute} in %arg1 : (!transform.any_op) -> !transform.any_op
         %inner_most_generics, %vec_loops:3 =
@@ -140,6 +134,7 @@ def generate_matmul_transform(
         transform.loop.unroll %vec_loops_to_unroll#0 factor = 2 : !transform.any_op
 
 """
+    # Phase 10 takes every herd; there is no herd to leave alone.
     herd_vectorize_filter = ""
     phase_11_12 = f"""\
     //==========================================================================

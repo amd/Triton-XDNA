@@ -215,10 +215,9 @@ COL_TIERS = (2 * L1 * AIE_ROWS, L1 * AIE_ROWS)
 #: The matmul schedules, by the core tile `(l1_m, l1_n)` they were generated
 #: for. The tile does not simply track the block, and that is measured rather
 #: than assumed: holding the herd at eight columns by shrinking `l1_m` is
-#: SLOWER than letting the herd shrink. On one wide-layer `gate`, a 256-row
-#: block runs 79.6 ms at `l1_m=32` (eight columns) against 73.9 at `l1_m=64`
-#: (four), and a 128-row block 128.1 at 16 against 124.1 at 64. Below 512 rows
-#: there are not enough of them to give every column a tile worth having.
+#: slower than letting the herd shrink, at both 256 and 128 rows. Below 512
+#: rows there are not enough of them to give every column a tile worth
+#: having.
 _MATMUL_SCRIPTS = {
     (64, 64): "gpt2/transform_matmul_aie2p.mlir",
     (128, 64): "llm_q4nx/transform_matmul_m128_aie2p.mlir",
@@ -861,9 +860,9 @@ def _swiglu_kernel(G, U, Y, BLOCK: tl.constexpr):
     tl.store(Y + offs[:], silu_gate * up)
 
 
-#: Both pad to bf16 and write bf16, so three 2-byte streams. At the PLE
-#: branch's [2040, 256] this is 7.579 ms per layer at the old 1024 and 3.264 at
-#: the cap, with the error unchanged at 1.825e-02.
+#: Both pad to bf16 and write bf16, so three 2-byte streams. Worth about 2x
+#: per layer on the PLE branch's [2040, 256] against the 1024 it replaced,
+#: at an unchanged error.
 SWIGLU_BLOCK = elem_block(None, 2 + 2 + 2)
 
 

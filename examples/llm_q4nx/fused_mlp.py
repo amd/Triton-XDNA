@@ -119,13 +119,9 @@ MERGE_SCRIPT = "qwen2_5/transform_swiglu_f32in_aie2p.mlir"
 #: the idle columns do.
 ADD_SCRIPT = "gpt2/transform_add_f32_aie2p.mlir"
 
-#: How many pieces `down`'s contraction may be cut into before padding the FFN
-#: width is the better deal. Each piece is a GEMM op and all but the first also
-#: an add, so the chain grows by two ops per piece -- cheap next to the
-#: arithmetic a padded width would add, but not without limit.
+
 class SharedBufferUnavailable(RuntimeError):
     """Raised inside `_io_pages` to take its fallback path."""
-
 
 
 #: The K a `down` capture is taken at. Any legal one will do -- the extent is
@@ -165,8 +161,9 @@ def _plan_down(inter):
     return inter, inter
 
 
-def _exact_k_ttshared(chain, rows, k, n, block_m, block_n, a_stride, script,
-                      k_capture=None):
+def _exact_k_ttshared(
+    chain, rows, k, n, block_m, block_n, a_stride, script, k_capture=None
+):
     """`_mm_kernel`'s ttsharedir, restated to contract exactly `k`.
 
     Two frontend rules stop a kernel from asking for the reduction a model
@@ -189,7 +186,8 @@ def _exact_k_ttshared(chain, rows, k, n, block_m, block_n, a_stride, script,
     tC = torch.zeros((rows, n), dtype=torch.float32)
     grid = (rows // block_m, n // block_n)
     src = chain._capture_ttshared(
-        _mm_kernel, grid,
+        _mm_kernel,
+        grid,
         (tA, tB, tC, rows, n, kp, a_stride, 1, n, 1, n, 1),
         {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": kp},
     )
@@ -436,9 +434,7 @@ class FusedMLP:
         try:
             from triton.backends.amd_triton_npu import shared
 
-            a = shared.zeros(
-                M, self.K_stride, dtype=torch.bfloat16, device="xrt:0"
-            )
+            a = shared.zeros(M, self.K_stride, dtype=torch.bfloat16, device="xrt:0")
             out = shared.zeros(M, self.D_pad, dtype=torch.float32, device="xrt:0")
             if a.bo is None or out.bo is None:
                 raise SharedBufferUnavailable
@@ -612,7 +608,14 @@ class FusedMLP:
         # module costs neither: the pieces were 3 launches and 2 full-width
         # f32 adds against this one, 54 MiB of output traffic against 6.
         dn_src = _exact_k_ttshared(
-            chain, M, HID, D_pad, dn_m, dn_n, HID, dn_script,
+            chain,
+            M,
+            HID,
+            D_pad,
+            dn_m,
+            dn_n,
+            HID,
+            dn_script,
             k_capture=_DOWN_CAPTURE_K,
         )
         chain.add(
@@ -664,9 +667,7 @@ class FusedMLP:
                     # The columns past D are already zero from the allocation
                     # and nothing ever writes them, so the contraction's
                     # padding stays harmless without a per-call memset.
-                    A_pg.torch()[:rows, :D] = h2d[m0 : m0 + rows].to(
-                        torch.bfloat16
-                    )
+                    A_pg.torch()[:rows, :D] = h2d[m0 : m0 + rows].to(torch.bfloat16)
                     A = A_pg.numpy()
                 else:
                     # Zeroed, not empty: the gate/up GEMMs contract over all
@@ -685,9 +686,7 @@ class FusedMLP:
                 args[self.BD_I] = _host(Bd)
                 # The gate's output is bf16 where its drain herd applied the
                 # activation, and f32 where the merge still has to.
-                args[self.CG_I] = np.empty(
-                    (M, HID), dtype=np.float32
-                )
+                args[self.CG_I] = np.empty((M, HID), dtype=np.float32)
                 args[self.CU_I] = np.empty((M, HID), dtype=np.float32)
                 args[self.H_I] = np.empty(M * HID, dtype=bfloat16)
                 for i in (self.OUT_I, *partials, *sums):
