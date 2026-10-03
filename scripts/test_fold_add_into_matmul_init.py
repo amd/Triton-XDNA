@@ -19,6 +19,7 @@ installed.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
@@ -231,12 +232,29 @@ def air_opt():
     exe = shutil.which("air-opt")
     if exe:
         return exe
-    try:
-        import mlir_air
-    except ImportError:
+    # Found, not imported, for the reason `_load` gives.
+    spec = importlib.util.find_spec("mlir_air")
+    if spec is None or not spec.submodule_search_locations:
         return None
-    cand = os.path.join(os.path.dirname(mlir_air.__file__), "bin", "air-opt")
+    cand = os.path.join(list(spec.submodule_search_locations)[0], "bin", "air-opt")
     return cand if os.path.isfile(cand) else None
+
+
+def _load(name):
+    """Load a stdlib-only module of the source tree's backend off disk.
+
+    Not `import amd_triton_npu.backend...`: the package loads air's LLVM, and
+    in CI's environment a second LLVM in the process aborts it before any check
+    runs (`LLVM ERROR: Option 'fast' already exists!`). This test needs no
+    native code, so it loads none.
+    """
+    path = os.path.join(
+        os.path.dirname(_HERE), "amd_triton_npu", "backend", name + ".py"
+    )
+    spec = importlib.util.spec_from_file_location(f"_fold_add_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def normalize(ir):
@@ -276,19 +294,16 @@ def main():
     if exe is None:
         skip("air-opt not found (needs mlir_air installed or on PATH)")
 
-    sys.path.insert(0, os.path.dirname(_HERE))
-    try:
-        from amd_triton_npu.backend.driver import _inject_transform_library
-        from amd_triton_npu.backend.matmul_transform import generate_matmul_transform
-    except ImportError as e:
-        skip(f"cannot import the backend: {e}")
+    _inject_transform_library = _load("transform_inject")._inject_transform_library
+    generate_matmul_transform = _load("matmul_transform").generate_matmul_transform
 
     script = _inject_transform_library(CALLER)
     if "fold_add_into_dest" not in script:
         print(
             "FAIL: transform.include @fold_add_into_matmul_init did not resolve.\n"
             "      transform_library/fold_add.mlir is missing, or the inliner in\n"
-            "      driver._inject_transform_library no longer matches its shape."
+            "      transform_inject._inject_transform_library no longer matches\n"
+            "      its shape."
         )
         return 1
 
