@@ -818,7 +818,6 @@ def triton_matmul(
         else shared_empty((Mp, Np), torch.float32)
     )
     if via_chain:
-        chain = _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script)
         pad = np.zeros(1024, dtype=np.float32)
         # `static_indices` holds one weight per key, so a key that does not
         # identify the WEIGHT would hand the next call the last one's buffer.
@@ -829,7 +828,13 @@ def triton_matmul(
         # The activation and the result are the caller's own pages where the
         # interop allows it, so neither is staged in nor copied back.
         io = {i: bo for i, bo in ((0, shared_bo(a)), (2, shared_bo(c))) if bo}
+        # The build too, not just the dispatch: it warmup-compiles the kernel,
+        # which needs a driver, and with no iGPU visible there is no default
+        # one to fall back on ("0 active drivers") -- as `FusedMLP.run` scopes.
         with _npu_driver():
+            chain = _proj_chain(
+                block_m, block_n, Mp, Np, Kp, a_stride, transform_script
+            )
             got = chain.run(
                 [_np(a), _np(b), _np(c), pad],
                 bo_key=key,
