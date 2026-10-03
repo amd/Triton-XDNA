@@ -14,9 +14,11 @@ This is an ADDITIVE path: nothing here touches the per-kernel ``compile_module``
 flow used by the example suite.
 """
 
+import collections
 import hashlib
 import os
 import re
+import weakref
 
 from triton.runtime.cache import get_cache_manager
 
@@ -492,7 +494,26 @@ class NPUChain:
     Chains of two or more ops are unaffected. Until this is fixed, pad a
     one-op chain with a second, trivial op -- see
     ``examples/zero_copy/common/add_chain.py``, which does exactly that.
+
+    Each chain that has run holds an ``xrt::hw_context``, and the NPU runs out
+    of those -- at about 30 in one process, as
+    ``DRM_IOCTL_AMDXDNA_CREATE_HWCTX ... err=-2``. A model that caches chains
+    by shape opens a fresh set for every new shape and reaches that within a
+    few prompt lengths. So at most ``max_open`` chains hold one at a time,
+    process-wide: dispatching another closes the least recently dispatched,
+    which reopens on its next ``run()`` from the ELF it already compiled.
+    Reopening re-stages its static operands, so the cap must stay above the
+    set of chains one forward pass cycles through, or every dispatch pays it.
     """
+
+    #: Chains holding an ``hw_context`` at once, across the process. Leaves
+    #: headroom under the device's ~30 for contexts opened outside ``NPUChain``
+    #: (the fused decode's, a plain kernel launch's).
+    max_open = 20
+    #: id -> weakref of every chain holding one, least recently dispatched
+    #: first. Weak, so a chain dropped without ``close()`` still closes on
+    #: collection as it always has.
+    _open = collections.OrderedDict()
 
     def __init__(self, name, air_project_path=None):
         self.name = name
@@ -564,7 +585,11 @@ class NPUChain:
         Restores the driver active on entry rather than ``reset_active()``, which
         resolves the auto-detected default and fails with "0 active drivers" on
         an iGPU-free host (no auto-active GPU driver; NPUDriver is set explicitly,
-        not detected).
+        not detected). For the same reason it reads ``_active`` and not
+        ``.active``, which resolves that default when nothing is active yet:
+        a chain reopened after ``max_open`` evicted it captures again from
+        wherever its ``run()`` was called, not only from inside a scope that
+        already made a driver active.
         """
         import triton
         from .driver import NPUDriver
@@ -572,13 +597,13 @@ class NPUChain:
         if isinstance(kernel, (str, bytes)):
             return kernel
 
-        prev = triton.runtime.driver.active
+        prev = getattr(triton.runtime.driver, "_active", None)
         triton.runtime.driver.set_active(NPUDriver())
         try:
             with config_context(compile_only=True):
                 compiled = kernel.warmup(*args, grid=grid, **constexprs)
         finally:
-            triton.runtime.driver.set_active(prev)
+            triton.runtime.driver._active = prev
         return compiled.asm["ttsharedir"]
 
     def _build(self):
@@ -602,7 +627,23 @@ class NPUChain:
             )
         self._builder = b
         self._elf_path, self._kernel_name = b.compile()
+
+    def _open_runner(self):
+        """Give this chain an ``hw_context``, closing the stalest if at the cap."""
+        open_ = NPUChain._open
+        for key, ref in list(open_.items()):
+            chain = ref()
+            if chain is None or chain._runner is None:
+                del open_[key]
+        while len(open_) >= NPUChain.max_open:
+            _, ref = open_.popitem(last=False)
+            stale = ref()
+            if stale is not None:
+                stale.close()
+        if self._elf_path is None:
+            self._build()
         self._runner = MultiLaunchRunner(self._elf_path, self._kernel_name)
+        open_[id(self)] = weakref.ref(self)
 
     def run(
         self,
@@ -616,7 +657,9 @@ class NPUChain:
     ):
         """Build (first call) + dispatch the chain. Returns {idx: ndarray}."""
         if self._runner is None:
-            self._build()
+            self._open_runner()
+        elif id(self) in NPUChain._open:
+            NPUChain._open.move_to_end(id(self))
         return self._runner.run(
             inputs,
             bo_key=bo_key or self.name,
@@ -632,6 +675,7 @@ class NPUChain:
         if self._runner is not None:
             self._runner.unload()
             self._runner = None
+        NPUChain._open.pop(id(self), None)
 
     def __del__(self):
         try:

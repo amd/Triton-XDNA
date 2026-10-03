@@ -234,6 +234,12 @@ runs:
           # leave the selection with no coverage at all.
           ( cd examples/llm_q4nx && python3 test_decode_artifact.py )
 
+          # That NPUChain's cap on open hardware contexts holds and that an
+          # evicted chain reopens correct. Every gate below runs one prompt
+          # length per process, which never reaches the cap, so without this
+          # nothing exercises eviction -- the path a long-lived chat takes.
+          python3 scripts/test_npu_chain_context_cap.py
+
           # The weight loader lives in mlir-air's sources, which the wheel does
           # not ship, so fetch them at the pinned commit first. Sparse and
           # blobless: ~1.7 MB of two directories. Without this the example
