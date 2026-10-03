@@ -24,6 +24,8 @@ from .config import npu_config, config_context
 from . import stitching
 from .driver import (
     _ttshared_to_air,
+    _detect_matmul,
+    _matmul_transform_params,
     _aircc_compile,
     _get_output_format,
     _get_cached_aircc_artifacts,
@@ -116,8 +118,25 @@ class MultiLaunchBuilder:
                     asm_src, gridX, gridY, gridZ, actual_sizes=actual_sizes
                 )
         else:
+            # What a single launch of this op would get (`compile_module`): a
+            # schedule generated for it if it is a plain matmul and no script
+            # is set globally either. Without this a scriptless matmul op fell
+            # through to the built-in default, which cannot lower one.
+            matmul_info = None
+            if not npu_config.transform_tiling_script:
+                text = asm_src
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", errors="ignore")
+                matmul_info = _matmul_transform_params(
+                    _detect_matmul(text), detect_npu_version()
+                )
             air_module = _ttshared_to_air(
-                asm_src, gridX, gridY, gridZ, actual_sizes=actual_sizes
+                asm_src,
+                gridX,
+                gridY,
+                gridZ,
+                actual_sizes=actual_sizes,
+                matmul_info=matmul_info,
             )
         air_text = str(air_module)
         arg_types = _extract_air_arg_types(air_text)
