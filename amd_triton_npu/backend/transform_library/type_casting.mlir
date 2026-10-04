@@ -5,12 +5,21 @@
 //
 // AIE2P constraint: most arithmetic/transcendental ops are bf16-only,
 // while divf, rsqrt, reciprocal are f32-only.
+//
+// For the transcendentals that is not a convention, it is the whole ISA:
+// `lib/clang/*/include/aie2p/aie2p_nlf_vector.h` has exactly two vector NLF
+// ops, `exp2` and `tanh`, each taking a v16/v32 accfloat and returning
+// bfloat16. `inv`, `invsqrt` and `sqrtf` live in the scalar header, so an f32
+// divide costs one call per lane -- a sigmoid's reciprocal comes out as 17
+// `@llvm.aie2p.inv` against 2 `exp2`. An op left in f32 does not fall back to
+// a slower vector form; it does not lower at all ("unable to legalize
+// instruction: G_FTANH").
 
 // Matcher: succeeds on ops that must be cast to bf16 on AIE2P.
 transform.named_sequence @match_bf16_only_op(
     %op: !transform.any_op {transform.readonly}) -> !transform.any_op {
   transform.match.operation_name %op
-      ["math.exp", "arith.addf", "arith.subf", "arith.mulf",
+      ["math.exp", "math.tanh", "arith.addf", "arith.subf", "arith.mulf",
        "arith.maxnumf", "vector.multi_reduction"] : !transform.any_op
   transform.yield %op : !transform.any_op
 }

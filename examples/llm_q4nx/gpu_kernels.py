@@ -1563,7 +1563,25 @@ def _attn_prefill_kernel(
     m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-    for j0 in range(0, N, BLOCK_N):
+    # Only the key blocks the mask can let through. Causal puts the last one at
+    # this query block's own end; a window puts the first one `window` back
+    # from it. Everything outside that span is masked to -inf in full and
+    # contributes nothing but its loads -- over a 2040-token prompt with a
+    # 512-token window, three key blocks in four.
+    #
+    # The bounds are deliberately one block loose on each side, so what they
+    # skip is only ever a block with no surviving element; the mask inside the
+    # loop is unchanged and still decides every element. They also keep each
+    # row's own diagonal block, without which a row would come out fully masked
+    # and divide by zero -- see the `BLOCK_M <= BLOCK_N` assertion in
+    # `attn_prefill`, which is what that rests on.
+    lo = 0
+    if HAS_WINDOW:
+        lo = tl.maximum(0, (pid_m + 1) * BLOCK_M - window - BLOCK_N)
+        lo = (lo // BLOCK_N) * BLOCK_N
+    hi = tl.minimum(N, (pid_m + 1) * BLOCK_M)
+
+    for j0 in range(lo, hi, BLOCK_N):
         offs_n = j0 + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
         k = tl.load(
@@ -1614,6 +1632,16 @@ def _attn_prefill_kernel(
         out,
         mask=mask_m[:, None] & mask_d[None, :],
     )
+
+
+#: Launch shape for `_attn_prefill_kernel`, which Triton would otherwise pick
+#: for itself and picks badly. The kernel carries the whole running softmax
+#: state in registers across a key loop that the mask bounds keep short, so
+#: extra pipeline stages buy no overlap and cost occupancy; and a `BLOCK_M` of
+#: 16 or 32 is too few rows to spread over four warps, let alone eight. Swept
+#: at both of Gemma4's head widths. The result differs from the default only by
+#: float reassociation -- nothing here changes what is computed.
+ATTN_WARPS, ATTN_STAGES = 2, 1
 
 
 @triton.jit
@@ -1764,6 +1792,13 @@ def attn_prefill(
         block_m = block_m or bm
         block_n = block_n or bn
     scale = dh**-0.5 if scale is None else scale
+    # The kernel starts its key loop `window + BLOCK_N` back from the query
+    # tile's end, and every row keeping its own diagonal block is what makes
+    # that safe at any window. It needs `BLOCK_M <= BLOCK_N`, which
+    # `_attn_blocks` gives for free at every head width -- checked rather than
+    # relied on, because a wider query tile would not fail, it would drop the
+    # earliest rows of each tile and still return finite numbers.
+    assert block_m <= block_n, (block_m, block_n)
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     out = torch.empty((N, n_q * dh), dtype=torch.float32, device=q.device)
     _attn_prefill_kernel[(n_q, triton.cdiv(N, block_m))](
@@ -1782,5 +1817,7 @@ def attn_prefill(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=_pow2(dh),
+        num_warps=ATTN_WARPS,
+        num_stages=ATTN_STAGES,
     )
     return out

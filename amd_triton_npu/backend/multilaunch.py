@@ -14,9 +14,11 @@ This is an ADDITIVE path: nothing here touches the per-kernel ``compile_module``
 flow used by the example suite.
 """
 
+import collections
 import hashlib
 import os
 import re
+import weakref
 
 from triton.runtime.cache import get_cache_manager
 
@@ -24,6 +26,8 @@ from .config import npu_config, config_context
 from . import stitching
 from .driver import (
     _ttshared_to_air,
+    _detect_matmul,
+    _matmul_transform_params,
     _aircc_compile,
     _get_output_format,
     _get_cached_aircc_artifacts,
@@ -116,8 +120,25 @@ class MultiLaunchBuilder:
                     asm_src, gridX, gridY, gridZ, actual_sizes=actual_sizes
                 )
         else:
+            # What a single launch of this op would get (`compile_module`): a
+            # schedule generated for it if it is a plain matmul and no script
+            # is set globally either. Without this a scriptless matmul op fell
+            # through to the built-in default, which cannot lower one.
+            matmul_info = None
+            if not npu_config.transform_tiling_script:
+                text = asm_src
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", errors="ignore")
+                matmul_info = _matmul_transform_params(
+                    _detect_matmul(text), detect_npu_version()
+                )
             air_module = _ttshared_to_air(
-                asm_src, gridX, gridY, gridZ, actual_sizes=actual_sizes
+                asm_src,
+                gridX,
+                gridY,
+                gridZ,
+                actual_sizes=actual_sizes,
+                matmul_info=matmul_info,
             )
         air_text = str(air_module)
         arg_types = _extract_air_arg_types(air_text)
@@ -155,8 +176,9 @@ class MultiLaunchBuilder:
             ir = stitching._wrap_ir_in_launch(op.air_text)
             body = stitching._extract_between_func_and_return(ir)
             maps = stitching._extract_affine_maps(ir)
-            body = stitching._rename_all(body, op.prefix)
-            maps = [stitching._rename_all(m, op.prefix) for m in maps]
+            extern = stitching._extern_symbols(ir)
+            body = stitching._rename_all(body, op.prefix, extern)
+            maps = [stitching._rename_all(m, op.prefix, extern) for m in maps]
             body = stitching._fix_launch_func_args(body, op.prefix, op.arg_map)
             bodies.append(body)
             maps_all.extend(maps)
@@ -472,7 +494,26 @@ class NPUChain:
     Chains of two or more ops are unaffected. Until this is fixed, pad a
     one-op chain with a second, trivial op -- see
     ``examples/zero_copy/common/add_chain.py``, which does exactly that.
+
+    Each chain that has run holds an ``xrt::hw_context``, and the NPU runs out
+    of those -- at about 30 in one process, as
+    ``DRM_IOCTL_AMDXDNA_CREATE_HWCTX ... err=-2``. A model that caches chains
+    by shape opens a fresh set for every new shape and reaches that within a
+    few prompt lengths. So at most ``max_open`` chains hold one at a time,
+    process-wide: dispatching another closes the least recently dispatched,
+    which reopens on its next ``run()`` from the ELF it already compiled.
+    Reopening re-stages its static operands, so the cap must stay above the
+    set of chains one forward pass cycles through, or every dispatch pays it.
     """
+
+    #: Chains holding an ``hw_context`` at once, across the process. Leaves
+    #: headroom under the device's ~30 for contexts opened outside ``NPUChain``
+    #: (the fused decode's, a plain kernel launch's).
+    max_open = 20
+    #: id -> weakref of every chain holding one, least recently dispatched
+    #: first. Weak, so a chain dropped without ``close()`` still closes on
+    #: collection as it always has.
+    _open = collections.OrderedDict()
 
     def __init__(self, name, air_project_path=None):
         self.name = name
@@ -528,6 +569,14 @@ class NPUChain:
     def _capture_ttshared(self, kernel, grid, args, constexprs):
         """Warmup-compile the kernel to obtain its ttsharedir source.
 
+        A `str`/`bytes` `kernel` is taken to be that source already and passed
+        through. The chain's own ops all come from `@triton.jit`, but some
+        shapes cannot be reached from the frontend at all -- `tl.arange` needs
+        a power of two, so a GEMM kernel can only ask for K=2048 where the
+        real K is 1536 -- while `linalg.matmul` and every schedule below it are
+        happy with either. Letting an op arrive as MLIR is what makes those
+        reachable without a second lowering path.
+
         Forces the NPU driver active for the warmup so the kernel lowers through
         the NPU backend (whose binary_ext is ``ttsharedir``). Without this, in a
         hetero model the GPU driver may be active and ``asm`` would lack
@@ -536,18 +585,25 @@ class NPUChain:
         Restores the driver active on entry rather than ``reset_active()``, which
         resolves the auto-detected default and fails with "0 active drivers" on
         an iGPU-free host (no auto-active GPU driver; NPUDriver is set explicitly,
-        not detected).
+        not detected). For the same reason it reads ``_active`` and not
+        ``.active``, which resolves that default when nothing is active yet:
+        a chain reopened after ``max_open`` evicted it captures again from
+        wherever its ``run()`` was called, not only from inside a scope that
+        already made a driver active.
         """
         import triton
         from .driver import NPUDriver
 
-        prev = triton.runtime.driver.active
+        if isinstance(kernel, (str, bytes)):
+            return kernel
+
+        prev = getattr(triton.runtime.driver, "_active", None)
         triton.runtime.driver.set_active(NPUDriver())
         try:
             with config_context(compile_only=True):
                 compiled = kernel.warmup(*args, grid=grid, **constexprs)
         finally:
-            triton.runtime.driver.set_active(prev)
+            triton.runtime.driver._active = prev
         return compiled.asm["ttsharedir"]
 
     def _build(self):
@@ -571,7 +627,41 @@ class NPUChain:
             )
         self._builder = b
         self._elf_path, self._kernel_name = b.compile()
-        self._runner = MultiLaunchRunner(self._elf_path, self._kernel_name)
+
+    @staticmethod
+    def _close_stalest():
+        """Close the least recently dispatched open chain. False if none is."""
+        open_ = NPUChain._open
+        while open_:
+            _, ref = open_.popitem(last=False)
+            stale = ref()
+            if stale is not None and stale._runner is not None:
+                stale.close()
+                return True
+        return False
+
+    def _open_runner(self):
+        """Give this chain an ``hw_context``, closing the stalest to make room.
+
+        Ahead of time at ``max_open``, and again whenever the device refuses
+        one: how many it grants depends on the driver and firmware -- ~30 on
+        amdxdna 2.21, fewer on 2.25, which also reports it as EINVAL rather
+        than ENOENT -- so the cap alone cannot be the guarantee. Only a
+        refusal with no chain of ours left to close is raised.
+        """
+        open_ = NPUChain._open
+        while len(open_) >= NPUChain.max_open and NPUChain._close_stalest():
+            pass
+        if self._elf_path is None:
+            self._build()
+        while True:
+            try:
+                self._runner = MultiLaunchRunner(self._elf_path, self._kernel_name)
+                break
+            except RuntimeError as e:
+                if "HWCTX" not in str(e) or not NPUChain._close_stalest():
+                    raise
+        open_[id(self)] = weakref.ref(self)
 
     def run(
         self,
@@ -585,7 +675,9 @@ class NPUChain:
     ):
         """Build (first call) + dispatch the chain. Returns {idx: ndarray}."""
         if self._runner is None:
-            self._build()
+            self._open_runner()
+        elif id(self) in NPUChain._open:
+            NPUChain._open.move_to_end(id(self))
         return self._runner.run(
             inputs,
             bo_key=bo_key or self.name,
@@ -601,6 +693,7 @@ class NPUChain:
         if self._runner is not None:
             self._runner.unload()
             self._runner = None
+        NPUChain._open.pop(id(self), None)
 
     def __del__(self):
         try:

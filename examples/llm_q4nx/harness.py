@@ -278,7 +278,11 @@ def make_session_class(air, prefill_cls, cfg, backend, ops, model):
                 f"building decode...",
                 flush=True,
             )
-            self.dec = air.FusedDecoder(staircase=air._staircase_on())
+            # `max_L`, positionally: the pinned mlir-air's `FusedDecoder` takes
+            # `(max_L=None)` and has no `_staircase_on` -- that name is from a
+            # different revision of its driver, and calling it made `--interactive`
+            # fail at construction on every model that supports it.
+            self.dec = air.FusedDecoder(seq_len)
             self.attn_maxl = self.dec.ATTN_MAXL
             # One throwaway prefill so the first real turn is warm: it compiles
             # and caches every kernel and opens the XRT session the launcher

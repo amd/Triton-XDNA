@@ -252,6 +252,13 @@ class LlamaPrefill:
     #: put one back for a bisection.
     DEFAULT_OPS = None
 
+    #: Query rows per chunk in the host attention body. It bounds the score
+    #: block at `[n_q, ATTN_CHUNK, window + ATTN_CHUNK]`, so smaller is a
+    #: tighter bound on a windowed layer and more Python iterations; at a
+    #: prompt of a few thousand the iterations are far below the GEMMs they
+    #: carry. The result does not depend on it -- see `_attention`.
+    ATTN_CHUNK = 128
+
     @classmethod
     def _resolve_ops(cls, spec):
         """Which operators may go to the NPU: "all", or a comma-separated list.
@@ -448,17 +455,31 @@ class LlamaPrefill:
             vh = v.reshape(N, n_kv, dh).transpose(0, 1)
             kh = kh.repeat_interleave(rep, dim=0)  # GQA broadcast
             vh = vh.repeat_interleave(rep, dim=0)
-            scores = (qh @ kh.transpose(1, 2)) * scale  # [n_q, N, N]
-            mask = torch.full((N, N), float("-inf")).triu(1)
-            if window is not None:
-                # `tril(-window)` is -inf exactly where j <= i - window, which
-                # is what falls out of the window. Added to the causal mask
-                # rather than replacing it: a position must satisfy both, and
-                # j == i always survives, so no row is fully masked.
-                mask = mask + torch.full((N, N), float("-inf")).tril(-window)
-            scores = scores + mask.to(scores.device)
-            p = torch.softmax(scores, dim=-1)
-            return (p @ vh).transpose(0, 1).reshape(N, n_q * dh)
+            out = torch.empty((n_q, N, dh), dtype=qh.dtype, device=qh.device)
+            # A chunk of queries at a time, against only the keys its mask can
+            # let through: causal stops at the chunk's LAST row, and a window
+            # starts `window` back from its FIRST -- the two ends of the chunk,
+            # not one of them, or the earliest rows lose keys they can see. Everything outside that span is
+            # -inf for every row in the chunk, and -inf contributes exactly
+            # zero to both the softmax denominator and `p @ v`, so leaving it
+            # out is the same arithmetic on fewer elements rather than an
+            # approximation of it. Whole-prompt scores are `[n_q, N, N]`; this
+            # is what a long prompt used to spend its prefill on.
+            for m0 in range(0, N, self.ATTN_CHUNK):
+                m1 = min(m0 + self.ATTN_CHUNK, N)
+                lo = 0 if window is None else max(0, m0 - window + 1)
+                s = (qh[:, m0:m1] @ kh[:, lo:m1].transpose(1, 2)) * scale
+                i = torch.arange(m0, m1, device=s.device)[:, None]
+                j = torch.arange(lo, m1, device=s.device)[None, :]
+                keep = j <= i
+                if window is not None:
+                    # `j <= i` is the causal half and `i - j < window` the
+                    # other; a position must satisfy both. `j == i` survives
+                    # both, so no row comes out fully masked.
+                    keep = keep & (i - j < window)
+                s = s.masked_fill(~keep, float("-inf"))
+                out[:, m0:m1] = torch.softmax(s, dim=-1) @ vh[:, lo:m1]
+            return out.transpose(0, 1).reshape(N, n_q * dh)
 
     def _lm_head(self, x, w, backend=None):
         """x: [N, D] -> logits [N, VOCAB]. w is [VOCAB, D] (tied embed).
@@ -474,6 +495,13 @@ class LlamaPrefill:
     #: resident. The norms and the per-head q/k norms are kilobytes and stay as
     #: they are.
     NPU_WEIGHTS = ("qkv", "o", "gate_up", "down")
+
+    #: Of those, the ones every call dispatches through a chain (`stage_key`).
+    #: Only these may be padded to their exact K: the others are also reached
+    #: by the unfused MLP path, which compiles a Triton kernel and so needs a
+    #: power-of-two reduction. `kernels.resident_weight` fixes the padding at
+    #: load time, so the choice cannot be deferred to the call.
+    CHAIN_WEIGHTS = ("qkv", "o")
 
     # ---- weights ----
     def make_npu_resident(self):
@@ -500,7 +528,9 @@ class LlamaPrefill:
         for w in self._w:
             for name in self.NPU_WEIGHTS:
                 if name in w:
-                    w[name] = kernels.resident_weight(w[name])
+                    w[name] = kernels.resident_weight(
+                        w[name], exact=name in self.CHAIN_WEIGHTS
+                    )
         return self
 
     def share_weights_from(self, other):
