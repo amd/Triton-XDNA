@@ -3,12 +3,13 @@
 # SPDX-License-Identifier: MIT
 """Checks for `NPUChain`'s process-wide cap on open hardware contexts.
 
-Every chain that has run holds an `xrt::hw_context`, and the NPU refuses the
-30th or so in one process (`DRM_IOCTL_AMDXDNA_CREATE_HWCTX ... err=-2`). A
+Every chain that has run holds an `xrt::hw_context`, and the NPU refuses one
+past a limit set by its driver and firmware -- the ~30th on amdxdna 2.21
+(`DRM_IOCTL_AMDXDNA_CREATE_HWCTX ... err=-2`), sooner on 2.25 (err=-22). A
 model that caches chains by shape opens a fresh set per prompt length, so a
 long-lived process used to die at its third length. `NPUChain.max_open` bounds
-them: opening one more closes the least recently dispatched, which reopens on
-its next `run()`.
+them, and a refusal below it closes chains too: either way the least recently
+dispatched goes, and reopens on its next `run()`.
 
 1. more chains than the device has contexts all dispatch, and no more than
    `max_open` hold one at any time;
@@ -16,7 +17,10 @@ its next `run()`.
    static operand, which the reopened context no longer holds and has to
    stage again. A reopen that skipped that would read an unwritten buffer;
 3. dispatching a chain makes it the most recent, so a working set that fits
-   under the cap is never evicted from under itself.
+   under the cap is never evicted from under itself;
+4. with the cap lifted, the device's own refusal is what evicts, and every
+   chain still dispatches -- the path a driver granting fewer than `max_open`
+   takes.
 
 Needs an npu2 device. Exits 77 without one.
 """
@@ -109,6 +113,15 @@ def main():
             dispatch(i, chain)
         stayed &= all(c._runner is not None for c in hot)
     check(stayed, "a recently dispatched working set is never evicted")
+
+    cap, NPUChain.max_open = NPUChain.max_open, 1 << 30
+    try:
+        ok = all(dispatch(i, chain) for i, chain in enumerate(chains))
+        check(
+            ok, f"with the cap lifted, the device's refusals evict ({len(live())} open)"
+        )
+    finally:
+        NPUChain.max_open = cap
 
     for chain in chains:
         chain.close()

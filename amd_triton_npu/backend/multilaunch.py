@@ -628,21 +628,39 @@ class NPUChain:
         self._builder = b
         self._elf_path, self._kernel_name = b.compile()
 
-    def _open_runner(self):
-        """Give this chain an ``hw_context``, closing the stalest if at the cap."""
+    @staticmethod
+    def _close_stalest():
+        """Close the least recently dispatched open chain. False if none is."""
         open_ = NPUChain._open
-        for key, ref in list(open_.items()):
-            chain = ref()
-            if chain is None or chain._runner is None:
-                del open_[key]
-        while len(open_) >= NPUChain.max_open:
+        while open_:
             _, ref = open_.popitem(last=False)
             stale = ref()
-            if stale is not None:
+            if stale is not None and stale._runner is not None:
                 stale.close()
+                return True
+        return False
+
+    def _open_runner(self):
+        """Give this chain an ``hw_context``, closing the stalest to make room.
+
+        Ahead of time at ``max_open``, and again whenever the device refuses
+        one: how many it grants depends on the driver and firmware -- ~30 on
+        amdxdna 2.21, fewer on 2.25, which also reports it as EINVAL rather
+        than ENOENT -- so the cap alone cannot be the guarantee. Only a
+        refusal with no chain of ours left to close is raised.
+        """
+        open_ = NPUChain._open
+        while len(open_) >= NPUChain.max_open and NPUChain._close_stalest():
+            pass
         if self._elf_path is None:
             self._build()
-        self._runner = MultiLaunchRunner(self._elf_path, self._kernel_name)
+        while True:
+            try:
+                self._runner = MultiLaunchRunner(self._elf_path, self._kernel_name)
+                break
+            except RuntimeError as e:
+                if "HWCTX" not in str(e) or not NPUChain._close_stalest():
+                    raise
         open_[id(self)] = weakref.ref(self)
 
     def run(
