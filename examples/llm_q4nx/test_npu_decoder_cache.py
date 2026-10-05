@@ -73,21 +73,6 @@ def test_close_keeps_the_cached_decoder_and_release_closes_it():
     assert getattr(pf, "_npu_decoder", None) is None
 
 
-class _RefusedOnce(_FakeFusedDecoder):
-    """A decoder whose first hardware context is refused, as amdxdna does when
-    other contexts hold what it grants."""
-
-    attempts = 0
-
-    def __init__(self, *a, **kw):
-        _RefusedOnce.attempts += 1
-        if _RefusedOnce.attempts == 1:
-            raise RuntimeError(
-                "DRM_IOCTL_AMDXDNA_CREATE_HWCTX IOCTL failed (err=-22): Invalid argument"
-            )
-        super().__init__(*a, **kw)
-
-
 class _Chain:
     def __init__(self):
         self._runner = object()
@@ -96,30 +81,22 @@ class _Chain:
         self._runner = None
 
 
-def test_a_refused_context_closes_the_chains_and_retries():
+def test_the_chains_give_up_their_contexts_before_the_decoder_opens():
     import weakref
 
     from triton.backends.amd_triton_npu.multilaunch import NPUChain
 
     chain = _Chain()
     NPUChain._open[id(chain)] = weakref.ref(chain)
-    _RefusedOnce.attempts = 0
-    air = SimpleNamespace(FusedDecoder=_RefusedOnce)
-    dec = _install(air, _prefiller("a"))
-    assert _RefusedOnce.attempts == 2
-    assert chain._runner is None and not NPUChain._open
-    assert dec.kvc == "bo-a"
+    seen = []
 
-
-def test_other_errors_are_not_retried():
-    class _Broken(_FakeFusedDecoder):
+    class _Recording(_FakeFusedDecoder):
         def __init__(self, *a, **kw):
-            raise RuntimeError("weight cache holds 3 elements, the build wants 4")
+            seen.append(chain._runner)
+            super().__init__(*a, **kw)
 
-    air = SimpleNamespace(FusedDecoder=_Broken)
-    try:
-        _install(air, _prefiller("a"))
-    except RuntimeError as e:
-        assert "weight cache" in str(e)
-    else:
-        raise AssertionError("a non-context error was swallowed")
+    air = SimpleNamespace(FusedDecoder=_Recording)
+    dec = _install(air, _prefiller("a"))
+    assert seen == [None], "the decoder opened while a chain still held its context"
+    assert not NPUChain._open
+    assert dec.kvc == "bo-a"

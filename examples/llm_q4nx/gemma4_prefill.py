@@ -1458,18 +1458,16 @@ def make_npu_decoder_class(air, prefiller):
             # reach instead is what would pick a different window, and a
             # different window is a different layout.
             kw["max_L"] = prefiller.kv_attn_maxl
-            try:
-                super().__init__(*a, **kw)
-            except RuntimeError as e:
-                # The device grants a limited number of hardware contexts, and
-                # the Triton prefill's chains may hold them all. Chains reopen
-                # on their next run, so release them and open this one again.
-                from triton.backends.amd_triton_npu.multilaunch import NPUChain
+            # The Triton prefill's chains may hold every hardware context the
+            # device grants, and a refused context is not the only failure
+            # seen: on amdxdna 2.25 a decoder opened after a refusal hung on
+            # its first dispatch. So the chains give theirs up before this
+            # one is opened. They reopen on their next run, and this decoder
+            # is built once per prefiller, so that happens once.
+            from triton.backends.amd_triton_npu.multilaunch import NPUChain
 
-                if "HWCTX" not in str(e) or not NPUChain._open:
-                    raise
-                NPUChain.close_all()
-                super().__init__(*a, **kw)
+            NPUChain.close_all()
+            super().__init__(*a, **kw)
             if self.ATTN_MAXL != prefiller.kv_attn_maxl:
                 raise RuntimeError(
                     f"the KV slab was built for ATTN_MAXL="
