@@ -705,6 +705,12 @@ class Gemma4Prefill(LlamaPrefill):
             ),
         )
 
+    def release_npu_decoder(self):
+        """Close the NPU decoder kept across turns, if one was built."""
+        dec = self.__dict__.pop("_npu_decoder", None)
+        if dec is not None:
+            dec.release()
+
     def clear_context(self):
         self.current_context_length = 0
         self._zero_slab()
@@ -1402,8 +1408,37 @@ def make_npu_decoder_class(air, prefiller):
       rearrangement, just not zero-copy.
     """
 
-    class Gemma4NpuDecode(air.FusedDecoder):
+    # `_install_shared_kv` replaces `air.FusedDecoder` with this class, so a
+    # later call would otherwise subclass the previous prefiller's adapter and
+    # reach its cached decoder through `super().__new__`. Always derive from
+    # mlir-air's own class.
+    if not hasattr(air, "_triton_fused_decoder_base"):
+        air._triton_fused_decoder_base = air.FusedDecoder
+    base = air._triton_fused_decoder_base
+
+    class Gemma4NpuDecode(base):
+        # One decoder per prefiller, kept across turns. mlir-air's `generate()`
+        # constructs a `FusedDecoder` on every call and closes it at the end.
+        # Construction loads the template, the weights and a hardware context,
+        # and none of that depends on the turn: `max_L` is pinned to the slab
+        # below and `seed_kv` is only a sync.
+        def __new__(cls, *a, **kw):
+            cached = getattr(prefiller, "_npu_decoder", None)
+            # An instance of an earlier turn's class is not an instance of this
+            # one, so Python does not run `__init__` on it again.
+            return cached if cached is not None else super().__new__(cls)
+
+        def close(self):
+            if getattr(prefiller, "_npu_decoder", None) is not self:
+                super().close()
+
+        def release(self):
+            """Close this decoder even though it is the one kept for reuse."""
+            base.close(self)
+
         def __init__(self, *a, **kw):
+            if getattr(self, "_built", False):
+                return
             # The prefiller comes from the closure, not the signature: upstream
             # `generate()` constructs this itself, as `FusedDecoder(model=...,
             # max_L=...)`, and knows nothing to pass.
@@ -1431,6 +1466,8 @@ def make_npu_decoder_class(air, prefiller):
                     f"{self.KV.shape}"
                 )
             self._bind_slab()
+            self._built = True
+            prefiller._npu_decoder = self
 
         def _bind_slab(self):
             """Point `kvc`/`KV` at the prefill's slab, zero-copy where possible."""

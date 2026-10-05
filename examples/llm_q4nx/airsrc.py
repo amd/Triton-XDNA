@@ -66,6 +66,11 @@ def fused_decode_dir(engine="fused_decode"):
     return str(air_llms_root().parent / ENGINES[engine].directory)
 
 
+def fused_prefill_dir(model_dir="gemma4_e2b_q4nx"):
+    """mlir-air's fused prefill builder for a model, beside its driver."""
+    return str(air_llms_root() / model_dir / "fused_prefill")
+
+
 def register_air_examples():
     """Publish mlir-air's `programming_examples/` as the `air_examples` package.
 

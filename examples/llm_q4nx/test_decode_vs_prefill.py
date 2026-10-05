@@ -78,6 +78,13 @@ def main():
         help=f"also run a {LONG_PROMPT_TOKENS}-token prompt, past the sliding "
         "window. Minutes, not seconds -- the oracle re-prefills per token.",
     )
+    ap.add_argument(
+        "--prefill-engine",
+        default="triton",
+        choices=("triton", "air-fused"),
+        help="air-fused: also run mlir-air's fused NPU prefill on each prompt "
+        "and decode from its slab on the iGPU",
+    )
     a = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -92,6 +99,13 @@ def main():
     # `npu_resident=False`: the padded resident form is one-way and a decode
     # that then multiplies with it raises. See `Gemma4GpuDecode`.
     load_prefill_weights(m, a.backend, npu_resident=False)
+
+    fused = None
+    if a.prefill_engine == "air-fused":
+        from harness import fused_prefill_cls
+
+        fused = fused_prefill_cls(cfg)(n_layers=cfg.N_LAYERS, max_seq=2048)
+        load_prefill_weights(fused, "cpu", npu_resident=False)
 
     prompts = list(PROMPTS)
     if a.long:
@@ -138,6 +152,27 @@ def main():
             f"  gpu prefill    : {got}   KV rel {diff.item():.1e}, same lanes "
             f"{lanes}, host slab in sync {mirrored}   {'ok' if good else 'MISMATCH'}"
         )
+        if fused is not None:
+            fused.prefill(ids)
+            fdec = Gemma4GpuDecode(fused, max_L=len(ids) + a.tokens + 2)
+            fkv = fdec._slab_t
+            # The decode must read the fused prefill's own slab, not a copy.
+            in_place = fdec._slab_shared and (
+                fkv.data_ptr() == fused._kv_slab.torch().data_ptr()
+            )
+            fdiff = (fkv.float() - host_kv.float()).norm() / host_kv.float().norm()
+            flanes = ((fkv != 0) == (host_kv != 0)).float().mean().item() > 0.9999
+            got = fdec.generate(n_tokens=a.tokens, eos=())[: len(oracle)]
+            # Looser than the iGPU prefill's bound: the fused prefill's own K/V
+            # move further from the exact reference in the deeper layers, while
+            # its logits and tokens still match.
+            good = got == oracle and flanes and fdiff.item() < 0.25 and in_place
+            ok &= good
+            print(
+                f"  fused prefill  : {got}   KV rel {fdiff.item():.1e}, same lanes "
+                f"{flanes}, decode reads its slab in place {in_place}   "
+                f"{'ok' if good else 'MISMATCH'}"
+            )
 
     # A prompt longer than the slab or the RoPE tables (`max_seq`) must be
     # refused before it writes anything.
