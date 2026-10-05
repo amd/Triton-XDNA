@@ -381,14 +381,26 @@ def test_prefill_config_must_be_a_config():
     raise AssertionError("a plain dict was accepted as a PrefillConfig")
 
 
-def _fake_air_tree(root):
+_FAKE_BUILDER = """
+import json, sys
+from pathlib import Path
+out = Path(sys.argv[1])
+(out / "manifest.json").write_text(json.dumps(dict(gemm=["g"], attn={}, lm="lm")))
+for n in ("g", "lm"):
+    for ext in (".xclbin", ".insts.bin"):
+        (out / (n + ext)).write_bytes(b"")
+(out / "libhostops.so").write_bytes(b"")
+"""
+
+
+def _fake_air_tree(root, builder="raise SystemExit('the builder must not run')\n"):
     """The files `fused_prefill.fingerprint` reads, in mlir-air's layout."""
     from pathlib import Path
 
     ex = Path(root) / "programming_examples"
     fp = ex / "llms" / "gemma4_e2b_q4nx" / "fused_prefill"
     fp.mkdir(parents=True)
-    (fp / "build.py").write_text("raise SystemExit('the builder must not run')\n")
+    (fp / "build.py").write_text(builder)
     (fp.parent / "gemma4_e2b_q4nx_weights.py").write_text("D = 1536\n")
     for rel in (
         "matrix_multiplication/bf16_in_fp32_out",
@@ -410,22 +422,24 @@ def test_prefill_fingerprint_follows_sources():
     cfg = m.PrefillConfig("gemma4-e2b")
     with tempfile.TemporaryDirectory() as tmp:
         d, ex = _fake_air_tree(tmp)
-        a = m.fingerprint(cfg, d, "/peano")
-        assert a == m.fingerprint(cfg, d, "/peano"), "not deterministic"
-        assert a != m.fingerprint(cfg, d, "/other-peano"), "ignores the toolchain"
+        a = m.fingerprint(cfg, d, "/peano", "/aie")
+        assert a == m.fingerprint(cfg, d, "/peano", "/aie"), "not deterministic"
+        assert a != m.fingerprint(cfg, d, "/other-peano", "/aie"), "ignores Peano"
+        assert a != m.fingerprint(cfg, d, "/peano", "/other-aie"), "ignores mlir-aie"
         (ex / "flash_attention/kernel_fusion_based/k.cc").write_text("// edited\n")
-        assert a != m.fingerprint(cfg, d, "/peano"), "ignores kernel sources"
+        assert a != m.fingerprint(cfg, d, "/peano", "/aie"), "ignores kernel sources"
         shutil.rmtree(ex / "matrix_multiplication")
         try:
-            m.fingerprint(cfg, d, "/peano")
+            m.fingerprint(cfg, d, "/peano", "/aie")
         except FileNotFoundError:
             return
         raise AssertionError("a missing kernel directory was hashed as empty")
 
 
 def test_prefill_reuses_a_complete_build():
-    """A complete build under the current fingerprint is returned as is; the
-    fake builder in `_fake_air_tree` fails if it is run."""
+    """A complete build under the current fingerprint is returned as is (the
+    fake builder in `_fake_air_tree` fails if it runs), and a build missing the
+    host library the runtime loads is not complete."""
     import json
     import tempfile
     from pathlib import Path
@@ -433,24 +447,67 @@ def test_prefill_reuses_a_complete_build():
     import triton.backends.amd_triton_npu.driver as drv
 
     m = importlib.import_module("triton.language.extra.npu.fused_prefill")
-
     cfg = m.PrefillConfig("gemma4-e2b")
-    saved = drv.find_peano_root
+    saved = drv.find_peano_root, m._mlir_aie_root
     drv.find_peano_root = lambda: "/peano"
+    m._mlir_aie_root = lambda: "/aie"
     try:
         with tempfile.TemporaryDirectory() as tmp:
             d, _ = _fake_air_tree(tmp)
-            out = Path(tmp) / "cache" / f"gemma4-e2b_{m.fingerprint(cfg, d, '/peano')}"
+            cache = Path(tmp) / "cache"
+            out = cache / f"gemma4-e2b_{m.fingerprint(cfg, d, '/peano', '/aie')}"
             out.mkdir(parents=True)
             man = dict(gemm=["g"], attn={"a": {"base": "b"}}, lm="lm")
             (out / "manifest.json").write_text(json.dumps(man))
             for n in ("g", "b", "lm"):
                 for ext in (".xclbin", ".insts.bin"):
                     (out / f"{n}{ext}").write_bytes(b"")
-            r = m.fused_prefill(cfg, d, cache_root=Path(tmp) / "cache")
-            assert r["cached"] and r["build_dir"] == str(out), r
+            (out / "libhostops.so").write_bytes(b"")
+            r = m.fused_prefill(cfg, d, cache_root=cache)
+            assert r["cached"] and r["build_dir"] == str(out.resolve()), r
+            (out / "libhostops.so").unlink()
+            assert not m._complete(out), "a build without libhostops.so is complete"
     finally:
-        drv.find_peano_root = saved
+        drv.find_peano_root, m._mlir_aie_root = saved
+
+
+def test_prefill_rebuild_publishes_a_new_generation():
+    """A rebuild publishes a new generation and switches the name to it; the
+    build it replaces, including one published as a plain directory, stays."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    import triton.backends.amd_triton_npu.driver as drv
+
+    m = importlib.import_module("triton.language.extra.npu.fused_prefill")
+    cfg = m.PrefillConfig("gemma4-e2b")
+    saved = drv.find_peano_root, m._mlir_aie_root
+    drv.find_peano_root = lambda: "/peano"
+    m._mlir_aie_root = lambda: "/aie"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            d, _ = _fake_air_tree(tmp, builder=_FAKE_BUILDER)
+            cache = Path(tmp) / "cache"
+            name = cache / f"gemma4-e2b_{m.fingerprint(cfg, d, '/peano', '/aie')}"
+            name.mkdir(parents=True)
+            (name / "old").write_text("plain directory")
+            r1 = m.fused_prefill(cfg, d, cache_root=cache, rebuild=True)
+            assert name.is_symlink() and not r1["cached"], r1
+            old = [p for p in cache.iterdir() if (p / "old").exists()]
+            assert old and old[0] != name, "the plain directory was not kept"
+            r2 = m.fused_prefill(cfg, d, cache_root=cache, rebuild=True)
+            assert r2["build_dir"] != r1["build_dir"], "rebuild reused a generation"
+            assert Path(
+                r1["build_dir"], "manifest.json"
+            ).is_file(), "old generation gone"
+            assert json.loads(Path(r2["build_dir"], "fingerprint.json").read_text())
+            assert (
+                m.fused_prefill(cfg, d, cache_root=cache)["build_dir"]
+                == r2["build_dir"]
+            )
+    finally:
+        drv.find_peano_root, m._mlir_aie_root = saved
 
 
 def main():
@@ -489,6 +546,10 @@ def main():
         (
             "a complete fused prefill build is reused",
             test_prefill_reuses_a_complete_build,
+        ),
+        (
+            "a fused prefill rebuild publishes a new generation",
+            test_prefill_rebuild_publishes_a_new_generation,
         ),
     ]
     print("tl.extra.npu:")

@@ -21,6 +21,7 @@ refuses any other model instead of building something that would run and
 produce wrong output.
 """
 
+import fcntl
 import hashlib
 import importlib.metadata
 import json
@@ -87,7 +88,7 @@ def _hash_tree(h, root, base):
             h.update(p.read_bytes())
 
 
-def fingerprint(config, fused_prefill_dir, peano_root):
+def fingerprint(config, fused_prefill_dir, peano_root, aie_root):
     """Digest of everything the build reads: sources, model constants, tools."""
     d = Path(fused_prefill_dir).resolve()
     examples = d.parents[2]
@@ -106,6 +107,8 @@ def fingerprint(config, fused_prefill_dir, peano_root):
         _hash_tree(h, src, examples)
     h.update(json.dumps(_toolchain_versions(), sort_keys=True).encode())
     h.update(str(peano_root).encode())
+    # The builder compiles against this installation's AIE headers.
+    h.update(str(Path(aie_root).resolve()).encode())
     return h.hexdigest()[:16]
 
 
@@ -120,9 +123,10 @@ def _mlir_aie_root():
 
 
 def _complete(build_dir):
-    """True if `build_dir` holds a manifest and every artifact it names."""
+    """True if `build_dir` holds a manifest, every artifact it names, and the
+    host library the runtime loads when it is constructed."""
     m = Path(build_dir) / "manifest.json"
-    if not m.is_file():
+    if not m.is_file() or not (Path(build_dir) / "libhostops.so").is_file():
         return False
     man = json.loads(m.read_text())
     names = list(man["gemm"]) + [man["lm"]]
@@ -166,56 +170,67 @@ def fused_prefill(config, fused_prefill_dir, cache_root=None, rebuild=False):
     peano = find_peano_root()
     if not peano:
         raise RuntimeError("no Peano (llvm-aie) install found for the AIE kernels")
-    fp = fingerprint(config, d, peano)
+    aie_root = _mlir_aie_root()
+    fp = fingerprint(config, d, peano, aie_root)
     root = Path(cache_root or default_cache_root())
-    out = root / f"{config.model}_{fp}"
-    with _BUILD_LOCK:
-        if out.is_dir() and _complete(out) and not rebuild:
+    root.mkdir(parents=True, exist_ok=True)
+    # `current` names the published generation. Generations are never modified
+    # or removed once published, so a reader holding one keeps a complete
+    # build; publishing a new one only switches the link.
+    current = root / f"{config.model}_{fp}"
+    with _BUILD_LOCK, open(root / f".{current.name}.lock", "w") as lock:
+        # Builders in other processes wait here, then reuse what the first
+        # one published.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if current.is_dir() and _complete(current) and not rebuild:
             cached = True
         else:
-            root.mkdir(parents=True, exist_ok=True)
-            tmp = Path(tempfile.mkdtemp(prefix=f".{out.name}.", dir=root))
+            gen = Path(tempfile.mkdtemp(prefix=f"{current.name}.g", dir=root))
             env = dict(
-                os.environ,
-                PEANO_INSTALL_DIR=str(peano),
-                MLIR_AIE_INSTALL_DIR=_mlir_aie_root(),
+                os.environ, PEANO_INSTALL_DIR=str(peano), MLIR_AIE_INSTALL_DIR=aie_root
             )
             cmd = [
                 sys.executable,
                 str(d / "build.py"),
-                str(tmp),
+                str(gen),
                 "-j",
                 str(config.jobs),
             ]
-            r = subprocess.run(cmd, env=env, cwd=tmp, capture_output=True, text=True)
-            if r.returncode != 0 or not _complete(tmp):
-                shutil.rmtree(tmp, ignore_errors=True)
+            r = subprocess.run(cmd, env=env, cwd=gen, capture_output=True, text=True)
+            if r.returncode != 0 or not _complete(gen):
+                shutil.rmtree(gen, ignore_errors=True)
                 raise RuntimeError(
                     f"fused prefill build failed (rc={r.returncode}):\n"
                     f"{r.stdout[-2000:]}\n{r.stderr[-4000:]}"
                 )
-            shutil.rmtree(tmp / "work", ignore_errors=True)
-            (tmp / "fingerprint.json").write_text(
+            shutil.rmtree(gen / "work", ignore_errors=True)
+            (gen / "fingerprint.json").write_text(
                 json.dumps(
                     dict(
                         fingerprint=fp,
                         model=config.model,
                         toolchain=_toolchain_versions(),
                         peano=str(peano),
+                        mlir_aie=aie_root,
                         sources=str(d),
                     ),
                     indent=1,
                 )
             )
-            if out.exists():
-                shutil.rmtree(out)
-            # Atomic on one filesystem: a concurrent reader sees the old
-            # directory or the new one, never a partial build.
-            os.replace(tmp, out)
+            if current.is_dir() and not current.is_symlink():
+                # A build published as a plain directory becomes a generation
+                # of its own, so the link below can take its name.
+                current.rename(root / f"{current.name}.g{os.urandom(4).hex()}")
+            link = root / f".{current.name}.link"
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(gen.name)
+            os.replace(link, current)
             cached = False
+        build_dir = current.resolve()
     return dict(
-        build_dir=str(out),
-        manifest=json.loads((out / "manifest.json").read_text()),
+        build_dir=str(build_dir),
+        manifest=json.loads((build_dir / "manifest.json").read_text()),
         fingerprint=fp,
         cached=cached,
         config=config,
