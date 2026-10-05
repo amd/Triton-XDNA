@@ -21,6 +21,11 @@ runs:
     - name: Test
       env:
         HOME: /workspace
+        # The inputs reach the script as environment variables rather than as
+        # `${{ }}` expressions in it: a `run:` string that contains one is
+        # capped at 21000 characters, and this one is longer.
+        TEST_ENV_NAME: ${{ inputs.env_name }}
+        TEST_DEVICE: ${{ inputs.device }}
       shell: "bash"
       run: |
         set -x  # Enable command tracing
@@ -41,11 +46,11 @@ runs:
         echo "=========================================="
         echo "STEP 2: Activate Virtual Environment"
         echo "=========================================="
-        if [ -f "${{ inputs.env_name }}/bin/activate" ]; then
-          echo "Virtual environment found at ${{ inputs.env_name }}"
-          source ${{ inputs.env_name }}/bin/activate
+        if [ -f "$TEST_ENV_NAME/bin/activate" ]; then
+          echo "Virtual environment found at $TEST_ENV_NAME"
+          source "$TEST_ENV_NAME/bin/activate"
         else
-          echo "ERROR: Virtual environment not found at ${{ inputs.env_name }}"
+          echo "ERROR: Virtual environment not found at $TEST_ENV_NAME"
           ls -la
           exit 1
         fi
@@ -167,7 +172,7 @@ runs:
         # Pick the tiling scripts that match the NPU this runner actually has.
         # Hard-coding aie2 ran the 8-core AIE2 schedules against AIE2P silicon
         # (e.g. Krackan), which fails in aiecc rather than at detection.
-        DEVICE="${{ inputs.device }}"
+        DEVICE="$TEST_DEVICE"
         if [ -z "$DEVICE" ]; then
           DEVICE=$(python -c "
         import pyxrt
