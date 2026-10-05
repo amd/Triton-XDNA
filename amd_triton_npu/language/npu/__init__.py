@@ -22,6 +22,7 @@ from .fused_decode import (
     DecodeEngine,
     fused_decode,
 )
+from .fused_prefill import PrefillConfig, PrefillConfigError, fused_prefill
 
 __all__ = [
     "ENGINES",
@@ -29,4 +30,7 @@ __all__ = [
     "DecodeConfigError",
     "DecodeEngine",
     "fused_decode",
+    "PrefillConfig",
+    "PrefillConfigError",
+    "fused_prefill",
 ]

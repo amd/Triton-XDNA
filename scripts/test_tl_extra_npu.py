@@ -23,6 +23,7 @@ covered where the decode is built.
     python3 scripts/test_tl_extra_npu.py
 """
 
+import importlib
 import sys
 
 
@@ -355,6 +356,103 @@ def test_config_must_be_a_config():
     raise AssertionError("a plain dict was accepted as a config")
 
 
+def test_prefill_config_refuses_other_models():
+    """mlir-air has a fused prefill builder for one model; any other is refused
+    instead of building with that model's shapes."""
+    import triton.language as tl
+
+    npu = tl.extra.npu
+    npu.PrefillConfig("gemma4-e2b")
+    try:
+        npu.PrefillConfig("llama-3.2-1b")
+    except npu.PrefillConfigError:
+        return
+    raise AssertionError("a model without a fused prefill builder was accepted")
+
+
+def test_prefill_config_must_be_a_config():
+    import triton.language as tl
+
+    npu = tl.extra.npu
+    try:
+        npu.fused_prefill({"model": "gemma4-e2b"}, "/nonexistent")
+    except npu.PrefillConfigError:
+        return
+    raise AssertionError("a plain dict was accepted as a PrefillConfig")
+
+
+def _fake_air_tree(root):
+    """The files `fused_prefill.fingerprint` reads, in mlir-air's layout."""
+    from pathlib import Path
+
+    ex = Path(root) / "programming_examples"
+    fp = ex / "llms" / "gemma4_e2b_q4nx" / "fused_prefill"
+    fp.mkdir(parents=True)
+    (fp / "build.py").write_text("raise SystemExit('the builder must not run')\n")
+    (fp.parent / "gemma4_e2b_q4nx_weights.py").write_text("D = 1536\n")
+    for rel in (
+        "matrix_multiplication/bf16_in_fp32_out",
+        "flash_attention/kernel_fusion_based",
+    ):
+        (ex / rel).mkdir(parents=True)
+        (ex / rel / "k.cc").write_text("// kernel\n")
+    return fp, ex
+
+
+def test_prefill_fingerprint_follows_sources():
+    """Same inputs, same digest; a changed kernel source or toolchain path
+    changes it; a missing kernel directory is an error, not a smaller digest."""
+    import shutil
+    import tempfile
+
+    m = importlib.import_module("triton.language.extra.npu.fused_prefill")
+
+    cfg = m.PrefillConfig("gemma4-e2b")
+    with tempfile.TemporaryDirectory() as tmp:
+        d, ex = _fake_air_tree(tmp)
+        a = m.fingerprint(cfg, d, "/peano")
+        assert a == m.fingerprint(cfg, d, "/peano"), "not deterministic"
+        assert a != m.fingerprint(cfg, d, "/other-peano"), "ignores the toolchain"
+        (ex / "flash_attention/kernel_fusion_based/k.cc").write_text("// edited\n")
+        assert a != m.fingerprint(cfg, d, "/peano"), "ignores kernel sources"
+        shutil.rmtree(ex / "matrix_multiplication")
+        try:
+            m.fingerprint(cfg, d, "/peano")
+        except FileNotFoundError:
+            return
+        raise AssertionError("a missing kernel directory was hashed as empty")
+
+
+def test_prefill_reuses_a_complete_build():
+    """A complete build under the current fingerprint is returned as is; the
+    fake builder in `_fake_air_tree` fails if it is run."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    import triton.backends.amd_triton_npu.driver as drv
+
+    m = importlib.import_module("triton.language.extra.npu.fused_prefill")
+
+    cfg = m.PrefillConfig("gemma4-e2b")
+    saved = drv.find_peano_root
+    drv.find_peano_root = lambda: "/peano"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            d, _ = _fake_air_tree(tmp)
+            out = Path(tmp) / "cache" / f"gemma4-e2b_{m.fingerprint(cfg, d, '/peano')}"
+            out.mkdir(parents=True)
+            man = dict(gemm=["g"], attn={"a": {"base": "b"}}, lm="lm")
+            (out / "manifest.json").write_text(json.dumps(man))
+            for n in ("g", "b", "lm"):
+                for ext in (".xclbin", ".insts.bin"):
+                    (out / f"{n}{ext}").write_bytes(b"")
+            r = m.fused_prefill(cfg, d, cache_root=Path(tmp) / "cache")
+            assert r["cached"] and r["build_dir"] == str(out), r
+    finally:
+        drv.find_peano_root = saved
+
+
 def main():
     tests = [
         ("tl.extra.npu is installed by the build", test_installed),
@@ -379,6 +477,19 @@ def main():
         ("model_type is required", test_model_type_is_required),
         ("another model's kernels are refused", test_refuses_another_models_kernels),
         ("a dict is not a DecodeConfig", test_config_must_be_a_config),
+        (
+            "fused_prefill refuses models without a builder",
+            test_prefill_config_refuses_other_models,
+        ),
+        ("a dict is not a PrefillConfig", test_prefill_config_must_be_a_config),
+        (
+            "the fused prefill fingerprint follows its inputs",
+            test_prefill_fingerprint_follows_sources,
+        ),
+        (
+            "a complete fused prefill build is reused",
+            test_prefill_reuses_a_complete_build,
+        ),
     ]
     print("tl.extra.npu:")
     failed = sum(not check(n, f) for n, f in tests)
