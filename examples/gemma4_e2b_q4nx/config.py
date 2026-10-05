@@ -147,20 +147,12 @@ EXPECT_FIRST = 9079  # " Paris"
 #: only by `--interactive`, which this model's driver does not support.
 BOS = 2
 
-#: What `--greedy` must generate from PROMPT, first token included --
-#: mlir-air's own `PARIS_GREEDY` for this model. Only two tokens, where every
-#: sibling here records ten: this is an instruction-tuned checkpoint that
-#: answers " Paris." and stops, and upstream's own gate additionally requires
-#: the run to STOP on 106 (<end_of_turn>) after them.
-EXPECT_IDS = [9079, 236761]
-
-#: Upstream's gate additionally requires the run to STOP on 106
-#: (<end_of_turn>) after those two tokens, and ours does not: the shared
-#: harness compares the leading ids and has no notion of where a generation
-#: ended. Recorded as a KNOWN GAP rather than as a constant, because a
-#: constant nothing reads is worse than none -- it reads as a check that is
-#: running. Closing it means teaching the harness about the stop token, which
-#: belongs with the first decode run on this model rather than ahead of it.
+#: What `--greedy` must generate from PROMPT, first token included and the
+#: stop token last: mlir-air's own gate for this model is `PARIS_GREEDY`
+#: followed by a stop on 106 (<end_of_turn>). The stop is part of the record
+#: because the two tokens before it survive a decode that reads a corrupted
+#: cache, and the stop does not.
+EXPECT_IDS = [9079, 236761, 106]
 
 #: Stop tokens for the GPU decode loop. mlir-air's own gate requires the run
 #: to stop on 106 (<end_of_turn>) after EXPECT_IDS; the NPU path leaves that to

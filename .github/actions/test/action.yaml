@@ -375,6 +375,25 @@ runs:
             # That is `make run` locally.
             gate gemma4_e2b_q4nx --prefill-only
 
+            # The KV layout our prefills hand the NPU decode in place, against
+            # mlir-air's own `seed_kv` run on the same K/V. The gate above never
+            # reaches the decode, and the iGPU decode below reads whatever
+            # layout `kv_layout` defines, so this is the only check that the
+            # two agree. No NPU and no weights: the fetched sources only.
+            rc=0
+            echo "📁 Example: llm_q4nx/test_kv_layout.py"
+            ( cd examples/llm_q4nx && python3 test_kv_layout.py ) || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "   ✅ PASS: test_kv_layout.py"
+              q_pass=$((q_pass + 1))
+            elif [ "$rc" -eq 77 ]; then
+              echo "   ⏭️  SKIP: test_kv_layout.py -- declined (exit 77)"
+              q_skip=$((q_skip + 1))
+            else
+              echo "   ❌ FAIL: test_kv_layout.py (exit code $rc)"
+              q_fail=$((q_fail + 1))
+            fi
+
             echo ""
             echo "--------------------------------------------------"
             echo "Q4NX Gate Results:"

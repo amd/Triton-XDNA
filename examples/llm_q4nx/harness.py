@@ -710,12 +710,12 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     out = air.generate(list(ids), args.max_tokens, **kwargs)
     # A driver that stops on EOS reports the token it stopped on, so its
     # `generate` returns `(ids, eos)` where the others return the ids alone.
-    # Gemma4-E2B is the first model here that does it -- it stops
-    # unconditionally, as the comment above says -- and unpacking was missed,
-    # so the decode gate was comparing `[[9079, 236761], 106]` against
-    # `[9079, 236761]` and failing on shape. Its NPU decode has therefore never
-    # gated green, while producing the right tokens the whole time.
-    return list(out[0] if isinstance(out, tuple) else out)
+    # The stop token goes back on the end, as the GPU decode returns it, so
+    # that the decode gate can require it.
+    if isinstance(out, tuple):
+        out, stop = out
+        return list(out) + ([stop] if stop is not None else [])
+    return list(out)
 
 
 #: Models with a `--decode gpu` implementation. One entry, deliberately: a
