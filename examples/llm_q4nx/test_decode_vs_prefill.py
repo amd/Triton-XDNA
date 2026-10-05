@@ -93,6 +93,10 @@ def main():
         "the pinned mlir-air",
     )
     a = ap.parse_args()
+    if a.npu_decode and a.tokens < 2:
+        # The first token comes from the prefill, so fewer than two never
+        # dispatches a decode step and the row would check nothing.
+        ap.error("--npu-decode needs --tokens 2 or more")
 
     if not torch.cuda.is_available():
         print("SKIP: no ROCm device; the decode under test is the GPU one")
