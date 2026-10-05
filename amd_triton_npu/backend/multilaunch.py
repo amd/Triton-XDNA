@@ -640,6 +640,16 @@ class NPUChain:
                 return True
         return False
 
+    @staticmethod
+    def close_all():
+        """Close every open chain's ``hw_context``. Each reopens on its next run.
+
+        For a context opened outside ``NPUChain`` that the device refuses while
+        chains hold theirs, such as a fused decode's.
+        """
+        while NPUChain._close_stalest():
+            pass
+
     def _open_runner(self):
         """Give this chain an ``hw_context``, closing the stalest to make room.
 
