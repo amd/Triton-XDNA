@@ -633,8 +633,8 @@ class Gemma4Prefill(LlamaPrefill):
         # ---- per-layer embedding injection ----
         # A GELU-tanh gate against this layer's PLE vector, projected back up
         # to D and added through the fifth norm. `_geglu` is the same operator:
-        # gelu_tanh(gate) * other. It runs on the host: the gate is only
-        # PLI_D wide, too small for an NPU dispatch to pay for itself.
+        # gelu_tanh(gate) * other, on the host: [N, PLI_D] is too small to
+        # offload.
         residual = x
         gate = self._geglu(
             self._matmul(x, w["inp_gate"], stage_key=f"ig_L{L}"), pli, backend="cpu"

@@ -240,8 +240,7 @@ runs:
           # nothing exercises eviction -- the path a long-lived chat takes.
           python3 scripts/test_npu_chain_context_cap.py
 
-          # That a one-op chain is right on every dispatch, not only the first.
-          # The LLM projection and attention chains are single ops.
+          # One-op NPUChain re-dispatch (the LLM projection and attention chains).
           python3 scripts/test_npu_chain_single_op.py
 
           # The weight loader lives in mlir-air's sources, which the wheel does

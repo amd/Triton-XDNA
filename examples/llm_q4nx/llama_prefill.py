@@ -109,14 +109,11 @@ _HEAP_KEPT = False
 
 
 def _keep_freed_blocks_in_heap():
-    """Keep glibc from returning large freed blocks to the OS, once per process.
+    """Stop glibc from unmapping large freed blocks (once per process).
 
-    The host operators allocate activation-sized tensors on every call. By
-    default glibc serves those with mmap and unmaps them on free, so each
-    call faults its output pages in again. Raising the mmap and trim
-    thresholds lets the heap reuse them; the process keeps its peak heap
-    instead of returning it between calls. Q4NX_KEEP_HEAP=0 leaves glibc's
-    defaults alone.
+    Host ops allocate activation-sized tensors on every call, and with the
+    default mmap threshold each one page-faults again. Q4NX_KEEP_HEAP=0 keeps
+    the glibc defaults.
     """
     global _HEAP_KEPT
     if _HEAP_KEPT or os.environ.get("Q4NX_KEEP_HEAP", "1") == "0":

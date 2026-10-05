@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""A one-op `NPUChain` gives correct results on every dispatch.
+"""Re-dispatch a one-op NPUChain and check every result.
 
-Single-op chains once returned stale data on every dispatch after the first,
-and callers padded them with a second op. The projection and attention chains
-in examples/llm_q4nx are single GEMM ops again, so this guards the case:
-
-1. plain host staging, fresh inputs on every dispatch;
-2. a static operand held across dispatches beside a changing one;
-3. operands and result bound to shared buffers, when the interop is available.
-
-Needs an npu2 device. Exits 77 without one.
+Cases: plain host staging, a static operand, and bound shared buffers
+(skipped without the interop). Needs an npu2 device; exits 77 otherwise.
 """
 
 from __future__ import annotations

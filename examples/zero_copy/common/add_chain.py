@@ -74,8 +74,7 @@ def add_kernel(A, B, C, n_elements: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 def build(name: str, n: int) -> NPUChain:
     """Compile the two-op add chain for ``n`` f32 elements.
 
-    Two ops so that the chain carries a device-only intermediate (TMP) between
-    launches, which is part of what the callers exercise.
+    Two ops, so the chain has a device-only intermediate (TMP).
     """
     zeros = torch.zeros(n, dtype=torch.float32)
     chain = NPUChain(name)

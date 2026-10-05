@@ -809,8 +809,7 @@ def triton_matmul(
                 [_np(a), _np(b), _np(c)],
                 bo_key=key,
                 static_indices={1},
-                # The kernel writes all of `c` and the host only reads it, so
-                # it needs no host->device sync before the dispatch.
+                # `c` is a kernel output; the host only reads it.
                 intermediate_indices={2},
                 output_indices={2},
                 bound_buffers=io or None,

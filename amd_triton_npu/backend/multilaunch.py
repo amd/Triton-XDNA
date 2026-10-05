@@ -486,8 +486,7 @@ class NPUChain:
     grid determine the lowered IR); the actual data is passed to ``run`` as numpy
     arrays in combined-arg order.
 
-    A chain may hold a single op; ``scripts/test_npu_chain_single_op.py``
-    checks that it stays correct across dispatches.
+    Single-op chains are supported (``scripts/test_npu_chain_single_op.py``).
 
     Each chain that has run holds an ``xrt::hw_context``, and the NPU runs out
     of those -- at about 30 in one process, as

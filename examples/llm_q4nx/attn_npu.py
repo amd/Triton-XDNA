@@ -100,8 +100,7 @@ class _Chain:
             [kn._np(t) for t in self.bufs],
             bo_key="attn",
             static_indices=set(),
-            # The score/output pages are written by the kernels and only read
-            # by the host, so they need no sync before the dispatch.
+            # Kernel outputs; the host only reads them.
             intermediate_indices=set(range(2 * n, 3 * n)),
             output_indices=set(range(2 * n, 3 * n)),
             bound_buffers=self.io,
@@ -188,8 +187,7 @@ class NPUAttention:
         with kn._npu_driver():
             qk.run()
         for b, (lo, nc) in enumerate(spans):
-            # Not in place: the score pages are declared as carrying no host
-            # data, so the host must not write them.
+            # Out of place: the score pages are intermediates (see run()).
             S = qk.c[b].view(n_q, QB, nc) + masks[b]
             pv.a[b][:, :nc].view(n_q, QB, nc).copy_(torch.softmax(S, -1))
         with kn._npu_driver():
