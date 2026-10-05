@@ -54,7 +54,7 @@ class Gemma4FusedPrefill(Gemma4Prefill):
                 self.kv.pop(L, None)
                 owner._store_kv_rows(L, r0, k, v)
 
-        self._fused = _Fused(build_dir, max_len=self.kv_attn_maxl)
+        self._fused = _Fused(build_dir, max_len=min(self.kv_attn_maxl, self.max_seq))
 
     def load_weights(self, model=None):
         super().load_weights(model)
@@ -62,6 +62,13 @@ class Gemma4FusedPrefill(Gemma4Prefill):
         import gemma4_e2b_q4nx_weights as gw
 
         self._fused.load_weights(gw.Q4nxModel(model or self.model))
+
+    def make_npu_resident(self):
+        """Nothing to convert: the projections run in the fused prefill.
+
+        The host weights here only give the decoders the embedding, norms and
+        head, so padding them into NPU buffers would be work nothing reads.
+        """
 
     def _store_kv_rows(self, layer_idx, r0, k, v):
         """Rows [r0, r0+t) of an owning layer, into every slab that reads it."""
@@ -82,10 +89,12 @@ class Gemma4FusedPrefill(Gemma4Prefill):
     def prefill(self, ids):
         ids = [int(t) for t in np.asarray(ids).reshape(-1)]
         N = len(ids)
-        if N > self.kv_attn_maxl:
+        # Both bound the rows written below; checked before the slab is touched.
+        limit = min(self.kv_attn_maxl, self.max_seq)
+        if N > limit:
             raise ValueError(
-                f"a {N}-token prompt needs {N} KV rows, but the slab has "
-                f"ATTN_MAXL={self.kv_attn_maxl}"
+                f"a {N}-token prompt exceeds the {limit} rows this prefiller "
+                f"holds (ATTN_MAXL={self.kv_attn_maxl}, max_seq={self.max_seq})"
             )
         self._zero_slab()
         logits = torch.from_numpy(np.asarray(self._fused.prefill(ids), np.float32))

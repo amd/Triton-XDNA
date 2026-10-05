@@ -709,7 +709,7 @@ class Gemma4Prefill(LlamaPrefill):
         """Close the NPU decoder kept across turns, if one was built."""
         dec = self.__dict__.pop("_npu_decoder", None)
         if dec is not None:
-            type(dec).__mro__[1].close(dec)
+            dec.release()
 
     def clear_context(self):
         self.current_context_length = 0
@@ -1408,7 +1408,15 @@ def make_npu_decoder_class(air, prefiller):
       rearrangement, just not zero-copy.
     """
 
-    class Gemma4NpuDecode(air.FusedDecoder):
+    # `_install_shared_kv` replaces `air.FusedDecoder` with this class, so a
+    # later call would otherwise subclass the previous prefiller's adapter and
+    # reach its cached decoder through `super().__new__`. Always derive from
+    # mlir-air's own class.
+    if not hasattr(air, "_triton_fused_decoder_base"):
+        air._triton_fused_decoder_base = air.FusedDecoder
+    base = air._triton_fused_decoder_base
+
+    class Gemma4NpuDecode(base):
         # One decoder per prefiller, kept across turns. mlir-air's `generate()`
         # constructs a `FusedDecoder` on every call and closes it at the end.
         # Construction loads the template, the weights and a hardware context,
@@ -1423,6 +1431,10 @@ def make_npu_decoder_class(air, prefiller):
         def close(self):
             if getattr(prefiller, "_npu_decoder", None) is not self:
                 super().close()
+
+        def release(self):
+            """Close this decoder even though it is the one kept for reuse."""
+            base.close(self)
 
         def __init__(self, *a, **kw):
             if getattr(self, "_built", False):
