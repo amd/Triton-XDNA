@@ -486,15 +486,6 @@ class NPUChain:
     grid determine the lowered IR); the actual data is passed to ``run`` as numpy
     arrays in combined-arg order.
 
-    Known defect -- do not build a chain of exactly one op if you intend to
-    dispatch it more than once. A single-op chain returns correct data on its
-    first dispatch and corrupt data on every dispatch after that. It reproduces
-    on an unmodified checkout with plain host staging and no shared buffers, so
-    it is in the lowering or the ELF stitching rather than anything above.
-    Chains of two or more ops are unaffected. Until this is fixed, pad a
-    one-op chain with a second, trivial op -- see
-    ``examples/zero_copy/common/add_chain.py``, which does exactly that.
-
     Each chain that has run holds an ``xrt::hw_context``, and the NPU runs out
     of those -- at about 30 in one process, as
     ``DRM_IOCTL_AMDXDNA_CREATE_HWCTX ... err=-2``. A model that caches chains

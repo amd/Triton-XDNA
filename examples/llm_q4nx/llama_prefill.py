@@ -105,6 +105,25 @@ def _as_bf16(a):
     return a.astype(bfloat16)
 
 
+def _keep_freed_blocks_in_heap():
+    """Keep glibc from returning large freed blocks to the OS.
+
+    The host operators allocate activation-sized tensors on every call. By
+    default glibc serves those with mmap and unmaps them on free, so each
+    call faults its output pages in again. Raising the mmap and trim
+    thresholds lets the heap reuse them.
+    """
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+    except OSError:
+        return
+    M_TRIM_THRESHOLD, M_MMAP_THRESHOLD = -1, -3
+    libc.mallopt(M_MMAP_THRESHOLD, ctypes.c_int(1 << 30))
+    libc.mallopt(M_TRIM_THRESHOLD, ctypes.c_int(2**31 - 1))
+
+
 class OpTimer:
     """Per-op wall-clock timer. Zero overhead when disabled.
 
@@ -190,6 +209,7 @@ class LlamaPrefill:
                 "was asked for; each model runs in its own process, with its own "
                 "example directory first on sys.path"
             )
+        _keep_freed_blocks_in_heap()
         self.backend = backend
         self.enabled = self._resolve_ops(ops)
         self.timer = OpTimer(enabled=False)
@@ -326,6 +346,8 @@ class LlamaPrefill:
 
                 return kernels.triton_rms_norm(x, weight, eps)
             v = x.to(torch.float32)
+            if hasattr(torch.nn.functional, "rms_norm"):
+                return torch.nn.functional.rms_norm(v, (v.shape[-1],), weight, eps)
             inv = torch.rsqrt((v * v).mean(-1, keepdim=True) + eps)
             return v * inv * weight
 
