@@ -74,14 +74,8 @@ def add_kernel(A, B, C, n_elements: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 def build(name: str, n: int) -> NPUChain:
     """Compile the two-op add chain for ``n`` f32 elements.
 
-    Two chained adds rather than one, deliberately. A chain holding a *single*
-    op returns correct data on its first dispatch and corrupt data on every
-    dispatch after that -- a pre-existing bug in the multi-launch path,
-    reproducible on an unmodified checkout with plain host staging and no
-    shared buffers involved. Two or more ops are unaffected, which is why the
-    fused MLP in examples/gpt2 (four ops) never hit it. Do not "simplify" this
-    back to one op: both callers dispatch repeatedly, so they would report
-    wrong results for a reason that has nothing to do with what they measure.
+    Two ops so that the chain carries a device-only intermediate (TMP) between
+    launches, which is part of what the callers exercise.
     """
     zeros = torch.zeros(n, dtype=torch.float32)
     chain = NPUChain(name)

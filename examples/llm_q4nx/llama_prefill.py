@@ -105,23 +105,34 @@ def _as_bf16(a):
     return a.astype(bfloat16)
 
 
+_HEAP_KEPT = False
+
+
 def _keep_freed_blocks_in_heap():
-    """Keep glibc from returning large freed blocks to the OS.
+    """Keep glibc from returning large freed blocks to the OS, once per process.
 
     The host operators allocate activation-sized tensors on every call. By
     default glibc serves those with mmap and unmaps them on free, so each
     call faults its output pages in again. Raising the mmap and trim
-    thresholds lets the heap reuse them.
+    thresholds lets the heap reuse them; the process keeps its peak heap
+    instead of returning it between calls. Q4NX_KEEP_HEAP=0 leaves glibc's
+    defaults alone.
     """
+    global _HEAP_KEPT
+    if _HEAP_KEPT or os.environ.get("Q4NX_KEEP_HEAP", "1") == "0":
+        return
+    _HEAP_KEPT = True
     import ctypes
 
     try:
-        libc = ctypes.CDLL("libc.so.6")
-    except OSError:
+        mallopt = ctypes.CDLL("libc.so.6").mallopt
+    except (OSError, AttributeError):
         return
     M_TRIM_THRESHOLD, M_MMAP_THRESHOLD = -1, -3
-    libc.mallopt(M_MMAP_THRESHOLD, ctypes.c_int(1 << 30))
-    libc.mallopt(M_TRIM_THRESHOLD, ctypes.c_int(2**31 - 1))
+    ok = mallopt(M_MMAP_THRESHOLD, ctypes.c_int(1 << 30))
+    ok &= mallopt(M_TRIM_THRESHOLD, ctypes.c_int(2**31 - 1))
+    if not ok and os.environ.get("AMD_TRITON_NPU_DEBUG"):
+        print("[prefill] mallopt refused the heap thresholds", flush=True)
 
 
 class OpTimer:
