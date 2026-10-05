@@ -257,7 +257,7 @@ class Gemma4Prefill(LlamaPrefill):
         )
         for L in self._kv_fanout[layer_idx]:
             for region, src in pair:
-                kv_layout.scatter_rows(self._region(L, region)[:keep], src, dh)
+                kv_layout.scatter_rows(self._region(L, region)[:keep], src, dh, region)
         if layer_idx in self._kv_src:
             kf, vf = self._kv_src[layer_idx]
             kf[:keep] = k[:keep].to(torch.float32).numpy()
@@ -698,10 +698,14 @@ class Gemma4Prefill(LlamaPrefill):
         src = kv_source_layer(layer_idx)
         return (
             kv_layout.gather_rows(
-                self._region(src, kv_layout.K_REGION)[:c], head_dim(src)
+                self._region(src, kv_layout.K_REGION)[:c],
+                head_dim(src),
+                kv_layout.K_REGION,
             ),
             kv_layout.gather_rows(
-                self._region(src, kv_layout.V_REGION)[:c], head_dim(src)
+                self._region(src, kv_layout.V_REGION)[:c],
+                head_dim(src),
+                kv_layout.V_REGION,
             ),
         )
 
@@ -782,10 +786,14 @@ class Gemma4Prefill(LlamaPrefill):
             src = kv_source_layer(L)
             dh = head_dim(src)
             ks.append(
-                kv_layout.gather_rows(self._region(src, kv_layout.K_REGION)[:c], dh)
+                kv_layout.gather_rows(
+                    self._region(src, kv_layout.K_REGION)[:c], dh, kv_layout.K_REGION
+                )
             )
             vs.append(
-                kv_layout.gather_rows(self._region(src, kv_layout.V_REGION)[:c], dh)
+                kv_layout.gather_rows(
+                    self._region(src, kv_layout.V_REGION)[:c], dh, kv_layout.V_REGION
+                )
             )
         return ks, vs
 
@@ -1306,7 +1314,8 @@ class Gemma4GpuDecode:
                 N_Q_HEADS,
                 dh,
                 ATTN_SCALE,
-                lane_shift=kv_layout.DH_A // 2 - dh // 2,
+                k_shift=kv_layout.lane_shift(dh, kv_layout.K_REGION),
+                v_shift=kv_layout.lane_shift(dh, kv_layout.V_REGION),
             )
 
             a = self._mm(a, w["o"])
@@ -1464,6 +1473,23 @@ def make_npu_decoder_class(air, prefiller):
                 raise RuntimeError(
                     f"KV slab shape {prefiller._kv_host.shape} != the decoder's "
                     f"{self.KV.shape}"
+                )
+            # The layers whose V the decoder keeps at the front of its slot.
+            # The slab is written with `kv_layout`'s choice; a decoder that
+            # disagrees reads every such layer's V from the wrong lanes.
+            ours = {
+                L
+                for L in range(self.UNI)
+                if kv_layout.lane_shift(head_dim(L), kv_layout.K_REGION)
+                != kv_layout.lane_shift(head_dim(L), kv_layout.V_REGION)
+            }
+            theirs = getattr(self, "SWA", None)
+            if theirs != ours:
+                raise RuntimeError(
+                    f"the decoder places V at the front of the slot on layers "
+                    f"{sorted(theirs) if theirs is not None else 'none'}, but "
+                    f"kv_layout does on {sorted(ours)}. The mlir-air in use "
+                    f"does not match the KV layout this prefill writes."
                 )
             self._bind_slab()
             self._built = True

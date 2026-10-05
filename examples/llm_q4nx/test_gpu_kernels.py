@@ -224,7 +224,9 @@ def _qkv_post(G, dev):
         for L in fan:
             for region, t in ((kv_layout.K_REGION, k), (kv_layout.V_REGION, v)):
                 view = kv_layout.region_view(want, L, region, maxl)
-                kv_layout.scatter_rows(view[pos : pos + 1], t.to(torch.bfloat16), dh)
+                kv_layout.scatter_rows(
+                    view[pos : pos + 1], t.to(torch.bfloat16), dh, region
+                )
         ok &= check(f"kv slab dh={dh}", slab.float(), want.float(), tol=1e-6)
 
     # The prefill's form: T tokens in one launch, rows pos .. pos + T - 1, and
@@ -494,15 +496,16 @@ def main():
         vd = torch.randn(S, dh, device=dev).to(torch.bfloat16)
         slab = torch.zeros(S, KVL.REGION_W, dtype=torch.bfloat16, device=dev)
         slabv = torch.zeros_like(slab)
-        KVL.scatter_rows(slab, kd, dh)
-        KVL.scatter_rows(slabv, vd, dh)
-        shift = KVL.DH_A // 2 - dh // 2
+        KVL.scatter_rows(slab, kd, dh, KVL.K_REGION)
+        KVL.scatter_rows(slabv, vd, dh, KVL.V_REGION)
+        ks = KVL.lane_shift(dh, KVL.K_REGION)
+        vs = KVL.lane_shift(dh, KVL.V_REGION)
         ref = G.attn_decode(q, kd, vd, N_Q_HEADS, dh, 1.0)
-        got = G.attn_decode(q, slab, slabv, N_Q_HEADS, dh, 1.0, lane_shift=shift)
+        got = G.attn_decode(q, slab, slabv, N_Q_HEADS, dh, 1.0, k_shift=ks, v_shift=vs)
         # Bit-identical, not merely close: the same values reach the same
         # accumulator in the same order, and only the address arithmetic
         # differs. A tolerance here would hide a lane map that is off by one.
-        ok &= check(f"S={S} dh={dh} shift={shift}", got, ref, tol=1e-9)
+        ok &= check(f"S={S} dh={dh} shifts={ks},{vs}", got, ref, tol=1e-9)
 
     # --- prefill shapes: N > 1, which the decode cases above never reach ---
     print("\nmatmul  [M,K]@[K,N]  (prefill)")

@@ -22,15 +22,18 @@ The layout, as the decode template is built:
 
 One device row holds the model's single MQA head TWICE, once per attention
 compute unit. Every layer is built at the widest layer's geometry, so a sliding
-layer's 256-wide head does not fill its 512-wide slot and does NOT sit
-contiguously in it -- it is scattered as
+layer's 256-wide head does not fill its 512-wide slot. Where it sits depends on
+the region:
 
-    [ real_lo 128 | zeros 128 | real_hi 128 | zeros 128 ]
+    K:  [ real_lo 128 | zeros 128 | real_hi 128 | zeros 128 ]
+    V:  [ real 256                | zeros 256               ]
 
-because `fused_decode/kernels/rope.cc` pairs dimension i with i + DH_A/2 = i+256
-at the BUILD's head dim, and that scatter is what makes the kernel's fixed
-pairing land on the real (i, i+128) pairs. Upstream records the contiguous
-alternative as measured-wrong.
+K is scattered because `fused_decode/kernels/rope.cc` pairs dimension i with
+i + DH_A/2 = i+256 at the BUILD's head dim, and that scatter is what makes the
+kernel's fixed pairing land on the real (i, i+128) pairs. Upstream records the
+contiguous alternative as measured-wrong for K. V is not roped, and the decode
+streams a sliding layer's o-proj weights for the front half of the slot only,
+so its V is contiguous there. `FusedDecoder.seed_kv` is the reference for both.
 
 All 35 layer slabs are live, including the 20 that read a lower layer's cache:
 `DECODE_KV_SRC` only reaches the builder when a Makefile sets `KV_SRC`, and
@@ -42,7 +45,7 @@ L. Filling only the 15 owning slabs decodes to garbage; that was measured.
 #: Attention compute units the decode template fans the KV head across.
 N_ATTN_CU = 2
 #: The build's head dim -- the full-attention layers' width. Sliding layers are
-#: half this and are padded up to it by the interleave below.
+#: half this and are padded up to it, as the module docstring describes.
 DH_A = 512
 #: One device row: the head once per CU.
 REGION_W = N_ATTN_CU * DH_A
@@ -66,18 +69,28 @@ def slab_shape(n_layers, attn_maxl):
     return (n_layers, layer_elems(attn_maxl))
 
 
-def lane(d, dh):
+def lane_shift(dh, region):
+    """How far the second half of a `dh`-wide head is moved in its slot.
+
+    Zero for a full-width head in either region, and for V in both widths, so
+    `lane` is the identity there. The Triton kernels take this as a constexpr
+    and spell `lane` inline.
+    """
+    if region not in (K_REGION, V_REGION):
+        raise ValueError(f"region must be K_REGION or V_REGION, got {region!r}")
+    return DH_A // 2 - dh // 2 if region == K_REGION else 0
+
+
+def lane(d, dh, region):
     """Where real dimension `d` of a `dh`-wide head sits in its DH_A slot.
 
-    One expression for both head widths: at ``dh == DH_A`` the offset term is
-    zero and this is the identity, so the full layers need no special case --
-    which is the point, because a special case is a thing to get wrong. The
-    Triton kernels spell the same map as
+    One expression for both head widths and both regions; the Triton kernels
+    spell the same map as
 
-        tl.where(d < dh // 2, d, d + (DH_A // 2 - dh // 2))
+        tl.where(d < dh // 2, d, d + lane_shift(dh, region))
     """
     half = dh // 2
-    return d if d < half else d + (DH_A // 2 - half)
+    return d if d < half else d + lane_shift(dh, region)
 
 
 def region_view(slab, layer_idx, region, attn_maxl):
@@ -91,7 +104,7 @@ def region_view(slab, layer_idx, region, attn_maxl):
     return flat.reshape(attn_maxl, REGION_W)
 
 
-def _runs(dh):
+def _runs(dh, region):
     """(dst_start, src_start, width) for the real lanes of one padded head.
 
     Two contiguous runs, which is the whole reason this layout can be written
@@ -100,10 +113,10 @@ def _runs(dh):
     the identical bytes written as slices.
     """
     half = dh // 2
-    return ((0, 0, half), (DH_A // 2, half, half))
+    return ((0, 0, half), (half + lane_shift(dh, region), half, half))
 
 
-def scatter_rows(dst, src, dh):
+def scatter_rows(dst, src, dh, region):
     """Write `src` `[n, dh]` into `dst` `[n, REGION_W]`, padded and duplicated.
 
     `dst` is a `region_view` slice; `src` is the prefill's dense head. numpy and
@@ -117,11 +130,11 @@ def scatter_rows(dst, src, dh):
     """
     for cu in range(N_ATTN_CU):
         base = cu * DH_A
-        for d0, s0, w in _runs(dh):
+        for d0, s0, w in _runs(dh, region):
             dst[:, base + d0 : base + d0 + w] = src[:, s0 : s0 + w]
 
 
-def lane_index(dh):
+def lane_index(dh, region):
     """Destination lanes for ONE row's real dimensions, all CU copies, in order.
 
     `scatter_rows` is the right shape for a prefill, which writes P rows at
@@ -130,7 +143,7 @@ def lane_index(dh):
     the four slice assignments become four kernel launches. Paired with the
     source repeated once per CU,
 
-        dst[pos:pos + 1, lane_index(dh)] = row.repeat(1, N_ATTN_CU)
+        dst[pos:pos + 1, lane_index(dh, region)] = row.repeat(1, N_ATTN_CU)
 
     is one launch and lands the identical bytes. Derived from the same `_runs`
     so the two spellings cannot drift.
@@ -140,12 +153,12 @@ def lane_index(dh):
     out = []
     for cu in range(N_ATTN_CU):
         base = cu * DH_A
-        for d0, _s0, w in _runs(dh):
+        for d0, _s0, w in _runs(dh, region):
             out.append(np.arange(base + d0, base + d0 + w))
     return np.concatenate(out)
 
 
-def gather_rows(src, dh, out=None):
+def gather_rows(src, dh, region, out=None):
     """The inverse of `scatter_rows`: `[n, REGION_W]` -> `[n, dh]`.
 
     For `kv_stack()` and `--compare-cpu`, which want the dense head back. Reads
@@ -156,6 +169,6 @@ def gather_rows(src, dh, out=None):
     n = src.shape[0]
     if out is None:
         out = np.empty((n, dh), dtype=np.float32)
-    for d0, s0, w in _runs(dh):
+    for d0, s0, w in _runs(dh, region):
         out[:, s0 : s0 + w] = src[:, d0 : d0 + w]
     return out

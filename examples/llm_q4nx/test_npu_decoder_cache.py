@@ -28,6 +28,9 @@ class _FakeFusedDecoder:
     def __init__(self, model=None, max_L=None, verbose=True):
         self.ATTN_MAXL = max_L
         self.KV = np.zeros(SHAPE)
+        # Two layers, both sliding, as mlir-air's decoder records them.
+        self.UNI = SHAPE[0]
+        self.SWA = {0, 1}
         self.closed = False
 
     def close(self):

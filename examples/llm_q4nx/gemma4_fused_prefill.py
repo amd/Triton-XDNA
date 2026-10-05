@@ -80,7 +80,9 @@ class Gemma4FusedPrefill(Gemma4Prefill):
         )
         for L in self._kv_fanout[layer_idx]:
             for region, src in pair:
-                kv_layout.scatter_rows(self._region(L, region)[r0 : r0 + t], src, dh)
+                kv_layout.scatter_rows(
+                    self._region(L, region)[r0 : r0 + t], src, dh, region
+                )
         if layer_idx in self._kv_src:
             kf, vf = self._kv_src[layer_idx]
             kf[r0 : r0 + t] = k
