@@ -723,6 +723,36 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
 #: in two places that can drift apart.
 GPU_DECODE_MODELS = frozenset({"gemma4-e2b"})
 
+#: Models with an mlir-air fused NPU prefill (`--prefill-engine air-fused`).
+FUSED_PREFILL_MODELS = frozenset({"gemma4-e2b"})
+
+
+def fused_prefill_cls(cfg):
+    """A `prefill_cls` that runs mlir-air's fused NPU prefill.
+
+    Builds it through `tl.extra.npu.fused_prefill` (a cache hit after the first
+    build) and returns a factory with `run_prefill`'s calling convention. The
+    prefiller's own host path runs on the CPU backend: it only serves the
+    decoders the embedding, norms and head, so no Triton NPU chain is built.
+    """
+    import triton.language as tl
+    from gemma4_fused_prefill import Gemma4FusedPrefill
+
+    npu = tl.extra.npu
+    built = npu.fused_prefill(
+        npu.PrefillConfig(cfg.MODEL_NAME), airsrc.fused_prefill_dir()
+    )
+    print(
+        f"[fused-prefill] {built['build_dir']} "
+        f"({'cached' if built['cached'] else 'built'})",
+        flush=True,
+    )
+
+    def make(backend=None, **kw):
+        return Gemma4FusedPrefill(built["build_dir"], backend="cpu", **kw)
+
+    return make
+
 
 def generate_on_gpu(cfg, args, prefiller, first, ids):
     """Greedy decode in torch on the iGPU, seeded by the NPU prefill.
@@ -774,6 +804,15 @@ def build_parser(doc):
         help="npu: mlir-air's fused decode, all layers in one dispatch. gpu: "
         "Triton on the iGPU, token by token -- the hybrid half of a run whose "
         "prefill is still on the NPU. Only Gemma4-E2B implements it.",
+    )
+    ap.add_argument(
+        "--prefill-engine",
+        choices=("triton", "air-fused"),
+        default="triton",
+        help="what runs the prefill. triton: this repository's prefill on "
+        "--backend. air-fused: mlir-air's one-device chunked NPU prefill "
+        "(tl.extra.npu.fused_prefill), writing the same shared KV slab, so "
+        "either --decode continues from it without a copy. Gemma4-E2B only.",
     )
     ap.add_argument(
         "--backend",
@@ -880,6 +919,20 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             f"implemented for {', '.join(sorted(GPU_DECODE_MODELS))} only; "
             f"{cfg.MODEL_NAME} has none. Use --backend hetero --decode npu."
         )
+
+    if args.prefill_engine == "air-fused":
+        if cfg.MODEL_NAME not in FUSED_PREFILL_MODELS:
+            raise SystemExit(
+                f"--prefill-engine air-fused is implemented for "
+                f"{', '.join(sorted(FUSED_PREFILL_MODELS))} only; "
+                f"{cfg.MODEL_NAME} has none."
+            )
+        if getattr(args, "interactive", False):
+            raise SystemExit(
+                "--prefill-engine air-fused cannot be combined with --interactive "
+                "yet: the interactive session constructs its own prefiller."
+            )
+        prefill_cls = fused_prefill_cls(cfg)
 
     # The interactive session comes from mlir-air and always drives its own
     # fused NPU decoder; it never consults `--decode`. Accepting the pair would
