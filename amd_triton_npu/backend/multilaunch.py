@@ -307,6 +307,8 @@ class MultiLaunchRunner:
                 zero-filled: their contents belong to the caller.
             bo_key: cache key for the BO set (e.g. f"{name}_L{layer}").
             static_indices: indices written host->device on first call only.
+                Bound static indices are also synced on the first call only,
+                so the caller must not write them between dispatches.
             intermediate_indices: indices carrying no host data. Zeroed on
                 the first call for a bo_key, skipped thereafter. Outputs are
                 not implied: they are staged from the host every call unless
@@ -393,8 +395,9 @@ class MultiLaunchRunner:
                 # still sync, which is a cache operation rather than a transfer.
                 # Skipping it for operands the device overwrites would assume no
                 # host write landed since the last dispatch, which is the
-                # caller's business, not ours.
-                if first_call or i not in scratch:
+                # caller's business, not ours. Declaring an operand static is
+                # that guarantee, so a bound static operand is synced once.
+                if first_call or (i not in scratch and i not in static_set):
                     bos[i].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
                 continue
             if not first_call and (i in static_set or i in scratch):
