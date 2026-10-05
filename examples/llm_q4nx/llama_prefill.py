@@ -105,6 +105,33 @@ def _as_bf16(a):
     return a.astype(bfloat16)
 
 
+_HEAP_KEPT = False
+
+
+def _keep_freed_blocks_in_heap():
+    """Stop glibc from unmapping large freed blocks (once per process).
+
+    Host ops allocate activation-sized tensors on every call, and with the
+    default mmap threshold each one page-faults again. Q4NX_KEEP_HEAP=0 keeps
+    the glibc defaults.
+    """
+    global _HEAP_KEPT
+    if _HEAP_KEPT or os.environ.get("Q4NX_KEEP_HEAP", "1") == "0":
+        return
+    _HEAP_KEPT = True
+    import ctypes
+
+    try:
+        mallopt = ctypes.CDLL("libc.so.6").mallopt
+    except (OSError, AttributeError):
+        return
+    M_TRIM_THRESHOLD, M_MMAP_THRESHOLD = -1, -3
+    ok = mallopt(M_MMAP_THRESHOLD, ctypes.c_int(1 << 30))
+    ok &= mallopt(M_TRIM_THRESHOLD, ctypes.c_int(2**31 - 1))
+    if not ok and os.environ.get("AMD_TRITON_NPU_DEBUG"):
+        print("[prefill] mallopt refused the heap thresholds", flush=True)
+
+
 class OpTimer:
     """Per-op wall-clock timer. Zero overhead when disabled.
 
@@ -190,6 +217,7 @@ class LlamaPrefill:
                 "was asked for; each model runs in its own process, with its own "
                 "example directory first on sys.path"
             )
+        _keep_freed_blocks_in_heap()
         self.backend = backend
         self.enabled = self._resolve_ops(ops)
         self.timer = OpTimer(enabled=False)
@@ -326,6 +354,8 @@ class LlamaPrefill:
 
                 return kernels.triton_rms_norm(x, weight, eps)
             v = x.to(torch.float32)
+            if hasattr(torch.nn.functional, "rms_norm"):
+                return torch.nn.functional.rms_norm(v, (v.shape[-1],), weight, eps)
             inv = torch.rsqrt((v * v).mean(-1, keepdim=True) + eps)
             return v * inv * weight
 

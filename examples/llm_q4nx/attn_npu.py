@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 import torch
 
 import fused_mlp
@@ -89,18 +88,8 @@ class _Chain:
             self.a.append(_page((M, stride), torch.bfloat16))
             self.b.append(_page((K, N), torch.bfloat16))
             self.c.append(_page((M, N), torch.float32))
-        pad = 3 * self.n
-        self.chain.add(
-            kn._stage_pad_kernel,
-            grid=(1,),
-            arg_map={0: pad, 1: pad, 2: pad},
-            args=tuple(torch.zeros(1024) for _ in range(3)),
-            constexprs={"BLOCK": 1024},
-            transform_script=kn.script(kn._PAD_SCRIPT),
-        )
         self.bufs = [*self.a, *self.b, *self.c]
         self.io = {i: kn.shared_bo(t) for i, t in enumerate(self.bufs)}
-        self.pad = np.zeros(1024, np.float32)
 
     def close(self):
         self.chain.close()
@@ -108,10 +97,11 @@ class _Chain:
     def run(self):
         n = self.n
         self.chain.run(
-            [*(kn._np(t) for t in self.bufs), self.pad],
+            [kn._np(t) for t in self.bufs],
             bo_key="attn",
             static_indices=set(),
-            intermediate_indices={3 * n},
+            # Kernel outputs; the host only reads them.
+            intermediate_indices=set(range(2 * n, 3 * n)),
             output_indices=set(range(2 * n, 3 * n)),
             bound_buffers=self.io,
         )
@@ -197,8 +187,8 @@ class NPUAttention:
         with kn._npu_driver():
             qk.run()
         for b, (lo, nc) in enumerate(spans):
-            S = qk.c[b].view(n_q, QB, nc)
-            S.add_(masks[b])
+            # Out of place: the score pages are intermediates (see run()).
+            S = qk.c[b].view(n_q, QB, nc) + masks[b]
             pv.a[b][:, :nc].view(n_q, QB, nc).copy_(torch.softmax(S, -1))
         with kn._npu_driver():
             pv.run()

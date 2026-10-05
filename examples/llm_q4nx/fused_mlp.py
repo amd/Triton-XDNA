@@ -700,7 +700,8 @@ class FusedMLP:
                     args,
                     bo_key=f"q4nx_mlp_{self.H}_L{layer_idx}",
                     static_indices=set(static),
-                    intermediate_indices={self.CG_I, self.CU_I, self.H_I}
+                    # OUT is a kernel output; the host only reads it.
+                    intermediate_indices={self.CG_I, self.CU_I, self.H_I, self.OUT_I}
                     | set(partials)
                     | set(sums),
                     output_indices={self.OUT_I},

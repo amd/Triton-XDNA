@@ -452,7 +452,9 @@ class Gemma4Prefill(LlamaPrefill):
         """
         N = x.shape[0]
         flat = x.reshape(N * n_heads, dh)
-        if weight is None:
+        if weight is None and hasattr(torch.nn.functional, "rms_norm"):
+            out = torch.nn.functional.rms_norm(flat, (dh,), None, RMS_EPS)
+        elif weight is None:
             rms = torch.rsqrt(flat.pow(2).mean(-1, keepdim=True) + RMS_EPS)
             out = flat * rms
         else:
@@ -631,9 +633,12 @@ class Gemma4Prefill(LlamaPrefill):
         # ---- per-layer embedding injection ----
         # A GELU-tanh gate against this layer's PLE vector, projected back up
         # to D and added through the fifth norm. `_geglu` is the same operator:
-        # gelu_tanh(gate) * other.
+        # gelu_tanh(gate) * other, on the host: [N, PLI_D] is too small to
+        # offload.
         residual = x
-        gate = self._geglu(self._matmul(x, w["inp_gate"], stage_key=f"ig_L{L}"), pli)
+        gate = self._geglu(
+            self._matmul(x, w["inp_gate"], stage_key=f"ig_L{L}"), pli, backend="cpu"
+        )
         p = self._matmul(gate, w["per_layer_projection"], stage_key=f"plp_L{L}")
         x = residual + self._rms_norm(p, w["post_ple_norm"], RMS_EPS)
 

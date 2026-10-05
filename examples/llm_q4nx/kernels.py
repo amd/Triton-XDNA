@@ -655,22 +655,6 @@ def elem_block(n_elems, bytes_per_elem):
 _PROJ_CHAINS = {}
 
 
-@triton.jit
-def _stage_pad_kernel(A, B, C, BLOCK: tl.constexpr):
-    """A trivial second op, so the chain is never exactly one.
-
-    `NPUChain` documents that a one-op chain is correct on its first dispatch
-    and corrupt on every one after. Four KiB of addition costs nothing
-    measurable next to a projection and keeps the chain out of that case.
-
-    Three operands and not one because `_PAD_SCRIPT` promotes a BINARY
-    elementwise op; a one-in/one-out kernel meets it with "expected a single
-    payload op". All three indices are the same buffer at the call site.
-    """
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    tl.store(C + offs[:], tl.load(A + offs[:]) + tl.load(B + offs[:]))
-
-
 def _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script):
     """The chain that runs a `Mp x Kp @ Kp x Np` projection, built once.
 
@@ -709,25 +693,8 @@ def _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script):
         args=(),
         transform_script=tscript,
     )
-    chain.add(
-        _stage_pad_kernel,
-        grid=(1,),
-        arg_map={0: 3, 1: 3, 2: 3},
-        args=(
-            torch.zeros(1024, dtype=torch.float32),
-            torch.zeros(1024, dtype=torch.float32),
-            torch.zeros(1024, dtype=torch.float32),
-        ),
-        constexprs={"BLOCK": 1024},
-        transform_script=script(_PAD_SCRIPT),
-    )
     _PROJ_CHAINS[key] = chain
     return chain
-
-
-#: The padding op's schedule. Any elementwise one will do; this is the f32 add
-#: every model already builds.
-_PAD_SCRIPT = "gpt2/transform_add_f32_aie2p.mlir"
 
 
 def triton_matmul(
@@ -822,7 +789,6 @@ def triton_matmul(
         else shared_empty((Mp, Np), torch.float32)
     )
     if via_chain:
-        pad = np.zeros(1024, dtype=np.float32)
         # `static_indices` holds one weight per key, so a key that does not
         # identify the WEIGHT would hand the next call the last one's buffer.
         # The address does identify it. A `stage_key` alone does not: chains
@@ -840,10 +806,11 @@ def triton_matmul(
                 block_m, block_n, Mp, Np, Kp, a_stride, transform_script
             )
             got = chain.run(
-                [_np(a), _np(b), _np(c), pad],
+                [_np(a), _np(b), _np(c)],
                 bo_key=key,
                 static_indices={1},
-                intermediate_indices={3},
+                # `c` is a kernel output; the host only reads it.
+                intermediate_indices={2},
                 output_indices={2},
                 bound_buffers=io or None,
             )
