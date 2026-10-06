@@ -399,10 +399,9 @@ runs:
             fi
 
             # The KV layout our prefills hand the NPU decode in place, against
-            # mlir-air's own `seed_kv` run on the same K/V. The gate above never
-            # reaches the decode, and the iGPU decode below reads whatever
-            # layout `kv_layout` defines, so this is the only check that the
-            # two agree. No NPU and no weights: the fetched sources only.
+            # mlir-air's own `seed_kv` run on the same K/V. The decode gate
+            # above sees a wrong layout only as wrong tokens; this names the
+            # layer and lane. No NPU and no weights: the fetched sources only.
             rc=0
             echo "📁 Example: llm_q4nx/test_kv_layout.py"
             ( cd examples/llm_q4nx && python3 test_kv_layout.py ) || rc=$?
