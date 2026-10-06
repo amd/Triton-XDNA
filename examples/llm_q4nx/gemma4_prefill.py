@@ -380,7 +380,12 @@ class Gemma4Prefill(LlamaPrefill):
             print("[gemma4] fused MLP disabled by Q4NX_FUSED_MLP=0")
             return
         try:
-            from fused_mlp import FusedMLP
+            # Gate, up and the GELU merge as one GEMM by default;
+            # Q4NX_FUSED_MLP_GU=0 keeps them as three ops.
+            if os.environ.get("Q4NX_FUSED_MLP_GU", "1") == "1":
+                from fused_mlp_gu import FusedMLPGU as FusedMLP
+            else:
+                from fused_mlp import FusedMLP
 
             by_width = {}
             for L in range(self.n_layers):
@@ -1081,11 +1086,16 @@ class Gemma4GpuDecode:
             inter = mlp_inter(L)
             g, u = self._mm(h, w["gate_up"]).split([inter, inter], dim=1)
             return self._mm(gpu_kernels.geglu(g, u), w["down"])
-        Bg, Bu, Bd = self._mlp_w[L]
-        K_pad = Bg.shape[0]
+        *Bgu, Bd = self._mlp_w[L]
+        K_pad = Bgu[0].shape[0]
         hp = torch.zeros(1, K_pad, dtype=torch.float32, device=self.dev)
         hp[0, : h.shape[-1]] = h.reshape(-1)
-        y = gpu_kernels.geglu(self._mm(hp, Bg), self._mm(hp, Bu))
+        if len(Bgu) == 1:
+            # `fused_mlp_gu`: gate and up columns interleaved in one weight.
+            g, u = self._mm(hp, Bgu[0]).reshape(1, -1, 2).unbind(-1)
+        else:
+            g, u = self._mm(hp, Bgu[0]), self._mm(hp, Bgu[1])
+        y = gpu_kernels.geglu(g, u)
         return self._mm(y, Bd)[:, : self.pf._w[L]["post_ffn_norm"].shape[-1]]
 
     def _ple(self, x):

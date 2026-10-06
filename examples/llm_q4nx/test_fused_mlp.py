@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Standalone check of `fused_mlp.FusedMLP` against a torch reference.
+"""Standalone check of `fused_mlp.FusedMLP` and `fused_mlp_gu.FusedMLPGU`
+against a torch reference.
 
 Runs the chain at Gemma4's two FFN widths and at a prompt length that needs
 more than one row tile, and asserts three things the chain could get wrong
@@ -27,6 +28,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fused_mlp import FusedMLP  # noqa: E402
+from fused_mlp_gu import FusedMLPGU  # noqa: E402
 
 D = 1536  # Gemma4's model dim
 
@@ -47,11 +49,14 @@ def reference(h, gate_up, down, inter):
     return merged.to(torch.float32) @ down.to(torch.bfloat16).to(torch.float32)
 
 
-def check(inter, n_rows, layers=(0, 1)):
+def check(cls, inter, n_rows, layers=(0, 1)):
     torch.manual_seed(0)
-    print(f"\n=== inter={inter}  N={n_rows}  layers={list(layers)} ===", flush=True)
+    print(
+        f"\n=== {cls.__name__}  inter={inter}  N={n_rows}  layers={list(layers)} ===",
+        flush=True,
+    )
 
-    mlp = FusedMLP(D, inter)
+    mlp = cls(D, inter)
     w = {}
     for L in layers:
         gate_up = (torch.randn(D, 2 * inter) * 0.05).to(torch.bfloat16)
@@ -99,10 +104,13 @@ def check(inter, n_rows, layers=(0, 1)):
 
 def main():
     ok = True
-    # One row tile, then more than one, at both of Gemma4's FFN widths.
-    ok &= check(6144, 6)
-    ok &= check(6144, 163)
-    ok &= check(12288, 6)
+    # One row tile, then more than one, at both of Gemma4's FFN widths. The
+    # fused op also at a tier wider than one program's rows.
+    for cls in (FusedMLP, FusedMLPGU):
+        ok &= check(cls, 6144, 6)
+        ok &= check(cls, 6144, 163)
+        ok &= check(cls, 12288, 6)
+    ok &= check(FusedMLPGU, 12288, 600)
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
