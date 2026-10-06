@@ -1023,7 +1023,8 @@ def _qkv_post_kernel(
     stride_row,
     NQ: tl.constexpr,
     HALF: tl.constexpr,
-    LANE_SHIFT: tl.constexpr,
+    K_SHIFT: tl.constexpr,
+    V_SHIFT: tl.constexpr,
     REGION_W: tl.constexpr,
     DH_A: tl.constexpr,
     N_CU: tl.constexpr,
@@ -1037,8 +1038,8 @@ def _qkv_post_kernel(
     order, as `_rmsnorm_kernel` followed by `_rope_kernel`. Program `NQ` is
     the single KV head: `k` gets the same with `KN`, `v` the weightless norm,
     and both are rounded to bf16 and written to row `pos` of every slab in
-    `FAN`, at both attention CUs' copies and the padded-head lane map of
-    `kv_layout` -- what `Gemma4GpuDecode._append_kv` did with ~9 launches.
+    `FAN`, at both attention CUs' copies and each region's padded-head lane map
+    in `kv_layout` -- what `Gemma4GpuDecode._append_kv` did with ~9 launches.
 
     Grid axis 1 is the token, written to row `pos + t`: one token for a
     decode step, the whole prompt for a prefill. With `DENSE_KV` the roped K
@@ -1092,11 +1093,10 @@ def _qkv_post_kernel(
             row = SLAB + tl.load(FAN + f).to(tl.int64) * layer_stride + pos * REGION_W
             for cu in tl.static_range(N_CU):
                 lo = row + cu * DH_A + o
-                hi = lo + HALF + LANE_SHIFT
                 tl.store(lo, k1)
-                tl.store(hi, k2)
+                tl.store(lo + HALF + K_SHIFT, k2)
                 tl.store(lo + region_stride, v1)
-                tl.store(hi + region_stride, v2)
+                tl.store(lo + region_stride + HALF + V_SHIFT, v2)
 
 
 def qkv_post(
@@ -1128,7 +1128,7 @@ def qkv_post(
     `out_dtype` is the dtype of q and of the dense K/V. The prefill passes
     fp16, which `attn_prefill_fa` takes; the slab is bf16 either way.
     """
-    from kv_layout import DH_A, N_ATTN_CU, REGION_W
+    from kv_layout import DH_A, K_REGION, N_ATTN_CU, REGION_W, V_REGION, lane_shift
 
     lut_rows = lut_rows.reshape(-1, dh)
     T = lut_rows.shape[0]
@@ -1166,7 +1166,8 @@ def qkv_post(
         lut_rows.stride(0),
         NQ=n_q,
         HALF=dh // 2,
-        LANE_SHIFT=DH_A // 2 - dh // 2,
+        K_SHIFT=lane_shift(dh, K_REGION),
+        V_SHIFT=lane_shift(dh, V_REGION),
         REGION_W=REGION_W,
         DH_A=DH_A,
         N_CU=N_ATTN_CU,
@@ -1243,7 +1244,8 @@ def _attn_decode_kernel(
     stride_s,
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    LANE_SHIFT: tl.constexpr,
+    K_SHIFT: tl.constexpr,
+    V_SHIFT: tl.constexpr,
     HALF: tl.constexpr,
 ):
     """softmax(q . K^T * scale) . V for one token, one program per query head.
@@ -1264,22 +1266,23 @@ def _attn_decode_kernel(
     The running max and sum are the online-softmax pair, so the scores for the
     whole context never exist at once.
 
-    `stride_s` and the lane map are what let this read the cache WHERE IT LIES
+    `stride_s` and the lane maps are what let this read the cache WHERE IT LIES
     rather than a repacked copy. In the shared layout a row is `REGION_W` wide
-    and a narrow head is scattered as `[real_lo | zeros | real_hi | zeros]`
-    (see `kv_layout`), so dimension `d` of the head is at
+    and a narrow head is padded within it (see `kv_layout`), so dimension `d`
+    of the head is at
 
-        d < HALF ? d : d + LANE_SHIFT
+        d < HALF ? d : d + SHIFT
 
-    with `LANE_SHIFT = DH_A//2 - dh//2`, which is zero for a full-width head --
-    so the same expression is the identity there and there is no second case to
-    keep in step. The real lanes are two contiguous 128-element runs, so the
-    loads stay coalesced; nothing extra is fetched.
+    with `K_SHIFT` and `V_SHIFT` from `kv_layout.lane_shift`. A zero shift is
+    the identity, so the full-width heads need no second case. The real lanes
+    are at most two contiguous runs, so the loads stay coalesced; nothing extra
+    is fetched.
     """
     h = tl.program_id(0)
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < dh
-    lane = tl.where(offs_d < HALF, offs_d, offs_d + LANE_SHIFT)
+    k_lane = tl.where(offs_d < HALF, offs_d, offs_d + K_SHIFT)
+    v_lane = tl.where(offs_d < HALF, offs_d, offs_d + V_SHIFT)
     q = tl.load(Q + h * dh + offs_d, mask=mask_d, other=0.0).to(tl.float32)
 
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
@@ -1290,7 +1293,7 @@ def _attn_decode_kernel(
         offs_s = j0 + tl.arange(0, BLOCK_S)
         mask_s = offs_s < S
         k = tl.load(
-            KC + offs_s[:, None] * stride_s + lane[None, :],
+            KC + offs_s[:, None] * stride_s + k_lane[None, :],
             mask=mask_s[:, None] & mask_d[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -1304,7 +1307,7 @@ def _attn_decode_kernel(
         acc = acc * alpha
 
         v = tl.load(
-            VC + offs_s[:, None] * stride_s + lane[None, :],
+            VC + offs_s[:, None] * stride_s + v_lane[None, :],
             mask=mask_s[:, None] & mask_d[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -1314,14 +1317,14 @@ def _attn_decode_kernel(
     tl.store(OUT + h * dh + offs_d, acc / l_i, mask=mask_d)
 
 
-def attn_decode(q, kc, vc, n_heads, dh, scale, block_s=64, lane_shift=0):
+def attn_decode(q, kc, vc, n_heads, dh, scale, block_s=64, k_shift=0, v_shift=0):
     """q: [1, n_heads*dh] against kc/vc: [S, *] -> [1, n_heads*dh].
 
     `kc`/`vc` are rows of the cache, NOT necessarily `[S, dh]` and NOT required
-    to be contiguous: the row stride is read off the tensor and `lane_shift`
-    places the second half of a padded head (see `_attn_decode_kernel`). A
-    caller holding a dense `[S, dh]` cache passes `lane_shift=0` and gets the
-    previous behaviour exactly.
+    to be contiguous: the row stride is read off the tensor, and `k_shift` and
+    `v_shift` place the second half of a padded head in each (see
+    `_attn_decode_kernel`). A caller holding a dense `[S, dh]` cache leaves
+    both at 0.
 
     The tensors are deliberately NOT forced contiguous. They used to be, which
     was free while every caller held a dense cache and would now silently
@@ -1329,7 +1332,7 @@ def attn_decode(q, kc, vc, n_heads, dh, scale, block_s=64, lane_shift=0):
     copy this signature exists to avoid.
 
     `block_s` is fixed, so the only constexprs that vary are `BLOCK_D` and the
-    lane map, and `dh` takes two values on this model -- two compiles per run.
+    lane maps, and `dh` takes two values on this model -- two compiles per run.
     """
     S = kc.shape[0]
     if kc.stride(0) != vc.stride(0):
@@ -1350,7 +1353,8 @@ def attn_decode(q, kc, vc, n_heads, dh, scale, block_s=64, lane_shift=0):
         kc.stride(0),
         BLOCK_S=block_s,
         BLOCK_D=_pow2(dh),
-        LANE_SHIFT=lane_shift,
+        K_SHIFT=k_shift,
+        V_SHIFT=v_shift,
         HALF=dh // 2,
     )
     return out.reshape(1, n_heads * dh)

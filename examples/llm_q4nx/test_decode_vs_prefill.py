@@ -19,7 +19,7 @@ checks, not the logits.
 Run it by hand; `llm_q4nx` is excluded from the `run_tests.py` sweep as a
 library. Exits 77 without an iGPU, the decode under test being the GPU one.
 
-    python test_decode_vs_prefill.py [--tokens 4] [--long]
+    python test_decode_vs_prefill.py [--tokens 4] [--long] [--npu-decode]
 
 It reports a disagreement between the two decoders. The GPU decode matches the
 oracle on every prompt tried; mlir-air's fused NPU decode matches on the
@@ -85,7 +85,18 @@ def main():
         help="air-fused: also run mlir-air's fused NPU prefill on each prompt "
         "and decode from its slab on the iGPU",
     )
+    ap.add_argument(
+        "--npu-decode",
+        action="store_true",
+        help="also decode each prompt with mlir-air's fused NPU decode, reading "
+        "the host prefill's slab in place. Needs a decode template built at "
+        "the pinned mlir-air",
+    )
     a = ap.parse_args()
+    if a.npu_decode and a.tokens < 2:
+        # The first token comes from the prefill, so fewer than two never
+        # dispatches a decode step and the row would check nothing.
+        ap.error("--npu-decode needs --tokens 2 or more")
 
     if not torch.cuda.is_available():
         print("SKIP: no ROCm device; the decode under test is the GPU one")
@@ -106,6 +117,13 @@ def main():
 
         fused = fused_prefill_cls(cfg)(n_layers=cfg.N_LAYERS, max_seq=2048)
         load_prefill_weights(fused, "cpu", npu_resident=False)
+
+    air = None
+    if a.npu_decode:
+        import harness
+        import registry
+
+        air = harness.air_inference_module(registry.spec(cfg.MODEL_NAME))
 
     prompts = list(PROMPTS)
     if a.long:
@@ -174,6 +192,12 @@ def main():
                 f"{'ok' if good else 'MISMATCH'}"
             )
 
+        if air is not None:
+            ok &= _npu_decode_row(air, m, ids, oracle, a.tokens)
+
+    if air is not None:
+        m.release_npu_decoder()
+
     # A prompt longer than the slab or the RoPE tables (`max_seq`) must be
     # refused before it writes anything.
     try:
@@ -185,6 +209,45 @@ def main():
 
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def _npu_decode_row(air, m, ids, oracle, n):
+    """mlir-air's NPU decode from the host prefill's slab, in place.
+
+    The decode reads the rows the prefill wrote, so this is the row that checks
+    `kv_layout` against the decode template; the iGPU rows cannot, since the
+    iGPU decode reads whatever layout `kv_layout` defines.
+
+    The reference is the same prefill's K/V seeded by mlir-air's own
+    `seed_kv`: identical bytes in the cache, so the tokens must be identical.
+    The oracle is not the gate here. mlir-air's decode departs from it on some
+    prompts even from its own exact prefill and seed.
+    """
+    import harness
+
+    m.prefill(ids)
+    first = m.last_first_token
+    base = getattr(air, "_triton_fused_decoder_base", air.FusedDecoder)
+
+    def run(fused_decoder, ks, vs):
+        air.FusedDecoder = fused_decoder
+        air._prefill_npu = lambda prompt, model, seq_len=None: (ks, vs, first, 0.0)
+        return list(air.generate(list(ids), n - 1, ignore_eos=True)[0])
+
+    want = run(base, *m.kv_stack())
+    ks, vs = harness._install_shared_kv(air, m)
+    got = run(air.FusedDecoder, ks, vs)
+    good = got == want
+    note = (
+        " (mlir-air's own seed departs from the oracle here too)"
+        if want[: len(oracle)] != oracle
+        else ""
+    )
+    print(
+        f"  npu decode     : {got}   upstream seed_kv {want}   "
+        f"{'ok' if good else 'MISMATCH'}{note}"
+    )
+    return good
 
 
 if __name__ == "__main__":
