@@ -102,25 +102,36 @@ def main():
         print("SKIP: no ROCm device; the decode under test is the GPU one")
         return 77
 
+    import airsrc
     import config as cfg
+    import harness
     from gemma4_prefill import Gemma4GpuDecode, Gemma4Prefill
     from harness import load_prefill_weights
 
-    m = Gemma4Prefill(backend=a.backend, n_layers=cfg.N_LAYERS, max_seq=2048)
-    # `npu_resident=False`: the padded resident form is one-way and a decode
-    # that then multiplies with it raises. See `Gemma4GpuDecode`.
-    load_prefill_weights(m, a.backend, npu_resident=False)
+    # Skipped rather than failed when mlir-air's sources or the weights cannot
+    # be had, as the example entry points do: neither is this test's subject.
+    try:
+        airsrc.air_llms_root()
+    except RuntimeError as e:
+        print(f"SKIP: {e}")
+        return harness.SKIP_EXIT_CODE
 
+    m = Gemma4Prefill(backend=a.backend, n_layers=cfg.N_LAYERS, max_seq=2048)
     fused = None
     if a.prefill_engine == "air-fused":
-        from harness import fused_prefill_cls
-
-        fused = fused_prefill_cls(cfg)(n_layers=cfg.N_LAYERS, max_seq=2048)
-        load_prefill_weights(fused, "cpu", npu_resident=False)
+        fused = harness.fused_prefill_cls(cfg)(n_layers=cfg.N_LAYERS, max_seq=2048)
+    try:
+        # `npu_resident=False`: the padded resident form is one-way and a
+        # decode that then multiplies with it raises. See `Gemma4GpuDecode`.
+        load_prefill_weights(m, a.backend, npu_resident=False)
+        if fused is not None:
+            load_prefill_weights(fused, "cpu", npu_resident=False)
+    except Exception as e:  # noqa: BLE001 -- as harness.run_prefill
+        print(f"SKIP: cannot load the q4nx weights: {e}")
+        return harness.SKIP_EXIT_CODE
 
     air = None
     if a.npu_decode:
-        import harness
         import registry
 
         air = harness.air_inference_module(registry.spec(cfg.MODEL_NAME))
