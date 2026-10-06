@@ -103,6 +103,9 @@ def main():
     ok &= check(6144, 6)
     ok &= check(6144, 163)
     ok &= check(12288, 6)
+    # A tier wide enough for the gate/up epilogues (GATE_EPILOGUE_MIN_ROWS).
+    ok &= check(6144, 600)
+    ok &= check(12288, 600)
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
