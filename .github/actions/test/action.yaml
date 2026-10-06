@@ -378,10 +378,25 @@ runs:
             # per-layer output scalar are all right, and every one of them
             # fails into fluent wrong text rather than an error.
             #
-            # Prefill only, like its siblings, so it does NOT cover the decode
-            # -- which on this model is the one built by a different engine.
-            # That is `make run` locally.
-            gate gemma4_e2b_q4nx --prefill-only
+            # Then the NPU decode, reading the prefill's KV slab in place --
+            # the handoff no other gate reaches, since the iGPU decode below
+            # reads whatever layout `kv_layout` defines. The recorded
+            # continuation ends with the stop token: a decode reading a
+            # corrupted cache still says " Paris." first. The decode's packed
+            # weight cache is built here on first use, and the NPU-decode row
+            # of test_decode_vs_prefill.py in STEP 10 reuses it.
+            build_rc=0
+            echo "📁 Example: gemma4_e2b_q4nx (decode build)"
+            ( cd examples/gemma4_e2b_q4nx && make compile-decode ) || build_rc=$?
+            if [ "$build_rc" -ne 0 ]; then
+              echo "   ❌ FAIL: make compile-decode (exit code $build_rc)"
+              q_fail=$((q_fail + 1))
+              gate gemma4_e2b_q4nx --prefill-only
+            else
+              echo "   ✅ PASS: make compile-decode"
+              q_pass=$((q_pass + 1))
+              gate gemma4_e2b_q4nx --decode npu --max-tokens 8 --greedy
+            fi
 
             # The KV layout our prefills hand the NPU decode in place, against
             # mlir-air's own `seed_kv` run on the same K/V. The gate above never
@@ -475,6 +490,22 @@ runs:
               hetero_rc=1
             fi
           done
+
+          # Each decode against a prefill re-run over the growing prefix, and
+          # mlir-air's NPU decode from the prefill's slab against the tokens
+          # its own `seed_kv` gives for the same K/V. Here and not in 9b
+          # because its other rows need the iGPU; the decode template and
+          # weight cache come from the Gemma4 gate in 9b.
+          echo "--- gemma4_e2b_q4nx: test_decode_vs_prefill.py --npu-decode ---"
+          rc=0
+          ( cd examples/llm_q4nx \
+            && python test_decode_vs_prefill.py --npu-decode ) || rc=$?
+          if [ "$rc" -eq 77 ]; then
+            echo "SKIP: test_decode_vs_prefill.py --npu-decode (exit 77)"
+          elif [ "$rc" -ne 0 ]; then
+            echo "FAIL: test_decode_vs_prefill.py --npu-decode (exit $rc)"
+            hetero_rc=1
+          fi
 
           # XRT zero-copy needs the iGPU, so it runs here, not in 9b (which hides
           # it). The golden gate passes on the staged fallback too, so the output
