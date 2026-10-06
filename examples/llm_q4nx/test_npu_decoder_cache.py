@@ -71,32 +71,3 @@ def test_close_keeps_the_cached_decoder_and_release_closes_it():
     Gemma4Prefill.release_npu_decoder(pf)
     assert dec.closed
     assert getattr(pf, "_npu_decoder", None) is None
-
-
-class _Chain:
-    def __init__(self):
-        self._runner = object()
-
-    def close(self):
-        self._runner = None
-
-
-def test_the_chains_give_up_their_contexts_before_the_decoder_opens():
-    import weakref
-
-    from triton.backends.amd_triton_npu.multilaunch import NPUChain
-
-    chain = _Chain()
-    NPUChain._open[id(chain)] = weakref.ref(chain)
-    seen = []
-
-    class _Recording(_FakeFusedDecoder):
-        def __init__(self, *a, **kw):
-            seen.append(chain._runner)
-            super().__init__(*a, **kw)
-
-    air = SimpleNamespace(FusedDecoder=_Recording)
-    dec = _install(air, _prefiller("a"))
-    assert seen == [None], "the decoder opened while a chain still held its context"
-    assert not NPUChain._open
-    assert dec.kvc == "bo-a"
