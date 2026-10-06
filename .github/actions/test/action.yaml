@@ -392,6 +392,13 @@ runs:
             else
               echo "   ✅ PASS: make compile-decode"
               q_pass=$((q_pass + 1))
+              # TEMPORARY, diagnostic only: mlir-air's decode with none of our
+              # code in the path, before ours. Not counted in the roll-up.
+              probe_rc=0
+              ( cd examples/gemma4_e2b_q4nx \
+                && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+                   timeout 1500 python probe_air_decode.py ) || probe_rc=$?
+              echo "   PROBE: probe_air_decode.py exit $probe_rc"
               gate gemma4_e2b_q4nx --decode npu --max-tokens 8 --greedy
             fi
 
