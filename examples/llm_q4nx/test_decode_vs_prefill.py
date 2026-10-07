@@ -38,6 +38,9 @@ import sys
 import numpy as np
 import torch
 
+#: The NPU's XRT device, held for the whole run; see `main`.
+_npu = None
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 #: Gemma4-specific, so it reaches into that example for `config`. This
 #: directory is a library and has none of its own -- every model keeps its
@@ -98,29 +101,49 @@ def main():
         # dispatches a decode step and the row would check nothing.
         ap.error("--npu-decode needs --tokens 2 or more")
 
+    # XRT opens the NPU before torch starts ROCm, and keeps it open. ROCm's
+    # runtime opens the NPU too, as an AIE agent, and holds it; some amdxdna
+    # drivers then refuse XRT's open as busy. Whichever opens second must be
+    # ROCm, which carries on without its AIE agent.
+    global _npu
+    import pyxrt
+
+    _npu = pyxrt.device(0)
+
     if not torch.cuda.is_available():
         print("SKIP: no ROCm device; the decode under test is the GPU one")
         return 77
 
+    import airsrc
     import config as cfg
+    import harness
     from gemma4_prefill import Gemma4GpuDecode, Gemma4Prefill
     from harness import load_prefill_weights
 
-    m = Gemma4Prefill(backend=a.backend, n_layers=cfg.N_LAYERS, max_seq=2048)
-    # `npu_resident=False`: the padded resident form is one-way and a decode
-    # that then multiplies with it raises. See `Gemma4GpuDecode`.
-    load_prefill_weights(m, a.backend, npu_resident=False)
+    # Skipped rather than failed when mlir-air's sources or the weights cannot
+    # be had, as the example entry points do: neither is this test's subject.
+    try:
+        airsrc.air_llms_root()
+    except RuntimeError as e:
+        print(f"SKIP: {e}")
+        return harness.SKIP_EXIT_CODE
 
+    m = Gemma4Prefill(backend=a.backend, n_layers=cfg.N_LAYERS, max_seq=2048)
     fused = None
     if a.prefill_engine == "air-fused":
-        from harness import fused_prefill_cls
-
-        fused = fused_prefill_cls(cfg)(n_layers=cfg.N_LAYERS, max_seq=2048)
-        load_prefill_weights(fused, "cpu", npu_resident=False)
+        fused = harness.fused_prefill_cls(cfg)(n_layers=cfg.N_LAYERS, max_seq=2048)
+    try:
+        # `npu_resident=False`: the padded resident form is one-way and a
+        # decode that then multiplies with it raises. See `Gemma4GpuDecode`.
+        load_prefill_weights(m, a.backend, npu_resident=False)
+        if fused is not None:
+            load_prefill_weights(fused, "cpu", npu_resident=False)
+    except Exception as e:  # noqa: BLE001 -- as harness.run_prefill
+        print(f"SKIP: cannot load the q4nx weights: {e}")
+        return harness.SKIP_EXIT_CODE
 
     air = None
     if a.npu_decode:
-        import harness
         import registry
 
         air = harness.air_inference_module(registry.spec(cfg.MODEL_NAME))
@@ -225,6 +248,10 @@ def _npu_decode_row(air, m, ids, oracle, n):
     """
     import harness
 
+    # One decoder at a time: the decoder kept from the previous prompt holds
+    # hardware contexts that the reference decoder below needs, and a driver
+    # that grants fewer of them refuses it.
+    m.release_npu_decoder()
     m.prefill(ids)
     first = m.last_first_token
     base = getattr(air, "_triton_fused_decoder_base", air.FusedDecoder)
@@ -236,7 +263,14 @@ def _npu_decode_row(air, m, ids, oracle, n):
 
     want = run(base, *m.kv_stack())
     ks, vs = harness._install_shared_kv(air, m)
-    got = run(air.FusedDecoder, ks, vs)
+    try:
+        got = run(air.FusedDecoder, ks, vs)
+    finally:
+        # The adapter keeps its decoder for the next turn. Here the next
+        # prompt opens the reference decoder first, and with this one still
+        # open the process holds two; the driver can refuse the second's
+        # hardware context.
+        m.release_npu_decoder()
     good = got == want
     note = (
         " (mlir-air's own seed departs from the oracle here too)"
