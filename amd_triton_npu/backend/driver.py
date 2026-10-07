@@ -41,6 +41,49 @@ from .transform_inject import _inject_transform_library
 
 IS_WINDOWS = sys.platform == "win32"
 
+
+def _make_active_driver_per_thread():
+    """Keep Triton's active driver per thread instead of per process.
+
+    Triton holds one active driver for the whole process, and a hetero model
+    switches it per scope: the NPU driver around NPU launches and NPUChain
+    warmups, the AMD one around iGPU work. With those in two threads, a switch
+    in one thread changes the backend the other compiles and launches for.
+
+    Triton's ``DriverConfig`` keeps the choice in ``_active``. Its one instance
+    gets a subclass that keeps the choice in a ContextVar instead. A thread
+    that has not chosen a driver since then sees the one that was active
+    process-wide when this ran.
+
+    Called from ``NPUDriver.__init__``, which every switch to the NPU goes
+    through, rather than at import: this module is imported while Triton is
+    still discovering backends, before ``triton.runtime.driver`` can load.
+    """
+    import contextvars
+
+    from triton.runtime.driver import driver as config
+
+    if getattr(type(config), "per_thread", False):
+        return
+    unset = object()
+    active = contextvars.ContextVar("triton_active_driver", default=unset)
+    shared = config.__dict__.pop("_active", None)
+
+    class PerThreadDriverConfig(type(config)):
+        per_thread = True
+
+        @property
+        def _active(self):
+            driver = active.get()
+            return shared if driver is unset else driver
+
+        @_active.setter
+        def _active(self, driver):
+            active.set(driver)
+
+    config.__class__ = PerThreadDriverConfig
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.CRITICAL)
 if npu_config.debug:
@@ -617,6 +660,74 @@ def _run_compile(cmd, env=None):
         raise subprocess.CalledProcessError(
             result.returncode, cmd, output=result.stdout
         )
+
+
+_npu_wait = None
+
+
+def npu_wait_module():
+    """The ``npu_wait`` extension, built once and cached; None where unusable.
+
+    Its ``wait(run)`` is ``pyxrt.run.wait2`` with the GIL released, so other
+    Python threads, such as one driving the iGPU, keep running while the NPU
+    executes. See ``include/NpuWait/NpuWait.cpp`` for how it reaches the
+    ``xrt::run`` and when pyxrt declines to hand it over. Linux only: the
+    Windows pyxrt is built by MSVC, whose ABI id the helper does not form.
+    """
+    global _npu_wait
+    if _npu_wait is None:
+        _npu_wait = False
+        if not IS_WINDOWS:
+            try:
+                _npu_wait = _build_npu_wait()
+            except Exception as e:  # noqa: BLE001 -- fall back to pyxrt's wait
+                logger.warning("npu_wait unavailable, NPU waits hold the GIL: %s", e)
+    return _npu_wait or None
+
+
+def _build_npu_wait():
+    import sysconfig
+    import importlib.machinery
+
+    include_dir = os.path.join(Path(__file__).resolve().parent, "include")
+    src_path = os.path.join(include_dir, "NpuWait", "NpuWait.cpp")
+    xrt_dir = _get_xrt_path()
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    gxx = subprocess.run(
+        ["g++", "-dumpfullversion"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    with open(src_path, "rb") as f:
+        key_src = f.read() + f"_xrt_{xrt_dir}_{suffix}_gxx_{gxx}_npuwait".encode()
+    cache = get_cache_manager(hashlib.md5(key_src).hexdigest())
+    name = "npu_wait" + suffix
+    path = cache.get_file(name)
+    if path is None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, name)
+            _run_compile(
+                [
+                    "g++",
+                    "-std=c++17",
+                    "-shared",
+                    "-fPIC",
+                    "-O2",
+                    src_path,
+                    f"-I{sysconfig.get_paths()['include']}",
+                    f"-I{os.path.join(xrt_dir, 'include')}",
+                    f"-L{os.path.join(xrt_dir, 'lib')}",
+                    f"-Wl,-rpath,{os.path.join(xrt_dir, 'lib')}",
+                    "-lxrt_coreutil",
+                    "-o",
+                    out_path,
+                ]
+            )
+            with open(out_path, "rb") as f:
+                path = cache.put(f.read(), name, binary=True)
+    loader = importlib.machinery.ExtensionFileLoader("npu_wait", path)
+    spec = importlib.util.spec_from_file_location("npu_wait", path, loader=loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
 
 
 def _build_hsa_runtime_lib(include_dir: str, rocr: _RocrInstall) -> str:
@@ -1487,6 +1598,7 @@ def _generate_launcher(constants, signature, kernel_name):
 #include <cstdlib>
 #include <ctime>
 #include <sstream>
+#include <string>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -1512,7 +1624,7 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 }}
 
 // Call to XRT goes here:
-static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {arg_decls}) {{
+static void _launch(std::string &err, int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
     try {{
 
@@ -1627,8 +1739,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
         std::cout << "Launch finished." << std::endl;
 
     }} catch (const std::exception& e) {{
-        std::string msg = std::string("XRT runtime error: ") + e.what();
-        PyErr_SetString(PyExc_RuntimeError, msg.c_str());
+        err = std::string("XRT runtime error: ") + e.what();
     }}
   }}
 }}
@@ -1660,7 +1771,16 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
   {"; ".join([f"long nelem{i} = getNumElements(_arg{i}); long ebytes{i} = getElementSizeInBytes(_arg{i}); if (nelem{i} == -1 || ebytes{i} == -1) return NULL; long tensor_volume{i} = nelem{i} * ebytes{i};" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  _launch(gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+  // The device work runs without the GIL, as a GPU wait does, so other
+  // Python threads keep running while the NPU executes.
+  std::string launch_err;
+  Py_BEGIN_ALLOW_THREADS
+  _launch(launch_err, gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+  Py_END_ALLOW_THREADS
+  if (!launch_err.empty()) {{
+    PyErr_SetString(PyExc_RuntimeError, launch_err.c_str());
+    return NULL;
+  }}
 
   if (PyErr_Occurred()) {{
     return NULL;
@@ -1747,7 +1867,9 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -1795,10 +1917,17 @@ static Session& session() {{
     return s;
 }}
 
+// Launches run without the GIL, so two threads can reach the same session.
+static std::mutex& session_mutex() {{
+    static std::mutex m;
+    return m;
+}}
+
 // Give the session back. The device is kept: opening it costs ~11 ms and it is
 // not rationed, so there is nothing to gain by releasing it. Everything built
 // from it goes, innermost first, and the next launch rebuilds what it needs.
 static PyObject* py_release_session(PyObject* self, PyObject* args) {{
+    std::lock_guard<std::mutex> lock(session_mutex());
     Session& s = session();
     {' '.join(f's.bo_{i} = xrt::bo(); s.cap{i} = -1;' for i, ty in ptr_args)}
     s.kernel = xrt::kernel();
@@ -1816,6 +1945,7 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
         return NULL;
     }}
 
+    std::lock_guard<std::mutex> lock(session_mutex());
     strncpy(elf_path, elf, sizeof(elf_path) - 1);
     elf_path[sizeof(elf_path) - 1] = '\\0';
     strncpy(elf_kernel_name, kname, sizeof(elf_kernel_name) - 1);
@@ -1825,7 +1955,8 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 }}
 
 // ELF-based XRT launch:
-static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in ptr_args)}, {arg_decls}) {{
+static void _launch(std::string &err, int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in ptr_args)}, {arg_decls}) {{
+  std::lock_guard<std::mutex> lock(session_mutex());
   if (gridX*gridY*gridZ > 0) {{
     try {{
 
@@ -1891,8 +2022,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
         std::cout << "Launch finished." << std::endl;
 
     }} catch (const std::exception& e) {{
-        std::string msg = std::string("XRT runtime error: ") + e.what();
-        PyErr_SetString(PyExc_RuntimeError, msg.c_str());
+        err = std::string("XRT runtime error: ") + e.what();
     }}
   }}
 }}
@@ -1924,7 +2054,16 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
   {"; ".join([f"long nelem{i} = getNumElements(_arg{i}); long ebytes{i} = getElementSizeInBytes(_arg{i}); if (nelem{i} == -1 || ebytes{i} == -1) return NULL; long tensor_volume{i} = nelem{i} * ebytes{i};" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  _launch(gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+  // The device work runs without the GIL, as a GPU wait does, so other
+  // Python threads keep running while the NPU executes.
+  std::string launch_err;
+  Py_BEGIN_ALLOW_THREADS
+  _launch(launch_err, gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+  Py_END_ALLOW_THREADS
+  if (!launch_err.empty()) {{
+    PyErr_SetString(PyExc_RuntimeError, launch_err.c_str());
+    return NULL;
+  }}
 
   if (PyErr_Occurred()) {{
     return NULL;
@@ -2792,6 +2931,7 @@ class NPUDriver(DriverBase):
         var, itself defaulting to ``"xrt"``), so ``NPUDriver()`` honors the
         environment while ``NPUDriver("hsa")`` / ``NPUDriver("xrt")`` force it.
         """
+        _make_active_driver_per_thread()
         super().__init__()
         if runtime is None:
             # Already validated + normalized by the config property.

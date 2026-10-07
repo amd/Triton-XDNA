@@ -1,0 +1,101 @@
+// Wait for a pyxrt.run without holding the GIL.
+//
+// pyxrt's own run.wait / run.wait2 block in the driver with the GIL held, so
+// every other Python thread stops for the whole NPU command. A GPU wait in
+// torch releases it. This does the same for the NPU: it takes the xrt::run
+// behind a pyxrt.run and calls wait2 with the GIL released.
+//
+// The xrt::run is obtained through pybind11's cpp conduit
+// (`_pybind11_conduit_v1_`), which hands the pointer over only when the
+// caller names the same platform ABI as the module that owns it. The id is
+// formed as pybind11 2.x forms it for a GCC/libstdc++ build, from the
+// compiler building this file. When pyxrt's id differs, from another
+// compiler, standard library or pybind11 spelling, pyxrt declines and the
+// caller falls back to pyxrt's own wait.
+
+#include <Python.h>
+
+#include <exception>
+#include <string>
+#include <typeinfo>
+
+#include "xrt/xrt_kernel.h"
+
+#if !defined(__GNUC__) || defined(__clang__) || !defined(__GLIBCXX__)
+#error "NpuWait is built with g++ against libstdc++"
+#endif
+
+static std::string abi_id() {
+  return "_gcc_libstdcpp_cxxabi" + std::to_string(__GXX_ABI_VERSION);
+}
+
+// The xrt::run behind `obj`, or nullptr (no Python error set) if pyxrt declines.
+static xrt::run *as_run(PyObject *obj) {
+  PyObject *ti = PyCapsule_New(const_cast<std::type_info *>(&typeid(xrt::run)),
+                               typeid(std::type_info).name(), nullptr);
+  if (!ti)
+    return nullptr;
+  std::string id = abi_id();
+  PyObject *cap = PyObject_CallMethod(obj, "_pybind11_conduit_v1_", "y#Oy",
+                                      id.data(), (Py_ssize_t)id.size(), ti,
+                                      "raw_pointer_ephemeral");
+  Py_DECREF(ti);
+  if (!cap) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  void *ptr = nullptr;
+  if (PyCapsule_CheckExact(cap))
+    ptr = PyCapsule_GetPointer(cap, PyCapsule_GetName(cap));
+  Py_DECREF(cap);
+  if (!ptr)
+    PyErr_Clear();
+  return static_cast<xrt::run *>(ptr);
+}
+
+static PyObject *py_supported(PyObject *, PyObject *args) {
+  PyObject *obj;
+  if (!PyArg_ParseTuple(args, "O", &obj))
+    return nullptr;
+  return PyBool_FromLong(as_run(obj) != nullptr);
+}
+
+// Same contract as pyxrt's wait2: returns once the run completed, raises
+// otherwise.
+static PyObject *py_wait(PyObject *, PyObject *args) {
+  PyObject *obj;
+  if (!PyArg_ParseTuple(args, "O", &obj))
+    return nullptr;
+  // `obj` is borrowed from the argument tuple, which outlives the wait, so the
+  // ephemeral pointer stays valid.
+  xrt::run *run = as_run(obj);
+  if (!run) {
+    PyErr_SetString(PyExc_TypeError,
+                    "pyxrt.run does not share this module's C++ ABI");
+    return nullptr;
+  }
+  std::string err;
+  Py_BEGIN_ALLOW_THREADS
+  try {
+    run->wait2();
+  } catch (const std::exception &e) {
+    err = e.what();
+  }
+  Py_END_ALLOW_THREADS
+  if (!err.empty()) {
+    PyErr_SetString(PyExc_RuntimeError, err.c_str());
+    return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+static PyMethodDef Methods[] = {
+    {"supported", py_supported, METH_VARARGS,
+     "Whether this pyxrt.run can be waited on here"},
+    {"wait", py_wait, METH_VARARGS, "pyxrt.run.wait2 without the GIL"},
+    {nullptr, nullptr, 0, nullptr}};
+
+static struct PyModuleDef Module = {PyModuleDef_HEAD_INIT, "npu_wait", nullptr,
+                                    -1, Methods};
+
+PyMODINIT_FUNC PyInit_npu_wait(void) { return PyModule_Create(&Module); }

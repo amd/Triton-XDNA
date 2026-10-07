@@ -33,7 +33,25 @@ from .driver import (
     _get_cached_aircc_artifacts,
     _put_aircc_artifacts,
     detect_npu_version,
+    npu_wait_module,
 )
+
+_wait_nogil = None
+
+
+def _wait(run):
+    """``run.wait2()``, with the GIL released when ``npu_wait`` can take the run.
+
+    Decided on the first run and kept: every run comes from the same pyxrt.
+    """
+    global _wait_nogil
+    if _wait_nogil is None:
+        mod = npu_wait_module()
+        _wait_nogil = mod.wait if mod is not None and mod.supported(run) else False
+    if _wait_nogil:
+        _wait_nogil(run)
+    else:
+        run.wait2()
 
 
 def _extract_air_arg_types(air_text):
@@ -419,7 +437,7 @@ class MultiLaunchRunner:
         for i, bo in enumerate(bos):
             run.set_arg(i, bo)
         run.start()
-        run.wait2()
+        _wait(run)
 
         results = {}
         for idx in readback:
