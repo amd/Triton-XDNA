@@ -263,7 +263,14 @@ def _npu_decode_row(air, m, ids, oracle, n):
 
     want = run(base, *m.kv_stack())
     ks, vs = harness._install_shared_kv(air, m)
-    got = run(air.FusedDecoder, ks, vs)
+    try:
+        got = run(air.FusedDecoder, ks, vs)
+    finally:
+        # The adapter keeps its decoder for the next turn. Here the next
+        # prompt opens the reference decoder first, and with this one still
+        # open the process holds two; the driver can refuse the second's
+        # hardware context.
+        m.release_npu_decoder()
     good = got == want
     note = (
         " (mlir-air's own seed departs from the oracle here too)"
