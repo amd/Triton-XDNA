@@ -41,8 +41,8 @@ SPARSE_PATHS = (
     # -- so Gemma4's `make compile-decode` fails before it builds anything.
     "programming_examples/fused_decode_ple",
     "programming_examples/llms",
-    # The AIE kernels Gemma4's fused prefill compiles beside its own
-    # (`llms/gemma4_e2b_q4nx/fused_prefill/build.py`).
+    # The AIE kernels the fused prefill compiles beside its own
+    # (`llms/shared/fused_prefill/build.py`, which `llms` above carries).
     "programming_examples/matrix_multiplication/bf16_in_fp32_out",
     "programming_examples/flash_attention/kernel_fusion_based",
 )

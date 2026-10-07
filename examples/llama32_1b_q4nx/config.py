@@ -51,9 +51,14 @@ BOS = 128000  # <|begin_of_text|>, for the session warmup
 #: This is the only assertion that covers the decode at all -- the first-token
 #: gate above is pure prefill, and every decode-side fact these examples carry
 #: (the builder environment, -DMODEL_TYPE, GLU_SLICE, the core stack, which
-#: driver API is used) is invisible to it. Regenerate with
-#: `--max-tokens 8 --greedy` if the decode legitimately changes.
+#: driver API is used) is invisible to it. Regenerate with `--prefill-engine
+#: triton --max-tokens 8 --greedy` if the decode legitimately changes.
 EXPECT_IDS = [12366, 13, 578, 6864, 315, 10057, 374, 20437, 13]
+
+#: The same after mlir-air's fused prefill, the default engine. Its numerics
+#: move a later greedy token on this model; these are what mlir-air's own
+#: driver generates from the same build.
+EXPECT_IDS_AIR_FUSED = [12366, 13, 578, 6864, 315, 279, 3723, 4273, 374]
 
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Llama-3.2-1B-NPU2")
 

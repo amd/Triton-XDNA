@@ -87,6 +87,11 @@ BOS = 199999
 #: right reference precisely because it is the one we replace.
 EXPECT_IDS = [12650, 11, 1118, 382, 5542, 395, 1617, 37118, 88691, 1299]
 
+#: The same after mlir-air's fused prefill, the default engine. Its numerics
+#: move a later greedy token on this model; these are what mlir-air's own
+#: driver generates from the same build.
+EXPECT_IDS_AIR_FUSED = [12650, 11, 1118, 84230, 316, 12650, 11, 326, 480, 382]
+
 MODEL_DEFAULT = os.environ.get(
     "Q4NX_MODEL_SOURCE", "FastFlowLM/Phi4-mini-Instruct-NPU2"
 )

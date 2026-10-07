@@ -357,14 +357,18 @@ def test_config_must_be_a_config():
 
 
 def test_prefill_config_refuses_other_models():
-    """mlir-air has a fused prefill builder for one model; any other is refused
-    instead of building with that model's shapes."""
+    """A model mlir-air has no fused prefill for is refused instead of built
+    with another model's shapes; Gemma4 keeps its own builder, a dense model
+    names its row in mlir-air's table."""
     import triton.language as tl
 
     npu = tl.extra.npu
-    npu.PrefillConfig("gemma4-e2b")
+    g4 = npu.PrefillConfig("gemma4-e2b")
+    assert (g4.dense, g4.package) == (None, "gemma4_e2b_q4nx"), g4
+    ll = npu.PrefillConfig("llama-3.2-1b")
+    assert (ll.dense, ll.package) == ("llama32_1b_q4nx", "shared"), ll
     try:
-        npu.PrefillConfig("llama-3.2-1b")
+        npu.PrefillConfig("qwen2.5-3b")
     except npu.PrefillConfigError:
         return
     raise AssertionError("a model without a fused prefill builder was accepted")
@@ -394,7 +398,9 @@ for n in ("g", "lm"):
 
 
 def _fake_air_tree(root, builder="raise SystemExit('the builder must not run')\n"):
-    """The files `fused_prefill.fingerprint` reads, in mlir-air's layout."""
+    """The files `fused_prefill.fingerprint` reads, in mlir-air's layout.
+    Returns Gemma4's builder directory and `programming_examples/`; the shared
+    one, which also holds the dense models' builder, is `_shared(ex)`."""
     from pathlib import Path
 
     ex = Path(root) / "programming_examples"
@@ -402,6 +408,10 @@ def _fake_air_tree(root, builder="raise SystemExit('the builder must not run')\n
     fp.mkdir(parents=True)
     (fp / "build.py").write_text(builder)
     (fp.parent / "gemma4_e2b_q4nx_weights.py").write_text("D = 1536\n")
+    shared = _shared(ex)
+    shared.mkdir(parents=True)
+    (shared / "dense_main.py").write_text(builder)
+    (shared / "models.py").write_text("MODELS = {}\n")
     for rel in (
         "matrix_multiplication/bf16_in_fp32_out",
         "flash_attention/kernel_fusion_based",
@@ -409,6 +419,10 @@ def _fake_air_tree(root, builder="raise SystemExit('the builder must not run')\n
         (ex / rel).mkdir(parents=True)
         (ex / rel / "k.cc").write_text("// kernel\n")
     return fp, ex
+
+
+def _shared(ex):
+    return ex / "llms" / "shared" / "fused_prefill"
 
 
 def test_prefill_fingerprint_follows_sources():
@@ -428,6 +442,14 @@ def test_prefill_fingerprint_follows_sources():
         assert a != m.fingerprint(cfg, d, "/peano", "/other-aie"), "ignores mlir-aie"
         (ex / "flash_attention/kernel_fusion_based/k.cc").write_text("// edited\n")
         assert a != m.fingerprint(cfg, d, "/peano", "/aie"), "ignores kernel sources"
+        b = m.fingerprint(cfg, d, "/peano", "/aie")
+        (_shared(ex) / "models.py").write_text("MODELS = {'x': 1}\n")
+        assert b != m.fingerprint(cfg, d, "/peano", "/aie"), "ignores shared builder"
+        # A dense model is built from the shared directory, by name.
+        l1 = m.PrefillConfig("llama-3.2-1b")
+        q4 = m.PrefillConfig("qwen3-4b")
+        s = _shared(ex)
+        assert m.fingerprint(l1, s, "/p", "/a") != m.fingerprint(q4, s, "/p", "/a")
         shutil.rmtree(ex / "matrix_multiplication")
         try:
             m.fingerprint(cfg, d, "/peano", "/aie")
@@ -467,6 +489,39 @@ def test_prefill_reuses_a_complete_build():
             assert r["cached"] and r["build_dir"] == str(out.resolve()), r
             (out / "libhostops.so").unlink()
             assert not m._complete(out), "a build without libhostops.so is complete"
+    finally:
+        drv.find_peano_root, m._mlir_aie_root = saved
+
+
+def test_prefill_reuses_a_dense_build():
+    """A dense model's build has no LM-head op (its head runs as GEMMs) and is
+    still complete; the dense builder is not run when one is published."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    import triton.backends.amd_triton_npu.driver as drv
+
+    m = importlib.import_module("triton.language.extra.npu.fused_prefill")
+    cfg = m.PrefillConfig("llama-3.2-1b")
+    saved = drv.find_peano_root, m._mlir_aie_root
+    drv.find_peano_root = lambda: "/peano"
+    m._mlir_aie_root = lambda: "/aie"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ex = _fake_air_tree(tmp)
+            d = _shared(ex)
+            cache = Path(tmp) / "cache"
+            out = cache / f"llama-3.2-1b_{m.fingerprint(cfg, d, '/peano', '/aie')}"
+            out.mkdir(parents=True)
+            man = dict(gemm=["g"], attn={"a": {"base": "b"}}, lm=None)
+            (out / "manifest.json").write_text(json.dumps(man))
+            for n in ("g", "b"):
+                for ext in (".xclbin", ".insts.bin"):
+                    (out / f"{n}{ext}").write_bytes(b"")
+            (out / "libhostops.so").write_bytes(b"")
+            r = m.fused_prefill(cfg, d, cache_root=cache)
+            assert r["cached"] and r["build_dir"] == str(out.resolve()), r
     finally:
         drv.find_peano_root, m._mlir_aie_root = saved
 
@@ -547,6 +602,7 @@ def main():
             "a complete fused prefill build is reused",
             test_prefill_reuses_a_complete_build,
         ),
+        ("a dense fused prefill build is reused", test_prefill_reuses_a_dense_build),
         (
             "a fused prefill rebuild publishes a new generation",
             test_prefill_rebuild_publishes_a_new_generation,

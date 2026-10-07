@@ -42,6 +42,8 @@ class Gemma4FusedPrefill(Gemma4Prefill):
     embedding, norms and head from it.
     """
 
+    ENGINE = "air-fused"
+
     def __init__(self, build_dir, *a, **kw):
         kw.setdefault("backend", "cpu")
         super().__init__(*a, **kw)
@@ -52,7 +54,9 @@ class Gemma4FusedPrefill(Gemma4Prefill):
             def _kv_append(self, L, r0, k, v):
                 super()._kv_append(L, r0, k, v)
                 self.kv.pop(L, None)
-                owner._store_kv_rows(L, r0, k, v)
+                # k, v are [T, 1, dh]: this model has one KV head.
+                t = k.shape[0]
+                owner._store_kv_rows(L, r0, k.reshape(t, -1), v.reshape(t, -1))
 
         self._fused = _Fused(build_dir, max_len=min(self.kv_attn_maxl, self.max_seq))
 

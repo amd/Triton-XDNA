@@ -131,7 +131,10 @@ def main():
     m = Gemma4Prefill(backend=a.backend, n_layers=cfg.N_LAYERS, max_seq=2048)
     fused = None
     if a.prefill_engine == "air-fused":
-        fused = harness.fused_prefill_cls(cfg)(n_layers=cfg.N_LAYERS, max_seq=2048)
+        make = harness.fused_prefill_cls(
+            cfg, Gemma4Prefill, harness.fused_prefill_config(cfg)
+        )
+        fused = make(n_layers=cfg.N_LAYERS, max_seq=2048)
     try:
         # `npu_resident=False`: the padded resident form is one-way and a
         # decode that then multiplies with it raises. See `Gemma4GpuDecode`.
@@ -258,7 +261,7 @@ def _npu_decode_row(air, m, ids, oracle, n):
 
     def run(fused_decoder, ks, vs):
         air.FusedDecoder = fused_decoder
-        air._prefill_npu = lambda prompt, model, seq_len=None: (ks, vs, first, 0.0)
+        air._prefill_npu = lambda *a, **k: (ks, vs, first, 0.0)
         return list(air.generate(list(ids), n - 1, ignore_eos=True)[0])
 
     want = run(base, *m.kv_stack())
