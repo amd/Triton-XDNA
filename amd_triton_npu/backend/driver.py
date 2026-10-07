@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import tempfile
+import threading
 import sys
 import functools
 
@@ -663,6 +664,7 @@ def _run_compile(cmd, env=None):
 
 
 _npu_wait = None
+_npu_wait_lock = threading.Lock()
 
 
 def npu_wait_module():
@@ -675,13 +677,19 @@ def npu_wait_module():
     Windows pyxrt is built by MSVC, whose ABI id the helper does not form.
     """
     global _npu_wait
-    if _npu_wait is None:
-        _npu_wait = False
-        if not IS_WINDOWS:
-            try:
-                _npu_wait = _build_npu_wait()
-            except Exception as e:  # noqa: BLE001 -- fall back to pyxrt's wait
-                logger.warning("npu_wait unavailable, NPU waits hold the GIL: %s", e)
+    # Locked so that a thread arriving mid-build waits for the result rather
+    # than reading an unfinished one: the build releases the GIL.
+    with _npu_wait_lock:
+        if _npu_wait is None:
+            module = False
+            if not IS_WINDOWS:
+                try:
+                    module = _build_npu_wait()
+                except Exception as e:  # noqa: BLE001 -- fall back to pyxrt's wait
+                    logger.warning(
+                        "npu_wait unavailable, NPU waits hold the GIL: %s", e
+                    )
+            _npu_wait = module
     return _npu_wait or None
 
 
