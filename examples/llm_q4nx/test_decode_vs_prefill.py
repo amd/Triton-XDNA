@@ -248,6 +248,10 @@ def _npu_decode_row(air, m, ids, oracle, n):
     """
     import harness
 
+    # One decoder at a time: the decoder kept from the previous prompt holds
+    # hardware contexts that the reference decoder below needs, and a driver
+    # that grants fewer of them refuses it.
+    m.release_npu_decoder()
     m.prefill(ids)
     first = m.last_first_token
     base = getattr(air, "_triton_fused_decoder_base", air.FusedDecoder)
