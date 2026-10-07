@@ -7,11 +7,14 @@
 //
 // The xrt::run is obtained through pybind11's cpp conduit
 // (`_pybind11_conduit_v1_`), which hands the pointer over only when the
-// caller names the same platform ABI as the module that owns it. pybind11
-// spells the ABI of a g++/libstdc++ build one way before its 3.0 and another
-// way from it, so both spellings are formed for the compiler building this
-// file and tried in turn. When neither matches pyxrt's, pyxrt declines and
-// the caller falls back to pyxrt's own wait.
+// caller names the platform ABI the module that owns it was built for.
+// pybind11 spells a g++/libstdc++ ABI one way before its 3.0 and another way
+// from it, so both spellings are formed for the compiler building this file.
+// Before 3.0 the spelling also carries g++'s ABI version, which differs
+// between compiler releases that pybind11 3.0 treats as one ABI; the caller
+// can add pyxrt's own spelling for such a case (`add_abi_id`). When no
+// spelling matches, pyxrt declines and the caller falls back to pyxrt's own
+// wait.
 
 #include <Python.h>
 
@@ -20,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <typeinfo>
+#include <vector>
 
 #include "xrt/xrt_kernel.h"
 
@@ -29,7 +33,7 @@
 
 // pybind11's spellings of this compiler's ABI, as its
 // pybind11_platform_abi_id.h forms them: before 3.0, then from 3.0 on.
-static const std::string abi_ids[] = {
+static std::vector<std::string> abi_ids = {
     "_gcc_libstdcpp_cxxabi" + std::to_string(__GXX_ABI_VERSION),
     "system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_" +
         std::to_string(_GLIBCXX_USE_CXX11_ABI),
@@ -64,6 +68,14 @@ static xrt::run *as_run(PyObject *obj) {
     if (xrt::run *run = as_run(obj, id))
       return run;
   return nullptr;
+}
+
+static PyObject *py_add_abi_id(PyObject *, PyObject *args) {
+  const char *id;
+  if (!PyArg_ParseTuple(args, "s", &id))
+    return nullptr;
+  abi_ids.emplace_back(id);
+  Py_RETURN_NONE;
 }
 
 static PyObject *py_supported(PyObject *, PyObject *args) {
@@ -122,6 +134,8 @@ static PyObject *py_block(PyObject *, PyObject *args) {
 }
 
 static PyMethodDef Methods[] = {
+    {"add_abi_id", py_add_abi_id, METH_VARARGS,
+     "Also ask pyxrt under this ABI spelling"},
     {"supported", py_supported, METH_VARARGS,
      "Whether this pyxrt.run can be waited on here"},
     {"wait", py_wait, METH_VARARGS, "pyxrt.run.wait2 without the GIL"},

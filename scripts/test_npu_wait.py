@@ -14,16 +14,7 @@ import sys
 import threading
 import time
 
-from triton.backends.amd_triton_npu.driver import npu_wait_module
-
-
-def _pyxrt_abi(pyxrt):
-    """The ABI pyxrt's pybind11 names, read from its internals key."""
-    import re
-
-    with open(pyxrt.__file__, "rb") as f:
-        keys = set(re.findall(rb"__pybind11_internals_v\d+_(\w+?)__", f.read()))
-    return ", ".join(k.decode() for k in sorted(keys)) or "unknown"
+from triton.backends.amd_triton_npu.driver import npu_wait_module, pyxrt_abi_ids
 
 
 def main():
@@ -36,7 +27,7 @@ def main():
     if not mod.supported(pyxrt.run()):
         print(
             "FAIL: pyxrt declined to hand over its xrt::run; it was built "
-            f"for ABI {_pyxrt_abi(pyxrt)}"
+            f"for ABI {', '.join(pyxrt_abi_ids()) or 'unknown'}"
         )
         return 1
     if mod.supported(object()):

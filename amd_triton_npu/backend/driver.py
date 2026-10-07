@@ -6,6 +6,7 @@ import functools
 import hashlib
 import json
 import logging
+import re
 import tempfile
 import threading
 import sys
@@ -735,7 +736,25 @@ def _build_npu_wait():
     spec = importlib.util.spec_from_file_location("npu_wait", path, loader=loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
+    # pybind11 before 3.0 names g++'s ABI version in the spelling, and pyxrt
+    # may come from another g++ release than this one. pybind11 3.0 counts
+    # every 1xxx version as one ABI, so pyxrt's own spelling is offered too.
+    for abi in pyxrt_abi_ids():
+        if re.fullmatch(r"_gcc_libstdcpp_cxxabi1\d{3}", abi):
+            mod.add_abi_id(abi)
     return mod
+
+
+def pyxrt_abi_ids():
+    """The platform ABI ids pyxrt's pybind11 was built for, from its internals key."""
+    import pyxrt
+
+    with open(pyxrt.__file__, "rb") as f:
+        found = re.findall(rb"__pybind11_internals_v\d+(_\w+?)__", f.read())
+    # From pybind11 3.0 the key puts an underscore before an id that does not
+    # start with one ("system_..."); before it the id itself starts with one.
+    ids = {k.decode() for k in found}
+    return sorted(i[1:] if i.startswith("_system") else i for i in ids)
 
 
 def _build_hsa_runtime_lib(include_dir: str, rocr: _RocrInstall) -> str:
