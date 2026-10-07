@@ -7,11 +7,11 @@
 //
 // The xrt::run is obtained through pybind11's cpp conduit
 // (`_pybind11_conduit_v1_`), which hands the pointer over only when the
-// caller names the same platform ABI as the module that owns it. The id is
-// formed as pybind11 2.x forms it for a GCC/libstdc++ build, from the
-// compiler building this file. When pyxrt's id differs, from another
-// compiler, standard library or pybind11 spelling, pyxrt declines and the
-// caller falls back to pyxrt's own wait.
+// caller names the same platform ABI as the module that owns it. pybind11
+// spells the ABI of a g++/libstdc++ build one way before its 3.0 and another
+// way from it, so both spellings are formed for the compiler building this
+// file and tried in turn. When neither matches pyxrt's, pyxrt declines and
+// the caller falls back to pyxrt's own wait.
 
 #include <Python.h>
 
@@ -27,18 +27,21 @@
 #error "NpuWait is built with g++ against libstdc++"
 #endif
 
-static std::string abi_id() {
-  return "_gcc_libstdcpp_cxxabi" + std::to_string(__GXX_ABI_VERSION);
-}
+// pybind11's spellings of this compiler's ABI, as its
+// pybind11_platform_abi_id.h forms them: before 3.0, then from 3.0 on.
+static const std::string abi_ids[] = {
+    "_gcc_libstdcpp_cxxabi" + std::to_string(__GXX_ABI_VERSION),
+    "system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_" +
+        std::to_string(_GLIBCXX_USE_CXX11_ABI),
+};
 
-// The xrt::run behind `obj`, or nullptr (no Python error set) if pyxrt
-// declines.
-static xrt::run *as_run(PyObject *obj) {
+// The xrt::run behind `obj` if pyxrt hands it over under `id`, else nullptr
+// with no Python error set.
+static xrt::run *as_run(PyObject *obj, const std::string &id) {
   PyObject *ti = PyCapsule_New(const_cast<std::type_info *>(&typeid(xrt::run)),
                                typeid(std::type_info).name(), nullptr);
   if (!ti)
     return nullptr;
-  std::string id = abi_id();
   PyObject *cap =
       PyObject_CallMethod(obj, "_pybind11_conduit_v1_", "y#Oy", id.data(),
                           (Py_ssize_t)id.size(), ti, "raw_pointer_ephemeral");
@@ -54,6 +57,13 @@ static xrt::run *as_run(PyObject *obj) {
   if (!ptr)
     PyErr_Clear();
   return static_cast<xrt::run *>(ptr);
+}
+
+static xrt::run *as_run(PyObject *obj) {
+  for (const std::string &id : abi_ids)
+    if (xrt::run *run = as_run(obj, id))
+      return run;
+  return nullptr;
 }
 
 static PyObject *py_supported(PyObject *, PyObject *args) {
