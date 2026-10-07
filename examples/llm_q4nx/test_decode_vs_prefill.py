@@ -38,6 +38,9 @@ import sys
 import numpy as np
 import torch
 
+#: The NPU's XRT device, held for the whole run; see `main`.
+_npu = None
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 #: Gemma4-specific, so it reaches into that example for `config`. This
 #: directory is a library and has none of its own -- every model keeps its
@@ -97,6 +100,15 @@ def main():
         # The first token comes from the prefill, so fewer than two never
         # dispatches a decode step and the row would check nothing.
         ap.error("--npu-decode needs --tokens 2 or more")
+
+    # XRT opens the NPU before torch starts ROCm, and keeps it open. ROCm's
+    # runtime opens the NPU too, as an AIE agent, and holds it; some amdxdna
+    # drivers then refuse XRT's open as busy. Whichever opens second must be
+    # ROCm, which carries on without its AIE agent.
+    global _npu
+    import pyxrt
+
+    _npu = pyxrt.device(0)
 
     if not torch.cuda.is_available():
         print("SKIP: no ROCm device; the decode under test is the GPU one")
