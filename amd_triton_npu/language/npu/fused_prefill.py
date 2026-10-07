@@ -36,9 +36,11 @@ import tempfile
 import threading
 from pathlib import Path
 
-#: Models mlir-air has a fused prefill for, by this repository's model name:
-#: the key of the model in `shared/fused_prefill/models.py`, or None for
-#: Gemma4-E2B, whose builder is `gemma4_e2b_q4nx/fused_prefill/build.py`.
+#: The models with an example here that mlir-air has a fused prefill for, by
+#: this repository's model name: the key of the model in
+#: `shared/fused_prefill/models.py`, or None for Gemma4-E2B, whose builder is
+#: `gemma4_e2b_q4nx/fused_prefill/build.py`. Rows of that table with no
+#: example here are left out.
 MODELS = {
     "gemma4-e2b": None,
     "llama-3.2-1b": "llama32_1b_q4nx",

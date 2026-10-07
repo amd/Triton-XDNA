@@ -103,7 +103,13 @@ class Gemma4FusedPrefill(Gemma4Prefill):
                 f"holds (ATTN_MAXL={self.kv_attn_maxl}, max_seq={self.max_seq})"
             )
         self._zero_slab()
-        logits = torch.from_numpy(np.asarray(self._fused.prefill(ids), np.float32))
+        try:
+            out = self._fused.prefill(ids)
+        finally:
+            # The decoder opens its own hw_context; the next prefill reopens
+            # this one.
+            self._fused.suspend()
+        logits = torch.from_numpy(np.asarray(out, np.float32))
         self._ids = ids
         self.current_context_length = N
         self.last_first_token = int(logits.argmax())

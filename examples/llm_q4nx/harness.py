@@ -242,7 +242,7 @@ def run_prefill(
         f"engine={engine}" if engine else f"backend={backend} ops={sorted(m.enabled)}"
     )
     print(
-        f"[triton-prefill] model={cfg.MODEL_NAME} {where} P={len(ids)} "
+        f"[{engine or 'triton'}-prefill] model={cfg.MODEL_NAME} {where} P={len(ids)} "
         f"load {t_load:.1f}s prefill {t_run:.2f}s first={first}",
         flush=True,
     )
@@ -999,7 +999,10 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             f"Use --max-tokens for a single turn."
         )
 
-    check_host_memory(spec)
+    # Sized for the Triton prefill's bf16 weights. A dense fused prefill keeps
+    # them packed and loads no host copy; Gemma4's still does.
+    if not (args.prefill_engine == "air-fused" and fused.dense):
+        check_host_memory(spec)
 
     air = None if args.prefill_only else air_inference_module(spec)
 
@@ -1050,7 +1053,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         """The canonical prompt's first token. Returns True if it holds."""
         ok = first == cfg.EXPECT_FIRST
         print(
-            f"[triton-prefill] first token {first} "
+            f"[{args.prefill_engine}-prefill] first token {first} "
             f"(expect {cfg.EXPECT_FIRST}) for {cfg.MODEL_NAME} "
             f"-- {'PASS' if ok else 'FAIL'}",
             flush=True,
