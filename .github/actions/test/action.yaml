@@ -239,6 +239,12 @@ runs:
           # leave the selection with no coverage at all.
           ( cd examples/llm_q4nx && python3 test_decode_artifact.py )
 
+          # The fused prefill releases its hardware contexts after each
+          # prefill and, when reopening them is refused, closes the Triton
+          # prefill's chains to make room. One prefill per gate never reaches
+          # the refusal. No NPU, no weights.
+          ( cd examples/llm_q4nx && python3 test_fused_prefill_contexts.py )
+
           # That NPUChain's cap on open hardware contexts holds and that an
           # evicted chain reopens correct. Every gate below runs one prompt
           # length per process, which never reaches the cap, so without this

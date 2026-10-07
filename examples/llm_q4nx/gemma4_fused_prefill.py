@@ -24,6 +24,7 @@ import torch
 import airsrc
 import kv_layout
 from config import head_dim
+from dense_fused_prefill import run_fused
 from gemma4_prefill import Gemma4Prefill, _bf16_np
 
 
@@ -103,12 +104,7 @@ class Gemma4FusedPrefill(Gemma4Prefill):
                 f"holds (ATTN_MAXL={self.kv_attn_maxl}, max_seq={self.max_seq})"
             )
         self._zero_slab()
-        try:
-            out = self._fused.prefill(ids)
-        finally:
-            # The decoder opens its own hw_context; the next prefill reopens
-            # this one.
-            self._fused.suspend()
+        out = run_fused(self._fused, ids)
         logits = torch.from_numpy(np.asarray(out, np.float32))
         self._ids = ids
         self.current_context_length = N

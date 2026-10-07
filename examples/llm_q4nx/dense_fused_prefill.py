@@ -28,6 +28,32 @@ def _dense():
     return dense, models
 
 
+def run_fused(fused, ids):
+    """`fused.prefill(ids)`, leaving its hardware contexts released.
+
+    The decoder opens its own contexts, and the next prefill reopens these.
+    The device grants a limited number, and Triton prefill chains in the same
+    process may hold the rest; chains reopen on their next run, so they are
+    closed to make room.
+    """
+    from triton.backends.amd_triton_npu.multilaunch import NPUChain
+
+    try:
+        try:
+            return fused.prefill(ids)
+        except RuntimeError as e:
+            if "HWCTX" not in str(e) or not NPUChain._open:
+                raise
+            while NPUChain._close_stalest():
+                pass
+            # A refused resume can leave some of its own contexts open.
+            for c in fused.contexts():
+                c.close()
+            return fused.prefill(ids)
+    finally:
+        fused.suspend()
+
+
 class _FusedPrefill:
     """Mixed in ahead of a `LlamaPrefill` class; see `fused_prefill_class`."""
 
@@ -71,15 +97,10 @@ class _FusedPrefill:
                 f"holds (fused max_len={self._fused.max_len}, "
                 f"max_seq={self.max_seq})"
             )
-        try:
-            logits = np.asarray(self._fused.prefill(ids), np.float32)
-            for L in range(self.n_layers):
-                k, v = self._fused.kv_view(L)
-                self._kv_store(L, torch.from_numpy(k), torch.from_numpy(v), N)
-        finally:
-            # The decoder opens its own hw_context; the next prefill reopens
-            # this one.
-            self._fused.suspend()
+        logits = np.asarray(run_fused(self._fused, ids), np.float32)
+        for L in range(self.n_layers):
+            k, v = self._fused.kv_view(L)
+            self._kv_store(L, torch.from_numpy(k), torch.from_numpy(v), N)
         self.current_context_length = N
         return torch.from_numpy(logits)
 
