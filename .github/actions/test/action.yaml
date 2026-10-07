@@ -239,6 +239,12 @@ runs:
           # leave the selection with no coverage at all.
           ( cd examples/llm_q4nx && python3 test_decode_artifact.py )
 
+          # The fused prefill releases its hardware contexts after each
+          # prefill and, when reopening them is refused, closes the Triton
+          # prefill's chains to make room. One prefill per gate never reaches
+          # the refusal. No NPU, no weights.
+          ( cd examples/llm_q4nx && python3 test_fused_prefill_contexts.py )
+
           # That NPUChain's cap on open hardware contexts holds and that an
           # evicted chain reopens correct. Every gate below runs one prompt
           # length per process, which never reaches the cap, so without this
@@ -268,6 +274,11 @@ runs:
             # own arguments: it invokes an entry point bare, which for these
             # means generating, and generation needs a decode build.
             q_pass=0; q_fail=0; q_skip=0
+
+            # The gates run the default prefill engine: mlir-air's fused
+            # prefill for the models it has one for, the Triton prefill for
+            # the rest. The Triton prefill of those models is gated
+            # separately, after the per-model gates.
 
             # gate <example> <args...>
             gate() {
@@ -311,6 +322,7 @@ runs:
               echo "   ✅ PASS: make compile-decode"
               q_pass=$((q_pass + 1))
               gate llama32_1b_q4nx --max-tokens 8 --greedy
+              gate llama32_1b_q4nx --prefill-engine triton --max-tokens 8 --greedy
             fi
 
             gate llama32_3b_q4nx --prefill-only
@@ -397,6 +409,12 @@ runs:
               q_pass=$((q_pass + 1))
               gate gemma4_e2b_q4nx --decode npu --max-tokens 8 --greedy
             fi
+
+            # The Triton prefill of the models whose default is the fused one.
+            for ex in llama32_3b_q4nx llama31_8b_q4nx qwen3_4b_q4nx \
+                      qwen3_8b_q4nx phi4_mini_q4nx gemma3_4b_q4nx gemma4_e2b_q4nx; do
+              gate "$ex" --prefill-engine triton --prefill-only
+            done
 
             # The KV layout our prefills hand the NPU decode in place, against
             # mlir-air's own `seed_kv` run on the same K/V. The decode gate
@@ -498,7 +516,8 @@ runs:
           echo "--- gemma4_e2b_q4nx: test_decode_vs_prefill.py --npu-decode ---"
           rc=0
           ( cd examples/llm_q4nx \
-            && python test_decode_vs_prefill.py --npu-decode ) || rc=$?
+            && python test_decode_vs_prefill.py --npu-decode \
+                 --prefill-engine air-fused ) || rc=$?
           if [ "$rc" -eq 77 ]; then
             echo "SKIP: test_decode_vs_prefill.py --npu-decode (exit 77)"
           elif [ "$rc" -ne 0 ]; then

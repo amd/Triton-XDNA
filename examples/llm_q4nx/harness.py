@@ -236,10 +236,14 @@ def run_prefill(
     # The model is named here, not left to the caller's shell trace. Every
     # Q4NX gate otherwise prints identical text -- same P, same first token --
     # so a loop that ran one model twice would read as two passes.
+    # A fused prefill runs none of this repository's ops, whatever was asked.
+    engine = getattr(m, "ENGINE", None)
+    where = (
+        f"engine={engine}" if engine else f"backend={backend} ops={sorted(m.enabled)}"
+    )
     print(
-        f"[triton-prefill] model={cfg.MODEL_NAME} backend={backend} "
-        f"ops={sorted(m.enabled)} P={len(ids)} load {t_load:.1f}s "
-        f"prefill {t_run:.2f}s first={first}",
+        f"[{engine or 'triton'}-prefill] model={cfg.MODEL_NAME} {where} P={len(ids)} "
+        f"load {t_load:.1f}s prefill {t_run:.2f}s first={first}",
         flush=True,
     )
     return first, len(ids), m
@@ -697,7 +701,9 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     # the nightly benchmark scrapes. It is our prefill that spent it, so the
     # measured wall clock goes back in rather than a zero that would read as a
     # free prefill.
-    air._prefill_npu = lambda prompt, model, seq_len=None: (K, V, first, ttft)
+    # Takes whatever the driver passes, `fused=` included: ours replaces their
+    # fused prefill too.
+    air._prefill_npu = lambda *a, **k: (K, V, first, ttft)
     params = inspect.signature(air.generate).parameters
     kwargs = dict(model=args.model or cfg.MODEL_DEFAULT)
     # Both offered only where the signature has somewhere to put them. Qwen3
@@ -723,33 +729,46 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
 #: in two places that can drift apart.
 GPU_DECODE_MODELS = frozenset({"gemma4-e2b"})
 
-#: Models with an mlir-air fused NPU prefill (`--prefill-engine air-fused`).
-FUSED_PREFILL_MODELS = frozenset({"gemma4-e2b"})
+
+def fused_prefill_config(cfg):
+    """The `PrefillConfig` of this model's mlir-air fused NPU prefill
+    (`--prefill-engine air-fused`), or None if mlir-air has none."""
+    import triton.language as tl
+
+    npu = tl.extra.npu
+    try:
+        return npu.PrefillConfig(cfg.MODEL_NAME)
+    except npu.PrefillConfigError:
+        return None
 
 
-def fused_prefill_cls(cfg):
+def fused_prefill_cls(cfg, prefill_cls, config):
     """A `prefill_cls` that runs mlir-air's fused NPU prefill.
 
     Builds it through `tl.extra.npu.fused_prefill` (a cache hit after the first
     build) and returns a factory with `run_prefill`'s calling convention. The
-    prefiller's own host path runs on the CPU backend: it only serves the
-    decoders the embedding, norms and head, so no Triton NPU chain is built.
+    prefiller's own host path runs on the CPU backend, so no Triton NPU chain
+    is built. Gemma4-E2B's keeps the embedding, norms and head its decoders
+    read; a dense model's (`dense_fused_prefill`) keeps nothing but the KV.
     """
     import triton.language as tl
-    from gemma4_fused_prefill import Gemma4FusedPrefill
 
-    npu = tl.extra.npu
-    built = npu.fused_prefill(
-        npu.PrefillConfig(cfg.MODEL_NAME), airsrc.fused_prefill_dir()
-    )
+    built = tl.extra.npu.fused_prefill(config, airsrc.fused_prefill_dir(config.package))
     print(
         f"[fused-prefill] {built['build_dir']} "
         f"({'cached' if built['cached'] else 'built'})",
         flush=True,
     )
 
+    if config.dense:
+        from dense_fused_prefill import fused_prefill_class
+
+        cls = fused_prefill_class(prefill_cls, config.dense)
+    else:
+        from gemma4_fused_prefill import Gemma4FusedPrefill as cls
+
     def make(backend=None, **kw):
-        return Gemma4FusedPrefill(built["build_dir"], backend="cpu", **kw)
+        return cls(built["build_dir"], backend="cpu", **kw)
 
     return make
 
@@ -807,12 +826,14 @@ def build_parser(doc):
     )
     ap.add_argument(
         "--prefill-engine",
-        choices=("triton", "air-fused"),
-        default="triton",
+        choices=("auto", "triton", "air-fused"),
+        default="auto",
         help="what runs the prefill. triton: this repository's prefill on "
         "--backend. air-fused: mlir-air's one-device chunked NPU prefill "
-        "(tl.extra.npu.fused_prefill), writing the same shared KV slab, so "
-        "either --decode continues from it without a copy. Gemma4-E2B only.",
+        "(tl.extra.npu.fused_prefill), handing its KV to the decode the way "
+        "the Triton prefill does. auto (default): air-fused where mlir-air "
+        "has one for the model, unless --backend, --ops or --interactive asks "
+        "for the Triton prefill; triton otherwise.",
     )
     ap.add_argument(
         "--backend",
@@ -861,7 +882,7 @@ def build_parser(doc):
     ap.add_argument(
         "--prefill-only",
         action="store_true",
-        help="run the Triton prefill and check the gate, without the decode "
+        help="run the prefill and check the gate, without the decode "
         "(so it needs no `make compile-decode`)",
     )
     return ap
@@ -920,19 +941,27 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             f"{cfg.MODEL_NAME} has none. Use --backend hetero --decode npu."
         )
 
+    fused = fused_prefill_config(cfg)
+    if args.prefill_engine == "auto":
+        # Those three only mean something to the Triton prefill.
+        asked_triton = getattr(args, "interactive", False) or any(
+            a.split("=")[0] in ("--backend", "--ops") for a in raw_argv
+        )
+        args.prefill_engine = (
+            "air-fused" if fused is not None and not asked_triton else "triton"
+        )
     if args.prefill_engine == "air-fused":
-        if cfg.MODEL_NAME not in FUSED_PREFILL_MODELS:
+        if fused is None:
             raise SystemExit(
-                f"--prefill-engine air-fused is implemented for "
-                f"{', '.join(sorted(FUSED_PREFILL_MODELS))} only; "
-                f"{cfg.MODEL_NAME} has none."
+                f"--prefill-engine air-fused: mlir-air has no fused prefill "
+                f"for {cfg.MODEL_NAME}."
             )
         if getattr(args, "interactive", False):
             raise SystemExit(
                 "--prefill-engine air-fused cannot be combined with --interactive "
                 "yet: the interactive session constructs its own prefiller."
             )
-        prefill_cls = fused_prefill_cls(cfg)
+        prefill_cls = fused_prefill_cls(cfg, prefill_cls, fused)
 
     # The interactive session comes from mlir-air and always drives its own
     # fused NPU decoder; it never consults `--decode`. Accepting the pair would
@@ -970,7 +999,10 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             f"Use --max-tokens for a single turn."
         )
 
-    check_host_memory(spec)
+    # Sized for the Triton prefill's bf16 weights. A dense fused prefill keeps
+    # them packed and loads no host copy; Gemma4's still does.
+    if not (args.prefill_engine == "air-fused" and fused.dense):
+        check_host_memory(spec)
 
     air = None if args.prefill_only else air_inference_module(spec)
 
@@ -1021,7 +1053,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         """The canonical prompt's first token. Returns True if it holds."""
         ok = first == cfg.EXPECT_FIRST
         print(
-            f"[triton-prefill] first token {first} "
+            f"[{args.prefill_engine}-prefill] first token {first} "
             f"(expect {cfg.EXPECT_FIRST}) for {cfg.MODEL_NAME} "
             f"-- {'PASS' if ok else 'FAIL'}",
             flush=True,
@@ -1161,8 +1193,15 @@ def _decode_gate(air, spec, cfg, args, ids, out):
     Factored out so the zero-copy path, which runs prefill and decode together
     and cannot reach the npz block above, gates the same way. Returns the
     process exit code (0 pass / 1 mismatch).
+
+    mlir-air's fused prefill computes in lower precision than the Triton one,
+    which moves a later greedy token on some models. Those record
+    `EXPECT_IDS_AIR_FUSED`, what mlir-air's own driver generates from the same
+    build; the rest gate on `EXPECT_IDS`.
     """
     golden = getattr(cfg, "EXPECT_IDS", None)
+    if getattr(args, "prefill_engine", None) == "air-fused":
+        golden = getattr(cfg, "EXPECT_IDS_AIR_FUSED", golden)
     if golden and args.greedy and ids == list(cfg.PROMPT):
         got = list(out)[: len(golden)]
         if got != list(golden):

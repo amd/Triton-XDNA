@@ -24,6 +24,7 @@ import torch
 import airsrc
 import kv_layout
 from config import head_dim
+from dense_fused_prefill import run_fused
 from gemma4_prefill import Gemma4Prefill, _bf16_np
 
 
@@ -42,6 +43,8 @@ class Gemma4FusedPrefill(Gemma4Prefill):
     embedding, norms and head from it.
     """
 
+    ENGINE = "air-fused"
+
     def __init__(self, build_dir, *a, **kw):
         kw.setdefault("backend", "cpu")
         super().__init__(*a, **kw)
@@ -52,7 +55,9 @@ class Gemma4FusedPrefill(Gemma4Prefill):
             def _kv_append(self, L, r0, k, v):
                 super()._kv_append(L, r0, k, v)
                 self.kv.pop(L, None)
-                owner._store_kv_rows(L, r0, k, v)
+                # k, v are [T, 1, dh]: this model has one KV head.
+                t = k.shape[0]
+                owner._store_kv_rows(L, r0, k.reshape(t, -1), v.reshape(t, -1))
 
         self._fused = _Fused(build_dir, max_len=min(self.kv_attn_maxl, self.max_seq))
 
@@ -99,7 +104,8 @@ class Gemma4FusedPrefill(Gemma4Prefill):
                 f"holds (ATTN_MAXL={self.kv_attn_maxl}, max_seq={self.max_seq})"
             )
         self._zero_slab()
-        logits = torch.from_numpy(np.asarray(self._fused.prefill(ids), np.float32))
+        out = run_fused(self._fused, ids)
+        logits = torch.from_numpy(np.asarray(out, np.float32))
         self._ids = ids
         self.current_context_length = N
         self.last_first_token = int(logits.argmax())
