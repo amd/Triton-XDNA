@@ -18,6 +18,7 @@ import collections
 import hashlib
 import os
 import re
+import time
 import weakref
 
 from triton.runtime.cache import get_cache_manager
@@ -33,7 +34,49 @@ from .driver import (
     _get_cached_aircc_artifacts,
     _put_aircc_artifacts,
     detect_npu_version,
+    npu_wait_module,
 )
+
+_wait_nogil = None
+
+#: ``ert_cmd_state`` values of a command not yet finished: NEW, QUEUED,
+#: RUNNING, SUBMITTED. pyxrt's enum does not name RUNNING, so values are used.
+_PENDING_STATES = frozenset((1, 2, 3, 7))
+_COMPLETED_STATE = 4
+#: Seconds between polls when waiting without ``npu_wait``.
+_POLL_INTERVAL = 0.0002
+
+
+def _wait_polling(run):
+    """``run.wait2()`` by polling ``run.state()``, sleeping between polls.
+
+    For a pyxrt built without pybind11's cpp conduit, which ``npu_wait`` needs
+    to reach the run: the sleep releases the GIL where pyxrt's own wait would
+    hold it for the whole command. Raises, as ``wait2`` does, unless the run
+    completed.
+    """
+    while True:
+        state = run.state()
+        if int(state) not in _PENDING_STATES:
+            break
+        time.sleep(_POLL_INTERVAL)
+    if int(state) != _COMPLETED_STATE:
+        raise RuntimeError(f"NPU run ended in state {state}")
+
+
+def _wait(run):
+    """Wait for ``run`` to complete without holding the GIL.
+
+    Through ``npu_wait`` where it can take the run, otherwise by polling.
+    Decided on the first run and kept: every run comes from the same pyxrt.
+    """
+    global _wait_nogil
+    if _wait_nogil is None:
+        mod = npu_wait_module()
+        _wait_nogil = (
+            mod.wait if mod is not None and mod.supported(run) else _wait_polling
+        )
+    _wait_nogil(run)
 
 
 def _extract_air_arg_types(air_text):
@@ -419,7 +462,7 @@ class MultiLaunchRunner:
         for i, bo in enumerate(bos):
             run.set_arg(i, bo)
         run.start()
-        run.wait2()
+        _wait(run)
 
         results = {}
         for idx in readback:
