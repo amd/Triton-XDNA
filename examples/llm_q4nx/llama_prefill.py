@@ -460,7 +460,7 @@ class LlamaPrefill:
                 # since they grew one.
                 import gpu_kernels
 
-                with driver_scope("amd"):
+                with driver_scope("gpu"):
                     out = gpu_kernels.rope_batch(
                         x.to(dev), lut.to(dev), n_heads, lut.shape[-1]
                     )
@@ -507,7 +507,7 @@ class LlamaPrefill:
                 # kernel rather than torch on a GPU tensor.
                 import gpu_kernels
 
-                with driver_scope("amd"):
+                with driver_scope("gpu"):
                     out = gpu_kernels.attn_prefill(
                         q.to(dev), k.to(dev), v.to(dev), n_q, n_kv, dh, window, scale
                     )

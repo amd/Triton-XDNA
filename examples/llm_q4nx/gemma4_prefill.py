@@ -585,7 +585,7 @@ class Gemma4Prefill(LlamaPrefill):
         iGPU."""
         if "gpu" not in (self._device("rope"), self._device("attention")):
             return contextlib.nullcontext()
-        return driver_scope("amd")
+        return driver_scope("gpu")
 
     def _layer(self, x, L, N, keep=None, pli=None):
         """One Gemma4 block, on the prompt. x: [N, D] -> [N, D].
@@ -1183,7 +1183,7 @@ class Gemma4GpuDecode:
         # The RoPE tables have `max_seq` rows, and the slab may have more.
         if N > pf.max_seq:
             raise ValueError(f"a {N}-token prompt exceeds max_seq={pf.max_seq}")
-        with driver_scope("amd"):
+        with driver_scope("gpu"):
             logits = self._prefill(list(ids))
             if not self._slab_shared:
                 # Without interop the device slab is a copy; the host one is
@@ -1303,7 +1303,7 @@ class Gemma4GpuDecode:
             raise ValueError(
                 f"position {pos} is outside the decode's {self.max_L} rows"
             )
-        with driver_scope("amd"):
+        with driver_scope("gpu"):
             return self._step(token, pos)
 
     def _step(self, token, pos):
@@ -1420,7 +1420,7 @@ class Gemma4GpuDecode:
         # cached -- but the old scope built a new AMD driver on every entry,
         # ~0.65 ms each. `driver_scope` builds it once; the hoist stays because
         # one scope is still cheaper than one per token.
-        with driver_scope("amd"):
+        with driver_scope("gpu"):
             for _ in range(max(0, n_tokens - 1)):
                 if pos >= self.max_L:
                     print(f"[gpu-decode] hit max_L={self.max_L}; stopping", flush=True)

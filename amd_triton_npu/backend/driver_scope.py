@@ -10,7 +10,7 @@ examples and the gpt2/qwen2_5 examples all go through it.
     with driver_scope("npu"):
         kernel[grid](...)          # compiled and launched for the NPU
 
-    with driver_scope("amd"):
+    with driver_scope("gpu"):
         gpu_kernel[grid](...)      # compiled and launched for the iGPU
 
 Kept free of `driver.py`'s imports (aie, air) so an iGPU-only caller does not
@@ -19,13 +19,15 @@ pay for the NPU toolchain.
 
 import contextlib
 
-_KINDS = ("npu", "amd")
+#: The two places a kernel can run, named as the placement tables name them.
+#: "gpu" is the AMD iGPU, which Triton's own registry calls its "amd" backend.
+_KINDS = ("npu", "gpu")
 
-#: The AMD driver, built once. Construction is ~0.14 ms (it builds HIPUtils),
+#: The iGPU driver, built once. Construction is ~0.14 ms (it builds HIPUtils),
 #: against ~2 us for an NPUDriver, and a hetero prefill switches to it twice per
 #: layer. The NPU driver is built per scope instead: `NPUDriver()` reads the
 #: launch runtime from the environment, which a caller may change in between.
-_amd = None
+_gpu = None
 
 
 def _is_kind(driver, kind):
@@ -39,21 +41,21 @@ def _is_kind(driver, kind):
 
 
 def _make(kind):
-    global _amd
+    global _gpu
     if kind == "npu":
         from .driver import NPUDriver
 
         return NPUDriver()
-    if _amd is None:
+    if _gpu is None:
         from triton.backends import backends
 
-        _amd = backends["amd"].driver()
-    return _amd
+        _gpu = backends["amd"].driver()
+    return _gpu
 
 
 @contextlib.contextmanager
 def driver_scope(kind):
-    """Make the `kind` driver ("npu" or "amd") active for the duration.
+    """Make the `kind` driver ("npu" or "gpu") active for the duration.
 
     Three rules, each one a bug an earlier copy of this had:
 

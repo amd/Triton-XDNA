@@ -10,9 +10,9 @@ Each check is a bug one of the copies it replaced had:
   iGPU kernel compiled for the NPU;
 - reading `.active` to find what to restore resolved the auto-detected default,
   which raises "0 active drivers" on an iGPU-free host;
-- the iGPU scope built a new AMD driver on every entry.
+- the iGPU scope built a new iGPU driver on every entry.
 
-Needs neither an NPU nor an iGPU; the AMD checks run only where torch sees one.
+Needs neither an NPU nor an iGPU; the iGPU checks run only where torch sees one.
 """
 
 import sys
@@ -65,17 +65,17 @@ def main():
     except ImportError:
         has_gpu = False
     if not has_gpu:
-        print("  skip AMD checks: no iGPU visible to torch")
+        print("  skip iGPU checks: no iGPU visible to torch")
     else:
         config._active = None
-        with driver_scope("amd") as a1:
+        with driver_scope("gpu") as a1:
             with driver_scope("npu") as n:
-                check(isinstance(n, NPUDriver), "npu nested inside amd")
-            check(config._active is a1, "amd restored after the nested npu")
-        check(config._active is None, "amd scope restores nothing-active")
-        with driver_scope("amd") as a2:
+                check(isinstance(n, NPUDriver), "npu nested inside gpu")
+            check(config._active is a1, "gpu restored after the nested npu")
+        check(config._active is None, "gpu scope restores nothing-active")
+        with driver_scope("gpu") as a2:
             pass
-        check(a1 is a2, "the AMD driver is built once and reused")
+        check(a1 is a2, "the iGPU driver is built once and reused")
 
     config._active = None
     if failures:

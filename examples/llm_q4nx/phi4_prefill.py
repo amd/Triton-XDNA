@@ -80,7 +80,7 @@ class Phi4Prefill(LlamaPrefill):
                 dev = "cuda"
                 import gpu_kernels
 
-                with driver_scope("amd"):
+                with driver_scope("gpu"):
                     out = gpu_kernels.rope_batch(
                         x.to(dev), lut.to(dev), n_heads, x.shape[-1] // n_heads, rot=R
                     )
