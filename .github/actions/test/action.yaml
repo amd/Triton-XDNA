@@ -258,6 +258,9 @@ runs:
           # One-op NPUChain re-dispatch (the LLM projection and attention chains).
           python3 scripts/test_npu_chain_single_op.py
 
+          # An NPUChain's own bf16_emulation setting, independent of the global one.
+          python3 scripts/test_npu_chain_bf16_emulation.py
+
           # The weight loader lives in mlir-air's sources, which the wheel does
           # not ship, so fetch them at the pinned commit first. Sparse and
           # blobless: ~1.7 MB of two directories. Without this the example

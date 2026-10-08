@@ -135,12 +135,16 @@ class MultiLaunchBuilder:
     index. Sharing a combined index across two ops wires op_i's output buffer to
     op_{i+1}'s input buffer (the DDR hand-off). Non-memref (i32 grid metadata)
     args are dropped: they are unused in the launch body.
+
+    ``bf16_emulation`` applies to the whole chain, which compiles as one
+    module; None takes ``npu_config.bf16_emulation``.
     """
 
-    def __init__(self, name, air_project_path=None):
+    def __init__(self, name, air_project_path=None, bf16_emulation=None):
         self.name = name
         self.ops = []
         self.air_project_path = air_project_path or npu_config.air_project_path
+        self.bf16_emulation = bf16_emulation
         # combined_idx -> type string (filled as ops are added; validated for
         # consistency when an index is reused for a hand-off).
         self._combined_types = {}
@@ -246,13 +250,18 @@ module {{
 """
         return combined
 
+    def _bf16_emulation(self):
+        if self.bf16_emulation is None:
+            return npu_config.bf16_emulation
+        return bool(self.bf16_emulation)
+
     def cache_key(self, output_format, npu_version, text=None):
         text = text if text is not None else self.build_module_text()
         key_data = (
             text
             + f"_format_{output_format}"
             + f"_npu_{npu_version}"
-            + f"_bf16emu_{npu_config.bf16_emulation}"
+            + f"_bf16emu_{self._bf16_emulation()}"
         )
         return hashlib.md5(key_data.encode("utf-8")).hexdigest()
 
@@ -287,7 +296,13 @@ module {{
         with open(air_mlir_path, "w") as f:
             f.write(combined)
 
-        artifacts = _aircc_compile(air_mlir_path, output_format, npu_version, air_proj)
+        artifacts = _aircc_compile(
+            air_mlir_path,
+            output_format,
+            npu_version,
+            air_proj,
+            bf16_emulation=self._bf16_emulation(),
+        )
         # Cache the format-specific artifacts and return the cached paths.
         cached = _put_aircc_artifacts(cache, artifacts, output_format)
         if output_format == "elf":
@@ -535,6 +550,10 @@ class NPUChain:
 
     Single-op chains are supported (``scripts/test_npu_chain_single_op.py``).
 
+    ``bf16_emulation`` sets aircc's ``--bf16-emulation`` for this chain alone;
+    None follows ``npu_config.bf16_emulation``. It covers every op in the
+    chain, since the chain compiles as one module.
+
     Each chain that has run holds an ``xrt::hw_context``, and the NPU runs out
     of those -- at about 30 in one process, as
     ``DRM_IOCTL_AMDXDNA_CREATE_HWCTX ... err=-2``. A model that caches chains
@@ -555,9 +574,10 @@ class NPUChain:
     #: collection as it always has.
     _open = collections.OrderedDict()
 
-    def __init__(self, name, air_project_path=None):
+    def __init__(self, name, air_project_path=None, bf16_emulation=None):
         self.name = name
         self.air_project_path = air_project_path
+        self.bf16_emulation = bf16_emulation
         self._specs = []  # (kernel, grid, arg_map, transform_script, args, constexprs)
         self._builder = None
         self._runner = None
@@ -647,7 +667,11 @@ class NPUChain:
         return compiled.asm["ttsharedir"]
 
     def _build(self):
-        b = MultiLaunchBuilder(self.name, air_project_path=self.air_project_path)
+        b = MultiLaunchBuilder(
+            self.name,
+            air_project_path=self.air_project_path,
+            bf16_emulation=self.bf16_emulation,
+        )
         for (
             kernel,
             grid,
