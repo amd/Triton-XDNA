@@ -320,22 +320,19 @@ class LlamaPrefill:
         return enabled
 
     #: Where each operator runs, per `--backend`: "npu" is a Triton kernel on
-    #: the NPU, "gpu" one on the iGPU, "cpu" torch on the host (the reference
-    #: `--compare-cpu` checks against). This table is the whole of what a
-    #: backend name means; `_device` is its only reader and every operator
-    #: below asks it. A subclass with other operators replaces the table.
+    #: the NPU, "gpu" a Triton kernel on the iGPU, "cpu" torch on the host
+    #: (the reference `--compare-cpu` checks against). Operators look their
+    #: device up through `_device`; a subclass with other operators replaces
+    #: the table.
     #:
-    #: Two rules apply on top of a cell, at lookup:
+    #: `_device` adjusts a cell in two cases:
     #:
-    #: * an "npu" cell whose operator `--ops` leaves out runs on the CPU:
-    #:   `--ops` bisects the NPU kernels, it does not move work to the iGPU;
-    #: * a "gpu" cell, on a host where torch sees no iGPU, takes the "npu"
-    #:   row's cell instead -- `hetero` without one runs as `npu`.
+    #: * an "npu" operator that `--ops` does not enable runs on the CPU;
+    #: * a "gpu" cell, when torch sees no iGPU, takes the "npu" row's value,
+    #:   so `hetero` without an iGPU runs as `npu`.
     #:
-    #: RoPE and attention have no NPU kernel here -- the position examples/gpt2
-    #: --backend npu takes on attention, not a Triton limit -- so their choice
-    #: is host or iGPU, and the iGPU is the one thing `hetero` changes. Not
-    #: listed because nothing chooses it: the LM head, torch on the CPU.
+    #: RoPE and attention have no NPU kernel here, so they run on the host or
+    #: the iGPU. The LM head is always torch on the host and is not listed.
     PLACEMENT = {
         "cpu": dict(
             matmul="cpu", rms_norm="cpu", swiglu="cpu", rope="cpu", attention="cpu"
@@ -359,11 +356,7 @@ class LlamaPrefill:
         return dev
 
     def _has_gpu(self):
-        """Whether torch sees an iGPU. Asked once; says so once when it does not.
-
-        Not an error: where an operator runs is a placement decision, not a
-        correctness one, and CI has no iGPU.
-        """
+        """Whether torch sees an iGPU. Checked once; prints a note if not."""
         if not hasattr(self, "_gpu_ok"):
             self._gpu_ok = torch.cuda.is_available()
             if not self._gpu_ok:
@@ -496,9 +489,8 @@ class LlamaPrefill:
             N = q.shape[0]
             rep = n_q // n_kv
             scale = dh**-0.5 if scale is None else scale
-            # The other op with no NPU kernel here, and the one that pays for
-            # the transfer: the scores are [n_q, N, N], so this is where a long
-            # prompt spends its prefill.
+            # The scores are [n_q, N, N], which is where a long prompt spends
+            # its prefill.
             if self._device("attention", backend) == "gpu":
                 dev = "cuda"
                 # Flash-style, so the [n_q, N, N] score matrix the torch body

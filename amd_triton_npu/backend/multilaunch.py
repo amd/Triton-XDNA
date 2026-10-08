@@ -622,10 +622,9 @@ class NPUChain:
         hetero model the GPU driver may be active and ``asm`` would lack
         ``ttsharedir`` (KeyError).
 
-        `driver_scope` restores whatever was active on entry, nothing included,
-        so a chain reopened after ``max_open`` evicted it can capture again
-        from wherever its ``run()`` was called, not only from inside a scope
-        that already made a driver active.
+        `driver_scope` restores whatever was active on entry, including no
+        driver at all, so a chain reopened after ``max_open`` evicted it can
+        capture from wherever its ``run()`` is called.
         """
         from .driver_scope import driver_scope
 

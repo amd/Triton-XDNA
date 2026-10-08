@@ -1,16 +1,12 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""`driver_scope` switches Triton's active driver and puts back exactly what
-was there.
+"""Checks for `driver_scope`.
 
-Each check is a bug one of the copies it replaced had:
-
-- a first scope in a process left the NPU driver active behind it, so the next
-  iGPU kernel compiled for the NPU;
-- reading `.active` to find what to restore resolved the auto-detected default,
-  which raises "0 active drivers" on an iGPU-free host;
-- the iGPU scope built a new iGPU driver on every entry.
+- the driver active on entry is restored on exit, including none at all and
+  when the body raises;
+- an already-active driver of the requested kind is kept, not replaced;
+- the iGPU driver is constructed once and reused.
 
 Needs neither an NPU nor an iGPU; the iGPU checks run only where torch sees one.
 """

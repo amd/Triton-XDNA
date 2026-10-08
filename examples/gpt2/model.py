@@ -129,9 +129,9 @@ GPT2_CONFIG = GPT2_CONFIGS["gpt2"]
 # the attention and `add2` the MLP. The MLP's four NPU cells (mlp_fc, gelu,
 # mlp_proj, add2) run as one fused dispatch where the chain is available.
 #
-# "gpu_torch" is a precision choice, not only a device one: the hetero split
-# keeps LayerNorm and the residual stream in float32, because triton_layernorm
-# emits bf16 and that compounds into visible logit drift over the full stack.
+# The hetero split uses "gpu_torch" for LayerNorm and the residual add to keep
+# them in float32: triton_layernorm emits bf16, which drifts the logits over
+# the full stack.
 _GPU = dict(
     embed="gpu_torch",
     ln="gpu",
@@ -146,8 +146,8 @@ _GPU = dict(
     add2="gpu",
     lm_head="gpu_torch",
 )
-# No NPU attention kernel yet: Q@K^T and attn@V run on the host (softmax on
-# the NPU), keeping npu mode off the iGPU. The LM head is an NPU GEMM.
+# There is no NPU attention kernel, so Q@K^T and attn@V run on the host (the
+# softmax on the NPU) and npu mode never touches the iGPU.
 _NPU = dict(
     embed="cpu",
     ln="npu",
@@ -162,8 +162,8 @@ _NPU = dict(
     add2="npu",
     lm_head="npu",
 )
-# The hidden state stays iGPU-resident for the whole layer; the NPU reads and
-# writes it in place through shared buffers for the MLP, the one block it runs.
+# The hidden state stays on the iGPU; the NPU runs the MLP, reading and
+# writing it through shared buffers.
 _HETERO = dict(
     embed="gpu_torch",
     ln="gpu_torch",
@@ -179,15 +179,14 @@ _HETERO = dict(
     lm_head="gpu_torch",
 )
 
-#: `--backend` -> the placement of the prompt ("prefill") and of each generated
-#: token ("decode", one-token forwards). The whole of what a backend name means;
-#: GPT2Model reads nothing else to decide where an operator runs.
+#: `--backend` -> the placement for the prompt ("prefill") and for each
+#: one-token step ("decode").
 PLACEMENT = {
     "gpu": {"prefill": _GPU, "decode": _GPU},
     "npu": {"prefill": _NPU, "decode": _NPU},
     "hetero": {"prefill": _HETERO, "decode": _HETERO},
-    # NPU dispatch overhead (~0.5-1 ms per launch x 72) dominates a one-token
-    # step, so the decode goes all-iGPU.
+    # NPU launch overhead outweighs a one-token step's compute, so the decode
+    # runs on the iGPU.
     "hetero-fast": {"prefill": _HETERO, "decode": _GPU},
 }
 
@@ -681,10 +680,9 @@ class GPT2Model:
         self._load_weights(state_dict)
         self._place_weights(rows)
 
-        # The LM head's float32 weight, cached on the iGPU once, where the
-        # run also uses the NPU: there it saves converting the tied embedding
-        # (~20 ms on the host) on every step. The all-iGPU backend converts per
-        # call instead and keeps that memory.
+        # For backends that also use the NPU, cache the LM head's float32
+        # weight on the iGPU instead of converting the tied embedding on every
+        # step. The all-iGPU backend converts per call and saves the memory.
         uses_npu = any("npu" in r.values() for r in rows)
         if uses_npu and any(r["lm_head"] == "gpu_torch" for r in rows):
             self._wte_lm_head = self.wte.to(device="cuda", dtype=torch.float32)
@@ -713,12 +711,10 @@ class GPT2Model:
             self.script_dir, "transform_gelu_f32in_aie2p.mlir"
         )
 
-        # Fuse mlp_fc->gelu->mlp_proj->add2 into one load_pdi ELF on NPU,
-        # wherever a row puts all four there. The unfused per-op path is ~10x
-        # slower, so it's only kept as an escape hatch via
-        # AMD_TRITON_NPU_FUSED_MLP=0. Its buffers are shared with the iGPU
-        # where the hidden state lives there (the residual add before it runs
-        # on the iGPU); npu mode stays XRT-only (no ROCm).
+        # Fuse mlp_fc->gelu->mlp_proj->add2 into one load_pdi ELF wherever a
+        # row puts all four on the NPU. AMD_TRITON_NPU_FUSED_MLP=0 selects the
+        # much slower unfused path. The chain's buffers are shared with the
+        # iGPU when the hidden state lives there; otherwise they are XRT-only.
         self._fused_mlp = None
         chain_rows = [r for r in rows if all(r[k] == "npu" for k in _MLP_CHAIN)]
         if chain_rows and os.getenv("AMD_TRITON_NPU_FUSED_MLP", "1") == "1":
@@ -794,15 +790,10 @@ class GPT2Model:
     def _place_weights(self, rows):
         """Put each weight where the operators that read it run.
 
-        A weight read on the iGPU in some row gets an iGPU copy, one read on
-        the NPU or host gets a host copy, and one read on both keeps both --
-        hetero-fast's MLP weights, which its prefill runs on the NPU and its
-        decode on the iGPU. `self._layers[side]` holds the per-layer dicts
-        and `self._glob[side]` the rest, for side "gpu" or "host".
-
-        The MLP weights read on the NPU stay host tensors: the fused chain
-        folds them into padded numpy arrays once (`_FusedMLP._prep_weights`)
-        and never reads them again.
+        A weight gets an iGPU copy if any row reads it on the iGPU, and a host
+        copy if any row reads it on the NPU or host; hetero-fast keeps both for
+        the MLP weights. `self._layers[side]` holds the per-layer dicts and
+        `self._glob[side]` the rest, for side "gpu" or "host".
         """
 
         def sides(*ops):
@@ -831,11 +822,8 @@ class GPT2Model:
         # The tied embedding on whichever side looks it up.
         self.wte = self._glob[_side(rows[0]["embed"])]["wte"]
 
-        # LayerNorm in float32 on the iGPU ("gpu_torch") wants float32 weights.
-        # Casting at the call site meant six tiny device casts per layer on
-        # every forward pass -- pure launch overhead for a value that never
-        # changes. Kept under separate keys so triton_layernorm, which wants
-        # the bf16 originals, is unaffected.
+        # "gpu_torch" LayerNorm uses float32 weights, cast once here and kept
+        # beside the bf16 originals that triton_layernorm uses.
         if any(r["ln"] == "gpu_torch" for r in rows):
             for layer in self._layers["gpu"]:
                 for k in ("ln1_weight", "ln1_bias", "ln2_weight", "ln2_bias"):
@@ -1079,21 +1067,16 @@ class GPT2Model:
     def _residual(self, x, y, cell):
         """x + y, placed at `cell`."""
         if cell == "gpu_torch":
-            # Next to the attention that produced `y`. Dispatching this tiny
-            # elementwise op to the NPU would cost more in launch overhead than
-            # the arithmetic.
             return x.to(torch.float32) + y.to(torch.float32)
         return self._add(self._on(x, cell), self._on(y, cell), backend=cell)
 
     def _mlp(self, i, x_norm, x, row):
         """x + mlp(x_norm): mlp_fc -> gelu -> mlp_proj -> add2, placed by `row`.
 
-        Where all four are on the NPU and the (flattened) row count fits one
-        M-block (<=256), the fused chain runs them as one load_pdi ELF and
-        applies mlp_proj's bias itself. Otherwise per op: the NPU wrappers
-        stage through host buffers, so their operands come to the host, and
-        the result goes back to wherever the hidden state lives, so the next
-        layer resumes where it left off.
+        Where all four are on the NPU and the rows fit one M-block, the fused
+        chain runs them as one load_pdi ELF. Otherwise each op runs where its
+        cell says, with its operands moved there, and the result is returned
+        on the device the hidden state came in on.
         """
         if (
             self._fused_mlp is not None
@@ -1153,9 +1136,8 @@ class GPT2Model:
         B, S = input_ids.shape
         row = self.place["decode" if S == 1 else "prefill"]
 
-        # Embeddings where the row looks them up. On the iGPU for every row
-        # that runs attention there, so the hidden state is born where it is
-        # used and never has to be shipped across.
+        # Look the embeddings up on the side the row puts them, so the hidden
+        # state starts where the layers use it.
         embed = self._glob[_side(row["embed"])]
         input_ids = self._on(input_ids, row["embed"])
         positions = torch.arange(
@@ -1218,7 +1200,7 @@ class GPT2Model:
                         x.shape[:-1] + (VOCAB_SIZE,)
                     )
             elif self._wte_lm_head is not None:
-                # On the iGPU (~0.5ms vs ~20ms on CPU), against the cached copy.
+                # On the iGPU, against the cached float32 copy.
                 logits = (
                     x.to(device="cuda", dtype=torch.float32) @ self._wte_lm_head.t()
                 )

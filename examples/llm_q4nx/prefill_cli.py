@@ -1,19 +1,16 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
-"""The `prefill.py` every Q4NX example ships: run the Triton prefill alone.
+"""Shared implementation of each Q4NX example's `prefill.py`.
 
     python prefill.py --backend cpu
     python prefill.py --backend npu --ops all
     python prefill.py --backend npu --ops matmul --compare-cpu
     python prefill.py --backend npu --kv-out /tmp/prefill_kv.npz
 
-Gates the canonical prompt's first token, like `harness --prefill-only`, and
-adds what that does not: `--compare-cpu`, the per-layer KV divergence from the
-CPU reference on the same weights, and `--kv-out`, the handoff as an npz. The
-weights stay unpadded (no `make_npu_resident`) so the CPU reference can share
-them.
-
-A model's own `prefill.py` is its docstring and one call to `main`.
+Runs the Triton prefill alone and gates the canonical prompt's first token.
+`--compare-cpu` reports the per-layer KV difference from the CPU reference on
+the same weights; `--kv-out` writes the handoff as an npz. The weights are not
+made NPU-resident, so the CPU reference can share them.
 """
 
 import argparse
@@ -26,9 +23,8 @@ import torch
 def main(prefill_cls, config, doc=None, argv=None):
     """Run `prefill_cls` for the example whose `config` module is bound.
 
-    `--backend` offers the rows of the class's `PLACEMENT` and `--ops` names
-    its `NPU_OPS`, so neither can drift from the forward it configures.
-    `--kv-out` only where the class can write one npz (`SAVES_KV_NPZ`).
+    `--backend` choices are the rows of the class's `PLACEMENT`, and `--ops`
+    names its `NPU_OPS`. `--kv-out` is offered only where `SAVES_KV_NPZ`.
     """
     ap = argparse.ArgumentParser(
         description=doc, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -100,20 +96,13 @@ def main(prefill_cls, config, doc=None, argv=None):
 
     if args.compare_cpu and args.backend != "cpu":
         ref = prefill_cls(backend="cpu", n_layers=args.n_layers, max_seq=args.max_seq)
-        # Not an attribute-by-attribute copy: the class declares what it owns
-        # (`WEIGHT_ATTRS`) and this asks for all of it -- Gemma's second RoPE
-        # table is what a hand-written list here would forget.
+        # Shares everything the class lists in `WEIGHT_ATTRS`.
         ref.share_weights_from(m)
         ref.prefill(ids)
-        # Only the layers that own a cache: from `FIRST_KV_SHARED` up (Gemma4)
-        # a layer attends a lower layer's, so comparing it would re-check that
-        # layer under a higher layer's name.
-        #
-        # Through `kv_view`, which returns the prompt's rows as plain [P, dh]
-        # on every model -- Gemma4 keeps its cache in the decode's slab layout
-        # and has no `kv_k`/`kv_v` arrays. Its slab is bf16, so its deltas
-        # bottom out at an ulp rather than at zero, which is the precision the
-        # decode actually reads.
+        # Only layers that own a cache: from `FIRST_KV_SHARED` up (Gemma4) a
+        # layer reads a lower layer's. `kv_view` returns the prompt's rows as
+        # [P, dh] whatever the cache layout; a bf16 cache bottoms out at one
+        # ulp rather than zero.
         for L in range(min(args.n_layers, getattr(config, "FIRST_KV_SHARED", 1 << 30))):
             gk, gv = m.kv_view(L)
             rk, rv = ref.kv_view(L)

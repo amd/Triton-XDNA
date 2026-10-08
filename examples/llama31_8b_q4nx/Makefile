@@ -16,9 +16,7 @@
 
 MODEL_NAME := llama-3.1-8b
 TITLE      := Llama-3.1-8B
-# This model's own gate prompt, not the siblings'. The 1B and 3B use "The
-# capital of France is"; on the 8B that ranks " a" above " Paris", which is
-# why config.PROMPT differs -- so `make run` has to differ with it.
+# Matches this model's config.PROMPT, which differs from the other Llamas'.
 PROMPT     ?= The capital city of France is called
 
 include $(dir $(lastword $(MAKEFILE_LIST)))../llm_q4nx/q4nx.mk

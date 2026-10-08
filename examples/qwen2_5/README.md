@@ -101,13 +101,13 @@ on the NPU) — a vocab-sized NPU matmul is far slower there than on the CPU.
 | Final RMSNorm | GPU | NPU | NPU | NPU | **GPU** |
 | LM head | GPU | CPU | GPU | GPU | GPU |
 
-This table is `PLACEMENT` in `model.py`, which is what the model reads; the
-cells there also say which side of a device runs torch rather than a Triton
+The model reads this placement from `PLACEMENT` in `model.py`, which is
+authoritative and also records which cells run torch rather than a Triton
 kernel. Outside `npu`, attention (Q/K/V/O, RoPE, the fused attention kernel)
 runs on the iGPU: the fused FlashAttention-style kernel is GPU-only, and
 Qwen's grouped-query attention is expanded to full heads before the kernel.
-In `hetero`, each layer's input RMSNorm comes out of the previous layer's fused
-NPU tail when that ran, rather than as a dispatch of its own.
+In `hetero`, each layer's input RMSNorm is produced by the previous layer's
+fused NPU tail when that ran.
 
 ## Architecture
 

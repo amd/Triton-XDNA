@@ -231,9 +231,8 @@ runs:
         # are silent. air-opt on fixtures; no NPU, no weights.
         python3 scripts/test_fold_add_into_matmul_init.py
 
-        # That switching Triton's active driver between the NPU and the iGPU
-        # restores exactly what was active, nothing included. No NPU; the
-        # iGPU half runs only where torch sees one.
+        # Switching Triton's active driver between the NPU and the iGPU. No
+        # NPU needed; the iGPU checks run only where torch sees one.
         python3 scripts/test_driver_scope.py
 
         if [ "$DEVICE" = "aie2p" ]; then
@@ -489,8 +488,7 @@ runs:
           #
           #   --prefill-engine triton --backend hetero
           #       the prefill's RoPE and attention on the iGPU, the rest on
-          #       the NPU. Gates the first token, like 9b. Coverage for that
-          #       routing, not a faster path.
+          #       the NPU. Gates the first token, like 9b.
           #   --prefill-engine triton --backend npu --decode gpu
           #       the Triton NPU prefill plus the Triton iGPU decode, gating
           #       the recorded continuation. The decode under test is ours,

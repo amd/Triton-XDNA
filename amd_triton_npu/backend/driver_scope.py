@@ -1,11 +1,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Switch Triton's active driver between the NPU and the AMD iGPU for a scope.
+"""Choose which device Triton compiles and launches for, within a scope.
 
-A model that splits its work between the two launches Triton kernels for both
-from one process, and Triton compiles and launches for whichever driver is
-active. This is the one helper for choosing it; NPUChain's warmup, the Q4NX
-examples and the gpt2/qwen2_5 examples all go through it.
+Triton holds one active driver per thread and every launch goes to it, so a
+program that runs kernels on both the NPU and the iGPU has to switch it
+around each group of launches:
 
     with driver_scope("npu"):
         kernel[grid](...)          # compiled and launched for the NPU
@@ -13,20 +12,18 @@ examples and the gpt2/qwen2_5 examples all go through it.
     with driver_scope("gpu"):
         gpu_kernel[grid](...)      # compiled and launched for the iGPU
 
-Kept free of `driver.py`'s imports (aie, air) so an iGPU-only caller does not
-pay for the NPU toolchain.
+This module does not import `driver.py` at load time, so iGPU-only callers do
+not pull in the NPU toolchain.
 """
 
 import contextlib
 
-#: The two places a kernel can run, named as the placement tables name them.
-#: "gpu" is the AMD iGPU, which Triton's own registry calls its "amd" backend.
+# "gpu" is the AMD iGPU; Triton registers its driver as the "amd" backend.
 _KINDS = ("npu", "gpu")
 
-#: The iGPU driver, built once. Construction is ~0.14 ms (it builds HIPUtils),
-#: against ~2 us for an NPUDriver, and a hetero prefill switches to it twice per
-#: layer. The NPU driver is built per scope instead: `NPUDriver()` reads the
-#: launch runtime from the environment, which a caller may change in between.
+# The iGPU driver is built once and reused: constructing one is far more
+# expensive than switching to it. The NPU driver is built on each entry
+# because `NPUDriver()` reads the launch runtime from the environment.
 _gpu = None
 
 
@@ -57,21 +54,14 @@ def _make(kind):
 def driver_scope(kind):
     """Make the `kind` driver ("npu" or "gpu") active for the duration.
 
-    Three rules, each one a bug an earlier copy of this had:
+    On exit the driver that was active on entry is restored, including none
+    at all. `_active` is read and assigned directly because the `.active`
+    property would resolve an auto-detected default, which raises on a host
+    with no iGPU, and `set_active` cannot restore "none". Entering a scope
+    whose driver is already active does nothing.
 
-    * It reads ``_active``, not ``.active``. The property resolves the
-      auto-detected default when nothing is active yet, and on an iGPU-free
-      host that raises "0 active drivers".
-    * It restores exactly what was active on entry, ``None`` included, by
-      assigning ``_active``: ``set_active`` cannot express "nothing chosen".
-      Leaving the NPU driver behind a process's first scope meant the next
-      unscoped iGPU kernel was compiled for the NPU and failed in aircc.
-    * It does nothing when a driver of that kind is already active, so nested
-      and repeated scopes cost nothing.
-
-    Switching does not drop compiled kernels: Triton's JIT cache is keyed by
-    the active driver's device, which is "npu" for the NPU and an ordinal for
-    the iGPU, so both stay cached across switches.
+    Switching does not invalidate compiled kernels: Triton caches them per
+    device, and the NPU and the iGPU are different devices.
     """
     if kind not in _KINDS:
         raise ValueError(f"driver_scope: kind must be one of {_KINDS}, not {kind!r}")

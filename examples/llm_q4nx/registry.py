@@ -72,19 +72,14 @@ class ModelSpec:
     #: `FusedDecoder` for the kv_arrays ones), so it is recorded rather than
     #: derived from the model name.
     decoder_class: str = ""
-    #: Whether `AMD_TRITON_NPU_RUNTIME=hsa` has been made to work for this
-    #: model. The HSA adapter (`hsa_decode.make_hsa_decoder_class`) wraps
-    #: whichever class `decoder_class` names and reads its geometry off the
-    #: decoder or its `fd` module, so the driver API alone does not rule a
-    #: model out; this records which ones have been run on HSA.
+    #: Whether the HSA decode (`AMD_TRITON_NPU_RUNTIME=hsa`) has been verified
+    #: for this model. `hsa_decode.make_hsa_decoder_class` wraps whichever class
+    #: `decoder_class` names, so the driver API alone does not rule a model out.
     supports_hsa: bool = False
-    #: Whether the XRT zero-copy decode (`harness.generate_zero_copy`) runs this
-    #: model: the prefill writes the decode's KV cache in pages XRT and HIP
-    #: share. Not implied by `driver_api`: the prefill's `_layer` must route its
-    #: K/V through `_kv_store`, which Qwen2.5's does not (it writes kv_k/kv_v
-    #: inline, so the shared slab would decode from an empty cache), and Gemma4
-    #: shares its own slab its own way (`_install_shared_kv`). Set only where
-    #: the decode has been gated on hardware.
+    #: Whether `harness.generate_zero_copy` may run this model over XRT, with the
+    #: prefill writing the decode's KV cache into pages XRT and HIP share. The
+    #: prefill must store K/V through `_kv_store`; set only where the decode has
+    #: been verified on hardware.
     supports_xrt_zero_copy: bool = False
     #: Host memory the prefill needs to hold this model's dequantized bf16
     #: weights, in GiB. Checked before anything is allocated: an undersized

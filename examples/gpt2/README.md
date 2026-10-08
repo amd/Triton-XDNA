@@ -100,11 +100,10 @@ CPU (there is no NPU attention kernel yet), so those rows are broken out below.
 | Final LayerNorm | GPU | NPU | **GPU** | **GPU** | GPU |
 | LM head | GPU | NPU | GPU | GPU | GPU |
 
-This table is `PLACEMENT` in `model.py`, which is what the model reads. The
-**GPU** cells of `hetero` are torch in float32 rather than Triton kernels:
-`triton_layernorm` emits bf16, and that compounds into visible logit drift over
-the full stack, so the hetero split keeps LayerNorm and the residual stream in
-float32.
+The model reads this placement from `PLACEMENT` in `model.py`, which is
+authoritative. In `hetero`, the LayerNorms and the attention residual add run
+as float32 torch on the iGPU rather than as Triton kernels, because
+`triton_layernorm` emits bf16 and that drifts the logits over the full stack.
 
 ## Architecture
 

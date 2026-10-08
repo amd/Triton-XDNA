@@ -17,24 +17,16 @@
 MODEL_NAME := gemma4-e2b
 TITLE      := Gemma4-E2B
 N_TOKENS   ?= 4
-# ATTN_MAXL the decode template is built for. 128, where the siblings take
-# decode_build.py's 2048 default: that is what mlir-air's own token driver
-# builds this model at (RUN_LBUILD), and every token streams a cache padded to
-# it, so a 35-layer model pays for the depth on every dispatch. Raise it for
-# longer sessions.
+# The decode template's ATTN_MAXL, matching mlir-air's own build of this
+# model. Every token streams a cache padded to it; raise it for longer sessions.
 DECODE_L   ?= 128
-# EMPTY by default, and that is load-bearing: an empty PROMPT runs the
-# canonical token IDS below, which is what lets `make run` gate the decode.
-# This tokenizer emits no <bos>, so `--text` of the same sentence gives ids
-# starting at 818 where `config.PROMPT` starts at 2, and the harness applies
-# the recorded continuation only when the ids match exactly. Setting PROMPT
-# sends text, as on every sibling, and correctly does not gate.
+# Empty by default so `make run` sends PROMPT_IDS (`config.PROMPT`) and the
+# decode is gated: this tokenizer emits no <bos>, so text never reproduces
+# those ids. Setting PROMPT sends text, ungated.
 PROMPT     ?=
-# `config.PROMPT`, as ids. Keep the two in step.
 PROMPT_IDS ?= 2,818,5279,529,7001,563
 
-# No `chat` target. mlir-air's Session/interactive_chat pair exists only on its
-# npz-API drivers; Gemma4-E2B's has neither, so there is nothing to host our
-# prefill in and the harness refuses --interactive up front.
+# No `chat` target: the harness only supports --interactive for npz-API
+# drivers, and this model's is not one.
 
 include $(dir $(lastword $(MAKEFILE_LIST)))../llm_q4nx/q4nx.mk

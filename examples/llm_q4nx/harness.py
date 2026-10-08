@@ -198,10 +198,8 @@ def load_prefill_weights(m, backend, npu_resident=True):
     on the CPU build their own model and do not come through here at all.
     """
     m.load_weights()
-    # Asked of the prefill's `PLACEMENT`, not of the backend name: `hetero`
-    # puts matmul on the NPU exactly as `npu` does, so it wants the same
-    # resident weights. Missing that costs nothing visible -- the run is simply
-    # slower and larger -- which is why it is worth stating.
+    # Applies to every backend whose `PLACEMENT` puts matmul on the NPU,
+    # `hetero` as well as `npu`.
     #
     # `npu_resident=False` is how a GPU decode opts out. The conversion is
     # ONE-WAY: it replaces each projection with a padded device-resident form
@@ -216,9 +214,8 @@ def load_prefill_weights(m, backend, npu_resident=True):
 def make_prefiller(prefill_cls, cfg, backend, ops, max_seq, model, npu_resident=True):
     """Construct `prefill_cls` for `cfg` and load its weights.
 
-    Every path that runs a prefill builds it here, so a weight load that fails
-    -- no network, no bundle -- is a skip (`ExampleUnavailable`, exit 77) on
-    all of them rather than a traceback on some.
+    A failure to obtain the weights (no network, no bundle) is raised as
+    `ExampleUnavailable`, which the example reports as a skip (exit 77).
     """
     m = prefill_cls(
         backend=backend,
@@ -355,11 +352,11 @@ def make_session_class(air, prefill_cls, cfg, backend, ops, model):
 
 
 def make_decoder(air, spec, cfg, args, max_L=None):
-    """This model's mlir-air decoder, constructed the way its driver wants.
+    """This model's mlir-air decoder, constructed per its `driver_api`.
 
-    The class is looked up on `air` by name rather than held, so the HSA
-    adapter `main` installs under that name is the one constructed. `max_L`
-    only reaches the kv_arrays drivers, the only ones that take it.
+    The class is looked up on `air` by name, so an HSA adapter installed under
+    that name by `main` is the one constructed. Only the kv_arrays drivers take
+    `max_L`.
     """
     cls = getattr(air, spec.decoder_class or "FusedDecoder")
     model = args.model or cfg.MODEL_DEFAULT
@@ -406,18 +403,18 @@ def _hsa_kv_sink(dec, spec):
 def _xrt_kv_sink(dec, spec):
     """A KV slab in pages XRT and HIP share, attached to the XRT decoder.
 
-    The rows are the decoder's layer count: the 1B's driver defines none and
-    hard-codes 16. The prefiller drivers keep their geometry on an `fd` module
-    and have no host mirror of the cache, so nothing marks it dirty for them
-    and the slab is synced to the device explicitly once the prefill is in.
-    The others take `KV` as their host mirror: their first dispatch writes it
-    out because `_kv_dirty` starts True. That assignment is load-bearing --
-    without it that first dispatch writes their own zeroed KV over the slab.
+    One row per decoder layer. The prefiller drivers keep their geometry on
+    an `fd` module and keep no host mirror of the cache, so the slab is synced
+    to the device explicitly after the prefill. The others use `dec.KV` as the
+    host mirror and write it to the device on their first dispatch, so `KV`
+    must point at the slab; otherwise that first write would overwrite the
+    prefill's K/V with the decoder's own empty cache.
     """
     import torch
     from triton.backends.amd_triton_npu import shared
 
     api = spec.driver_api
+    # The npz driver does not expose its layer count.
     rows = {"npz": 16, "kv_arrays": "UNI_DEC", "prefiller": "N_LAYERS"}[api]
     rows = rows if isinstance(rows, int) else getattr(dec, rows)
     geom = dec.fd if api == "prefiller" else dec
@@ -445,13 +442,12 @@ def _xrt_kv_sink(dec, spec):
 def generate_zero_copy(air, spec, cfg, prefill_cls, args, ids, runtime):
     """Prefill straight into the decode's KV cache, then decode from it.
 
-    No handoff step at all: the prefill is bound to the decode's own cache
-    (`bind_kv_sink`) and writes each layer's K/V where the decode reads it.
-    `runtime` says where that cache lives -- "hsa", the HSA decoder's resident
-    buffer, or "xrt", pages XRT and HIP share. Returns None when "xrt" is asked
-    for and the interop is absent, for the caller to take the staged path.
+    The prefill is bound to the decode's own cache (`bind_kv_sink`) and writes
+    each layer's K/V where the decode reads it. `runtime` says where that cache
+    lives: "hsa", the HSA decoder's resident buffer, or "xrt", pages XRT and
+    HIP share. Returns None when "xrt" is asked for and the interop is absent.
 
-    The loop is greedy (argmax), so the caller sends a sampled run elsewhere.
+    The decode loop is greedy (argmax).
     """
     import numpy as np
 
@@ -498,7 +494,6 @@ def generate_zero_copy(air, spec, cfg, prefill_cls, args, ids, runtime):
     t_dec = time.time() - t0
     n_gen = len(gen_ids) - 1
     if n_gen > 0:
-        # "(X tok/s)" is what mlir-air's bench/extract_perf.py looks for first.
         print(
             f"Generated {n_gen} tokens in {t_dec:.2f}s ({n_gen / t_dec:.2f} tok/s)",
             flush=True,
@@ -751,15 +746,12 @@ def build_parser(doc, backends=("cpu", "npu", "hetero")):
         default=None,
         help="where the Triton prefill's operators run (default: npu); needs "
         "--prefill-engine triton on a model with a fused prefill. cpu: every "
-        "operator "
-        "in torch on the host -- this stack's own reference, NOT "
-        "examples/gpt2's --backend reference, which is HuggingFace. npu: the "
-        "operators --ops enables on the NPU, the rest in torch on the host -- "
-        "RoPE and attention on every model but Gemma4-E2B, whose attention "
-        "has an NPU kernel. hetero: as npu, but RoPE and attention as Triton "
-        "kernels on the iGPU -- coverage for the iGPU path, not a speedup. "
-        "Where the decode runs is --decode, separately: the NPU prefill with "
-        "the iGPU decode is --backend npu --decode gpu.",
+        "operator in torch on the host (this stack's own reference, not the "
+        "HuggingFace one examples/gpt2 calls reference). npu: the operators "
+        "--ops enables on the NPU, the rest in torch on the host. hetero: as "
+        "npu, but RoPE and attention as Triton kernels on the iGPU. The "
+        "model's PLACEMENT table has the per-operator detail. The decode's "
+        "device is --decode.",
     )
     ap.add_argument(
         "--ops",
@@ -823,20 +815,17 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     fused = fused_prefill_config(cfg)
     asked = args.prefill_engine
     if asked == "auto":
-        # Decided by what the model and the run can use, never by which other
-        # flags were typed: `--backend npu` spelled out runs the same prefill
-        # as `--backend` left at its default. The interactive session builds
-        # its own prefiller and cannot host the fused one.
+        # Depends only on the model, and on --interactive: the interactive
+        # session builds its own prefiller and cannot host the fused one.
         args.prefill_engine = (
             "air-fused"
             if fused is not None and not getattr(args, "interactive", False)
             else "triton"
         )
     if args.prefill_engine == "air-fused":
-        # These configure the Triton prefill's operators, and the fused
-        # prefill has none of them. Refused rather than dropped: a run that
-        # asked for `--backend hetero` and silently got neither the iGPU nor
-        # the Triton prefill would report on something it did not run.
+        # These only apply to the Triton prefill. Reject them instead of
+        # ignoring them, so a run cannot report on a configuration it did not
+        # use.
         triton_only = [
             flag
             for flag, given in (
@@ -880,9 +869,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         )
 
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and not spec.supports_hsa:
-        # Up front, for the same reason --interactive is below: a property of
-        # the model, not of anything on disk, and otherwise found only after
-        # minutes of weight loading.
+        # Checked before any weights load.
         raise SystemExit(
             f"AMD_TRITON_NPU_RUNTIME=hsa is not supported for {spec.name}: the "
             f"HSA decode adapter has not been made to work with its driver "
@@ -979,12 +966,10 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             return 0
         return 0 if gate(first) else 1
 
-    # Zero-copy: the prefill writes the decode's KV cache in place, so there is
-    # no separate run_prefill or handoff. Where that cache lives depends on the
-    # runtime: the HSA decoder's resident buffer, or pages XRT and HIP share
-    # (None without that interop: fall through to the staged decode below).
-    # Its loop samples with argmax, so a non-greedy run stays on the staged
-    # driver, which honours its own sampler; `--profile` times the staged one.
+    # Zero-copy: the prefill writes the decode's KV cache in place. On XRT it
+    # returns None when the XRT/HIP interop is missing, and the staged path
+    # below runs instead. Its loop is argmax only, so sampled runs and
+    # `--profile` take the staged path.
     runtime = "hsa" if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" else "xrt"
     if (
         air is not None

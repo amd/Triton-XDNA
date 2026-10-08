@@ -156,12 +156,12 @@ _GPU = dict(
     final_norm="gpu",
     lm_head="gpu_torch",
 )
-# hetero-fast's decode: _GPU with the embedding looked up on the host, where
-# its prefill keeps the table, rather than holding a second copy on the iGPU.
+# hetero-fast's decode: _GPU, but the embedding lookup stays on the host where
+# its prefill keeps the table, so there is no second copy on the iGPU.
 _GPU_DECODE = dict(_GPU, embed="cpu")
-# No NPU attention kernel yet: its core runs on the host in float32, keeping
-# npu mode off the iGPU. So does the LM head: a [M,896]@[896,151936] runs
-# ~29s/token on the AIE but ~20ms on the CPU.
+# There is no NPU attention kernel, so its core runs on the host in float32
+# and npu mode never touches the iGPU. The LM head runs on the host too: the
+# vocab-sized GEMM is much slower on the NPU.
 _NPU = dict(
     embed="cpu",
     input_norm="npu",
@@ -179,9 +179,8 @@ _NPU = dict(
     final_norm="npu",
     lm_head="cpu",
 )
-# Attention on the iGPU, everything else on the NPU. RMSNorm stays on the NPU
-# because its kernel computes in float32, matching the gpt2 example's
-# rationale that float32 norm precision avoids logit drift across layers.
+# Attention on the iGPU, everything else on the NPU, whose RMSNorm kernel
+# computes in float32.
 _HETERO = dict(
     _NPU,
     input_norm="npu_chain",
@@ -192,15 +191,14 @@ _HETERO = dict(
     lm_head="gpu_torch",
 )
 
-#: `--backend` -> the placement of the prompt ("prefill") and of each generated
-#: token ("decode", one-token forwards). The whole of what a backend name means;
-#: Qwen2Model reads nothing else to decide where an operator runs.
+#: `--backend` -> the placement for the prompt ("prefill") and for each
+#: one-token step ("decode").
 PLACEMENT = {
     "gpu": {"prefill": _GPU, "decode": _GPU},
     "npu": {"prefill": _NPU, "decode": _NPU},
     "hetero": {"prefill": _HETERO, "decode": _HETERO},
-    # NPU dispatch overhead dominates a one-token step, so the decode goes
-    # all-iGPU.
+    # NPU launch overhead outweighs a one-token step's compute, so the decode
+    # runs on the iGPU.
     "hetero-fast": {"prefill": _HETERO, "decode": _GPU_DECODE},
 }
 
@@ -694,10 +692,9 @@ class Qwen2Model:
 
         self._load_weights(state_dict)
 
-        # The LM head's float32 weight (tied to the embeddings), cached on the
-        # iGPU once, where the run also uses the NPU: the embedding table stays
-        # on the host there, and this saves converting it on every step. The
-        # all-iGPU backend converts its iGPU copy per call instead.
+        # For backends that also use the NPU, cache the LM head's float32
+        # weight (the tied embedding) on the iGPU instead of converting it on
+        # every step. The all-iGPU backend converts per call.
         uses_npu = any("npu" in r.values() or "npu_chain" in r.values() for r in rows)
         if uses_npu and any(r["lm_head"] == "gpu_torch" for r in rows):
             self._lm_head = self.embed_tokens.to(device="cuda", dtype=torch.float32)
@@ -779,10 +776,9 @@ class Qwen2Model:
     def _place_weights(self, rows):
         """Put each weight where the operators that read it run.
 
-        A weight read on the iGPU in some row gets an iGPU copy, one read on
-        the NPU or host gets a host copy, and one read on both keeps both --
-        hetero-fast's norm and MLP weights, which its prefill runs on the NPU
-        and its decode on the iGPU. `self._layers[side]` holds the per-layer
+        A weight gets an iGPU copy if any row reads it on the iGPU, and a host
+        copy if any row reads it on the NPU or host; hetero-fast keeps both for
+        the norm and MLP weights. `self._layers[side]` holds the per-layer
         dicts and `self._glob[side]` the rest, for side "gpu" or "host".
         """
 
@@ -798,8 +794,8 @@ class Qwen2Model:
                     self._layers["gpu"][i][k] = layer[k].to("cuda")
                 if "host" not in where:
                     del layer[k]
-        # The LM head reads the embedding table itself only where nothing
-        # cached a float32 copy of it for that.
+        # Without the cached float32 copy, the LM head reads the embedding
+        # table directly.
         lm = sides("lm_head") if self._lm_head is None else set()
         glob = {
             "embed_tokens": sides("embed") | lm,
@@ -985,9 +981,8 @@ class Qwen2Model:
 
         scale = 1.0 / math.sqrt(self.head_dim)
         if row["attn_core"] == "cpu":
-            # Scaled-dot-product attention on the host in float32 (no NPU
-            # attention kernel yet). q/k/v are already host tensors from the
-            # NPU qkv linear.
+            # Scaled-dot-product attention on the host in float32. q/k/v are
+            # already host tensors from the NPU qkv linear.
             q_f = q.to(torch.float32)
             k_f = k_exp.to(torch.float32)
             v_f = v_exp.to(torch.float32)
@@ -1029,12 +1024,12 @@ class Qwen2Model:
     def _tail(self, i, x, attn_out, row):
         """The block after attention: add1 -> post_norm -> SwiGLU MLP -> add2.
 
-        Returns `(x, xnorm_next)`. Where all of it is on the NPU and the row
-        count fits one M-block, the fused chain runs it as ONE load_pdi ELF --
-        gamma folded into the gate/up weights keeps its rmsnorm bare -- and
-        also returns the next layer's bare input rmsnorm, which an
-        `input_norm` of "npu_chain" takes instead of a dispatch of its own.
-        Otherwise per op, and `xnorm_next` is None.
+        Returns `(x, xnorm_next)`. Where all of it is on the NPU and the rows
+        fit one M-block, the fused chain runs it as one load_pdi ELF (gamma is
+        folded into the gate/up weights, so its rmsnorm is bare) and also
+        returns the next layer's bare input rmsnorm, used when `input_norm` is
+        "npu_chain". Otherwise each op runs where its cell says and
+        `xnorm_next` is None.
         """
         if (
             self._fused_mlp is not None
