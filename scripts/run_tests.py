@@ -28,8 +28,8 @@ DEFAULT_SKIPPED_EXAMPLES = {
     "gpt2",
     "qwen2_5",
     # Same as above, and additionally: the no-argument run generates, which
-    # needs a one-time `make compile-decode`. CI gates it on --prefill-only
-    # instead, in its own step, which needs no decode build.
+    # needs a one-time `make compile-decode`. CI runs them in their own step,
+    # with per-model arguments.
     "llama32_1b_q4nx",
     "llama32_3b_q4nx",
     "llama31_8b_q4nx",

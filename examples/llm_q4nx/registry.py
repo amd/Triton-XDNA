@@ -72,13 +72,15 @@ class ModelSpec:
     #: `FusedDecoder` for the kv_arrays ones), so it is recorded rather than
     #: derived from the model name.
     decoder_class: str = ""
-    #: Whether `AMD_TRITON_NPU_RUNTIME=hsa` works for this model. The HSA
-    #: adapter subclasses `air.FusedDecoder`, which only the npz-API drivers
-    #: define -- the prefiller ones name theirs `FusedDecode3B` -- so asking
-    #: for HSA elsewhere raises AttributeError from inside hsa_decode.py.
-    #: Generalizing it belongs with the HSA scratchpad work, not with adding
-    #: models.
+    #: Whether the HSA decode (`AMD_TRITON_NPU_RUNTIME=hsa`) has been verified
+    #: for this model. `hsa_decode.make_hsa_decoder_class` wraps whichever class
+    #: `decoder_class` names, so the driver API alone does not rule a model out.
     supports_hsa: bool = False
+    #: Whether `harness.generate_zero_copy` may run this model over XRT, with the
+    #: prefill writing the decode's KV cache into pages XRT and HIP share. The
+    #: prefill must store K/V through `_kv_store`; set only where the decode has
+    #: been verified on hardware.
+    supports_xrt_zero_copy: bool = False
     #: Host memory the prefill needs to hold this model's dequantized bf16
     #: weights, in GiB. Checked before anything is allocated: an undersized
     #: host is SIGKILLed partway through the load, and a process cannot catch
@@ -208,6 +210,7 @@ LLAMA_3_2_1B = ModelSpec(
     tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.2-1B",
     extra_packages=("llama32_1b",),
     supports_hsa=True,
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -249,6 +252,7 @@ LLAMA_3_2_3B = ModelSpec(
     driver_api="prefiller",
     decoder_class="FusedDecode3B",
     supports_hsa=True,
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -290,6 +294,7 @@ LLAMA_3_1_8B = ModelSpec(
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",
     decoder_class="FusedDecode8B",
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -339,6 +344,7 @@ QWEN3_4B = ModelSpec(
     min_host_gib=14.0,
     extra_packages=("qwen3_8b_q4nx", "qwen3_4b"),
     supports_hsa=True,
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -382,6 +388,7 @@ GEMMA3_4B = ModelSpec(
     # tied.
     min_host_gib=17.0,
     supports_hsa=True,
+    supports_xrt_zero_copy=True,
 )
 
 #: `DECODE_ENV` in `fused_decode_ple/Makefile` -- the ENGINE's, not the model's:
@@ -604,6 +611,7 @@ PHI4_MINI = ModelSpec(
     min_host_gib=14.0,
     extra_packages=("llama32_1b_q4nx", "llama32_3b"),
     supports_hsa=False,
+    supports_xrt_zero_copy=True,
 )
 
 

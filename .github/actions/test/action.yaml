@@ -231,6 +231,10 @@ runs:
         # are silent. air-opt on fixtures; no NPU, no weights.
         python3 scripts/test_fold_add_into_matmul_init.py
 
+        # Switching Triton's active driver between the NPU and the iGPU. No
+        # NPU needed; the iGPU checks run only where torch sees one.
+        python3 scripts/test_driver_scope.py
+
         if [ "$DEVICE" = "aie2p" ]; then
           # Which decode artifact the example asks mlir-air for. Needs no NPU,
           # no weights and no mlir-air sources, so it runs before the fetch and
@@ -482,15 +486,13 @@ runs:
           # gpu` have no coverage there at all -- which is what this step is
           # for. Two runs, because they fail differently:
           #
-          #   hetero       the prefill's RoPE and attention on the iGPU, the
-          #                rest on the NPU. Gates the first token, like 9b.
-          #                Coverage for that routing, not a faster path.
-          #   hetero-fast  the NPU prefill plus the GPU decode, gating the
-          #                recorded continuation. It needs no `make
-          #                compile-decode`: the decode under test is the torch
-          #                -- now Triton -- one, not mlir-air's template. That
-          #                makes it the only end-to-end decode gate this model
-          #                has in CI.
+          #   --prefill-engine triton --backend hetero
+          #       the prefill's RoPE and attention on the iGPU, the rest on
+          #       the NPU. Gates the first token, like 9b.
+          #   --prefill-engine triton --backend npu --decode gpu
+          #       the Triton NPU prefill plus the Triton iGPU decode, gating
+          #       the recorded continuation. The decode under test is ours,
+          #       not mlir-air's template, so it needs no `make compile-decode`.
           #
           # So the two runs cover the two halves separately: the first is the
           # only gate on the iGPU prefill operators, the second the only gate
@@ -498,8 +500,8 @@ runs:
           #
           # Skipped rather than failed when the weights or mlir-air's sources
           # are unreachable; the example exits 77 for both.
-          for args in "--backend hetero --prefill-only" \
-                      "--backend hetero-fast --prompt 2,818,5279,529,7001,563 --max-tokens 3 --greedy"; do
+          for args in "--prefill-engine triton --backend hetero --prefill-only" \
+                      "--prefill-engine triton --backend npu --decode gpu --prompt 2,818,5279,529,7001,563 --max-tokens 3 --greedy"; do
             echo "--- hetero: gemma4_e2b_q4nx $args ---"
             rc=0
             ( cd examples/gemma4_e2b_q4nx \

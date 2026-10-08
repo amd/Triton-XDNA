@@ -87,6 +87,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 # The tile width, the row tiers and Triton's tensor cap come from `kernels`.
 # The chain runs the same GEMM kernel on the same schedule as every standalone
@@ -99,7 +100,6 @@ from kernels import (
     MAX_TILE_NUMEL,
     _GELU_2C,
     _GELU_K,
-    _npu_driver,
     col_tier,
     elem_block,
     matmul_script,
@@ -650,7 +650,7 @@ class FusedMLP:
         # way, and this runs inside a prefill that also issues torch ops. The
         # chain's warmup compilation needs it too, so the scope covers the
         # build, not just the dispatch.
-        with _npu_driver():
+        with driver_scope("npu"):
             chain = self._get_chain(M)
             for m0 in range(0, N, M):
                 rows = min(M, N - m0)

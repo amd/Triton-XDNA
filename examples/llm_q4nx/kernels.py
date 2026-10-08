@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _EXAMPLES = os.path.dirname(_HERE)
@@ -64,7 +65,7 @@ def launch(kernel, grid, *args, transform_script=None, **constexprs):
     error instead of leaving it to this comment.
     """
     _check_script(kernel, constexprs, transform_script)
-    with _npu_driver(), _tiling_script(transform_script):
+    with driver_scope("npu"), _tiling_script(transform_script):
         kernel[grid](*args, **constexprs)
 
 
@@ -90,26 +91,6 @@ def _check_script(kernel, constexprs, transform_script):
             f"does not key on the script, so {transform_script!r} would be "
             f"ignored and the first schedule used instead."
         )
-
-
-class _npu_driver:
-    """Make the NPU driver active for the duration of a launch.
-
-    Restores whatever was active on entry rather than resetting: on a host with
-    no iGPU there is no driver to auto-detect back to. Reading `.active` is
-    itself what resolves the default, and on an iGPU-free host that raises
-    "0 active drivers" -- so only read it if one has already been chosen.
-    """
-
-    def __enter__(self):
-        from triton.backends.amd_triton_npu.driver import NPUDriver
-
-        self._prev = getattr(triton.runtime.driver, "_active", None)
-        triton.runtime.driver.set_active(NPUDriver())
-
-    def __exit__(self, *exc):
-        if self._prev is not None:
-            triton.runtime.driver.set_active(self._prev)
 
 
 class _tiling_script:
@@ -801,7 +782,7 @@ def triton_matmul(
         # The build too, not just the dispatch: it warmup-compiles the kernel,
         # which needs a driver, and with no iGPU visible there is no default
         # one to fall back on ("0 active drivers") -- as `FusedMLP.run` scopes.
-        with _npu_driver():
+        with driver_scope("npu"):
             chain = _proj_chain(
                 block_m, block_n, Mp, Np, Kp, a_stride, transform_script
             )

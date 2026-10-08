@@ -63,6 +63,7 @@ import os
 
 import numpy as np
 import torch
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 from config import (
     ATTN_SCALE,
@@ -129,6 +130,50 @@ class Gemma4Prefill(LlamaPrefill):
     #: before assuming it still holds: the answer turns on dispatch overhead,
     #: which is exactly what the XRT launcher work would change.
     DEFAULT_OPS = ("matmul", "geglu", "attention")
+
+    #: No `prefill.py --kv-out`: sliding and full layers have caches of
+    #: different widths, so there is no single array to save.
+    SAVES_KV_NPZ = False
+
+    #: Where each operator runs; see `LlamaPrefill.PLACEMENT` for the rules.
+    #: Differences from Llama:
+    #:
+    #: * `attention` has an NPU kernel (`attn_npu`: Q.K^T and P.V on the NPU,
+    #:   the masked softmax on the host), used when there is one KV head. Under
+    #:   `hetero` attention runs on the iGPU instead.
+    #: * `ple_gate`, the GELU gate of the per-layer embedding, uses the `geglu`
+    #:   kernel but is placed separately; it is small and stays on the host.
+    #: * `rms_norm` is "npu" but not in `DEFAULT_OPS`, so it runs on the host
+    #:   unless `--ops` enables it.
+    #:
+    #: Always torch on the host, so not listed: the weightless value norm in
+    #: `_head_norm`, the logit softcap and the LM head.
+    PLACEMENT = {
+        "cpu": dict(
+            matmul="cpu",
+            rms_norm="cpu",
+            geglu="cpu",
+            ple_gate="cpu",
+            rope="cpu",
+            attention="cpu",
+        ),
+        "npu": dict(
+            matmul="npu",
+            rms_norm="npu",
+            geglu="npu",
+            ple_gate="cpu",
+            rope="cpu",
+            attention="npu",
+        ),
+        "hetero": dict(
+            matmul="npu",
+            rms_norm="npu",
+            geglu="npu",
+            ple_gate="cpu",
+            rope="gpu",
+            attention="gpu",
+        ),
+    }
 
     #: Everything `load_weights` establishes. `_lut` is a LIST here, one table
     #: per layer, where the base class has a single tensor -- see
@@ -369,12 +414,8 @@ class Gemma4Prefill(LlamaPrefill):
         the same label rather than saying so.
         """
         self._fused_mlp = None
-        # `_NPU_BACKENDS`, not `== "npu"`: `hetero` puts these two operators on
-        # the NPU exactly as `npu` does, so it wants the chain for exactly the
-        # same reason. Spelled as the shared tuple so the next backend that
-        # routes to the NPU does not have to remember this line exists.
-        fused_ops = {"matmul", "geglu"}
-        if self.backend not in self._NPU_BACKENDS or not fused_ops <= self.enabled:
+        # Built for any backend whose PLACEMENT puts both operators on the NPU.
+        if any(self._device(op) != "npu" for op in ("matmul", "geglu")):
             return
         if os.environ.get("Q4NX_FUSED_MLP", "1") != "1":
             print("[gemma4] fused MLP disabled by Q4NX_FUSED_MLP=0")
@@ -431,10 +472,14 @@ class Gemma4Prefill(LlamaPrefill):
         return self
 
     # ---- forward ----
-    def _geglu(self, gate, up, backend=None):
-        """gelu_tanh(gate) * up, elementwise. Gemma3's, for the same reason."""
+    def _geglu(self, gate, up, backend=None, op="geglu"):
+        """gelu_tanh(gate) * up, elementwise. Gemma3's, for the same reason.
+
+        `op` is the `PLACEMENT` key for the call site: the MLP's `geglu` or
+        the per-layer embedding's `ple_gate`.
+        """
         with self.timer.track("geglu"):
-            if self._on_npu("geglu", backend):
+            if self._device(op, backend) == "npu":
                 import kernels
 
                 return kernels.triton_geglu(gate, up)
@@ -512,15 +557,11 @@ class Gemma4Prefill(LlamaPrefill):
 
         `attn_npu` runs Q.K^T and P.V on the array and keeps the masked
         softmax on the host, over pages both sides address directly. Taken
-        only where it applies -- one KV head, which is every Gemma4 layer, and
-        no iGPU in play: under `hetero` the iGPU's flash kernel already does
-        the whole operator, and does it faster.
+        only where it applies -- one KV head, which is every Gemma4 layer --
+        and where `PLACEMENT` puts attention on the NPU. Otherwise the base
+        class's, on the host or the iGPU.
         """
-        if (
-            n_kv != 1
-            or not self._on_npu("attention", backend)
-            or self._gpu_device(backend) is not None
-        ):
+        if n_kv != 1 or self._device("attention", backend) != "npu":
             return super()._attention(
                 q, k, v, n_q, n_kv, dh, window=window, scale=scale, backend=backend
             )
@@ -534,10 +575,11 @@ class Gemma4Prefill(LlamaPrefill):
             return att(q, k, v, scale=dh**-0.5 if scale is None else scale)
 
     def _gpu_scope(self):
-        """Hold the GPU driver across a region, or do nothing on the host path."""
-        if self._gpu_device() is None:
+        """The iGPU driver scope for the head norms through the attention, or
+        a no-op if neither RoPE nor attention runs on the iGPU."""
+        if "gpu" not in (self._device("rope"), self._device("attention")):
             return contextlib.nullcontext()
-        return gpu_kernels.gpu_driver()
+        return driver_scope("gpu")
 
     def _layer(self, x, L, N, keep=None, pli=None):
         """One Gemma4 block, on the prompt. x: [N, D] -> [N, D].
@@ -559,17 +601,11 @@ class Gemma4Prefill(LlamaPrefill):
         h = self._rms_norm(x, w["attn_norm"], RMS_EPS)  # input_layernorm
 
         # One GPU-driver scope over the sublayer rather than one per operator.
-        # `gpu_driver` no-ops when the GPU backend is already active, so the
-        # scopes inside `_rope` and `_attention` cost nothing. Switching does
-        # cost: `set_active` drops Triton's kernel cache.
+        # `driver_scope` no-ops when the GPU driver is already active, so the
+        # scopes inside `_rope` and `_attention` cost nothing.
         #
-        # The qkv GEMM inside still switches to the NPU and back. That is
-        # unavoidable; what this removes is the two ropes and the attention
-        # each doing it again.
-        # The projections first, outside the GPU scope below. They are NPU
-        # work, and an NPU launch inside that scope would switch the active
-        # driver and drop the GPU kernels' compiled cache -- the thing the
-        # scope exists to keep.
+        # The projections run first, outside the iGPU scope below, because
+        # they are NPU work.
         # `stage_key` keeps this layer's weight on the device between calls.
         # It is the weight's identity, not the shape's: the chain behind it is
         # shared by everything of the same shape, and this is what gives each
@@ -632,12 +668,11 @@ class Gemma4Prefill(LlamaPrefill):
 
         # ---- per-layer embedding injection ----
         # A GELU-tanh gate against this layer's PLE vector, projected back up
-        # to D and added through the fifth norm. `_geglu` is the same operator:
-        # gelu_tanh(gate) * other, on the host: [N, PLI_D] is too small to
-        # offload.
+        # to D and added through the fifth norm. `_geglu` is the same operator,
+        # gelu_tanh(gate) * other, placed as `ple_gate`.
         residual = x
         gate = self._geglu(
-            self._matmul(x, w["inp_gate"], stage_key=f"ig_L{L}"), pli, backend="cpu"
+            self._matmul(x, w["inp_gate"], stage_key=f"ig_L{L}"), pli, op="ple_gate"
         )
         p = self._matmul(gate, w["per_layer_projection"], stage_key=f"plp_L{L}")
         x = residual + self._rms_norm(p, w["post_ple_norm"], RMS_EPS)
@@ -807,13 +842,12 @@ class Gemma4Prefill(LlamaPrefill):
 # GPU decode
 # ---------------------------------------------------------------------------
 #
-# The other half of a hybrid run: Triton prefill on the NPU, then token-by-token
-# decode in torch on the iGPU, instead of mlir-air's fused NPU superkernel.
+# The other half of a hybrid run: the prefill on the NPU, then token-by-token
+# decode in Triton on the iGPU, instead of mlir-air's fused NPU superkernel.
+# Spelled `--backend npu --decode gpu`.
 #
-# Named after `examples/qwen2_5`'s `hetero-fast`, which is the same split for
-# that model -- hetero prefill, all-GPU decode -- and reached the same way, by
-# running the ordinary forward at one token with a KV cache. The math below is
-# `_layer`'s, at N=1, with three differences that only appear at N=1:
+# The math below is `_layer`'s at N=1, run against a KV cache, with three
+# differences that only appear at N=1:
 #
 #   * the new token attends the CACHE, so K and V come from it rather than from
 #     this step's projections, and the sliding window becomes a bound on how far
@@ -1139,7 +1173,7 @@ class Gemma4GpuDecode:
         # The RoPE tables have `max_seq` rows, and the slab may have more.
         if N > pf.max_seq:
             raise ValueError(f"a {N}-token prompt exceeds max_seq={pf.max_seq}")
-        with gpu_kernels.gpu_driver():
+        with driver_scope("gpu"):
             logits = self._prefill(list(ids))
             if not self._slab_shared:
                 # Without interop the device slab is a copy; the host one is
@@ -1252,14 +1286,14 @@ class Gemma4GpuDecode:
 
         The driver scope is here rather than around each launch: a step issues
         several hundred, and every one of them has to reach the GPU backend
-        rather than the NPU one that a preceding prefill leaves active. See
-        `gpu_kernels.gpu_driver`.
+        rather than the NPU one a preceding prefill may have left active. See
+        `driver_scope`.
         """
         if not 0 <= pos < self.max_L:
             raise ValueError(
                 f"position {pos} is outside the decode's {self.max_L} rows"
             )
-        with gpu_kernels.gpu_driver():
+        with driver_scope("gpu"):
             return self._step(token, pos)
 
     def _step(self, token, pos):
@@ -1369,12 +1403,9 @@ class Gemma4GpuDecode:
         self.P = self.pf.current_context_length
         out = [int(first)]
         pos = self.P
-        # One driver scope for the whole loop. `step` takes one too, which
-        # no-ops inside this; what must not happen is a *switch* per token,
-        # because that drops Triton's kernel cache and recompiles every shape
-        # the token touches -- 7.5 s of an 9.3 s, 64-token run before this was
-        # hoisted. See `gpu_kernels.gpu_driver`.
-        with gpu_kernels.gpu_driver():
+        # One driver scope for the whole loop; the one `step` opens is then a
+        # no-op.
+        with driver_scope("gpu"):
             for _ in range(max(0, n_tokens - 1)):
                 if pos >= self.max_L:
                     print(f"[gpu-decode] hit max_L={self.max_L}; stopping", flush=True)

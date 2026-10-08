@@ -68,9 +68,9 @@ def _phi4_partial_rope(dev):
     x = torch.randn(N, nh * dh)
     lut = torch.randn(N, R)
 
-    pf._gpu_device = lambda backend=None: None
+    pf._device = lambda op, backend=None: "cpu"
     host = pf._rope(x, lut, nh)
-    pf._gpu_device = lambda backend=None: dev
+    pf._device = lambda op, backend=None: "gpu"
     gpu = pf._rope(x, lut, nh)
 
     # The tail is the half the rotation must not touch, so it is checked on its

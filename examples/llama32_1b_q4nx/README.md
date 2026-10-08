@@ -14,7 +14,7 @@ Generated 6 tokens in 0.13s (47.24 tok/s)
 ```
 
 ```
-$ python llama32_1b_q4nx_inference.py --backend npu --max-tokens 12 --greedy
+$ python llama32_1b_q4nx_inference.py --prefill-engine triton --backend npu --max-tokens 12 --greedy
 [triton-prefill] backend=npu ops={'matmul', 'rms_norm', 'swiglu'} P=6 ... first=12366
 [triton-prefill] first token 12366 (expect 12366) -- PASS
 Generated 12 tokens in 0.22s (55.76 tok/s)
@@ -179,7 +179,8 @@ Underneath:
 python llama32_1b_q4nx_inference.py --prefill-only
 
 # End to end
-python llama32_1b_q4nx_inference.py --backend npu --max-tokens 20 --greedy
+python llama32_1b_q4nx_inference.py --max-tokens 20 --greedy   # mlir-air's fused prefill
+python llama32_1b_q4nx_inference.py --prefill-engine triton --backend npu --max-tokens 20 --greedy
 python llama32_1b_q4nx_inference.py --text "The theory of relativity was developed by"
 
 # The prefill on its own, with per-op routing and a CPU cross-check

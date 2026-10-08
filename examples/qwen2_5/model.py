@@ -15,16 +15,13 @@ Architecture (Qwen2 decoder), differs from GPT-2 in several ways:
 This module is config-driven via QWEN_CONFIGS so the same code serves multiple
 model sizes (0.5B, 1.5B); select one with the --model CLI flag.
 
-Four backends route operators across iGPU and NPU:
+Four backends route operators across iGPU and NPU; PLACEMENT below is the
+table of exactly where:
   "gpu":         all ops on iGPU via ROCm/Triton
   "npu":         all ops on NPU via MLIR-AIR/AIE; no iGPU. Attention's
                  scaled-dot-product core runs on CPU (no NPU kernel yet)
   "hetero":      attention on iGPU; RMSNorm/MLP/add on NPU (prefill & decode)
   "hetero-fast": same as hetero for prefill; all-GPU decode (lower TPOT)
-
-RMSNorm runs on NPU in hetero modes because the NPU kernel computes in float32,
-matching the gpt2 example's rationale that float32 norm precision avoids logit
-drift across many transformer layers.
 """
 
 import os
@@ -128,18 +125,112 @@ class OpTimer:
         return sum(ms for _, ms in self.records)
 
 
-# Default hetero routing policy: which device runs each operator
-HETERO_ROUTING = {
-    "rmsnorm": "npu",
-    "qkv_linear": "gpu",
-    "attn_proj": "gpu",
-    "softmax": "gpu",
-    "mlp_gate": "npu",
-    "mlp_up": "npu",
-    "swiglu": "npu",
-    "mlp_down": "npu",
-    "add": "npu",
+# Where each operator runs. A cell is one of:
+#
+#   "npu"        a Triton kernel on the NPU
+#   "gpu"        a Triton kernel on the iGPU
+#   "gpu_torch"  torch on the iGPU, in float32
+#   "cpu"        torch on the host, in float32
+#
+# and, for `input_norm` only, "npu_chain": on the NPU, taken from the previous
+# layer's fused tail where that ran (the chain computes the next layer's bare
+# rmsnorm as its last op; gamma is applied on the host), else a standalone NPU
+# rmsnorm. `attn_core` is scores, softmax and attn@V; `rope` is torch where the
+# q/k projections leave q and k. The NPU tail -- add1, post_norm, mlp_gate,
+# mlp_up, swiglu, mlp_down, add2 -- runs as one fused dispatch where all of it
+# is on the NPU and the chain is available.
+_GPU = dict(
+    embed="gpu_torch",
+    input_norm="gpu",
+    qkv="gpu",
+    rope="gpu_torch",
+    attn_core="gpu",
+    attn_proj="gpu",
+    add1="gpu",
+    post_norm="gpu",
+    mlp_gate="gpu",
+    mlp_up="gpu",
+    swiglu="gpu",
+    mlp_down="gpu",
+    add2="gpu",
+    final_norm="gpu",
+    lm_head="gpu_torch",
+)
+# hetero-fast's decode: _GPU, but the embedding lookup stays on the host where
+# its prefill keeps the table, so there is no second copy on the iGPU.
+_GPU_DECODE = dict(_GPU, embed="cpu")
+# There is no NPU attention kernel, so its core runs on the host in float32
+# and npu mode never touches the iGPU. The LM head runs on the host too: the
+# vocab-sized GEMM is much slower on the NPU.
+_NPU = dict(
+    embed="cpu",
+    input_norm="npu",
+    qkv="npu",
+    rope="cpu",
+    attn_core="cpu",
+    attn_proj="npu",
+    add1="npu",
+    post_norm="npu",
+    mlp_gate="npu",
+    mlp_up="npu",
+    swiglu="npu",
+    mlp_down="npu",
+    add2="npu",
+    final_norm="npu",
+    lm_head="cpu",
+)
+# Attention on the iGPU, everything else on the NPU, whose RMSNorm kernel
+# computes in float32.
+_HETERO = dict(
+    _NPU,
+    input_norm="npu_chain",
+    qkv="gpu",
+    rope="gpu_torch",
+    attn_core="gpu",
+    attn_proj="gpu",
+    lm_head="gpu_torch",
+)
+
+#: `--backend` -> the placement for the prompt ("prefill") and for each
+#: one-token step ("decode").
+PLACEMENT = {
+    "gpu": {"prefill": _GPU, "decode": _GPU},
+    "npu": {"prefill": _NPU, "decode": _NPU},
+    "hetero": {"prefill": _HETERO, "decode": _HETERO},
+    # NPU launch overhead outweighs a one-token step's compute, so the decode
+    # runs on the iGPU.
+    "hetero-fast": {"prefill": _HETERO, "decode": _GPU_DECODE},
 }
+
+# Which weights each operator reads, for placing them where it runs.
+_WEIGHT_OPS = {
+    "input_ln": "input_norm",
+    "post_ln": "post_norm",
+    "q_weight": "qkv",
+    "q_bias": "qkv",
+    "k_weight": "qkv",
+    "k_bias": "qkv",
+    "v_weight": "qkv",
+    "v_bias": "qkv",
+    "o_weight": "attn_proj",
+    "gate_weight": "mlp_gate",
+    "up_weight": "mlp_up",
+    "down_weight": "mlp_down",
+}
+_TAIL_CHAIN = (
+    "add1",
+    "post_norm",
+    "mlp_gate",
+    "mlp_up",
+    "swiglu",
+    "mlp_down",
+    "add2",
+)
+
+
+def _side(cell):
+    """The memory an operator placed at `cell` reads: "gpu" or "host"."""
+    return "gpu" if cell in ("gpu", "gpu_torch") else "host"
 
 
 def _next_pow2(n):
@@ -582,9 +673,11 @@ class Qwen2Model:
             "rms_eps": RMS_EPS,
             **(config or QWEN_CONFIG),
         }
+        if backend not in PLACEMENT:
+            raise ValueError(f"backend {backend!r}: one of {sorted(PLACEMENT)}")
         self.backend = backend
-        self._is_hetero = backend in ("hetero", "hetero-fast")
-        self.op_backend = HETERO_ROUTING if self._is_hetero else None
+        self.place = PLACEMENT[backend]
+        rows = (self.place["prefill"], self.place["decode"])
         self.timer = OpTimer(enabled=False)
 
         self.n_layer = self.cfg["n_layer"]
@@ -599,20 +692,15 @@ class Qwen2Model:
 
         self._load_weights(state_dict)
 
-        if backend == "gpu":
-            self._move_weights_to_gpu()
-        elif backend == "hetero-fast":
-            self._place_weights_fast()
-        elif backend == "hetero":
-            self._place_weights()
-
-        # LM head matmul (tied to embeddings). Cache on GPU for speed in hetero;
-        # npu mode runs it on the NPU instead (see forward()) so it never touches
-        # cuda.
-        if backend in ("hetero", "hetero-fast"):
+        # For backends that also use the NPU, cache the LM head's float32
+        # weight (the tied embedding) on the iGPU instead of converting it on
+        # every step. The all-iGPU backend converts per call.
+        uses_npu = any("npu" in r.values() or "npu_chain" in r.values() for r in rows)
+        if uses_npu and any(r["lm_head"] == "gpu_torch" for r in rows):
             self._lm_head = self.embed_tokens.to(device="cuda", dtype=torch.float32)
         else:
             self._lm_head = None
+        self._place_weights(rows)
 
         # RoPE tables (float32 on CPU; sliced/moved per call)
         self.rope_cos, self.rope_sin = precompute_rope_cache(
@@ -641,14 +729,15 @@ class Qwen2Model:
             self.script_dir, "transform_swiglu_f32in_aie2p.mlir"
         )
 
-        # Optional: fuse the SwiGLU MLP (gate->up->silu*mul->down->residual add)
-        # into one load_pdi ELF on NPU. Opt-in via AMD_TRITON_NPU_FUSED_MLP=1;
-        # active whenever the MLP runs on NPU -- i.e. hetero/hetero-fast (MLP
-        # routed to NPU) or npu mode. See docs/load_pdi_multilaunch_design.md.
+        # Fuse the NPU tail (add1 -> rmsnorm -> gate/up -> silu*mul -> down ->
+        # add2) into one load_pdi ELF, wherever a row puts all of it on the NPU.
+        # On by default; AMD_TRITON_NPU_FUSED_MLP=0 opts out to the unfused
+        # per-op path. See docs/load_pdi_multilaunch_design.md.
         self._fused_mlp = None
-        if (self._is_hetero or backend == "npu") and os.getenv(
-            "AMD_TRITON_NPU_FUSED_MLP", "1"
-        ) == "1":
+        if (
+            any(all(r[k] == "npu" for k in _TAIL_CHAIN) for r in rows)
+            and os.getenv("AMD_TRITON_NPU_FUSED_MLP", "1") == "1"
+        ):
             self._fused_mlp = _FusedMLP(
                 self.n_embd,
                 self.intermediate,
@@ -684,50 +773,50 @@ class Qwen2Model:
 
         self.norm_weight = sd["model.norm.weight"].to(dtype)
 
-    def _move_weights_to_gpu(self):
-        device = "cuda"
-        self.embed_tokens = self.embed_tokens.to(device)
-        for layer in self.layers:
-            for k, v in layer.items():
-                layer[k] = v.to(device)
-        self.norm_weight = self.norm_weight.to(device)
+    def _place_weights(self, rows):
+        """Put each weight where the operators that read it run.
 
-    def _place_weights(self):
-        """hetero: attention weights -> GPU; norm/MLP weights stay on CPU for NPU."""
-        gpu_keys = {
-            "q_weight",
-            "q_bias",
-            "k_weight",
-            "k_bias",
-            "v_weight",
-            "v_bias",
-            "o_weight",
+        A weight gets an iGPU copy if any row reads it on the iGPU, and a host
+        copy if any row reads it on the NPU or host; hetero-fast keeps both for
+        the norm and MLP weights. `self._layers[side]` holds the per-layer
+        dicts and `self._glob[side]` the rest, for side "gpu" or "host".
+        """
+
+        def sides(*ops):
+            return {_side(r[op]) for r in rows for op in ops}
+
+        host_layers, self.layers = self.layers, None
+        self._layers = {"gpu": [{} for _ in host_layers], "host": host_layers}
+        for i, layer in enumerate(host_layers):
+            for k in list(layer):
+                where = sides(_WEIGHT_OPS[k])
+                if "gpu" in where:
+                    self._layers["gpu"][i][k] = layer[k].to("cuda")
+                if "host" not in where:
+                    del layer[k]
+        # Without the cached float32 copy, the LM head reads the embedding
+        # table directly.
+        lm = sides("lm_head") if self._lm_head is None else set()
+        glob = {
+            "embed_tokens": sides("embed") | lm,
+            "norm_weight": sides("final_norm"),
         }
-        for layer in self.layers:
-            for k, v in layer.items():
-                if k in gpu_keys:
-                    layer[k] = v.to("cuda")
+        self._glob = {"gpu": {}, "host": {}}
+        for k, where in glob.items():
+            v = getattr(self, k)
+            for side in where:
+                self._glob[side][k] = v.to("cuda") if side == "gpu" else v
+        del self.embed_tokens, self.norm_weight
 
-    def _place_weights_fast(self):
-        """hetero-fast: all weights on GPU + CPU copies of NPU-routed weights."""
-        npu_keys = {"input_ln", "post_ln", "gate_weight", "up_weight", "down_weight"}
-        self._cpu_layers = []
-        for layer in self.layers:
-            cpu_layer = {k: layer[k].clone() for k in npu_keys}
-            self._cpu_layers.append(cpu_layer)
+    def _lw(self, i, cell):
+        """Layer `i`'s weights on the side an operator placed at `cell` reads."""
+        return self._layers[_side(cell)][i]
 
-        self._cpu_norm_weight = self.norm_weight.clone()
-
-        for layer in self.layers:
-            for k, v in layer.items():
-                layer[k] = v.to("cuda")
-        self.norm_weight = self.norm_weight.to("cuda")
-
-    def _to_gpu(self, x):
-        return x.to("cuda") if x.device.type != "cuda" else x
-
-    def _to_cpu(self, x):
-        return x.cpu() if x.device.type != "cpu" else x
+    def _on(self, x, cell):
+        """`x` where an operator placed at `cell` reads it; a no-op if there."""
+        if _side(cell) == "gpu":
+            return x if x.device.type == "cuda" else x.to("cuda")
+        return x if x.device.type == "cpu" else x.cpu()
 
     # ----- op helpers (mirror gpt2 example, with PyTorch fallbacks) -----
     def _linear(self, x, weight, bias=None, backend=None):
@@ -823,24 +912,15 @@ class Qwen2Model:
             out = torch.softmax(x.to(torch.float32), dim=-1)
             return out.to(torch.bfloat16) if be == "gpu" else out
 
-    def _attention(self, x, layer, kv_cache=None, pos_offset=0):
+    def _attention(self, x, i, row, kv_cache=None, pos_offset=0):
         """Multi-head GQA self-attention with RoPE and optional KV cache.
 
-        In gpu/hetero modes attention runs on the iGPU via the fused kernel. In
-        npu mode there is no NPU attention kernel yet, so qkv/o_proj run on the
-        NPU and the scaled-dot-product core (RoPE, scores, softmax, attn@V) runs
-        on CPU float32, keeping npu mode off the iGPU.
+        Placed by `row`: the q/k/v and o projections at `qkv` and `attn_proj`,
+        and the scaled-dot-product core at `attn_core` -- the fused iGPU kernel,
+        or float32 torch on the host where there is no NPU attention kernel.
         """
         B, S, D = x.shape
-
-        npu = self.backend == "npu"
-        # qkv/o_proj on the NPU in npu mode, else the iGPU (the fused kernel is
-        # GPU-only). op_backend, set only in hetero, overrides both.
-        if self.op_backend:
-            attn_be = self.op_backend["qkv_linear"]
-            proj_be = self.op_backend["attn_proj"]
-        else:
-            attn_be = proj_be = "npu" if npu else "gpu"
+        layer = self._lw(i, row["qkv"])
 
         # Fused QKV projection: q/k/v share input x, so concat their weights and
         # biases into one (n_head+2*n_kv_head)*hd linear -> one GPU launch instead
@@ -853,7 +933,12 @@ class Qwen2Model:
             layer["qkv_bias"] = torch.cat(
                 [layer["q_bias"], layer["k_bias"], layer["v_bias"]], dim=0
             )
-        qkv = self._linear(x, layer["qkv_weight"], layer["qkv_bias"], backend=attn_be)
+        qkv = self._linear(
+            self._on(x, row["qkv"]),
+            layer["qkv_weight"],
+            layer["qkv_bias"],
+            backend=row["qkv"],
+        )
         q_dim = self.n_head * self.head_dim
         kv_dim = self.n_kv_head * self.head_dim
         q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
@@ -863,9 +948,13 @@ class Qwen2Model:
         k_new = k.reshape(B, S, self.n_kv_head, self.head_dim).transpose(1, 2)
         v_new = v.reshape(B, S, self.n_kv_head, self.head_dim).transpose(1, 2)
 
-        # RoPE on q and k (on GPU)
+        # RoPE on q and k
         q, k_new = apply_rope(
-            q, k_new, self.rope_cos, self.rope_sin, pos_offset=pos_offset
+            self._on(q, row["rope"]),
+            self._on(k_new, row["rope"]),
+            self.rope_cos,
+            self.rope_sin,
+            pos_offset=pos_offset,
         )
 
         if kv_cache is not None:
@@ -891,9 +980,9 @@ class Qwen2Model:
             v_exp = v_full
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        if npu:
-            # CPU scaled-dot-product attention in float32 (no NPU attention
-            # kernel yet). q/k/v are already CPU tensors from the NPU qkv linear.
+        if row["attn_core"] == "cpu":
+            # Scaled-dot-product attention on the host in float32. q/k/v are
+            # already host tensors from the NPU qkv linear.
             q_f = q.to(torch.float32)
             k_f = k_exp.to(torch.float32)
             v_f = v_exp.to(torch.float32)
@@ -923,221 +1012,156 @@ class Qwen2Model:
 
         attn_output = attn_output.transpose(1, 2).reshape(B, S, self.n_embd)
 
-        proj = self._linear(attn_output, layer["o_weight"], None, backend=proj_be)
+        proj_w = self._lw(i, row["attn_proj"])
+        proj = self._linear(
+            self._on(attn_output, row["attn_proj"]),
+            proj_w["o_weight"],
+            None,
+            backend=row["attn_proj"],
+        )
         return proj, new_kv_cache
 
+    def _tail(self, i, x, attn_out, row):
+        """The block after attention: add1 -> post_norm -> SwiGLU MLP -> add2.
+
+        Returns `(x, xnorm_next)`. Where all of it is on the NPU and the rows
+        fit one M-block, the fused chain runs it as one load_pdi ELF (gamma is
+        folded into the gate/up weights, so its rmsnorm is bare) and also
+        returns the next layer's bare input rmsnorm, used when `input_norm` is
+        "npu_chain". Otherwise each op runs where its cell says and
+        `xnorm_next` is None.
+        """
+        if (
+            self._fused_mlp is not None
+            and all(row[k] == "npu" for k in _TAIL_CHAIN)
+            and x.reshape(-1, self.n_embd).shape[0] <= self._fused_mlp.BM
+        ):
+            w = self._lw(i, "npu")
+            with self.timer.track("mlp_fused"):
+                x, xnorm_next = self._fused_mlp.run(
+                    i,
+                    x,
+                    attn_out,
+                    w["gate_weight"],
+                    w["up_weight"],
+                    w["down_weight"],
+                    w["post_ln"],
+                )
+            return x, xnorm_next
+        with self.timer.track("add1"):
+            x = self._add(
+                self._on(x, row["add1"]),
+                self._on(attn_out, row["add1"]),
+                backend=row["add1"],
+            )
+        with self.timer.track("rmsnorm"):
+            x_norm = self._rmsnorm(
+                self._on(x, row["post_norm"]),
+                self._lw(i, row["post_norm"])["post_ln"],
+                backend=row["post_norm"],
+            )
+        with self.timer.track("mlp_gate"):
+            gate = self._linear(
+                self._on(x_norm, row["mlp_gate"]),
+                self._lw(i, row["mlp_gate"])["gate_weight"],
+                None,
+                backend=row["mlp_gate"],
+            )
+        with self.timer.track("mlp_up"):
+            up = self._linear(
+                self._on(x_norm, row["mlp_up"]),
+                self._lw(i, row["mlp_up"])["up_weight"],
+                None,
+                backend=row["mlp_up"],
+            )
+        with self.timer.track("swiglu"):
+            h = self._swiglu(
+                self._on(gate, row["swiglu"]),
+                self._on(up, row["swiglu"]),
+                backend=row["swiglu"],
+            )
+        with self.timer.track("mlp_down"):
+            mlp_out = self._linear(
+                self._on(h, row["mlp_down"]),
+                self._lw(i, row["mlp_down"])["down_weight"],
+                None,
+                backend=row["mlp_down"],
+            )
+        with self.timer.track("add2"):
+            x = self._add(
+                self._on(x, row["add2"]),
+                self._on(mlp_out, row["add2"]),
+                backend=row["add2"],
+            )
+        return x, None
+
     def forward(self, input_ids, kv_caches=None, pos_offset=0):
+        """Logits for `input_ids`, and the KV caches updated.
+
+        A one-token forward runs the "decode" row of this backend's PLACEMENT,
+        anything longer the "prefill" row.
+        """
         B, S = input_ids.shape
-        hetero = self._is_hetero
-        decode_gpu = self.backend == "hetero-fast" and S == 1
+        row = self.place["decode" if S == 1 else "prefill"]
 
-        if self.backend == "gpu" and input_ids.device.type != "cuda":
-            input_ids = input_ids.to("cuda")
+        embed = self._glob[_side(row["embed"])]["embed_tokens"]
+        x = embed[self._on(input_ids, row["embed"])]  # (B, S, n_embd) bf16
 
-        x = self.embed_tokens[input_ids]  # (B, S, n_embd) bf16
-
-        # Bare rmsnorm(x_out) carried from the previous layer's fused tail (the
-        # folded rmsnorm_in); None means "compute rmsnorm_in standalone" (layer 0
-        # or after an unfused layer). Local -> auto-resets each forward.
+        # Bare rmsnorm(x_out) carried from the previous layer's fused tail; None
+        # means "compute the input rmsnorm standalone" (layer 0, after an
+        # unfused layer, or where `input_norm` is not "npu_chain").
         pending_xnorm = None
         new_kv_caches = []
-        for i, layer in enumerate(self.layers):
+        for i in range(self.n_layer):
             logger.debug(f"Layer {i}/{self.n_layer}")
-
-            if decode_gpu:
-                if x.device.type != "cuda":
-                    x = self._to_gpu(x)
-                with self.timer.track("rmsnorm"):
-                    x_norm = self._rmsnorm(x, layer["input_ln"], backend="gpu")
-                layer_cache = kv_caches[i] if kv_caches else None
-                with self.timer.track("attention"):
-                    attn_out, new_cache = self._attention(
-                        x_norm, layer, kv_cache=layer_cache, pos_offset=pos_offset
+            cell = row["input_norm"]
+            gamma_in = self._lw(i, cell)["input_ln"]
+            with self.timer.track("rmsnorm"):
+                if pending_xnorm is None:
+                    norm_at = "npu" if cell == "npu_chain" else cell
+                    x_norm = self._rmsnorm(
+                        self._on(x, norm_at), gamma_in, backend=norm_at
                     )
-                new_kv_caches.append(new_cache)
-                with self.timer.track("add1"):
-                    x = self._add(x, attn_out, backend="gpu")
-                with self.timer.track("rmsnorm"):
-                    x_norm = self._rmsnorm(x, layer["post_ln"], backend="gpu")
-                with self.timer.track("mlp_gate"):
-                    gate = self._linear(
-                        x_norm, layer["gate_weight"], None, backend="gpu"
-                    )
-                with self.timer.track("mlp_up"):
-                    up = self._linear(x_norm, layer["up_weight"], None, backend="gpu")
-                with self.timer.track("swiglu"):
-                    h = self._swiglu(gate, up, backend="gpu")
-                with self.timer.track("mlp_down"):
-                    mlp_out = self._linear(h, layer["down_weight"], None, backend="gpu")
-                with self.timer.track("add2"):
-                    x = self._add(x, mlp_out, backend="gpu")
-
-            elif hetero:
-                npu_w = self._cpu_layers[i] if hasattr(self, "_cpu_layers") else layer
-                ln_be = self.op_backend["rmsnorm"]
-                with self.timer.track("rmsnorm"):
-                    if pending_xnorm is None:
-                        # layer 0 (or after an unfused layer): standalone rmsnorm_in
-                        x_norm = self._rmsnorm(x, npu_w["input_ln"], backend=ln_be)
-                    else:
-                        # bare rmsnorm(x) came from the previous layer's fused
-                        # tail; apply this layer's input_ln gamma (f32) here. Same
-                        # math as the standalone NPU rmsnorm_in (bare f32 * gamma).
-                        gamma_in = npu_w["input_ln"].to(torch.float32)
-                        x_norm = (torch.from_numpy(pending_xnorm) * gamma_in).reshape(
-                            x.shape[0], x.shape[1], self.n_embd
-                        )
+                else:
+                    # The bare rmsnorm(x) came from the previous layer's fused
+                    # tail; apply this layer's input_ln gamma (f32) here. Same
+                    # math as the standalone NPU rmsnorm (bare f32 * gamma).
+                    x_norm = (
+                        torch.from_numpy(pending_xnorm) * gamma_in.to(torch.float32)
+                    ).reshape(x.shape[0], x.shape[1], self.n_embd)
+            if _side(row["qkv"]) != _side(cell):
                 with self.timer.track("to_gpu"):
-                    x_norm = self._to_gpu(x_norm)
-                layer_cache = kv_caches[i] if kv_caches else None
-                with self.timer.track("attention"):
-                    attn_out, new_cache = self._attention(
-                        x_norm, layer, kv_cache=layer_cache, pos_offset=pos_offset
-                    )
-                new_kv_caches.append(new_cache)
+                    x_norm = self._on(x_norm, row["qkv"])
+            layer_cache = kv_caches[i] if kv_caches else None
+            with self.timer.track("attention"):
+                attn_out, new_cache = self._attention(
+                    x_norm, i, row, kv_cache=layer_cache, pos_offset=pos_offset
+                )
+            new_kv_caches.append(new_cache)
+            if _side(row["add1"]) == "host":
                 with self.timer.track("to_cpu"):
-                    attn_out = self._to_cpu(attn_out)
-                add_be = self.op_backend["add"]
-                gate_be = self.op_backend["mlp_gate"]
-                up_be = self.op_backend["mlp_up"]
-                swiglu_be = self.op_backend["swiglu"]
-                down_be = self.op_backend["mlp_down"]
-                # Fused fast path: ONE load_pdi ELF for the whole per-layer NPU
-                # tail -- add1 -> rmsnorm(post_ln) -> gate/up -> silu*mul -> down
-                # -> add2 -- when all those ops route to NPU and the row count
-                # fits a single M-block. gamma folded into gate/up weights keeps
-                # the in-chain rmsnorm bare. run() takes the pre-attn hidden x and
-                # attn_out and returns x + attn_out + mlp(rmsnorm(x + attn_out)).
-                _fused_ok = (
-                    self._fused_mlp is not None
-                    and gate_be == "npu"
-                    and up_be == "npu"
-                    and swiglu_be == "npu"
-                    and down_be == "npu"
-                    and add_be == "npu"
-                    and x.reshape(-1, self.n_embd).shape[0] <= self._fused_mlp.BM
-                )
-                if _fused_ok:
-                    with self.timer.track("mlp_fused"):
-                        x, pending_xnorm = self._fused_mlp.run(
-                            i,
-                            x,
-                            attn_out,
-                            npu_w["gate_weight"],
-                            npu_w["up_weight"],
-                            npu_w["down_weight"],
-                            npu_w["post_ln"],
-                        )
-                else:
-                    pending_xnorm = None
-                    with self.timer.track("add1"):
-                        x = self._add(x, attn_out, backend=add_be)
-                    with self.timer.track("rmsnorm"):
-                        x_norm = self._rmsnorm(x, npu_w["post_ln"], backend=ln_be)
-                    with self.timer.track("mlp_gate"):
-                        gate = self._linear(
-                            x_norm, npu_w["gate_weight"], None, backend=gate_be
-                        )
-                    with self.timer.track("mlp_up"):
-                        up = self._linear(
-                            x_norm, npu_w["up_weight"], None, backend=up_be
-                        )
-                    with self.timer.track("swiglu"):
-                        h = self._swiglu(gate, up, backend=swiglu_be)
-                    with self.timer.track("mlp_down"):
-                        mlp_out = self._linear(
-                            h, npu_w["down_weight"], None, backend=down_be
-                        )
-                    with self.timer.track("add2"):
-                        x = self._add(x, mlp_out, backend=add_be)
+                    attn_out = self._on(attn_out, row["add1"])
+            x, xnorm_next = self._tail(i, x, attn_out, row)
+            pending_xnorm = xnorm_next if cell == "npu_chain" else None
 
-            else:
-                with self.timer.track("rmsnorm"):
-                    x_norm = self._rmsnorm(x, layer["input_ln"])
-                layer_cache = kv_caches[i] if kv_caches else None
-                with self.timer.track("attention"):
-                    attn_out, new_cache = self._attention(
-                        x_norm, layer, kv_cache=layer_cache, pos_offset=pos_offset
-                    )
-                new_kv_caches.append(new_cache)
+        cell = row["final_norm"]
+        with self.timer.track("norm"):
+            x = self._rmsnorm(
+                self._on(x, cell), self._glob[_side(cell)]["norm_weight"], backend=cell
+            )
 
-                with self.timer.track("to_cpu"):
-                    attn_out = self._to_cpu(attn_out)
-                # Fused fast path (npu mode): ONE load_pdi ELF for the whole
-                # per-layer NPU tail -- add1 -> rmsnorm(post_ln) -> gate/up ->
-                # silu*mul -> down -> add2 -- when the row count fits a single
-                # M-block; else the unfused path. gamma folded into gate/up
-                # weights keeps the in-chain rmsnorm bare, so run() takes the
-                # pre-attn hidden x and attn_out.
-                _fused_ok = (
-                    self._fused_mlp is not None
-                    and self.backend == "npu"
-                    and x.reshape(-1, self.n_embd).shape[0] <= self._fused_mlp.BM
-                )
-                if _fused_ok:
-                    with self.timer.track("mlp_fused"):
-                        # npu mode keeps standalone rmsnorm_in above; ignore the
-                        # chain's folded rmsnorm_in output.
-                        x, _ = self._fused_mlp.run(
-                            i,
-                            x,
-                            attn_out,
-                            layer["gate_weight"],
-                            layer["up_weight"],
-                            layer["down_weight"],
-                            layer["post_ln"],
-                        )
-                else:
-                    with self.timer.track("add1"):
-                        x = self._add(x, attn_out)
-                    with self.timer.track("rmsnorm"):
-                        x_norm = self._rmsnorm(x, layer["post_ln"])
-                    with self.timer.track("mlp_gate"):
-                        gate = self._linear(x_norm, layer["gate_weight"])
-                    with self.timer.track("mlp_up"):
-                        up = self._linear(x_norm, layer["up_weight"])
-                    with self.timer.track("swiglu"):
-                        h = self._swiglu(gate, up)
-                    with self.timer.track("mlp_down"):
-                        mlp_out = self._linear(h, layer["down_weight"])
-                    with self.timer.track("add2"):
-                        x = self._add(x, mlp_out)
-
-        # Final RMSNorm
-        if hetero and not decode_gpu:
-            with self.timer.track("norm"):
-                ln_be = self.op_backend["rmsnorm"]
-                nw = (
-                    self._cpu_norm_weight
-                    if hasattr(self, "_cpu_norm_weight")
-                    else self.norm_weight
-                )
-                x = self._rmsnorm(x, nw, backend=ln_be)
-        elif hetero:
-            with self.timer.track("norm"):
-                x = self._rmsnorm(x, self.norm_weight, backend="gpu")
-        else:
-            with self.timer.track("norm"):
-                x = self._rmsnorm(x, self.norm_weight)
-
-        # LM head (tied embeddings): x @ embed_tokens^T
+        # LM head (tied embeddings): x @ embed_tokens^T, logits on the host
         with self.timer.track("lm_head"):
-            if self._lm_head is not None:
+            if self._lm_head is not None and row["lm_head"] == "gpu_torch":
                 logits = (
                     x.to(device="cuda", dtype=torch.float32) @ self._lm_head.t()
                 ).cpu()
-            elif self.backend == "npu":
-                # LM head on CPU keeps npu mode iGPU-free without paying the NPU
-                # cost of the vocab-151936 matmul: a single [M,896]@[896,151936]
-                # runs ~29s/token on the AIE (73% of decode) but ~20ms on the
-                # CPU. gpt2's smaller vocab makes the NPU LM head worthwhile; this
-                # one does not.
+            else:
+                embed = self._glob[_side(row["lm_head"])]["embed_tokens"]
                 x2d = x.reshape(-1, self.n_embd).to(torch.float32)
-                logits = (x2d @ self.embed_tokens.to(torch.float32).t()).reshape(
+                logits = (x2d @ embed.to(torch.float32).t()).reshape(
                     x.shape[:-1] + (VOCAB_SIZE,)
                 )
-            else:
-                logits = x.to(torch.float32) @ self.embed_tokens.to(torch.float32).t()
                 if logits.device.type == "cuda":
                     logits = logits.cpu()
 
@@ -1172,8 +1196,9 @@ class Qwen2Model:
     ):
         B, prompt_len = input_ids.shape
         total_seq_len = prompt_len + max_new_tokens
+        # The KV cache lives where attention runs.
         device = input_ids.device
-        if self.backend in ("gpu", "hetero", "hetero-fast"):
+        if self.place["prefill"]["attn_core"] == "gpu":
             device = "cuda"
 
         generated_ids = []
