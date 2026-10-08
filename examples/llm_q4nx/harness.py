@@ -64,7 +64,12 @@ def _apply_engine_env(model):
 
 
 def air_inference_module(model):
-    """mlir-air's driver for this model, importable and unmodified."""
+    """mlir-air's driver for this model, importable.
+
+    Unmodified but for its decoder classes, which release idle fused
+    prefills' hardware contexts before opening their own; see
+    `_releasing_fused_prefills`.
+    """
     # Before the import: mlir-air's module reads its decode-shape selection at
     # import time, so a later choice would not be seen. See
     # airsrc.select_decode_artifact for why these examples fix it rather than
@@ -108,7 +113,31 @@ def air_inference_module(model):
     mod = importlib.util.module_from_spec(spec)
     sys.modules["q4nx_inference"] = mod
     spec.loader.exec_module(mod)
+    for name in {"FusedDecoder", model.decoder_class} - {""}:
+        cls = getattr(mod, name, None)
+        if isinstance(cls, type):
+            setattr(mod, name, _releasing_fused_prefills(cls))
     return mod
+
+
+def _releasing_fused_prefills(cls):
+    """`cls`, releasing idle fused prefills' contexts before it opens its own.
+
+    A decoder opens its hardware contexts after loading its weights, so one
+    refused by the device cannot be retried cheaply, and mlir-air's
+    `generate()` constructs it where no retry can reach.
+    """
+    from dense_fused_prefill import release_fused_prefills
+
+    def __init__(self, *a, **kw):
+        release_fused_prefills()
+        cls.__init__(self, *a, **kw)
+
+    return type(
+        cls.__name__,
+        (cls,),
+        {"__init__": __init__, "__doc__": cls.__doc__, "__module__": cls.__module__},
+    )
 
 
 def tokenizer_dir(air, model):
