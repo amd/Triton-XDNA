@@ -87,7 +87,7 @@ on the NPU) — a vocab-sized NPU matmul is far slower there than on the CPU.
 |----|-------|-------|----------|----------------------|---------------------|
 | RMSNorm (input) | GPU | NPU | NPU | NPU | **GPU** |
 | Q/K/V projection | GPU | NPU | GPU | GPU | GPU |
-| RoPE | GPU | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
+| RoPE (torch) | GPU | CPU | GPU | GPU | GPU |
 | Attention scores (Q·Kᵀ) | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
 | Softmax | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
 | Attention · V | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
@@ -101,10 +101,13 @@ on the NPU) — a vocab-sized NPU matmul is far slower there than on the CPU.
 | Final RMSNorm | GPU | NPU | NPU | NPU | **GPU** |
 | LM head | GPU | CPU | GPU | GPU | GPU |
 
-Attention (Q/K/V/O, RoPE, the fused attention kernel) always runs on the iGPU:
-the fused FlashAttention-style kernel is GPU-only, and Qwen's grouped-query
-attention is expanded to full heads before the kernel. The LM head also always
-runs on the iGPU.
+This table is `PLACEMENT` in `model.py`, which is what the model reads; the
+cells there also say which side of a device runs torch rather than a Triton
+kernel. Outside `npu`, attention (Q/K/V/O, RoPE, the fused attention kernel)
+runs on the iGPU: the fused FlashAttention-style kernel is GPU-only, and
+Qwen's grouped-query attention is expanded to full heads before the kernel.
+In `hetero`, each layer's input RMSNorm comes out of the previous layer's fused
+NPU tail when that ran, rather than as a dispatch of its own.
 
 ## Architecture
 

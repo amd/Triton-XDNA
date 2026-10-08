@@ -100,6 +100,12 @@ CPU (there is no NPU attention kernel yet), so those rows are broken out below.
 | Final LayerNorm | GPU | NPU | **GPU** | **GPU** | GPU |
 | LM head | GPU | NPU | GPU | GPU | GPU |
 
+This table is `PLACEMENT` in `model.py`, which is what the model reads. The
+**GPU** cells of `hetero` are torch in float32 rather than Triton kernels:
+`triton_layernorm` emits bf16, and that compounds into visible logit drift over
+the full stack, so the hetero split keeps LayerNorm and the residual stream in
+float32.
+
 ## Architecture
 
 ### Forward Pass
