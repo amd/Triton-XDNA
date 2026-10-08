@@ -76,8 +76,8 @@ class Phi4Prefill(LlamaPrefill):
                     f"partial RoPE needs a {R}-wide LUT (cos|sin of {half}); "
                     f"got {lut.shape[-1]}"
                 )
-            dev = self._gpu_device(backend)
-            if dev is not None:
+            if self._device("rope", backend) == "gpu":
+                dev = "cuda"
                 import gpu_kernels
 
                 with driver_scope("amd"):

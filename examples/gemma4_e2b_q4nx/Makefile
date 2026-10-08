@@ -14,157 +14,27 @@
 #
 # `make preflight` checks all of this and says what is missing.
 
-PYTHON  ?= python3
-srcdir  := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
-DRIVER  := $(srcdir)/gemma4_e2b_q4nx_inference.py
-# The harness shared with the other Q4NX model families.
-shared  := $(srcdir)/../llm_q4nx
-# This example's model family, as ../llm_q4nx/registry.py names it.
 MODEL_NAME := gemma4-e2b
-# Absolute, so the remediation messages in `preflight` name a path that works
-# from wherever make was invoked. See the Qwen3 Makefile for what the relative
-# spelling got wrong.
-root    := $(realpath $(srcdir)/../..)
-
-# Dispatch runtime. Only xrt here: the HSA decode adapter subclasses mlir-air's
-# `FusedDecoder`, which this driver does name -- but nothing has run it on
-# hardware for this model, so the harness refuses rather than pretending
-# (registry.py: supports_hsa). Kept as a variable so enabling it is a one-line
-# change once it is tested.
-RUNTIME  ?= xrt
-export AMD_TRITON_NPU_RUNTIME = $(RUNTIME)
-DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),pdi,xclbin)
-
-OPS      ?= all
-BACKEND  ?= npu
-# The prefill engine. triton (default here): this repository's prefill, its
-# operators placed by BACKEND and OPS. auto: the harness's own default --
-# mlir-air's fused prefill where it has one, which BACKEND/OPS do not apply to.
-ENGINE   ?= triton
-N_TOKENS ?= 4
+TITLE      := Gemma4-E2B
+N_TOKENS   ?= 4
 # ATTN_MAXL the decode template is built for. 128, where the siblings take
 # decode_build.py's 2048 default: that is what mlir-air's own token driver
 # builds this model at (RUN_LBUILD), and every token streams a cache padded to
 # it, so a 35-layer model pays for the depth on every dispatch. Raise it for
 # longer sessions.
-DECODE_L ?= 128
-# EMPTY by default, and that is load-bearing -- the same shape mlir-air's own
-# Gemma4 Makefile uses. An absent PROMPT selects the canonical token IDS below,
-# which is what lets `make run` gate the decode; setting it sends text, exactly
-# as on every sibling here, and correctly does not gate.
-PROMPT   ?=
-# The canonical prompt, as IDS -- `config.PROMPT`, whose leading 2 is a <bos>
-# this tokenizer does not emit. Keep the two in step: the harness applies the
-# recorded continuation only when the ids it ran match `config.PROMPT` exactly.
+DECODE_L   ?= 128
+# EMPTY by default, and that is load-bearing: an empty PROMPT runs the
+# canonical token IDS below, which is what lets `make run` gate the decode.
+# This tokenizer emits no <bos>, so `--text` of the same sentence gives ids
+# starting at 818 where `config.PROMPT` starts at 2, and the harness applies
+# the recorded continuation only when the ids match exactly. Setting PROMPT
+# sends text, as on every sibling, and correctly does not gate.
+PROMPT     ?=
+# `config.PROMPT`, as ids. Keep the two in step.
 PROMPT_IDS ?= 2,818,5279,529,7001,563
-MODEL    ?=
-
-MODEL_ARG  := $(if $(MODEL),--model "$(MODEL)",)
-COMMON     := --prefill-engine $(ENGINE) \
-	$(if $(filter triton,$(ENGINE)),--backend $(BACKEND) --ops $(OPS)) $(MODEL_ARG)
-
-.PHONY: help run prefill profile compile-decode \
-	recompile-decode decode-kernels air-src preflight clean
-
-## Fail early, and say what is actually wrong.
-preflight:
-	@$(PYTHON) -c "import triton" 2>/dev/null || { \
-	  echo "ERROR: '$(PYTHON)' cannot import triton."; \
-	  echo "  A virtualenv with triton-xdna installed must be active:"; \
-	  echo "    source $(root)/sandbox/bin/activate"; \
-	  echo "    source /opt/xilinx/xrt/setup.sh && source $(root)/utils/env_setup.sh"; \
-	  exit 1; }
-	@$(PYTHON) -c "import mlir_air, mlir_aie" 2>/dev/null || { \
-	  echo "ERROR: mlir_air / mlir_aie are not installed in this environment."; \
-	  echo "  With the venv ACTIVE, run:  source $(root)/utils/env_setup.sh"; \
-	  exit 1; }
-	@test -n "$$XILINX_XRT" || { \
-	  echo "ERROR: XRT is not set up.  Run: source /opt/xilinx/xrt/setup.sh"; exit 1; }
-	@test -n "$$MLIR_AIE_INSTALL_DIR" || { \
-	  echo "ERROR: MLIR_AIE_INSTALL_DIR is unset.  Run: source $(root)/utils/env_setup.sh"; exit 1; }
-
-help:
-	@echo "Gemma4-E2B Q4NX -- Triton prefill + mlir-air fused decode"
-	@echo ""
-	@echo "  make run              The canonical prompt (gated), N_TOKENS=$(N_TOKENS)"
-	@echo "                        PROMPT=\"...\" asks something else, ungated"
-	@echo "  make prefill          Prefill only + Paris gate (no decode build)"
-	@echo "  make profile          Per-operator prefill timing"
-	@echo "  make compile-decode   Build the decode from nothing (~22 s, run once)"
-	@echo "  make recompile-decode Relower just the decode xclbins (~9 s)"
-	@echo "  make decode-kernels   Rebuild just the decode's AIE kernels (~13 s)"
-	@echo "  make air-src          Fetch mlir-air sources at the pinned commit"
-	@echo "  make preflight        Check the environment is set up"
-	@echo ""
-	@echo "  ENGINE=triton|auto    Prefill engine (default: triton; auto = fused where available)"
-	@echo "  BACKEND=npu|hetero|cpu Where the Triton prefill runs (default: npu)"
-	@echo "  OPS=all|matmul,...    Which operators go to the NPU (default: all)"
 
 # No `chat` target. mlir-air's Session/interactive_chat pair exists only on its
 # npz-API drivers; Gemma4-E2B's has neither, so there is nothing to host our
-# prefill in and the harness refuses --interactive up front. A target that can
-# only fail is worse than no target.
+# prefill in and the harness refuses --interactive up front.
 
-## One prompt, greedy, N_TOKENS of output.
-##
-## Sends token IDS rather than text, unlike every sibling here, and that is the
-## difference between gating the decode and not gating it. This tokenizer emits
-## no <bos>, so `--text` produces ids starting at 818 where `config.PROMPT`
-## starts at 2 -- and the harness only applies the recorded continuation when
-## `ids == cfg.PROMPT`. The check would be silently skipped, and the target
-## would pass by not testing anything.
-##
-## `make run PROMPT="..."` asks something else, through `--text`, exactly as on
-## every sibling here -- and correctly does not gate, because the ids differ.
-run: preflight
-	@cd $(srcdir) && $(PYTHON) $(DRIVER) $(COMMON) \
-		$(if $(PROMPT),--text "$(PROMPT)",--prompt "$(PROMPT_IDS)") \
-		--max-tokens $(N_TOKENS) --greedy
-
-## Prefill on its own -- needs no decode build. Gates on first token == 9079.
-prefill: preflight
-	@cd $(srcdir) && $(PYTHON) $(DRIVER) --prefill-only $(COMMON)
-
-## Per-operator timing for one prefill.
-profile: preflight
-	@cd $(srcdir) && $(PYTHON) $(DRIVER) --prefill-only --profile $(COMMON)
-
-## Everything the decode needs, from nothing. Run once, before `run`.
-##
-## Two steps, both owned here:
-##
-##   1. ../llm_q4nx/decode_kernels.py -- the SEVEN AIE kernels this engine links,
-##      compiled with Peano (~19 s). Six come from the shared engine; `ple.cc`
-##      is the PLE fork's own.
-##      Byte-identical to what mlir-air's Makefile produces, and cached on the
-##      source and flags, so a re-run is free.
-##   2. ../llm_q4nx/decode_build.py -- the xclbins, lowered through FusedDecodeOp: mlir-air's
-##      build_module() supplies the AIR IR, this backend's _aircc_compile turns
-##      it into an artifact exactly as for every other AIR design (~9 s).
-##
-## This used to delegate to mlir-air's `compile-decode`, which took ~15 min --
-## almost all of it building templates we then relowered anyway. What is needed
-## from mlir-air now is SOURCE, not its build system.
-compile-decode: preflight air-src
-	@cd $(shared) && $(PYTHON) decode_kernels.py --model $(MODEL_NAME)
-	@cd $(shared) && $(PYTHON) decode_build.py --model $(MODEL_NAME) --format $(DECODE_FORMAT) --max-context-length $(DECODE_L)
-
-## Just step 2 -- relower the xclbins from the AIR IR (~9 s), reusing the AIE
-## kernels already on disk. The one to run while iterating on the builder or
-## the lowering.
-recompile-decode: preflight air-src
-	@cd $(shared) && $(PYTHON) decode_build.py --model $(MODEL_NAME) --format $(DECODE_FORMAT) --max-context-length $(DECODE_L)
-
-## Just step 1 -- rebuild the AIE kernels. Only needed if their C++ changed.
-decode-kernels: preflight air-src
-	@cd $(shared) && $(PYTHON) decode_kernels.py --model $(MODEL_NAME) --force
-
-## mlir-air's sources at the commit utils/mlir-air-hash.txt already pins -- the
-## same one env_setup.sh builds the wheel version from. Sparse and blobless
-## (~1.7 MB of sources), idempotent, and skipped entirely if you have your own
-## checkout at mlir-air-local/ or AIR_LLMS_ROOT.
-air-src:
-	@$(PYTHON) $(srcdir)/../../utils/fetch_mlir_air_src.py
-
-clean:
-	rm -rf $(srcdir)/air_project $(srcdir)/__pycache__ $(srcdir)/params.txt
+include $(dir $(lastword $(MAKEFILE_LIST)))../llm_q4nx/q4nx.mk

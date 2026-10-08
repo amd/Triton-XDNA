@@ -88,8 +88,8 @@ class _Bare:
 
     timer = _Timer()
 
-    def _gpu_device(self, backend=None):
-        return None
+    def _device(self, op, backend=None):
+        return "cpu"
 
 
 def compare(got, q, k, v, n_q, n_kv, dh, window):

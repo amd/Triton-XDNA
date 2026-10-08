@@ -131,6 +131,53 @@ class Gemma4Prefill(LlamaPrefill):
     #: which is exactly what the XRT launcher work would change.
     DEFAULT_OPS = ("matmul", "geglu", "attention")
 
+    #: No `prefill.py --kv-out`: the layers' caches are not one width (256
+    #: lanes on a sliding layer, 512 on a full one), so there is no one array to
+    #: save. `--compare-cpu` covers what that option was for.
+    SAVES_KV_NPZ = False
+
+    #: Where each operator runs; see `LlamaPrefill.PLACEMENT` for the rules.
+    #: Gemma4 differs from Llama in three cells:
+    #:
+    #: * `attention` has an NPU kernel (`attn_npu`: Q.K^T and P.V on the
+    #:   array, the masked softmax on the host). It takes it only for one KV
+    #:   head, which is every Gemma4 layer; `hetero` gives the operator to the
+    #:   iGPU's flash kernel instead, which does all of it, faster.
+    #: * `ple_gate`, the GELU gate of the per-layer embedding, stays on the
+    #:   host everywhere: over [N, 256] the dispatch costs more than the
+    #:   arithmetic. It is the `geglu` kernel, placed separately.
+    #: * `rms_norm` is "npu" but out of `DEFAULT_OPS`, so it runs on the host
+    #:   unless `--ops` asks for it (see above).
+    #:
+    #: Not listed because nothing chooses them: the weightless value norm in
+    #: `_head_norm`, the logit softcap, the LM head -- torch on the CPU.
+    PLACEMENT = {
+        "cpu": dict(
+            matmul="cpu",
+            rms_norm="cpu",
+            geglu="cpu",
+            ple_gate="cpu",
+            rope="cpu",
+            attention="cpu",
+        ),
+        "npu": dict(
+            matmul="npu",
+            rms_norm="npu",
+            geglu="npu",
+            ple_gate="cpu",
+            rope="cpu",
+            attention="npu",
+        ),
+        "hetero": dict(
+            matmul="npu",
+            rms_norm="npu",
+            geglu="npu",
+            ple_gate="cpu",
+            rope="gpu",
+            attention="gpu",
+        ),
+    }
+
     #: Everything `load_weights` establishes. `_lut` is a LIST here, one table
     #: per layer, where the base class has a single tensor -- see
     #: `load_weights`. The PLE trio and the two extra globals join it so a
@@ -370,12 +417,10 @@ class Gemma4Prefill(LlamaPrefill):
         the same label rather than saying so.
         """
         self._fused_mlp = None
-        # `_NPU_BACKENDS`, not `== "npu"`: `hetero` puts these two operators on
-        # the NPU exactly as `npu` does, so it wants the chain for exactly the
-        # same reason. Spelled as the shared tuple so the next backend that
-        # routes to the NPU does not have to remember this line exists.
-        fused_ops = {"matmul", "geglu"}
-        if self.backend not in self._NPU_BACKENDS or not fused_ops <= self.enabled:
+        # Asked of the table rather than of the backend name, so every backend
+        # that puts both operators on the NPU gets the chain -- `hetero` does,
+        # exactly as `npu` does.
+        if any(self._device(op) != "npu" for op in ("matmul", "geglu")):
             return
         if os.environ.get("Q4NX_FUSED_MLP", "1") != "1":
             print("[gemma4] fused MLP disabled by Q4NX_FUSED_MLP=0")
@@ -432,10 +477,14 @@ class Gemma4Prefill(LlamaPrefill):
         return self
 
     # ---- forward ----
-    def _geglu(self, gate, up, backend=None):
-        """gelu_tanh(gate) * up, elementwise. Gemma3's, for the same reason."""
+    def _geglu(self, gate, up, backend=None, op="geglu"):
+        """gelu_tanh(gate) * up, elementwise. Gemma3's, for the same reason.
+
+        `op` names the call site in `PLACEMENT`: the MLP's `geglu` or the
+        per-layer embedding's `ple_gate`, the same kernel placed apart.
+        """
         with self.timer.track("geglu"):
-            if self._on_npu("geglu", backend):
+            if self._device(op, backend) == "npu":
                 import kernels
 
                 return kernels.triton_geglu(gate, up)
@@ -513,15 +562,11 @@ class Gemma4Prefill(LlamaPrefill):
 
         `attn_npu` runs Q.K^T and P.V on the array and keeps the masked
         softmax on the host, over pages both sides address directly. Taken
-        only where it applies -- one KV head, which is every Gemma4 layer, and
-        no iGPU in play: under `hetero` the iGPU's flash kernel already does
-        the whole operator, and does it faster.
+        only where it applies -- one KV head, which is every Gemma4 layer --
+        and where `PLACEMENT` puts attention on the NPU. Otherwise the base
+        class's, on the host or the iGPU.
         """
-        if (
-            n_kv != 1
-            or not self._on_npu("attention", backend)
-            or self._gpu_device(backend) is not None
-        ):
+        if n_kv != 1 or self._device("attention", backend) != "npu":
             return super()._attention(
                 q, k, v, n_q, n_kv, dh, window=window, scale=scale, backend=backend
             )
@@ -535,8 +580,10 @@ class Gemma4Prefill(LlamaPrefill):
             return att(q, k, v, scale=dh**-0.5 if scale is None else scale)
 
     def _gpu_scope(self):
-        """Hold the GPU driver across a region, or do nothing on the host path."""
-        if self._gpu_device() is None:
+        """Hold the GPU driver across the region from the head norms to the
+        attention, where RoPE and attention run; nothing if neither is on the
+        iGPU."""
+        if "gpu" not in (self._device("rope"), self._device("attention")):
             return contextlib.nullcontext()
         return driver_scope("amd")
 
@@ -629,12 +676,11 @@ class Gemma4Prefill(LlamaPrefill):
 
         # ---- per-layer embedding injection ----
         # A GELU-tanh gate against this layer's PLE vector, projected back up
-        # to D and added through the fifth norm. `_geglu` is the same operator:
-        # gelu_tanh(gate) * other, on the host: [N, PLI_D] is too small to
-        # offload.
+        # to D and added through the fifth norm. `_geglu` is the same operator,
+        # gelu_tanh(gate) * other, placed as `ple_gate`.
         residual = x
         gate = self._geglu(
-            self._matmul(x, w["inp_gate"], stage_key=f"ig_L{L}"), pli, backend="cpu"
+            self._matmul(x, w["inp_gate"], stage_key=f"ig_L{L}"), pli, op="ple_gate"
         )
         p = self._matmul(gate, w["per_layer_projection"], stage_key=f"plp_L{L}")
         x = residual + self._rms_norm(p, w["post_ple_norm"], RMS_EPS)

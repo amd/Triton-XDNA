@@ -198,9 +198,9 @@ def load_prefill_weights(m, backend, npu_resident=True):
     on the CPU build their own model and do not come through here at all.
     """
     m.load_weights()
-    # `hetero` too: it puts matmul on the NPU exactly as `npu` does and differs
-    # only in where RoPE and attention go, so it wants the same resident
-    # weights. Missing it here costs nothing visible -- the run is simply
+    # Asked of the prefill's `PLACEMENT`, not of the backend name: `hetero`
+    # puts matmul on the NPU exactly as `npu` does, so it wants the same
+    # resident weights. Missing that costs nothing visible -- the run is simply
     # slower and larger -- which is why it is worth stating.
     #
     # `npu_resident=False` is how a GPU decode opts out. The conversion is
@@ -209,7 +209,7 @@ def load_prefill_weights(m, backend, npu_resident=True):
     # with it gets `unsupported operand type(s) for @: Tensor and
     # ResidentWeight`. The prefill pays for that -- it re-pads per call -- and
     # that is the trade a hybrid run makes.
-    if npu_resident and backend in ("npu", "hetero") and "matmul" in m.enabled:
+    if npu_resident and m._device("matmul", backend) == "npu":
         m.make_npu_resident()
 
 
@@ -720,7 +720,9 @@ def generate_on_gpu(cfg, args, prefiller, first, ids):
     return dec.generate(first, args.max_tokens, eos=eos)
 
 
-def build_parser(doc):
+def build_parser(doc, backends=("cpu", "npu", "hetero")):
+    """The example's arguments. `backends` is its prefill class's `PLACEMENT`
+    rows, which is what `--backend` chooses between."""
     ap = argparse.ArgumentParser(description=doc)
     ap.add_argument(
         "--decode",
@@ -745,7 +747,7 @@ def build_parser(doc):
     )
     ap.add_argument(
         "--backend",
-        choices=("cpu", "npu", "hetero"),
+        choices=tuple(backends),
         default=None,
         help="where the Triton prefill's operators run (default: npu); needs "
         "--prefill-engine triton on a model with a fused prefill. cpu: every "
@@ -805,7 +807,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         cfg: its `config` module -- N_LAYERS, PROMPT, EXPECT_FIRST.
         prefill_cls: its prefill class, from `model.py`.
     """
-    args = build_parser(doc).parse_args(argv)
+    args = build_parser(doc, tuple(prefill_cls.PLACEMENT)).parse_args(argv)
 
     # `--decode gpu` is implemented per model, and only Gemma4-E2B has one.
     # Checked here rather than in `generate_on_gpu`, which runs after the
