@@ -9,8 +9,9 @@ glue (argument parsing, pointer/size resolution) and delegates all HSA work to
 the shared runtime library ``libtriton_npu_hsa.so`` (see
 ``include/HsaRuntime/HsaRuntime.{h,cpp}``) via a small C ABI:
 
-* ``triton_npu_hsa_prepare(pdi, insts)`` -> opaque program handle (once, from
-  ``set_paths``).
+* ``triton_npu_hsa_prepare(hsaco, kernel_name)`` -> opaque program handle
+  (once, from ``set_paths``), loaded from an hsaco and resolved by kernel
+  name.
 * ``triton_npu_hsa_dispatch(program, n, ptrs, sizes)`` (per launch).
 
 Because every launcher links the same shared library, the ``HsaRuntime``
@@ -34,7 +35,7 @@ from .codegen import extracted_type, format_of
 def _generate_hsa_launcher(constants, signature, _kernel_name, written=None) -> str:
     """Generate the thin C++ CPython launcher that dispatches via HSA/ROCR.
 
-    The generated module exposes ``set_paths(pdi_path, insts_path)`` (which calls
+    The generated module exposes ``set_paths(hsaco_path, kernel_name)`` (which calls
     ``triton_npu_hsa_prepare`` once and stashes the handle) and ``launch(...)``
     (which marshals the tensor pointers/sizes and calls
     ``triton_npu_hsa_dispatch`` with the GIL released). All HSA state lives in
@@ -44,8 +45,9 @@ def _generate_hsa_launcher(constants, signature, _kernel_name, written=None) -> 
     (``codegen.written_pointer_args``), or None when that is not known.
 
     ``_kernel_name`` is accepted for signature parity with the XRT launcher
-    generators but is unused: the HSA path selects work by PDI/insts address,
-    not by a kernel symbol name.
+    generators but is unused here: the real kernel name is threaded through at
+    runtime via ``set_paths``'s second argument (see driver.py's
+    ``compile_module``), not baked into the generated source.
     """
     args_format = "".join(format_of(extracted_type(ty)) for ty in signature.values())
     fmt = "iiiOOOO" + args_format
@@ -114,19 +116,20 @@ def _generate_hsa_launcher(constants, signature, _kernel_name, written=None) -> 
 // Number of tensor kernel arguments for this specialized launcher.
 static constexpr std::uint32_t NUM_KERNARGS = {num_ptr_args};
 
-// Handle to this module's prepared (pdi, insts) program in the shared runtime.
+// Handle to this module's prepared hsaco kernel in the shared runtime.
 static triton_npu_hsa_program_t g_program = nullptr;
 
-// Python-callable set_paths(pdi_path, insts_path): prepare (load + cache) the
-// program in the shared runtime and stash its handle. Called once per module.
+// Python-callable set_paths(hsaco_path, kernel_name): pack-load the hsaco
+// in the shared runtime and stash its program handle. Called once per
+// module.
 static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
-  const char* pdi;
-  const char* insts;
-  if (!PyArg_ParseTuple(args, "ss", &pdi, &insts)) {{
+  const char* hsaco_path;
+  const char* kernel_name;
+  if (!PyArg_ParseTuple(args, "ss", &hsaco_path, &kernel_name)) {{
     return NULL;
   }}
   char err[512];
-  g_program = triton_npu_hsa_prepare(pdi, insts, err, sizeof(err));
+  g_program = triton_npu_hsa_prepare(hsaco_path, kernel_name, err, sizeof(err));
   if (g_program == nullptr) {{
     PyErr_SetString(PyExc_RuntimeError, err);
     return NULL;
@@ -198,7 +201,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 // Methods exported by this per-signature dispatch extension module.
 static PyMethodDef ModuleMethods[] = {{
   {{"launch", launch, METH_VARARGS, "Entry point for all kernels with this signature"}},
-  {{"set_paths", py_set_paths, METH_VARARGS, "Set paths to aie.pdi and insts.bin"}},
+  {{"set_paths", py_set_paths, METH_VARARGS, "Set path to kernel.hsaco and the kernel name"}},
   {{NULL, NULL, 0, NULL}}  // sentinel
 }};
 
