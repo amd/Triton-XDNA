@@ -35,6 +35,7 @@ from .driver import (
     _put_aircc_artifacts,
     detect_npu_version,
     npu_wait_module,
+    release_external_contexts,
 )
 
 _wait_nogil = None
@@ -685,8 +686,10 @@ class NPUChain:
         Ahead of time at ``max_open``, and again whenever the device refuses
         one: how many it grants depends on the driver and firmware -- ~30 on
         amdxdna 2.21, fewer on 2.25, which also reports it as EINVAL rather
-        than ENOENT -- so the cap alone cannot be the guarantee. Only a
-        refusal with no chain of ours left to close is raised.
+        than ENOENT -- so the cap alone cannot be the guarantee. Contexts
+        held outside the backend that their owner can reopen go first (see
+        ``driver.context_releasers``), then our own chains, stalest first.
+        Only a refusal with nothing left to release is raised.
         """
         open_ = NPUChain._open
         while len(open_) >= NPUChain.max_open and NPUChain._close_stalest():
@@ -698,7 +701,9 @@ class NPUChain:
                 self._runner = MultiLaunchRunner(self._elf_path, self._kernel_name)
                 break
             except RuntimeError as e:
-                if "HWCTX" not in str(e) or not NPUChain._close_stalest():
+                if "HWCTX" not in str(e) or not (
+                    release_external_contexts() or NPUChain._close_stalest()
+                ):
                     raise
         open_[id(self)] = weakref.ref(self)
 

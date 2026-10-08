@@ -15,6 +15,8 @@ them to `_kv_store`, so the host cache, `kv_view`, `kv_stack`, the npz and a
 bound decoder sink all see them exactly as they see the Triton prefill's.
 """
 
+import weakref
+
 import numpy as np
 import torch
 
@@ -28,16 +30,38 @@ def _dense():
     return dense, models
 
 
-def run_fused(fused, ids):
-    """`fused.prefill(ids)`, leaving its hardware contexts released.
+#: Fused prefills that may hold their hardware contexts between prompts.
+_holding = weakref.WeakSet()
 
-    The decoder opens its own contexts, and the next prefill reopens these.
-    The device grants a limited number, and Triton prefill chains in the same
-    process may hold the rest; chains reopen on their next run, so they are
-    closed to make room.
+
+def release_fused_prefills():
+    """Release the hardware contexts of every fused prefill between prompts.
+
+    Each reopens them at its next prefill. Called before an NPU decoder opens
+    its own, and by the Triton backend when the device refuses it one. True if
+    any context was released.
     """
+    held = [f for f in _holding if not f.suspended]
+    _holding.clear()
+    for f in held:
+        f.suspend()
+    return bool(held)
+
+
+def run_fused(fused, ids):
+    """`fused.prefill(ids)`, leaving its hardware contexts open.
+
+    Reopening them reconfigures the array, so they stay open until something
+    else needs the room and calls `release_fused_prefills`. The device grants
+    a limited number, and Triton prefill chains in the same process may hold
+    the rest; chains reopen on their next run, so they are closed to make
+    room.
+    """
+    from triton.backends.amd_triton_npu import driver
     from triton.backends.amd_triton_npu.multilaunch import NPUChain
 
+    if release_fused_prefills not in driver.context_releasers:
+        driver.context_releasers.append(release_fused_prefills)
     try:
         try:
             return fused.prefill(ids)
@@ -51,7 +75,7 @@ def run_fused(fused, ids):
                 c.close()
             return fused.prefill(ids)
     finally:
-        fused.suspend()
+        _holding.add(fused)
 
 
 class _FusedPrefill:

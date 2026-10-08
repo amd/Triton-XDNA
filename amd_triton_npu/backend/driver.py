@@ -2370,6 +2370,18 @@ def _release_all_sessions(keep=None):
         del _live_sessions[key]
 
 
+#: Callables that release hardware contexts held outside this backend by an
+#: owner that reopens them on its next use, such as mlir-air's fused prefill
+#: between prompts. Each returns whether it released any. Tried when the device
+#: refuses a context to a launch or an ``NPUChain``.
+context_releasers = []
+
+
+def release_external_contexts():
+    """Run every ``context_releasers`` entry. True if any released a context."""
+    return any([release() for release in context_releasers])
+
+
 # What the driver reports when no hw_context is available. Matched on text
 # because XRT raises a plain std::runtime_error here, with no error code to
 # test; a miss only costs the retry, since the exception is re-raised either
@@ -2391,6 +2403,7 @@ def _launch_with_session(key, mod, *launch_args):
         # if it still fails, the device is genuinely full and the caller
         # should hear about it.
         logger.debug("no hw_context available; releasing %d", len(_live_sessions))
+        release_external_contexts()
         _release_all_sessions(keep=key)
         mod.release_session()
         return mod.launch(*launch_args)
