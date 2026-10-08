@@ -10,8 +10,9 @@
 // mutex.
 //
 // Memory strategy:
-// * PDI + instructions: plain HSA pool allocation from the dev pool
-//   (coarse-grained, non-allocatable), loaded once per (pdi, insts) and cached.
+// * Kernels: packed into an hsaco (PDI+insts or full ELF), loaded through
+//   ROCR's code-object-reader/executable flow, and dispatched by the
+//   resulting opaque kernel object -- one load per (hsaco_path, kernel_name).
 // * Tensor I/O: the vmem API (handle_create -> reserve -> map -> set_access),
 //   RW-accessible to CPU and AIE agents, pooled and reused across dispatches.
 // * Shared regions: the same vmem API, but owned by the caller rather than the
@@ -318,13 +319,91 @@ struct SharedRegion {
 
 } // namespace
 
-// A prepared program is just its two pool allocations; the opaque handle in the
-// C ABI points at one of these, owned by the runtime's program cache. Both
-// members free themselves, so a prepare() that loads the PDI and then fails on
-// the instructions releases the PDI on the way out.
+// An hsaco loaded as a frozen HSA executable, plus the kernel object its one
+// dispatchable kernel resolves to. Self-freeing and move-only, same
+// reasoning as PoolBuffer: a load() that creates the reader and then fails
+// resolving the kernel symbol releases the reader/executable on the way
+// out, and a throw partway through still leaves nothing dangling.
+//
+// hsaco_ is held, not just read once: ROCR reads the code object in place
+// for as long as the reader exists, so these bytes must outlive it.
+class LoadedExecutable {
+public:
+  LoadedExecutable() = default;
+  LoadedExecutable(const LoadedExecutable &) = delete;
+  LoadedExecutable &operator=(const LoadedExecutable &) = delete;
+  LoadedExecutable(LoadedExecutable &&o) noexcept
+      : hsaco_(std::move(o.hsaco_)), reader_(std::exchange(o.reader_, {})),
+        executable_(std::exchange(o.executable_, {})),
+        kernel_object_(std::exchange(o.kernel_object_, 0)) {}
+  LoadedExecutable &operator=(LoadedExecutable &&o) noexcept {
+    if (this != &o) {
+      reset();
+      hsaco_ = std::move(o.hsaco_);
+      reader_ = std::exchange(o.reader_, {});
+      executable_ = std::exchange(o.executable_, {});
+      kernel_object_ = std::exchange(o.kernel_object_, 0);
+    }
+    return *this;
+  }
+  ~LoadedExecutable() { reset(); }
+
+  std::uint64_t kernel_object() const { return kernel_object_; }
+
+  // Load hsaco_bytes on `agent` and resolve kernel_name to its kernel
+  // object. Throws std::runtime_error (via HSA_CHECK) naming the failing
+  // call; already-acquired state is torn down before rethrowing.
+  static LoadedExecutable load(hsa_agent_t agent,
+                              std::vector<char> hsaco_bytes,
+                              const char *kernel_name) {
+    LoadedExecutable exe;
+    exe.hsaco_ = std::move(hsaco_bytes);
+    try {
+      HSA_CHECK(hsa_code_object_reader_create_from_memory(
+          exe.hsaco_.data(), exe.hsaco_.size(), &exe.reader_));
+      HSA_CHECK(hsa_executable_create_alt(
+          HSA_PROFILE_FULL, HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT, nullptr,
+          &exe.executable_));
+      HSA_CHECK(hsa_executable_load_agent_code_object(
+          exe.executable_, agent, exe.reader_, nullptr, nullptr));
+      HSA_CHECK(hsa_executable_freeze(exe.executable_, nullptr));
+      hsa_executable_symbol_t symbol{};
+      HSA_CHECK(hsa_executable_get_symbol_by_name(
+          exe.executable_, kernel_name, &agent, &symbol));
+      HSA_CHECK(hsa_executable_symbol_get_info(
+          symbol, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT,
+          &exe.kernel_object_));
+    } catch (...) {
+      exe.reset();
+      throw;
+    }
+    return exe;
+  }
+
+private:
+  void reset() {
+    if (executable_.handle)
+      log_status("hsa_executable_destroy",
+                 hsa_executable_destroy(executable_));
+    if (reader_.handle)
+      log_status("hsa_code_object_reader_destroy",
+                 hsa_code_object_reader_destroy(reader_));
+    executable_ = {};
+    reader_ = {};
+    kernel_object_ = 0;
+    hsaco_.clear();
+  }
+
+  std::vector<char> hsaco_;
+  hsa_code_object_reader_t reader_{};
+  hsa_executable_t executable_{};
+  std::uint64_t kernel_object_{};
+};
+
+// The opaque handle in the C ABI points at one of these, owned by the
+// runtime's program cache.
 struct triton_npu_hsa_program {
-  PoolBuffer pdi;
-  PoolBuffer insts;
+  LoadedExecutable exe;
 };
 
 namespace {
@@ -375,53 +454,22 @@ public:
     return std::string(buf);
   }
 
-  // Load + cache the PDI/insts for a kernel and return its program handle.
-  // Keyed by (pdi_path, insts_path) so repeated prepares (or a PDI shared by
-  // two signatures) reuse the same device allocation. Thread-safe.
-  triton_npu_hsa_program *prepare(const char *pdi_path,
-                                  const char *insts_path) {
-    std::string key = std::string(pdi_path) + '\0' + insts_path;
+  // Load + cache the hsaco at hsaco_path and resolve kernel_name to a kernel
+  // object; return its program handle. Keyed by (hsaco_path, kernel_name) so
+  // repeated prepares reuse the same loaded executable. Thread-safe.
+  triton_npu_hsa_program *prepare(const char *hsaco_path,
+                                  const char *kernel_name) {
+    std::string key = std::string(hsaco_path) + '\0' + kernel_name;
     std::lock_guard<std::mutex> lock(programs_mtx_);
     auto it = programs_.find(key);
     if (it != programs_.end())
       return it->second.get();
     auto prog = std::make_unique<triton_npu_hsa_program>();
-    // If the second load throws, ~PoolBuffer releases the first.
-    prog->pdi = load_binary(pdi_path);
-    prog->insts = load_binary(insts_path);
+    prog->exe = LoadedExecutable::load(aie_agent_, read_host_file(hsaco_path),
+                                       kernel_name);
     triton_npu_hsa_program *raw = prog.get();
     programs_.emplace(std::move(key), std::move(prog));
     return raw;
-  }
-
-  // Overwrite `nbytes` of a prepared program's instruction stream at
-  // `byte_offset`.
-  //
-  // The AIE dispatch packet carries insts_addr and insts_size per enqueue, so
-  // the stream is an input to each dispatch rather than a property of the
-  // program -- prepare() only fixes where it lives. A decode needs that: its
-  // context length L is encoded in a handful of stream words, and mlir-air's
-  // xclbin path rewrites exactly those words per token. This is the same edit
-  // against the buffer the packet already points at.
-  //
-  // Takes dispatch_mtx_, the same lock a dispatch holds. The GIL does not
-  // serialise this: the dispatch path releases it for the duration of the
-  // device work, and this is reached through ctypes, which releases it too.
-  // Without the lock another thread could memcpy into the stream while the
-  // queue is consuming it, and the dispatch would run a mix of two contexts.
-  void patch_insts(triton_npu_hsa_program *program, std::uint64_t byte_offset,
-                   const void *src, std::uint64_t nbytes) {
-    if (program == nullptr)
-      throw std::runtime_error("patch_insts called with a null program handle");
-    if (byte_offset + nbytes < byte_offset ||
-        byte_offset + nbytes > program->insts.size())
-      throw std::runtime_error(
-          "patch_insts range [" + std::to_string(byte_offset) + ", +" +
-          std::to_string(nbytes) + ") is outside the " +
-          std::to_string(program->insts.size()) + "-byte instruction stream");
-    std::lock_guard<std::mutex> lock(dispatch_mtx_);
-    std::memcpy(static_cast<char *>(program->insts.va()) + byte_offset, src,
-                static_cast<std::size_t>(nbytes));
   }
 
   // Run one dispatch of `program` over num_tensors (host_ptr, size) pairs.
@@ -521,16 +569,14 @@ public:
       pkt.opcode = HSA_AMD_AIE_PACKET_OPCODE_KMQ;
       pkt.count = AIE_PACKET_COUNT;
       pkt.completion_signal = signal_;
-      const auto insts_addr =
-          reinterpret_cast<std::uintptr_t>(program->insts.va());
-      pkt.insts_addr_low = static_cast<std::uint32_t>(insts_addr & 0xFFFFFFFFu);
-      pkt.insts_addr_high = static_cast<std::uint32_t>(insts_addr >> 32);
+      const std::uint64_t kernel_object = program->exe.kernel_object();
+      pkt.kernel_object_low =
+          static_cast<std::uint32_t>(kernel_object & 0xFFFFFFFFu);
+      pkt.kernel_object_high = static_cast<std::uint32_t>(kernel_object >> 32);
       // Narrowing checked by the static_assert on TRITON_NPU_HSA_MAX_KERNARGS.
       pkt.num_kernargs = static_cast<std::uint16_t>(num_tensors);
       // The ABI requires kernarg_address to be NULL when num_kernargs is 0.
       pkt.kernarg_address = (num_tensors > 0) ? kernargs : nullptr;
-      pkt.insts_size = program->insts.size();
-      pkt.pdi_addr = program->pdi.va();
 
       // Arm the signal to 1 (device decrements to 0 on success, or sets a
       // negative error code) and write the packet into the slot. Nothing from
@@ -754,7 +800,6 @@ public:
 
 private:
   hsa_agent_t aie_agent_{};
-  hsa_amd_memory_pool_t dev_pool_{};
   hsa_amd_memory_pool_t data_pool_{};
   hsa_queue_t *queue_ = nullptr;
   hsa_signal_t signal_{};
@@ -780,9 +825,10 @@ private:
   // cannot be reliably re-reserved+mapped, and reuse removes per-launch cost).
   std::unordered_map<std::size_t, std::vector<DeviceBuffer>> vmem_pool_;
 
-  // Prepared programs, keyed by "pdi\0insts"; owns the loaded PDI/insts and
-  // makes prepare() idempotent (a repeated (pdi, insts) reuses one dev
-  // allocation rather than loading/leaking a second copy).
+  // Prepared programs, keyed by "hsaco_path\0kernel_name"; owns the loaded
+  // executable and makes prepare() idempotent (a repeated (hsaco_path,
+  // kernel_name) reuses the same loaded executable rather than loading/
+  // leaking a second copy).
   //
   // Unordered: every use is an exact-key lookup, and the one iteration is the
   // destructor freeing them all. Unlike regions_ below, which cannot be.
@@ -971,10 +1017,6 @@ private:
     aie_agents_ = aies;
     cpu_agents_ = cpus;
 
-    // dev pool: coarse-grained, non-allocatable (PDI + instructions).
-    if (!discover_pool(HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED, false,
-                       &dev_pool_))
-      throw std::runtime_error("no dev memory pool on AIE agent");
     // data pool: coarse-grained, allocatable (tensor data via vmem).
     if (!discover_pool(HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED, true,
                        &data_pool_))
@@ -1199,8 +1241,10 @@ private:
     return ((n + data_granule_ - 1) / data_granule_) * data_granule_;
   }
 
-  // Read a file into a fresh dev-pool allocation.
-  PoolBuffer load_binary(const std::string &path) {
+  // Read a file into plain host memory. Distinct from the AIE dev-pool
+  // allocation load_binary() used to return: hsa_code_object_reader_create_
+  // from_memory reads from ordinary host memory, not a device allocation.
+  std::vector<char> read_host_file(const std::string &path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f)
       throw std::runtime_error("failed to open '" + path + "'");
@@ -1208,14 +1252,10 @@ private:
     if (sz <= 0)
       throw std::runtime_error("empty or unreadable '" + path + "'");
     f.seekg(0);
-    void *raw = nullptr;
-    HSA_CHECK(hsa_amd_memory_pool_allocate(
-        dev_pool_, static_cast<std::size_t>(sz), 0, &raw));
-    // Owned from here on, so the short-read path below frees it by unwinding.
-    PoolBuffer b(raw, static_cast<std::size_t>(sz));
-    if (!f.read(static_cast<char *>(raw), sz))
+    std::vector<char> buf(static_cast<std::size_t>(sz));
+    if (!f.read(buf.data(), sz))
       throw std::runtime_error("short read loading '" + path + "'");
-    return b;
+    return buf;
   }
 
   // Reserve `b.size` bytes of address space for the handle `b` already holds,
@@ -1438,10 +1478,10 @@ extern "C" int triton_npu_hsa_agent_name(char *buf, size_t buf_len,
 }
 
 extern "C" triton_npu_hsa_program_t
-triton_npu_hsa_prepare(const char *pdi_path, const char *insts_path,
+triton_npu_hsa_prepare(const char *hsaco_path, const char *kernel_name,
                        char *errbuf, size_t errbuf_len) {
   try {
-    return runtime().prepare(pdi_path, insts_path);
+    return runtime().prepare(hsaco_path, kernel_name);
   } catch (const std::exception &e) {
     write_err(errbuf, errbuf_len, "HSA prepare failed", e.what());
     return nullptr;
@@ -1505,22 +1545,6 @@ extern "C" int triton_npu_hsa_shared_mark_dirty(void *va, char *errbuf,
   } catch (...) {
     write_err(errbuf, errbuf_len, "HSA shared mark dirty failed",
               "unknown error");
-    return -1;
-  }
-}
-
-extern "C" int triton_npu_hsa_patch_insts(triton_npu_hsa_program_t program,
-                                          uint64_t byte_offset, const void *src,
-                                          uint64_t nbytes, char *errbuf,
-                                          size_t errbuf_len) {
-  try {
-    runtime().patch_insts(program, byte_offset, src, nbytes);
-    return 0;
-  } catch (const std::exception &e) {
-    write_err(errbuf, errbuf_len, "HSA patch insts failed", e.what());
-    return -1;
-  } catch (...) {
-    write_err(errbuf, errbuf_len, "HSA patch insts failed", "unknown error");
     return -1;
   }
 }

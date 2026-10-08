@@ -28,7 +28,8 @@ extern "C" {
 // ring slot (a few KiB in total).
 #define TRITON_NPU_HSA_MAX_KERNARGS 16
 
-// Opaque handle to a prepared (pdi, insts) program, owned by the runtime.
+// Opaque handle to a prepared kernel, loaded from an hsaco and dispatched by
+// its kernel object, owned by the runtime.
 typedef struct triton_npu_hsa_program *triton_npu_hsa_program_t;
 
 // Initialize the runtime (idempotent) and write the AIE agent's device name
@@ -39,11 +40,18 @@ typedef struct triton_npu_hsa_program *triton_npu_hsa_program_t;
 int triton_npu_hsa_agent_name(char *buf, size_t buf_len, char *errbuf,
                               size_t errbuf_len);
 
-// Initialize the runtime (idempotent) and load + cache the PDI and instruction
-// binaries for one kernel. Returns an opaque program handle, or NULL on error
-// (with a message written to errbuf). Call once per launcher module.
-triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *pdi_path,
-                                                const char *insts_path,
+// Initialize the runtime (idempotent), pack-load an hsaco, and resolve
+// kernel_name to a kernel object. Returns an opaque program handle, or NULL
+// on error (with a message written to errbuf). Call once per launcher
+// module.
+//
+// hsaco_path must name a code object ROCR's AIE loader recognises -- an
+// architecture-named (aie2/aie2p) section carrying either a PDI plus
+// instruction sequence, or a full ELF (aie2p only). The hsaco's bytes are
+// read into this call and kept alive for as long as the returned program is
+// prepared, since ROCR reads the code object in place.
+triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *hsaco_path,
+                                                const char *kernel_name,
                                                 char *errbuf,
                                                 size_t errbuf_len);
 
@@ -98,21 +106,6 @@ int triton_npu_hsa_dispatch_ex(triton_npu_hsa_program_t program,
                                uint32_t num_tensors, void *const *host_ptrs,
                                const uint64_t *sizes, const uint8_t *writeback,
                                char *errbuf, size_t errbuf_len);
-
-// Overwrite nbytes of a prepared program's instruction stream at byte_offset.
-// Returns 0 on success, or a negative value (with a message in errbuf).
-//
-// The dispatch packet carries the stream's address and size per enqueue, so the
-// stream is an input to each dispatch and not a property of the program. A
-// decode needs that: its context length is encoded in a few stream words and
-// changes every token.
-//
-// Serialised against dispatch internally. The GIL does not do it: the dispatch
-// path releases the GIL, and so does the ctypes call that reaches this.
-int triton_npu_hsa_patch_insts(triton_npu_hsa_program_t program,
-                               uint64_t byte_offset, const void *src,
-                               uint64_t nbytes, char *errbuf,
-                               size_t errbuf_len);
 
 // ---------------------------------------------------------------------------
 // Shared regions
