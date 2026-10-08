@@ -30,8 +30,13 @@ class CachedNPUKernel:
         self._cache = {}
 
     def __call__(self, kernel, grid, *args, **constexpr_kwargs):
-        # Cache key: grid dimensions + constexpr values determine the compiled binary
-        cache_key = (grid, tuple(constexpr_kwargs.items()))
+        # Order constexprs by kernel signature, not caller kwarg order, so the
+        # fast path's positional launch matches the slow path's name-based binding.
+        constexpr_names = [p.name for p in kernel.params if p.name in constexpr_kwargs]
+        ordered_constexprs = [constexpr_kwargs[n] for n in constexpr_names]
+
+        # Cache key: grid + constexpr values (in signature order) determine the binary
+        cache_key = (grid, tuple(zip(constexpr_names, ordered_constexprs)))
 
         if cache_key in self._cache:
             # Fast path: direct C extension call (~0.1ms)
@@ -39,7 +44,7 @@ class CachedNPUKernel:
             gX = grid[0] if len(grid) > 0 else 1
             gY = grid[1] if len(grid) > 1 else 1
             gZ = grid[2] if len(grid) > 2 else 1
-            all_args = list(args) + list(constexpr_kwargs.values())
+            all_args = list(args) + ordered_constexprs
             mod.launch(gX, gY, gZ, None, None, None, None, *all_args)
         else:
             # Slow path: full Triton JIT compilation (~27ms + compile time)
