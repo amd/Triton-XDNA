@@ -674,6 +674,8 @@ class NPUChain:
         self._runner = None
         self._elf_path = None
         self._kernel_name = None
+        # The runtime the built artifact runs on; `_build` decides it.
+        self._runtime = "xrt"
 
     def add(
         self,
