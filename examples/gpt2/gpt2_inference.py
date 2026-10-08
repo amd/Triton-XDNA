@@ -101,7 +101,7 @@ def run_triton_model(state_dict, input_ids, backend, profile=False, config=None)
     from model import GPT2Model
 
     # Select backend driver
-    # In hetero mode, leave default GPU driver active — per-kernel npu_driver_scope()
+    # In hetero mode, leave default GPU driver active — per-kernel driver_scope("npu")
     # handles NPU switching inside each kernel wrapper.
     if backend == "npu":
         import benchmark
@@ -195,7 +195,7 @@ def run_generation(hf_model, tokenizer, input_ids, args):
     from model import GPT2Model
 
     # Select backend driver
-    # In hetero mode, leave default GPU driver active — per-kernel npu_driver_scope()
+    # In hetero mode, leave default GPU driver active — per-kernel driver_scope("npu")
     # handles NPU switching inside each kernel wrapper.
     if args.backend == "npu":
         import benchmark

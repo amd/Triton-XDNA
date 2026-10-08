@@ -31,6 +31,7 @@ Qwen2.5's projection bias, Gemma's norm sandwich.
 """
 
 import torch
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 from config import ROPE_DIM
 
@@ -79,7 +80,7 @@ class Phi4Prefill(LlamaPrefill):
             if dev is not None:
                 import gpu_kernels
 
-                with gpu_kernels.gpu_driver():
+                with driver_scope("amd"):
                     out = gpu_kernels.rope_batch(
                         x.to(dev), lut.to(dev), n_heads, x.shape[-1] // n_heads, rot=R
                     )

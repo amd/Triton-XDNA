@@ -72,12 +72,11 @@ class ModelSpec:
     #: `FusedDecoder` for the kv_arrays ones), so it is recorded rather than
     #: derived from the model name.
     decoder_class: str = ""
-    #: Whether `AMD_TRITON_NPU_RUNTIME=hsa` works for this model. The HSA
-    #: adapter subclasses `air.FusedDecoder`, which only the npz-API drivers
-    #: define -- the prefiller ones name theirs `FusedDecode3B` -- so asking
-    #: for HSA elsewhere raises AttributeError from inside hsa_decode.py.
-    #: Generalizing it belongs with the HSA scratchpad work, not with adding
-    #: models.
+    #: Whether `AMD_TRITON_NPU_RUNTIME=hsa` has been made to work for this
+    #: model. The HSA adapter (`hsa_decode.make_hsa_decoder_class`) wraps
+    #: whichever class `decoder_class` names and reads its geometry off the
+    #: decoder or its `fd` module, so the driver API alone does not rule a
+    #: model out; this records which ones have been run on HSA.
     supports_hsa: bool = False
     #: Host memory the prefill needs to hold this model's dequantized bf16
     #: weights, in GiB. Checked before anything is allocated: an undersized

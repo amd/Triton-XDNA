@@ -37,6 +37,7 @@ from __future__ import annotations
 import math
 
 import torch
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 import fused_mlp
 import kernels as kn
@@ -139,7 +140,7 @@ class NPUAttention:
             rows, dh = self.n_q * QB, self.dh
             spans = self._spans(nblk)
             tag = f"{dh}_{self.window or 0}_{nblk}"
-            with kn._npu_driver():
+            with driver_scope("npu"):
                 qk = _Chain(f"attn_qk_{tag}", [(rows, dh, nc) for _, nc in spans])
                 pv = _Chain(f"attn_pv_{tag}", [(rows, nc, dh) for _, nc in spans])
             plan = self._plans[nblk] = (qk, pv, spans)
@@ -184,13 +185,13 @@ class NPUAttention:
                 pv.b[b].zero_()
             qk.b[b][:, k0 - lo : k1 - lo] = k[k0:k1].T
             pv.b[b][k0 - lo : k1 - lo] = v[k0:k1]
-        with kn._npu_driver():
+        with driver_scope("npu"):
             qk.run()
         for b, (lo, nc) in enumerate(spans):
             # Out of place: the score pages are intermediates (see run()).
             S = qk.c[b].view(n_q, QB, nc) + masks[b]
             pv.a[b][:, :nc].view(n_q, QB, nc).copy_(torch.softmax(S, -1))
-        with kn._npu_driver():
+        with driver_scope("npu"):
             pv.run()
         out = torch.empty(N, n_q, dh)
         for b in range(nblk):

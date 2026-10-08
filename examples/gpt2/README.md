@@ -127,7 +127,7 @@ kernels/
     gelu.py                        # GELU activation (GPU + NPU)
     add.py                         # Elementwise addition (GPU + NPU)
     attention.py                   # Fused multi-head attention (GPU only)
-    backend_utils.py               # CachedNPUKernel, npu_driver_scope
+    backend_utils.py               # CachedNPUKernel
 transform_matmul_aie2p.mlir        # NPU tiling recipe for matmul
 transform_elementwise_aie2p.mlir   # NPU tiling recipe for GELU
 transform_add_aie2p.mlir           # NPU tiling recipe for add
@@ -155,7 +155,7 @@ python gpt2_inference.py [OPTIONS]
 
 Options:
   --backend {gpu,npu,hetero,hetero-fast,reference}
-                        Inference backend (default: gpu)
+                        Inference backend (default: npu)
   --prompt TEXT         Input prompt (default: "The quick brown fox")
   --max-tokens N        Tokens to generate; 0 = single forward pass (default: 0)
   --interactive         Interactive REPL mode

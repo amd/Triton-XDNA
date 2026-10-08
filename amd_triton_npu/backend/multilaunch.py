@@ -622,28 +622,18 @@ class NPUChain:
         hetero model the GPU driver may be active and ``asm`` would lack
         ``ttsharedir`` (KeyError).
 
-        Restores the driver active on entry rather than ``reset_active()``, which
-        resolves the auto-detected default and fails with "0 active drivers" on
-        an iGPU-free host (no auto-active GPU driver; NPUDriver is set explicitly,
-        not detected). For the same reason it reads ``_active`` and not
-        ``.active``, which resolves that default when nothing is active yet:
-        a chain reopened after ``max_open`` evicted it captures again from
-        wherever its ``run()`` was called, not only from inside a scope that
-        already made a driver active.
+        `driver_scope` restores whatever was active on entry, nothing included,
+        so a chain reopened after ``max_open`` evicted it can capture again
+        from wherever its ``run()`` was called, not only from inside a scope
+        that already made a driver active.
         """
-        import triton
-        from .driver import NPUDriver
+        from .driver_scope import driver_scope
 
         if isinstance(kernel, (str, bytes)):
             return kernel
 
-        prev = getattr(triton.runtime.driver, "_active", None)
-        triton.runtime.driver.set_active(NPUDriver())
-        try:
-            with config_context(compile_only=True):
-                compiled = kernel.warmup(*args, grid=grid, **constexprs)
-        finally:
-            triton.runtime.driver._active = prev
+        with driver_scope("npu"), config_context(compile_only=True):
+            compiled = kernel.warmup(*args, grid=grid, **constexprs)
         return compiled.asm["ttsharedir"]
 
     def _build(self):

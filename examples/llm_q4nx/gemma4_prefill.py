@@ -63,6 +63,7 @@ import os
 
 import numpy as np
 import torch
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 from config import (
     ATTN_SCALE,
@@ -537,7 +538,7 @@ class Gemma4Prefill(LlamaPrefill):
         """Hold the GPU driver across a region, or do nothing on the host path."""
         if self._gpu_device() is None:
             return contextlib.nullcontext()
-        return gpu_kernels.gpu_driver()
+        return driver_scope("amd")
 
     def _layer(self, x, L, N, keep=None, pli=None):
         """One Gemma4 block, on the prompt. x: [N, D] -> [N, D].
@@ -559,17 +560,13 @@ class Gemma4Prefill(LlamaPrefill):
         h = self._rms_norm(x, w["attn_norm"], RMS_EPS)  # input_layernorm
 
         # One GPU-driver scope over the sublayer rather than one per operator.
-        # `gpu_driver` no-ops when the GPU backend is already active, so the
-        # scopes inside `_rope` and `_attention` cost nothing. Switching does
-        # cost: `set_active` drops Triton's kernel cache.
+        # `driver_scope` no-ops when the GPU driver is already active, so the
+        # scopes inside `_rope` and `_attention` cost nothing.
         #
-        # The qkv GEMM inside still switches to the NPU and back. That is
-        # unavoidable; what this removes is the two ropes and the attention
-        # each doing it again.
-        # The projections first, outside the GPU scope below. They are NPU
-        # work, and an NPU launch inside that scope would switch the active
-        # driver and drop the GPU kernels' compiled cache -- the thing the
-        # scope exists to keep.
+        # The projections first, outside the GPU scope below: they are NPU
+        # work, and an NPU launch inside it would switch the driver away and
+        # back. A switch is cheap (the compiled kernels of both stay cached),
+        # but it is still one per launch that this ordering avoids.
         # `stage_key` keeps this layer's weight on the device between calls.
         # It is the weight's identity, not the shape's: the chain behind it is
         # shared by everything of the same shape, and this is what gives each
@@ -807,13 +804,14 @@ class Gemma4Prefill(LlamaPrefill):
 # GPU decode
 # ---------------------------------------------------------------------------
 #
-# The other half of a hybrid run: Triton prefill on the NPU, then token-by-token
-# decode in torch on the iGPU, instead of mlir-air's fused NPU superkernel.
+# The other half of a hybrid run: the prefill on the NPU, then token-by-token
+# decode in Triton on the iGPU, instead of mlir-air's fused NPU superkernel.
+# Spelled `--backend npu --decode gpu`.
 #
-# Named after `examples/qwen2_5`'s `hetero-fast`, which is the same split for
-# that model -- hetero prefill, all-GPU decode -- and reached the same way, by
-# running the ordinary forward at one token with a KV cache. The math below is
-# `_layer`'s, at N=1, with three differences that only appear at N=1:
+# `examples/qwen2_5`'s `hetero-fast` ends in the same all-GPU decode, reached
+# the same way, by running the ordinary forward at one token with a KV cache
+# (its prefill is its hetero one). The math below is `_layer`'s, at N=1, with
+# three differences that only appear at N=1:
 #
 #   * the new token attends the CACHE, so K and V come from it rather than from
 #     this step's projections, and the sliding window becomes a bound on how far
@@ -1139,7 +1137,7 @@ class Gemma4GpuDecode:
         # The RoPE tables have `max_seq` rows, and the slab may have more.
         if N > pf.max_seq:
             raise ValueError(f"a {N}-token prompt exceeds max_seq={pf.max_seq}")
-        with gpu_kernels.gpu_driver():
+        with driver_scope("amd"):
             logits = self._prefill(list(ids))
             if not self._slab_shared:
                 # Without interop the device slab is a copy; the host one is
@@ -1252,14 +1250,14 @@ class Gemma4GpuDecode:
 
         The driver scope is here rather than around each launch: a step issues
         several hundred, and every one of them has to reach the GPU backend
-        rather than the NPU one that a preceding prefill leaves active. See
-        `gpu_kernels.gpu_driver`.
+        rather than the NPU one a preceding prefill may have left active. See
+        `driver_scope`.
         """
         if not 0 <= pos < self.max_L:
             raise ValueError(
                 f"position {pos} is outside the decode's {self.max_L} rows"
             )
-        with gpu_kernels.gpu_driver():
+        with driver_scope("amd"):
             return self._step(token, pos)
 
     def _step(self, token, pos):
@@ -1370,11 +1368,13 @@ class Gemma4GpuDecode:
         out = [int(first)]
         pos = self.P
         # One driver scope for the whole loop. `step` takes one too, which
-        # no-ops inside this; what must not happen is a *switch* per token,
-        # because that drops Triton's kernel cache and recompiles every shape
-        # the token touches -- 7.5 s of an 9.3 s, 64-token run before this was
-        # hoisted. See `gpu_kernels.gpu_driver`.
-        with gpu_kernels.gpu_driver():
+        # no-ops inside this. Switching per token cost 7.5 s of a 9.3 s,
+        # 64-token run before this was hoisted. That was never recompilation --
+        # Triton caches the compiled kernels per device, so both drivers' stay
+        # cached -- but the old scope built a new AMD driver on every entry,
+        # ~0.65 ms each. `driver_scope` builds it once; the hoist stays because
+        # one scope is still cheaper than one per token.
+        with driver_scope("amd"):
             for _ in range(max(0, n_tokens - 1)):
                 if pos >= self.max_L:
                     print(f"[gpu-decode] hit max_L={self.max_L}; stopping", flush=True)

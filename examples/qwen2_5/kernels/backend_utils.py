@@ -3,27 +3,7 @@
 
 """Backend utilities for heterogeneous iGPU+NPU execution."""
 
-import triton
-from contextlib import contextmanager
-
-
-@contextmanager
-def npu_driver_scope():
-    """Temporarily activate NPU driver for a kernel launch, then restore.
-
-    Restores the driver active on entry rather than ``reset_active()``, which
-    resolves the auto-detected default and fails with "0 active drivers" on an
-    iGPU-free host (CI without ROCm): npu mode sets NPUDriver explicitly, so no
-    GPU driver is auto-active to fall back to.
-    """
-    from triton.backends.amd_triton_npu.driver import NPUDriver
-
-    prev = triton.runtime.driver.active
-    triton.runtime.driver.set_active(NPUDriver())
-    try:
-        yield
-    finally:
-        triton.runtime.driver.set_active(prev)
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 
 class CachedNPUKernel:
@@ -63,7 +43,7 @@ class CachedNPUKernel:
             mod.launch(gX, gY, gZ, None, None, None, None, *all_args)
         else:
             # Slow path: full Triton JIT compilation (~27ms + compile time)
-            with npu_driver_scope():
+            with driver_scope("npu"):
                 kernel[grid](*args, **constexpr_kwargs)
             from triton.backends.amd_triton_npu.driver import _last_dispatched_module
 

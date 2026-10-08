@@ -161,7 +161,7 @@ kernels/
     rope.py                         # Rotary position embeddings (torch, applied pre-attention)
     add.py                          # Elementwise addition (GPU + NPU)
     attention.py                    # Fused multi-head attention (GPU only)
-    backend_utils.py                # CachedNPUKernel, npu_driver_scope
+    backend_utils.py                # CachedNPUKernel
 transform_matmul_aie2p.mlir         # NPU tiling recipe for matmul
 transform_rmsnorm_aie2p.mlir        # NPU tiling recipe for RMSNorm (single reduction)
 transform_elementwise_aie2p.mlir    # NPU tiling recipe for SiLU

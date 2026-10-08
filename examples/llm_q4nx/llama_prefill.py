@@ -40,6 +40,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import torch
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 from config import (
     D,
@@ -428,7 +429,7 @@ class LlamaPrefill:
                 # since they grew one.
                 import gpu_kernels
 
-                with gpu_kernels.gpu_driver():
+                with driver_scope("amd"):
                     out = gpu_kernels.rope_batch(
                         x.to(dev), lut.to(dev), n_heads, lut.shape[-1]
                     )
@@ -475,7 +476,7 @@ class LlamaPrefill:
                 # kernel rather than torch on a GPU tensor.
                 import gpu_kernels
 
-                with gpu_kernels.gpu_driver():
+                with driver_scope("amd"):
                     out = gpu_kernels.attn_prefill(
                         q.to(dev), k.to(dev), v.to(dev), n_q, n_kv, dh, window, scale
                     )

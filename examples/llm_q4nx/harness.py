@@ -866,18 +866,17 @@ def build_parser(doc):
     )
     ap.add_argument(
         "--backend",
-        choices=("cpu", "npu", "hetero", "hetero-fast"),
+        choices=("cpu", "npu", "hetero"),
         default="npu",
-        help="cpu: every operator in torch on the host -- this stack's own "
-        "reference, NOT examples/gpt2's --backend reference, which is "
-        "HuggingFace. npu: the operators with an NPU kernel on the NPU, the "
-        "rest (RoPE, attention) in torch on the host. hetero: the same NPU "
-        "split, but those two as Triton kernels on the iGPU -- coverage for "
-        "the iGPU path, not a speedup; the per-layer driver switch it costs "
-        "outweighs what the two operators save. hetero-fast: the NPU prefill "
-        "plus the GPU decode, i.e. --backend npu --decode gpu, which is the "
-        "fastest combination measured here. Only Gemma4-E2B has a GPU decode, "
-        "so hetero-fast and --decode gpu decline on the other models.",
+        help="where the Triton prefill's operators run. cpu: every operator "
+        "in torch on the host -- this stack's own reference, NOT "
+        "examples/gpt2's --backend reference, which is HuggingFace. npu: the "
+        "operators --ops enables on the NPU, the rest in torch on the host -- "
+        "RoPE and attention on every model but Gemma4-E2B, whose attention "
+        "has an NPU kernel. hetero: as npu, but RoPE and attention as Triton "
+        "kernels on the iGPU -- coverage for the iGPU path, not a speedup. "
+        "Where the decode runs is --decode, separately: the NPU prefill with "
+        "the iGPU decode is --backend npu --decode gpu.",
     )
     ap.add_argument(
         "--ops",
@@ -927,47 +926,17 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     """
     args = build_parser(doc).parse_args(argv)
 
-    # `hetero-fast` is one name for two knobs, and it exists because
-    # examples/gpt2 and examples/qwen2_5 have spelled it that way since before
-    # this directory had a GPU path at all. Expanded here rather than carried
-    # inward so nothing below has to know there are two spellings.
-    #
-    # It expands to the NPU prefill, NOT the hetero one, and that is a
-    # DELIBERATE divergence from the siblings, where `hetero-fast` is "hetero
-    # for prefill, all-GPU decode". The name promises the fastest way to get a
-    # token out of this model, and on this model it is not the hetero prefill:
-    # the layers are sequential, so routing RoPE and attention to the iGPU
-    # switches the active Triton driver twice per layer, each switch dropping
-    # the compiled-kernel cache. Measured on npu2 + Radeon 8060S, that costs
-    # more than the two operators save. `--backend hetero --decode gpu` still
-    # spells the sibling meaning for anyone comparing the two.
     raw_argv = sys.argv[1:] if argv is None else argv
-    if args.backend == "hetero-fast":
-        # `--decode npu` and `--decode=npu` are the same argument to argparse
-        # and have to be the same argument here; testing for the bare flag let
-        # the second form through and then silently overwrote it, which is
-        # precisely what the error below promises does not happen.
-        asked_decode = any(
-            a == "--decode" or a.startswith("--decode=") for a in raw_argv
-        )
-        if args.decode != "gpu" and asked_decode:
-            raise SystemExit(
-                "--backend hetero-fast already means --decode gpu; "
-                f"--decode {args.decode} contradicts it. Use --backend hetero "
-                f"--decode {args.decode} if that is what you meant."
-            )
-        args.backend, args.decode = "npu", "gpu"
 
     # `--decode gpu` is implemented per model, and only Gemma4-E2B has one.
     # Checked here rather than in `generate_on_gpu`, which runs after the
     # weights have loaded -- minutes to say a flag combination was never going
-    # to work. `hetero-fast` reaches this through the expansion above, which is
-    # the point: it advertises a GPU decode on every model and only one has it.
+    # to work.
     if args.decode == "gpu" and cfg.MODEL_NAME not in GPU_DECODE_MODELS:
         raise SystemExit(
-            f"--decode gpu (and --backend hetero-fast, which implies it) is "
-            f"implemented for {', '.join(sorted(GPU_DECODE_MODELS))} only; "
-            f"{cfg.MODEL_NAME} has none. Use --backend hetero --decode npu."
+            f"--decode gpu is implemented for "
+            f"{', '.join(sorted(GPU_DECODE_MODELS))} only; {cfg.MODEL_NAME} has "
+            f"none. Use --decode npu."
         )
 
     fused = fused_prefill_config(cfg)
@@ -1004,15 +973,12 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
 
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and not spec.supports_hsa:
         # Up front, for the same reason --interactive is below: a property of
-        # the model, not of anything on disk. Without this the run loads
-        # weights for minutes and then dies inside hsa_decode.py on
-        # `air.FusedDecoder`, an attribute this model's driver does not define.
+        # the model, not of anything on disk, and otherwise found only after
+        # minutes of weight loading.
         raise SystemExit(
-            f"AMD_TRITON_NPU_RUNTIME=hsa is not supported for {spec.name}. The "
-            f"HSA decode adapter subclasses mlir-air's `FusedDecoder`, which "
-            f"only its npz-API drivers define; this model's driver names its "
-            f"decoder {spec.decoder_class or 'something else'}. Use the "
-            f"default XRT runtime."
+            f"AMD_TRITON_NPU_RUNTIME=hsa is not supported for {spec.name}: the "
+            f"HSA decode adapter has not been made to work with its driver "
+            f"(registry.ModelSpec.supports_hsa). Use the default XRT runtime."
         )
 
     if args.interactive and spec.driver_api != "npz":
