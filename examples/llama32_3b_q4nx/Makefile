@@ -35,12 +35,17 @@ DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),pdi,xclbin)
 
 OPS      ?= all
 BACKEND  ?= npu
+# The prefill engine. triton (default here): this repository's prefill, its
+# operators placed by BACKEND and OPS. auto: the harness's own default --
+# mlir-air's fused prefill where it has one, which BACKEND/OPS do not apply to.
+ENGINE   ?= triton
 N_TOKENS ?= 200
 PROMPT   ?= The capital of France is
 MODEL    ?=
 
 MODEL_ARG  := $(if $(MODEL),--model "$(MODEL)",)
-COMMON     := --backend $(BACKEND) --ops $(OPS) $(MODEL_ARG)
+COMMON     := --prefill-engine $(ENGINE) \
+	$(if $(filter triton,$(ENGINE)),--backend $(BACKEND) --ops $(OPS)) $(MODEL_ARG)
 
 .PHONY: help run prefill profile compile-decode \
 	recompile-decode decode-kernels air-src preflight clean
@@ -75,7 +80,8 @@ help:
 	@echo "  make preflight        Check the environment is set up"
 	@echo ""
 	@echo "  RUNTIME=xrt|hsa       Dispatch runtime (default: xrt)"
-	@echo "  BACKEND=npu|cpu       Where the prefill runs (default: npu)"
+	@echo "  ENGINE=triton|auto    Prefill engine (default: triton; auto = fused where available)"
+	@echo "  BACKEND=npu|hetero|cpu Where the Triton prefill runs (default: npu)"
 	@echo "  OPS=all|matmul,...    Which operators go to the NPU (default: all)"
 
 # No `chat` target, unlike the 1B's Makefile. mlir-air's Session /

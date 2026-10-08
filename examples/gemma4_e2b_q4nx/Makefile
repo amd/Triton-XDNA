@@ -37,6 +37,10 @@ DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),pdi,xclbin)
 
 OPS      ?= all
 BACKEND  ?= npu
+# The prefill engine. triton (default here): this repository's prefill, its
+# operators placed by BACKEND and OPS. auto: the harness's own default --
+# mlir-air's fused prefill where it has one, which BACKEND/OPS do not apply to.
+ENGINE   ?= triton
 N_TOKENS ?= 4
 # ATTN_MAXL the decode template is built for. 128, where the siblings take
 # decode_build.py's 2048 default: that is what mlir-air's own token driver
@@ -56,7 +60,8 @@ PROMPT_IDS ?= 2,818,5279,529,7001,563
 MODEL    ?=
 
 MODEL_ARG  := $(if $(MODEL),--model "$(MODEL)",)
-COMMON     := --backend $(BACKEND) --ops $(OPS) $(MODEL_ARG)
+COMMON     := --prefill-engine $(ENGINE) \
+	$(if $(filter triton,$(ENGINE)),--backend $(BACKEND) --ops $(OPS)) $(MODEL_ARG)
 
 .PHONY: help run prefill profile compile-decode \
 	recompile-decode decode-kernels air-src preflight clean
@@ -91,7 +96,8 @@ help:
 	@echo "  make air-src          Fetch mlir-air sources at the pinned commit"
 	@echo "  make preflight        Check the environment is set up"
 	@echo ""
-	@echo "  BACKEND=npu|cpu       Where the prefill runs (default: npu)"
+	@echo "  ENGINE=triton|auto    Prefill engine (default: triton; auto = fused where available)"
+	@echo "  BACKEND=npu|hetero|cpu Where the Triton prefill runs (default: npu)"
 	@echo "  OPS=all|matmul,...    Which operators go to the NPU (default: all)"
 
 # No `chat` target. mlir-air's Session/interactive_chat pair exists only on its

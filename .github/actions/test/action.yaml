@@ -487,16 +487,14 @@ runs:
           # gpu` have no coverage there at all -- which is what this step is
           # for. Two runs, because they fail differently:
           #
-          #   --backend hetero
+          #   --prefill-engine triton --backend hetero
           #       the prefill's RoPE and attention on the iGPU, the rest on
           #       the NPU. Gates the first token, like 9b. Coverage for that
           #       routing, not a faster path.
-          #   --backend npu --decode gpu
+          #   --prefill-engine triton --backend npu --decode gpu
           #       the Triton NPU prefill plus the Triton iGPU decode, gating
-          #       the recorded continuation. `--backend` is spelled out so the
-          #       prefill stays the Triton one rather than the fused one `auto`
-          #       picks. The decode under test is ours, not mlir-air's
-          #       template, so it needs no `make compile-decode`.
+          #       the recorded continuation. The decode under test is ours,
+          #       not mlir-air's template, so it needs no `make compile-decode`.
           #
           # So the two runs cover the two halves separately: the first is the
           # only gate on the iGPU prefill operators, the second the only gate
@@ -504,8 +502,8 @@ runs:
           #
           # Skipped rather than failed when the weights or mlir-air's sources
           # are unreachable; the example exits 77 for both.
-          for args in "--backend hetero --prefill-only" \
-                      "--backend npu --decode gpu --prompt 2,818,5279,529,7001,563 --max-tokens 3 --greedy"; do
+          for args in "--prefill-engine triton --backend hetero --prefill-only" \
+                      "--prefill-engine triton --backend npu --decode gpu --prompt 2,818,5279,529,7001,563 --max-tokens 3 --greedy"; do
             echo "--- hetero: gemma4_e2b_q4nx $args ---"
             rc=0
             ( cd examples/gemma4_e2b_q4nx \

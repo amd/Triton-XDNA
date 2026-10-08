@@ -78,6 +78,14 @@ class ModelSpec:
     #: decoder or its `fd` module, so the driver API alone does not rule a
     #: model out; this records which ones have been run on HSA.
     supports_hsa: bool = False
+    #: Whether the XRT zero-copy decode (`harness.generate_zero_copy`) runs this
+    #: model: the prefill writes the decode's KV cache in pages XRT and HIP
+    #: share. Not implied by `driver_api`: the prefill's `_layer` must route its
+    #: K/V through `_kv_store`, which Qwen2.5's does not (it writes kv_k/kv_v
+    #: inline, so the shared slab would decode from an empty cache), and Gemma4
+    #: shares its own slab its own way (`_install_shared_kv`). Set only where
+    #: the decode has been gated on hardware.
+    supports_xrt_zero_copy: bool = False
     #: Host memory the prefill needs to hold this model's dequantized bf16
     #: weights, in GiB. Checked before anything is allocated: an undersized
     #: host is SIGKILLed partway through the load, and a process cannot catch
@@ -207,6 +215,7 @@ LLAMA_3_2_1B = ModelSpec(
     tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.2-1B",
     extra_packages=("llama32_1b",),
     supports_hsa=True,
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -248,6 +257,7 @@ LLAMA_3_2_3B = ModelSpec(
     driver_api="prefiller",
     decoder_class="FusedDecode3B",
     supports_hsa=True,
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -289,6 +299,7 @@ LLAMA_3_1_8B = ModelSpec(
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",
     decoder_class="FusedDecode8B",
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -338,6 +349,7 @@ QWEN3_4B = ModelSpec(
     min_host_gib=14.0,
     extra_packages=("qwen3_8b_q4nx", "qwen3_4b"),
     supports_hsa=True,
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -381,6 +393,7 @@ GEMMA3_4B = ModelSpec(
     # tied.
     min_host_gib=17.0,
     supports_hsa=True,
+    supports_xrt_zero_copy=True,
 )
 
 #: `DECODE_ENV` in `fused_decode_ple/Makefile` -- the ENGINE's, not the model's:
@@ -603,6 +616,7 @@ PHI4_MINI = ModelSpec(
     min_host_gib=14.0,
     extra_packages=("llama32_1b_q4nx", "llama32_3b"),
     supports_hsa=False,
+    supports_xrt_zero_copy=True,
 )
 
 

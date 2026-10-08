@@ -213,6 +213,47 @@ def load_prefill_weights(m, backend, npu_resident=True):
         m.make_npu_resident()
 
 
+def make_prefiller(prefill_cls, cfg, backend, ops, max_seq, model, npu_resident=True):
+    """Construct `prefill_cls` for `cfg` and load its weights.
+
+    Every path that runs a prefill builds it here, so a weight load that fails
+    -- no network, no bundle -- is a skip (`ExampleUnavailable`, exit 77) on
+    all of them rather than a traceback on some.
+    """
+    m = prefill_cls(
+        backend=backend,
+        ops=ops,
+        n_layers=cfg.N_LAYERS,
+        max_seq=max_seq,
+        model=model,
+        expect_model=cfg.MODEL_NAME,
+    )
+    try:
+        load_prefill_weights(m, backend, npu_resident=npu_resident)
+    except Exception as e:  # noqa: BLE001 -- any failure to obtain weights
+        raise ExampleUnavailable(f"cannot load the q4nx weights: {e}") from e
+    return m
+
+
+def report_prefill(m, cfg, backend, P, t_load, t_run, first):
+    """The one line every prefill prints.
+
+    The model is named here, not left to the caller's shell trace. Every Q4NX
+    gate otherwise prints identical text -- same P, same first token -- so a
+    loop that ran one model twice would read as two passes. A fused prefill
+    runs none of this repository's ops, whatever was asked.
+    """
+    engine = getattr(m, "ENGINE", None)
+    where = (
+        f"engine={engine}" if engine else f"backend={backend} ops={sorted(m.enabled)}"
+    )
+    print(
+        f"[{engine or 'triton'}-prefill] model={cfg.MODEL_NAME} {where} P={P} "
+        f"load {t_load:.1f}s prefill {t_run:.2f}s first={first}",
+        flush=True,
+    )
+
+
 def run_prefill(
     prefill_cls,
     cfg,
@@ -235,21 +276,12 @@ def run_prefill(
     """
     import torch
 
-    m = prefill_cls(
-        backend=backend,
-        ops=ops,
-        n_layers=cfg.N_LAYERS,
-        max_seq=max_seq,
-        model=model,
-        expect_model=cfg.MODEL_NAME,
-    )
-    m.timer.enabled = profile
     t0 = time.time()
-    try:
-        load_prefill_weights(m, backend, npu_resident=npu_resident)
-    except Exception as e:  # noqa: BLE001 -- any failure to obtain weights
-        raise ExampleUnavailable(f"cannot load the q4nx weights: {e}") from e
+    m = make_prefiller(
+        prefill_cls, cfg, backend, ops, max_seq, model, npu_resident=npu_resident
+    )
     t_load = time.time() - t0
+    m.timer.enabled = profile
     if profile:  # one warm pass so timings exclude compilation
         m.prefill(ids)
         m.clear_context()
@@ -262,19 +294,7 @@ def run_prefill(
     first = int(torch.argmax(logits))
     if kv_path is not None:
         m.save_kv_npz(kv_path, first, ids)
-    # The model is named here, not left to the caller's shell trace. Every
-    # Q4NX gate otherwise prints identical text -- same P, same first token --
-    # so a loop that ran one model twice would read as two passes.
-    # A fused prefill runs none of this repository's ops, whatever was asked.
-    engine = getattr(m, "ENGINE", None)
-    where = (
-        f"engine={engine}" if engine else f"backend={backend} ops={sorted(m.enabled)}"
-    )
-    print(
-        f"[{engine or 'triton'}-prefill] model={cfg.MODEL_NAME} {where} P={len(ids)} "
-        f"load {t_load:.1f}s prefill {t_run:.2f}s first={first}",
-        flush=True,
-    )
+    report_prefill(m, cfg, backend, len(ids), t_load, t_run, first)
     return first, len(ids), m
 
 
@@ -297,15 +317,9 @@ def make_session_class(air, prefill_cls, cfg, backend, ops, model):
             self.seq_len = seq_len
             t0 = time.perf_counter()
             print("[session] loading prefill weights (once)...", flush=True)
-            self.prefiller = prefill_cls(
-                backend=backend,
-                ops=ops,
-                n_layers=cfg.N_LAYERS,
-                max_seq=seq_len,
-                model=model,
-                expect_model=cfg.MODEL_NAME,
+            self.prefiller = make_prefiller(
+                prefill_cls, cfg, backend, ops, seq_len, model
             )
-            load_prefill_weights(self.prefiller, backend)
             print(
                 f"[session] Triton prefill resident ({time.perf_counter() - t0:.2f}s); "
                 f"building decode...",
@@ -340,63 +354,22 @@ def make_session_class(air, prefill_cls, cfg, backend, ops, model):
     return TritonSession
 
 
-def generate_via_zero_copy(air, spec, cfg, prefill_cls, args, ids):
-    """HSA generation with the prefill writing the decode's resident KV in place."""
-    import numpy as np
+def make_decoder(air, spec, cfg, args, max_L=None):
+    """This model's mlir-air decoder, constructed the way its driver wants.
 
-    decoder_cls = getattr(air, spec.decoder_class or "FusedDecoder")
+    The class is looked up on `air` by name rather than held, so the HSA
+    adapter `main` installs under that name is the one constructed. `max_L`
+    only reaches the kv_arrays drivers, the only ones that take it.
+    """
+    cls = getattr(air, spec.decoder_class or "FusedDecoder")
+    model = args.model or cfg.MODEL_DEFAULT
     if spec.driver_api == "prefiller":
-        dec = decoder_cls(
-            args.model or cfg.MODEL_DEFAULT,
-            airsrc.fused_decode_dir(spec.engine),
-            model_type=spec.model_type,
+        return cls(
+            model, airsrc.fused_decode_dir(spec.engine), model_type=spec.model_type
         )
-    elif spec.driver_api == "kv_arrays":
-        # The model the prefill uses; a custom --model would otherwise decode
-        # against different weights. `max_L` is left to the build's own stamp.
-        dec = decoder_cls(model=args.model or cfg.MODEL_DEFAULT)
-    else:
-        dec = decoder_cls()
-    if not hasattr(dec, "kv_sink"):
-        raise ExampleUnavailable(
-            f"{spec.name}: the HSA decoder exposes no kv_sink; zero-copy needs it"
-        )
-    prefiller = prefill_cls(
-        backend=args.backend,
-        ops=args.ops,
-        n_layers=cfg.N_LAYERS,
-        max_seq=args.max_seq,
-        model=args.model,
-        expect_model=cfg.MODEL_NAME,
-    )
-    load_prefill_weights(prefiller, args.backend)
-    prefiller.bind_kv_sink(dec.kv_sink())
-
-    dec._kv[:] = 0
-    prefiller.clear_context()
-    logits = np.asarray(prefiller.prefill(list(ids)), np.float32)
-    first = int(logits.argmax())
-    P = prefiller.current_context_length
-    dec.seed_direct(P)
-
-    n_eff = min(args.max_tokens, dec.ATTN_MAXL - P)
-    tokens = list(ids) + [first]
-    gen_ids = [first]
-    t0 = time.time()
-    for p in range(P, P + n_eff):
-        lg = dec.dispatch(tokens[p], p)
-        pred = int(np.asarray(lg).argmax())
-        gen_ids.append(pred)
-        if p + 1 >= len(tokens):
-            tokens.append(pred)
-    t_dec = time.time() - t0
-    n_gen = len(gen_ids) - 1
-    if n_gen > 0:
-        print(
-            f"Generated {n_gen} tokens in {t_dec:.2f}s ({n_gen / t_dec:.2f} tok/s)",
-            flush=True,
-        )
-    return gen_ids
+    if spec.driver_api == "kv_arrays":
+        return cls(model=model) if max_L is None else cls(model=model, max_L=max_L)
+    return cls()
 
 
 def _xrt_shared_available():
@@ -421,56 +394,97 @@ def _xrt_shared_available():
         return False
 
 
-def generate_via_xrt_zero_copy(air, spec, cfg, prefill_cls, args, ids):
-    """XRT twin of the HSA path, for the npz 1B. None when interop is absent."""
-    import numpy as np
-    import torch
+def _hsa_kv_sink(dec, spec):
+    """The HSA decoder's own resident KV buffer, and how to publish into it."""
+    if not hasattr(dec, "kv_sink"):
+        raise ExampleUnavailable(
+            f"{spec.name}: the HSA decoder exposes no kv_sink; zero-copy needs it"
+        )
+    return dec.kv_sink(), dec.seed_direct
 
-    # Probe interop before the decoder, whose construction loads weights.
-    if not _xrt_shared_available():
-        return None
+
+def _xrt_kv_sink(dec, spec):
+    """A KV slab in pages XRT and HIP share, attached to the XRT decoder.
+
+    The rows are the decoder's layer count: the 1B's driver defines none and
+    hard-codes 16. The prefiller drivers keep their geometry on an `fd` module
+    and have no host mirror of the cache, so nothing marks it dirty for them
+    and the slab is synced to the device explicitly once the prefill is in.
+    The others take `KV` as their host mirror: their first dispatch writes it
+    out because `_kv_dirty` starts True. That assignment is load-bearing --
+    without it that first dispatch writes their own zeroed KV over the slab.
+    """
+    import torch
     from triton.backends.amd_triton_npu import shared
 
-    dec = air.FusedDecoder()
+    api = spec.driver_api
+    rows = {"npz": 16, "kv_arrays": "UNI_DEC", "prefiller": "N_LAYERS"}[api]
+    rows = rows if isinstance(rows, int) else getattr(dec, rows)
+    geom = dec.fd if api == "prefiller" else dec
     slab = shared.zeros(
-        16, dec.LREG, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
+        rows, dec.LREG, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
     )
     host = slab.numpy()
     dec.kvc = slab.bo
-    dec.KV = host
+    if api == "prefiller":
+        publish = lambda P: dec.kvc.sync(dec.TO)  # noqa: E731
+    else:
+        dec.KV = host
+        publish = lambda P: None  # noqa: E731
+    sink = {
+        "buf": host.reshape(-1),
+        "region_w": geom.REGION_W,
+        "ngrp": geom.NGRP,
+        # The decoder's own seed_kv stride; the module REGION_STRIDE can differ.
+        "region_stride": dec.ATTN_MAXL * geom.REGION_W,
+        "lreg": dec.LREG,
+    }
+    return sink, publish
 
-    prefiller = prefill_cls(
-        backend=args.backend,
-        ops=args.ops,
-        n_layers=cfg.N_LAYERS,
-        max_seq=args.max_seq,
-        model=args.model,
-        expect_model=cfg.MODEL_NAME,
-    )
-    load_prefill_weights(prefiller, args.backend)
-    prefiller.bind_kv_sink(
-        {
-            "buf": host.reshape(-1),
-            "region_w": dec.REGION_W,
-            "ngrp": dec.NGRP,
-            # seed_kv's own stride; the module REGION_STRIDE can differ.
-            "region_stride": dec.ATTN_MAXL * dec.REGION_W,
-            "lreg": dec.LREG,
-        }
-    )
 
-    host[:] = 0
+def generate_zero_copy(air, spec, cfg, prefill_cls, args, ids, runtime):
+    """Prefill straight into the decode's KV cache, then decode from it.
+
+    No handoff step at all: the prefill is bound to the decode's own cache
+    (`bind_kv_sink`) and writes each layer's K/V where the decode reads it.
+    `runtime` says where that cache lives -- "hsa", the HSA decoder's resident
+    buffer, or "xrt", pages XRT and HIP share. Returns None when "xrt" is asked
+    for and the interop is absent, for the caller to take the staged path.
+
+    The loop is greedy (argmax), so the caller sends a sampled run elsewhere.
+    """
+    import numpy as np
+
+    # Probe interop before the decoder, whose construction loads weights.
+    if runtime == "xrt" and not _xrt_shared_available():
+        return None
+    dec = make_decoder(
+        air, spec, cfg, args, max_L=args.max_seq if runtime == "xrt" else None
+    )
+    sink, publish = (_hsa_kv_sink if runtime == "hsa" else _xrt_kv_sink)(dec, spec)
+
+    t0 = time.time()
+    prefiller = make_prefiller(
+        prefill_cls, cfg, args.backend, args.ops, args.max_seq, args.model
+    )
+    t_load = time.time() - t0
+    prefiller.bind_kv_sink(sink)
+
+    sink["buf"][:] = 0
     prefiller.clear_context()
+    t0 = time.time()
     logits = np.asarray(prefiller.prefill(list(ids)), np.float32)
+    t_run = time.time() - t0
     first = int(logits.argmax())
     P = prefiller.current_context_length
+    report_prefill(prefiller, cfg, args.backend, P, t_load, t_run, first)
+    publish(P)
     print(
         f"[e2e] KV handed over in place: {P} rows already in the decode's "
         f"layout, nothing to rearrange",
         flush=True,
     )
 
-    # `_kv_dirty` stays True: the first dispatch syncs the slab, seed_kv never runs.
     n_eff = min(args.max_tokens, dec.ATTN_MAXL - P)
     tokens = list(ids) + [first]
     gen_ids = [first]
@@ -484,144 +498,11 @@ def generate_via_xrt_zero_copy(air, spec, cfg, prefill_cls, args, ids):
     t_dec = time.time() - t0
     n_gen = len(gen_ids) - 1
     if n_gen > 0:
+        # "(X tok/s)" is what mlir-air's bench/extract_perf.py looks for first.
         print(
             f"Generated {n_gen} tokens in {t_dec:.2f}s ({n_gen / t_dec:.2f} tok/s)",
             flush=True,
         )
-    return gen_ids
-
-
-def generate_via_xrt_zero_copy_kv_arrays(air, spec, cfg, prefill_cls, args, ids):
-    """XRT zero-copy for the kv_arrays models (Qwen3-4B, Gemma3-4B)."""
-    import numpy as np
-    import torch
-
-    if not _xrt_shared_available():
-        return None
-    from triton.backends.amd_triton_npu import shared
-
-    dec = air.FusedDecoder(model=args.model or cfg.MODEL_DEFAULT, max_L=args.max_seq)
-    slab = shared.zeros(
-        dec.UNI_DEC, dec.LREG, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
-    )
-    host = slab.numpy()
-    dec.kvc = slab.bo
-    dec.KV = host
-
-    prefiller = prefill_cls(
-        backend=args.backend,
-        ops=args.ops,
-        n_layers=cfg.N_LAYERS,
-        max_seq=args.max_seq,
-        model=args.model,
-        expect_model=cfg.MODEL_NAME,
-    )
-    load_prefill_weights(prefiller, args.backend)
-    prefiller.bind_kv_sink(
-        {
-            "buf": host.reshape(-1),
-            "region_w": dec.REGION_W,
-            "ngrp": dec.NGRP,
-            "region_stride": dec.ATTN_MAXL * dec.REGION_W,
-            "lreg": dec.LREG,
-        }
-    )
-
-    host[:] = 0
-    prefiller.clear_context()
-    logits = np.asarray(prefiller.prefill(list(ids)), np.float32)
-    first = int(logits.argmax())
-    P = prefiller.current_context_length
-    print(
-        f"[e2e] KV handed over in place: {P} rows already in the decode's "
-        f"layout, nothing to rearrange",
-        flush=True,
-    )
-
-    n_eff = min(args.max_tokens, dec.ATTN_MAXL - P)
-    tokens = list(ids) + [first]
-    gen_ids = [first]
-    t0 = time.time()
-    for p in range(P, P + n_eff):
-        lg = dec.dispatch(tokens[p], p)
-        pred = int(np.asarray(lg).argmax())
-        gen_ids.append(pred)
-        if p + 1 >= len(tokens):
-            tokens.append(pred)
-    t_dec = time.time() - t0
-    n_gen = len(gen_ids) - 1
-    if n_gen > 0:
-        # Scraped by bench/extract_perf.py; their bypassed generate() prints it.
-        print(f"Tokens/second: {n_gen / t_dec:.2f}", flush=True)
-    return gen_ids
-
-
-def generate_via_xrt_zero_copy_prefiller(air, spec, cfg, prefill_cls, args, ids):
-    """XRT zero-copy for the prefiller models (Llama-3.2-3B/8B, Phi-4)."""
-    import numpy as np
-    import torch
-
-    if not _xrt_shared_available():
-        return None
-    from triton.backends.amd_triton_npu import shared
-
-    dec = getattr(air, spec.decoder_class)(
-        args.model or cfg.MODEL_DEFAULT,
-        airsrc.fused_decode_dir(spec.engine),
-        model_type=spec.model_type,
-    )
-    slab = shared.zeros(
-        dec.N_LAYERS, dec.LREG, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
-    )
-    host = slab.numpy()
-    dec.kvc = slab.bo
-
-    prefiller = prefill_cls(
-        backend=args.backend,
-        ops=args.ops,
-        n_layers=cfg.N_LAYERS,
-        max_seq=args.max_seq,
-        model=args.model,
-        expect_model=cfg.MODEL_NAME,
-    )
-    load_prefill_weights(prefiller, args.backend)
-    prefiller.bind_kv_sink(
-        {
-            "buf": host.reshape(-1),
-            "region_w": dec.fd.REGION_W,
-            "ngrp": dec.fd.NGRP,
-            "region_stride": dec.ATTN_MAXL * dec.fd.REGION_W,
-            "lreg": dec.LREG,
-        }
-    )
-
-    host[:] = 0
-    prefiller.clear_context()
-    logits = np.asarray(prefiller.prefill(list(ids)), np.float32)
-    first = int(logits.argmax())
-    P = prefiller.current_context_length
-    # `seed_kv` would have synced the cache to the device; it never runs here.
-    dec.kvc.sync(dec.TO)
-    print(
-        f"[e2e] KV handed over in place: {P} rows already in the decode's "
-        f"layout, nothing to rearrange",
-        flush=True,
-    )
-
-    n_eff = min(args.max_tokens, dec.ATTN_MAXL - P)
-    tokens = list(ids) + [first]
-    gen_ids = [first]
-    t0 = time.time()
-    for p in range(P, P + n_eff):
-        lg = dec.dispatch(tokens[p], p)
-        pred = int(np.asarray(lg).argmax())
-        gen_ids.append(pred)
-        if p + 1 >= len(tokens):
-            tokens.append(pred)
-    t_dec = time.time() - t0
-    n_gen = len(gen_ids) - 1
-    if n_gen > 0:
-        print(f"Tokens/second: {n_gen / t_dec:.2f}", flush=True)
     return gen_ids
 
 
@@ -644,11 +525,7 @@ def generate_via_prefiller(air, spec, cfg, args, ids, prefiller):
       their EOS stop on would make the two paths' token counts differ for
       reasons that have nothing to do with the kernels.
     """
-    dec = getattr(air, spec.decoder_class)(
-        args.model or cfg.MODEL_DEFAULT,
-        airsrc.fused_decode_dir(spec.engine),
-        model_type=spec.model_type,
-    )
+    dec = make_decoder(air, spec, cfg, args)
     gen, t_prompt, t_gen = air.generate_stream(
         dec,
         None,  # tokenizer: only used for streaming output, which we do not do
@@ -857,18 +734,22 @@ def build_parser(doc):
         "--prefill-engine",
         choices=("auto", "triton", "air-fused"),
         default="auto",
-        help="what runs the prefill. triton: this repository's prefill on "
-        "--backend. air-fused: mlir-air's one-device chunked NPU prefill "
-        "(tl.extra.npu.fused_prefill), handing its KV to the decode the way "
-        "the Triton prefill does. auto (default): air-fused where mlir-air "
-        "has one for the model, unless --backend, --ops or --interactive asks "
-        "for the Triton prefill; triton otherwise.",
+        help="what runs the prefill. triton: this repository's prefill, its "
+        "operators placed by --backend and --ops. air-fused: mlir-air's "
+        "one-device chunked NPU prefill (tl.extra.npu.fused_prefill), handing "
+        "its KV to the decode the way the Triton prefill does; --backend, "
+        "--ops and --profile do not apply to it and are refused. auto "
+        "(default): air-fused where mlir-air has one for the model, except "
+        "with --interactive, which only hosts the Triton prefill; triton "
+        "otherwise.",
     )
     ap.add_argument(
         "--backend",
         choices=("cpu", "npu", "hetero"),
-        default="npu",
-        help="where the Triton prefill's operators run. cpu: every operator "
+        default=None,
+        help="where the Triton prefill's operators run (default: npu); needs "
+        "--prefill-engine triton on a model with a fused prefill. cpu: every "
+        "operator "
         "in torch on the host -- this stack's own reference, NOT "
         "examples/gpt2's --backend reference, which is HuggingFace. npu: the "
         "operators --ops enables on the NPU, the rest in torch on the host -- "
@@ -926,8 +807,6 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     """
     args = build_parser(doc).parse_args(argv)
 
-    raw_argv = sys.argv[1:] if argv is None else argv
-
     # `--decode gpu` is implemented per model, and only Gemma4-E2B has one.
     # Checked here rather than in `generate_on_gpu`, which runs after the
     # weights have loaded -- minutes to say a flag combination was never going
@@ -940,14 +819,41 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         )
 
     fused = fused_prefill_config(cfg)
-    if args.prefill_engine == "auto":
-        # Those three only mean something to the Triton prefill.
-        asked_triton = getattr(args, "interactive", False) or any(
-            a.split("=")[0] in ("--backend", "--ops") for a in raw_argv
-        )
+    asked = args.prefill_engine
+    if asked == "auto":
+        # Decided by what the model and the run can use, never by which other
+        # flags were typed: `--backend npu` spelled out runs the same prefill
+        # as `--backend` left at its default. The interactive session builds
+        # its own prefiller and cannot host the fused one.
         args.prefill_engine = (
-            "air-fused" if fused is not None and not asked_triton else "triton"
+            "air-fused"
+            if fused is not None and not getattr(args, "interactive", False)
+            else "triton"
         )
+    if args.prefill_engine == "air-fused":
+        # These configure the Triton prefill's operators, and the fused
+        # prefill has none of them. Refused rather than dropped: a run that
+        # asked for `--backend hetero` and silently got neither the iGPU nor
+        # the Triton prefill would report on something it did not run.
+        triton_only = [
+            flag
+            for flag, given in (
+                ("--backend", args.backend is not None),
+                ("--ops", args.ops is not None),
+                ("--profile", args.profile),
+            )
+            if given
+        ]
+        if triton_only:
+            why = "the default for this model" if asked == "auto" else "as asked"
+            raise SystemExit(
+                f"{', '.join(triton_only)} "
+                f"{'configures' if len(triton_only) == 1 else 'configure'} the "
+                f"Triton prefill, but "
+                f"the prefill engine is air-fused ({why}). Add --prefill-engine "
+                f"triton to run the Triton prefill."
+            )
+    args.backend = args.backend or "npu"
     if args.prefill_engine == "air-fused":
         if fused is None:
             raise SystemExit(
@@ -1071,48 +977,21 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             return 0
         return 0 if gate(first) else 1
 
-    # HSA zero-copy fuses prefill and decode; no separate run_prefill/handoff.
-    zero_copy = (
-        os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa"
-        and spec.supports_hsa
-        and air is not None
-        and args.decode != "gpu"
-        and not args.profile
-    )
-    if zero_copy:
-        out = generate_via_zero_copy(air, spec, cfg, prefill_cls, args, ids)
-        print(f"[e2e] ids {out}", flush=True)
-        if ids == list(cfg.PROMPT) and not gate(out[0]):
-            return 1
-        return _decode_gate(air, spec, cfg, args, ids, out)
-
-    # XRT zero-copy, per driver_api. An allowlist, not `driver_api` alone:
-    # gemma4 has its own _kv_slab path, and the Qwen2.5 models write kv_k/kv_v
-    # inline rather than through `_kv_store`, so the shared slab would decode
-    # from an empty cache. Only models whose `_layer` routes through the sink
-    # and whose decode has been gated on hardware are listed. None without
-    # interop falls through to the staged decode below.
-    _XRT_ZERO_COPY = {
-        "llama-3.2-1b": generate_via_xrt_zero_copy,
-        "qwen3-4b": generate_via_xrt_zero_copy_kv_arrays,
-        "gemma3-4b": generate_via_xrt_zero_copy_kv_arrays,
-        "llama-3.2-3b": generate_via_xrt_zero_copy_prefiller,
-        "llama-3.1-8b": generate_via_xrt_zero_copy_prefiller,
-        "phi4-mini": generate_via_xrt_zero_copy_prefiller,
-    }
-    xrt_fn = None
+    # Zero-copy: the prefill writes the decode's KV cache in place, so there is
+    # no separate run_prefill or handoff. Where that cache lives depends on the
+    # runtime: the HSA decoder's resident buffer, or pages XRT and HIP share
+    # (None without that interop: fall through to the staged decode below).
+    # Its loop samples with argmax, so a non-greedy run stays on the staged
+    # driver, which honours its own sampler; `--profile` times the staged one.
+    runtime = "hsa" if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" else "xrt"
     if (
-        os.environ.get("AMD_TRITON_NPU_RUNTIME") != "hsa"
-        and air is not None
-        and args.decode != "gpu"
-        and not args.profile
-        # These loops sample with argmax; a non-greedy run stays on the staged
-        # driver, which honours its own sampler.
+        air is not None
+        and args.decode == "npu"
         and args.greedy
+        and not args.profile
+        and (spec.supports_hsa if runtime == "hsa" else spec.supports_xrt_zero_copy)
     ):
-        xrt_fn = _XRT_ZERO_COPY.get(spec.name)
-    if xrt_fn is not None:
-        out = xrt_fn(air, spec, cfg, prefill_cls, args, ids)
+        out = generate_zero_copy(air, spec, cfg, prefill_cls, args, ids, runtime)
         if out is not None:
             print(f"[e2e] ids {out}", flush=True)
             if ids == list(cfg.PROMPT) and not gate(out[0]):
