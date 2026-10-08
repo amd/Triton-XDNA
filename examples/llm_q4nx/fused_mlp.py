@@ -102,6 +102,7 @@ from kernels import (
     _GELU_K,
     col_tier,
     elem_block,
+    igpu_share,
     matmul_script,
     narrow_k,
     row_tier,
@@ -454,7 +455,7 @@ class FusedMLP:
             from triton.backends.amd_triton_npu import shared
 
             return shared.zeros(
-                rows, cols, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
+                rows, cols, dtype=torch.bfloat16, device="xrt:0", share=igpu_share()
             )
         except Exception as e:  # noqa: BLE001 -- see the docstring
             if os.environ.get("AMD_TRITON_NPU_DEBUG"):

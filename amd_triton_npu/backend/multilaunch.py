@@ -655,7 +655,11 @@ class NPUChain:
                 actual_sizes=actual_sizes,
             )
         self._builder = b
-        self._elf_path, self._kernel_name = b.compile()
+        # MultiLaunchRunner dispatches through XRT whatever the process's
+        # launch runtime is, so the chain is built in XRT's format.
+        self._elf_path, self._kernel_name = b.compile(
+            output_format=_get_output_format(runtime="xrt")
+        )
 
     @staticmethod
     def _close_stalest():

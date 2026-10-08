@@ -269,10 +269,15 @@ class Gemma4Prefill(LlamaPrefill):
         """
         shape = kv_layout.slab_shape(self.n_layers, self.kv_attn_maxl)
         try:
+            import kernels
             from triton.backends.amd_triton_npu import shared
 
+            # Under the HSA runtime the slab is pages that runtime maps; a
+            # decoder adopts it through `bind_kv_sink` instead.
+            if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa":
+                return shared.zeros(*shape, dtype=torch.bfloat16, device="hsa:0")
             return shared.zeros(
-                *shape, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
+                *shape, dtype=torch.bfloat16, device="xrt:0", share=kernels.igpu_share()
             )
         except Exception as e:  # noqa: BLE001 -- see the docstring
             if os.environ.get("AMD_TRITON_NPU_DEBUG"):
@@ -281,7 +286,28 @@ class Gemma4Prefill(LlamaPrefill):
 
             return np.zeros(shape, dtype=bfloat16)
 
-    # ---- the canonical cache ----
+    def bind_kv_sink(self, sink):
+        """Write the cache straight into a decoder's resident KV buffer.
+
+        The decoder's cache has this slab's layout, so the prefill adopts that
+        buffer as its slab rather than scattering into it afterwards. The sink's
+        geometry is checked against `kv_layout`: a mismatch would put every
+        row at the wrong offset without failing.
+        """
+        shape = kv_layout.slab_shape(self.n_layers, self.kv_attn_maxl)
+        want = dict(
+            n_layers=self.n_layers,
+            lreg=shape[1],
+            region_w=kv_layout.REGION_W,
+            region_stride=kv_layout.region_stride(self.kv_attn_maxl),
+        )
+        got = {k: sink.get(k) for k in want}
+        if got != want:
+            raise ValueError(f"KV sink geometry {got} does not match the slab {want}")
+        self._kv_sink = sink
+        self._kv_slab = None
+        self._kv_host = sink["buf"].reshape(shape)
+
     def _region(self, layer_idx, region):
         """One layer's K or V region as `[attn_maxl, REGION_W]`."""
         return kv_layout.region_view(
@@ -1533,7 +1559,9 @@ def make_npu_decoder_class(air, prefiller):
 
         def _bind_slab(self):
             """Point `kvc`/`KV` at the prefill's slab, zero-copy where possible."""
-            bo = getattr(self._pf._kv_slab, "bo", None)
+            import kernels
+
+            bo = kernels.xrt_bo(self._pf._kv_slab)
             if bo is None:
                 self._shared = False
                 return
@@ -1550,6 +1578,11 @@ def make_npu_decoder_class(air, prefiller):
             """
             if P > self.ATTN_MAXL:
                 raise ValueError(f"prompt of {P} exceeds ATTN_MAXL={self.ATTN_MAXL}")
+            if hasattr(self, "seed_direct"):
+                # The HSA decoder dispatches on its own resident buffer.
+                self._kv[:] = self._pf._kv_host.reshape(-1)
+                self.seed_direct(P)
+                return
             TO = self.xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
             if not self._shared:
                 # Same layout, so this is one contiguous write, not a scatter.

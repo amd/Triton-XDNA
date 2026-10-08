@@ -406,9 +406,30 @@ def shared_bo(t):
     `bound_buffers` takes these: the chain then dispatches on the caller's own
     pages instead of staging a copy in and copying the result back out. At
     qkv's shape that is 6 MiB in and 42 MiB out, on every one of 35 layers.
+
+    None too for pages XRT does not map (HSA-runtime pages), which the chain
+    then stages.
     """
-    buf = getattr(t, "_shared_buffer", None)
-    return None if buf is None else buf.bo
+    return xrt_bo(getattr(t, "_shared_buffer", None))
+
+
+def xrt_bo(buf):
+    """`buf.bo` for a shared buffer XRT maps; None for anything else."""
+    if buf is None:
+        return None
+    from triton.backends.amd_triton_npu.shared import SharedBufferError
+
+    try:
+        return getattr(buf, "bo", None)
+    except SharedBufferError:
+        return None
+
+
+def igpu_share():
+    """The `share=` for pages the iGPU may also read: "hip:0", or none at all
+    under the HSA runtime. That runtime loads its own ROCR, and torch's HIP
+    cannot run kernels on top of it, so nothing on that path uses the iGPU."""
+    return () if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" else "hip:0"
 
 
 class ResidentWeight:
