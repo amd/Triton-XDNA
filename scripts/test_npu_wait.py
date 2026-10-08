@@ -27,7 +27,8 @@ def main():
     if not mod.supported(pyxrt.run()):
         print(
             "FAIL: pyxrt declined to hand over its xrt::run; it was built "
-            f"for ABI {', '.join(pyxrt_abi_ids()) or 'unknown'}"
+            f"for ABI {', '.join(pyxrt_abi_ids()) or 'unknown'} "
+            f"({pyxrt.__file__}). Per spelling: {mod._probe(pyxrt.run())}"
         )
         return 1
     if mod.supported(object()):

@@ -18,6 +18,7 @@
 
 #include <Python.h>
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <string>
@@ -70,11 +71,49 @@ static xrt::run *as_run(PyObject *obj) {
   return nullptr;
 }
 
+// For diagnosing a refusal: what pyxrt's conduit returned for each spelling.
+static PyObject *py_probe(PyObject *, PyObject *args) {
+  PyObject *obj;
+  if (!PyArg_ParseTuple(args, "O", &obj))
+    return nullptr;
+  if (!PyObject_HasAttrString(obj, "_pybind11_conduit_v1_"))
+    return PyUnicode_FromString("no _pybind11_conduit_v1_ method");
+  std::string out;
+  for (const std::string &id : abi_ids) {
+    PyObject *ti =
+        PyCapsule_New(const_cast<std::type_info *>(&typeid(xrt::run)),
+                      typeid(std::type_info).name(), nullptr);
+    PyObject *cap =
+        PyObject_CallMethod(obj, "_pybind11_conduit_v1_", "y#Oy", id.data(),
+                            (Py_ssize_t)id.size(), ti, "raw_pointer_ephemeral");
+    Py_XDECREF(ti);
+    out += id + ": ";
+    if (!cap) {
+      PyObject *type, *value, *tb;
+      PyErr_Fetch(&type, &value, &tb);
+      PyObject *msg = value ? PyObject_Str(value) : nullptr;
+      out += std::string("raised ") +
+             (msg ? PyUnicode_AsUTF8(msg) : "(no message)");
+      Py_XDECREF(msg);
+      Py_XDECREF(type);
+      Py_XDECREF(value);
+      Py_XDECREF(tb);
+    } else {
+      out += cap == Py_None ? "None" : Py_TYPE(cap)->tp_name;
+      Py_DECREF(cap);
+    }
+    out += "; ";
+  }
+  out += std::string("type_info name ") + typeid(xrt::run).name();
+  return PyUnicode_FromString(out.c_str());
+}
+
 static PyObject *py_add_abi_id(PyObject *, PyObject *args) {
   const char *id;
   if (!PyArg_ParseTuple(args, "s", &id))
     return nullptr;
-  abi_ids.emplace_back(id);
+  if (std::find(abi_ids.begin(), abi_ids.end(), id) == abi_ids.end())
+    abi_ids.emplace_back(id);
   Py_RETURN_NONE;
 }
 
@@ -134,6 +173,7 @@ static PyObject *py_block(PyObject *, PyObject *args) {
 }
 
 static PyMethodDef Methods[] = {
+    {"_probe", py_probe, METH_VARARGS, "What pyxrt returns for each spelling"},
     {"add_abi_id", py_add_abi_id, METH_VARARGS,
      "Also ask pyxrt under this ABI spelling"},
     {"supported", py_supported, METH_VARARGS,
