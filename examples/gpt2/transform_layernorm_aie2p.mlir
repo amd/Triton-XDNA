@@ -74,7 +74,7 @@ module attributes {transform.with_named_sequence} {
         // PHASE 3: Batch-Level Tiling and Producer-Consumer Fusion
         //===================================================================
         %output_buf, %new_output = transform.structured.bufferize_to_allocation %output_generic
-          {memory_space = 1, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         %tiled_output, %forall_4 =
         transform.structured.tile_using_forall %output_generic tile_sizes [1]  : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
@@ -106,7 +106,7 @@ module attributes {transform.with_named_sequence} {
         // enables efficient access by subsequent reduction operations within the kernel.
         %fills_2 = transform.structured.match ops{["linalg.fill"]} in %arg1  : (!transform.any_op) -> !transform.any_op
         %fill1_buffer, %fill1_new = transform.structured.bufferize_to_allocation %fills_2
-          {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+          <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         // Step 2: Re-match operations for individual L2 allocation.
         // Without generalize, there are 2 linalg.generic + 2 linalg.reduce ops.
@@ -122,16 +122,16 @@ module attributes {transform.with_named_sequence} {
 
         // Step 4: Allocate intermediate outputs to L2 memory
         %gen1_in_buffer, %gen1_in_new = transform.structured.bufferize_to_allocation %tiled_generic1
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         %red1_in_buffer, %red1_in_new = transform.structured.bufferize_to_allocation %tiled_reduce_a
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         %gen2_in_buffer, %gen2_in_new = transform.structured.bufferize_to_allocation %tiled_generic2
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
         %red2_in_buffer, %red2_in_new = transform.structured.bufferize_to_allocation %tiled_reduce_b
-            {memory_space = 2, bufferize_destination_only, emit_dealloc} : !transform.any_op
+            <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 
 
         //===================================================================
@@ -242,7 +242,7 @@ module attributes {transform.with_named_sequence} {
         // AIE vector unary operations (like rsqrt) may require explicit broadcasts
         // to replicate scalar values across vector lanes. This transformation inserts
         // necessary broadcast operations before math.rsqrt calls.
-        %vectorized_herd_updated = transform.air.broadcast_before_unary %func4 {op_name = "math.rsqrt"} : (!transform.any_op) -> !transform.any_op
+        %vectorized_herd_updated = transform.air.broadcast_before_unary %func4 <{op_name = "math.rsqrt"}> : (!transform.any_op) -> !transform.any_op
 
         // Step 7: Type cast operations to bf16 for AIE intrinsics
         // AIE provides optimized bf16 vector intrinsics. Cast vector operations
@@ -250,11 +250,11 @@ module attributes {transform.with_named_sequence} {
         
         // Cast vector reductions (e.g., sum, max) to bf16
         %vector_reductions_in_herd = transform.structured.match ops{["vector.multi_reduction"]} in %vectorized_herd_updated : (!transform.any_op) -> !transform.any_op
-        %result10 = transform.air.vector_type_cast %vector_reductions_in_herd {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+        %result10 = transform.air.vector_type_cast %vector_reductions_in_herd <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
 
         // Cast vector multiplications to bf16
         %vector_muls_in_herd = transform.structured.match ops{["arith.mulf"]} in %vectorized_herd_updated : (!transform.any_op) -> !transform.any_op
-        %result11 = transform.air.vector_type_cast %vector_muls_in_herd {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
+        %result11 = transform.air.vector_type_cast %vector_muls_in_herd <{target_element_type = bf16}> : (!transform.any_op) -> !transform.any_op
 
         // NOTE: For aie2p, casting math.rsqrt operations to bf16 is NOT needed.
         // Peano's aie2p workflow expects inputs and outputs to remain in f32 format.

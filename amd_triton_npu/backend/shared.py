@@ -215,20 +215,53 @@ def _hip() -> ctypes.CDLL:
         import torch
     except ImportError as e:  # pragma: no cover - torch is required to consume
         raise SharedBufferError(f"torch is required for shared buffers: {e}")
-    root = os.path.join(os.path.dirname(torch.__file__), "lib")
-    hits = glob.glob(os.path.join(root, "libamdhip64.so*"))
-    if not hits:
+    path = _torch_hip_path(torch)
+    if path is None:
         raise SharedBufferError(
-            f"no libamdhip64.so under {root}; this needs a ROCm build of torch"
+            "no libamdhip64.so in torch's runtime; this needs a ROCm build of torch"
         )
     if not torch.cuda.is_available():
         # Checked here rather than left to hipHostRegister: the library loads
         # fine without a device and the failure would surface later as an
         # opaque HIP error code.
         raise SharedBufferError("no ROCm device visible to torch")
-    lib = ctypes.CDLL(hits[0])
+    lib = ctypes.CDLL(path)
     lib.hipGetErrorName.restype = ctypes.c_char_p
     return lib
+
+
+def _torch_hip_path(torch) -> str | None:
+    """The `libamdhip64.so` torch is actually using, or None.
+
+    It must be torch's own HIP runtime -- the device pointer we register has to
+    be valid in torch's HIP context. On a ROCm build torch has already loaded
+    it, so the mapped copy is the exact one wherever the wheel put it: bundled
+    under `torch/lib` on older builds, split into `_rocm_sdk_core/lib` on the
+    ROCm SDK wheels (torch>=2.14+rocm7). Reading it from the process map avoids
+    guessing that layout; the directory globs are a fallback for a platform
+    with no `/proc/self/maps`.
+    """
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                if "libamdhip64.so" in line:
+                    i = line.find("/")
+                    if i != -1:
+                        return line[i:].strip()
+    except OSError:
+        pass
+    roots = [os.path.join(os.path.dirname(torch.__file__), "lib")]
+    try:
+        import _rocm_sdk_core
+
+        roots.append(os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "lib"))
+    except ImportError:
+        pass
+    for root in roots:
+        hits = glob.glob(os.path.join(root, "libamdhip64.so*"))
+        if hits:
+            return hits[0]
+    return None
 
 
 def _hip_check(rc: int, what: str) -> None:

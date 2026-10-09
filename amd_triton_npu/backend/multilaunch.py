@@ -14,9 +14,12 @@ This is an ADDITIVE path: nothing here touches the per-kernel ``compile_module``
 flow used by the example suite.
 """
 
+import collections
 import hashlib
 import os
 import re
+import time
+import weakref
 
 from triton.runtime.cache import get_cache_manager
 
@@ -24,12 +27,57 @@ from .config import npu_config, config_context
 from . import stitching
 from .driver import (
     _ttshared_to_air,
+    _detect_matmul,
+    _matmul_transform_params,
     _aircc_compile,
     _get_output_format,
     _get_cached_aircc_artifacts,
     _put_aircc_artifacts,
     detect_npu_version,
+    npu_wait_module,
+    release_external_contexts,
 )
+
+_wait_nogil = None
+
+#: ``ert_cmd_state`` values of a command not yet finished: NEW, QUEUED,
+#: RUNNING, SUBMITTED. pyxrt's enum does not name RUNNING, so values are used.
+_PENDING_STATES = frozenset((1, 2, 3, 7))
+_COMPLETED_STATE = 4
+#: Seconds between polls when waiting without ``npu_wait``.
+_POLL_INTERVAL = 0.0002
+
+
+def _wait_polling(run):
+    """``run.wait2()`` by polling ``run.state()``, sleeping between polls.
+
+    For a pyxrt built without pybind11's cpp conduit, which ``npu_wait`` needs
+    to reach the run: the sleep releases the GIL where pyxrt's own wait would
+    hold it for the whole command. Raises, as ``wait2`` does, unless the run
+    completed.
+    """
+    while True:
+        state = run.state()
+        if int(state) not in _PENDING_STATES:
+            break
+        time.sleep(_POLL_INTERVAL)
+    if int(state) != _COMPLETED_STATE:
+        raise RuntimeError(f"NPU run ended in state {state}")
+
+
+def _wait(run):
+    """Wait for ``run`` to complete without holding the GIL.
+
+    Through ``npu_wait`` where it can take the run, otherwise by polling.
+    Decided on the first run and kept: every run comes from the same pyxrt.
+    """
+    global _wait_nogil
+    if _wait_nogil is None:
+        mod = npu_wait_module()
+        _wait_nogil = (
+            mod.wait if mod is not None and mod.supported(run) else _wait_polling
+        )
+    _wait_nogil(run)
 
 
 def _extract_air_arg_types(air_text):
@@ -116,8 +164,25 @@ class MultiLaunchBuilder:
                     asm_src, gridX, gridY, gridZ, actual_sizes=actual_sizes
                 )
         else:
+            # What a single launch of this op would get (`compile_module`): a
+            # schedule generated for it if it is a plain matmul and no script
+            # is set globally either. Without this a scriptless matmul op fell
+            # through to the built-in default, which cannot lower one.
+            matmul_info = None
+            if not npu_config.transform_tiling_script:
+                text = asm_src
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", errors="ignore")
+                matmul_info = _matmul_transform_params(
+                    _detect_matmul(text), detect_npu_version()
+                )
             air_module = _ttshared_to_air(
-                asm_src, gridX, gridY, gridZ, actual_sizes=actual_sizes
+                asm_src,
+                gridX,
+                gridY,
+                gridZ,
+                actual_sizes=actual_sizes,
+                matmul_info=matmul_info,
             )
         air_text = str(air_module)
         arg_types = _extract_air_arg_types(air_text)
@@ -155,8 +220,9 @@ class MultiLaunchBuilder:
             ir = stitching._wrap_ir_in_launch(op.air_text)
             body = stitching._extract_between_func_and_return(ir)
             maps = stitching._extract_affine_maps(ir)
-            body = stitching._rename_all(body, op.prefix)
-            maps = [stitching._rename_all(m, op.prefix) for m in maps]
+            extern = stitching._extern_symbols(ir)
+            body = stitching._rename_all(body, op.prefix, extern)
+            maps = [stitching._rename_all(m, op.prefix, extern) for m in maps]
             body = stitching._fix_launch_func_args(body, op.prefix, op.arg_map)
             bodies.append(body)
             maps_all.extend(maps)
@@ -285,6 +351,8 @@ class MultiLaunchRunner:
                 zero-filled: their contents belong to the caller.
             bo_key: cache key for the BO set (e.g. f"{name}_L{layer}").
             static_indices: indices written host->device on first call only.
+                Bound static indices are also synced on the first call only,
+                so the caller must not write them between dispatches.
             intermediate_indices: indices carrying no host data. Zeroed on
                 the first call for a bo_key, skipped thereafter. Outputs are
                 not implied: they are staged from the host every call unless
@@ -371,8 +439,9 @@ class MultiLaunchRunner:
                 # still sync, which is a cache operation rather than a transfer.
                 # Skipping it for operands the device overwrites would assume no
                 # host write landed since the last dispatch, which is the
-                # caller's business, not ours.
-                if first_call or i not in scratch:
+                # caller's business, not ours. Declaring an operand static is
+                # that guarantee, so a bound static operand is synced once.
+                if first_call or (i not in scratch and i not in static_set):
                     bos[i].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
                 continue
             if not first_call and (i in static_set or i in scratch):
@@ -394,7 +463,7 @@ class MultiLaunchRunner:
         for i, bo in enumerate(bos):
             run.set_arg(i, bo)
         run.start()
-        run.wait2()
+        _wait(run)
 
         results = {}
         for idx in readback:
@@ -431,6 +500,117 @@ class MultiLaunchRunner:
             pass
 
 
+class HsaChainRunner:
+    """``MultiLaunchRunner``'s contract on the HSA runtime.
+
+    The chain is compiled to one PDI and instruction stream and dispatched as
+    one HSA program. Each ``bo_key`` owns a shared region per operand the
+    caller does not bind; a static operand is written on the first call and
+    made resident, an intermediate is zeroed on the first call, and every
+    other operand is copied in per call. A bound operand is the caller's own
+    shared pages: whatever ``bound_buffers`` maps it to, the caller's array is
+    what the dispatch runs on, in place.
+    """
+
+    def __init__(self, pdi_path, insts_path):
+        from .hsa_xrt import HsaXrtError, _errbuf, _runtime
+
+        buf, n = _errbuf()
+        self._handle = _runtime().triton_npu_hsa_prepare(
+            pdi_path.encode(), insts_path.encode(), buf, n
+        )
+        if not self._handle:
+            raise HsaXrtError(buf.value.decode())
+        self._sets = {}
+
+    def run(
+        self,
+        inputs,
+        *,
+        bo_key,
+        static_indices=(),
+        intermediate_indices=(),
+        output_indices=None,
+        bound_buffers=None,
+    ):
+        """Execute the chain. Same arguments and result as ``MultiLaunchRunner``."""
+        import ctypes
+
+        import numpy as np
+
+        from .hsa_xrt import _Region, _check, _errbuf, _runtime
+
+        bound = set(bound_buffers or ())
+        readback = {len(inputs) - 1} if output_indices is None else set(output_indices)
+        scratch = set(intermediate_indices)
+        static = set(static_indices)
+        sizes = [a.size * a.itemsize for a in inputs]
+        first_call = bo_key not in self._sets
+        if first_call:
+            for i in bound:
+                if not 0 <= i < len(inputs):
+                    raise ValueError(
+                        f"bound buffer index {i} is out of range for "
+                        f"{len(inputs)} args"
+                    )
+            regions = {
+                i: _Region(max(s, 64)) for i, s in enumerate(sizes) if i not in bound
+            }
+            self._sets[bo_key] = (sizes, bound, regions)
+        cached_sizes, cached_bound, regions = self._sets[bo_key]
+        if sizes != cached_sizes or bound != cached_bound:
+            raise ValueError(
+                f"bo_key '{bo_key}' was set up for sizes {cached_sizes} and bound "
+                f"{sorted(cached_bound)}; use a distinct bo_key per operand set"
+            )
+        ptrs = []
+        for i, a in enumerate(inputs):
+            if i in bound:
+                if not a.flags["C_CONTIGUOUS"]:
+                    raise ValueError(f"bound arg {i} is not contiguous")
+                ptrs.append(a.ctypes.data)
+                continue
+            r = regions[i]
+            ptrs.append(r.va)
+            if not first_call and (i in static or i in scratch):
+                continue
+            if i in scratch and i not in static:
+                r.host[: sizes[i]] = 0
+                continue
+            r.host[: sizes[i]] = np.frombuffer(a.tobytes(), np.uint8)
+            if i in static:
+                r.make_resident()
+        n = len(inputs)
+        cptrs = (ctypes.c_void_p * n)(*ptrs)
+        csizes = (ctypes.c_uint64 * n)(*sizes)
+        buf, nb = _errbuf()
+        _check(
+            _runtime().triton_npu_hsa_dispatch(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_uint32(n),
+                cptrs,
+                csizes,
+                buf,
+                nb,
+            ),
+            buf,
+        )
+        results = {}
+        for idx in readback:
+            a = inputs[idx]
+            if idx in bound:
+                results[idx] = a
+                continue
+            results[idx] = np.frombuffer(
+                regions[idx].host, dtype=a.dtype, count=a.size
+            ).reshape(a.shape)
+        return results
+
+    def unload(self):
+        """Drop the operand regions. The program stays cached by the runtime."""
+        self._sets = {}
+
+
 class NPUChain:
     """Model-facing wrapper: declare a chain of NPU ops, dispatch as one ELF.
 
@@ -464,15 +644,27 @@ class NPUChain:
     grid determine the lowered IR); the actual data is passed to ``run`` as numpy
     arrays in combined-arg order.
 
-    Known defect -- do not build a chain of exactly one op if you intend to
-    dispatch it more than once. A single-op chain returns correct data on its
-    first dispatch and corrupt data on every dispatch after that. It reproduces
-    on an unmodified checkout with plain host staging and no shared buffers, so
-    it is in the lowering or the ELF stitching rather than anything above.
-    Chains of two or more ops are unaffected. Until this is fixed, pad a
-    one-op chain with a second, trivial op -- see
-    ``examples/zero_copy/common/add_chain.py``, which does exactly that.
+    Single-op chains are supported (``scripts/test_npu_chain_single_op.py``).
+
+    Each chain that has run holds an ``xrt::hw_context``, and the NPU runs out
+    of those -- at about 30 in one process, as
+    ``DRM_IOCTL_AMDXDNA_CREATE_HWCTX ... err=-2``. A model that caches chains
+    by shape opens a fresh set for every new shape and reaches that within a
+    few prompt lengths. So at most ``max_open`` chains hold one at a time,
+    process-wide: dispatching another closes the least recently dispatched,
+    which reopens on its next ``run()`` from the ELF it already compiled.
+    Reopening re-stages its static operands, so the cap must stay above the
+    set of chains one forward pass cycles through, or every dispatch pays it.
     """
+
+    #: Chains holding an ``hw_context`` at once, across the process. Leaves
+    #: headroom under the device's ~30 for contexts opened outside ``NPUChain``
+    #: (the fused decode's, a plain kernel launch's).
+    max_open = 20
+    #: id -> weakref of every chain holding one, least recently dispatched
+    #: first. Weak, so a chain dropped without ``close()`` still closes on
+    #: collection as it always has.
+    _open = collections.OrderedDict()
 
     def __init__(self, name, air_project_path=None):
         self.name = name
@@ -482,6 +674,8 @@ class NPUChain:
         self._runner = None
         self._elf_path = None
         self._kernel_name = None
+        # The runtime the built artifact runs on; `_build` decides it.
+        self._runtime = "xrt"
 
     def add(
         self,
@@ -528,26 +722,30 @@ class NPUChain:
     def _capture_ttshared(self, kernel, grid, args, constexprs):
         """Warmup-compile the kernel to obtain its ttsharedir source.
 
+        A `str`/`bytes` `kernel` is taken to be that source already and passed
+        through. The chain's own ops all come from `@triton.jit`, but some
+        shapes cannot be reached from the frontend at all -- `tl.arange` needs
+        a power of two, so a GEMM kernel can only ask for K=2048 where the
+        real K is 1536 -- while `linalg.matmul` and every schedule below it are
+        happy with either. Letting an op arrive as MLIR is what makes those
+        reachable without a second lowering path.
+
         Forces the NPU driver active for the warmup so the kernel lowers through
         the NPU backend (whose binary_ext is ``ttsharedir``). Without this, in a
         hetero model the GPU driver may be active and ``asm`` would lack
         ``ttsharedir`` (KeyError).
 
-        Restores the driver active on entry rather than ``reset_active()``, which
-        resolves the auto-detected default and fails with "0 active drivers" on
-        an iGPU-free host (no auto-active GPU driver; NPUDriver is set explicitly,
-        not detected).
+        `driver_scope` restores whatever was active on entry, including no
+        driver at all, so a chain reopened after ``max_open`` evicted it can
+        capture from wherever its ``run()`` is called.
         """
-        import triton
-        from .driver import NPUDriver
+        from .driver_scope import driver_scope
 
-        prev = triton.runtime.driver.active
-        triton.runtime.driver.set_active(NPUDriver())
-        try:
-            with config_context(compile_only=True):
-                compiled = kernel.warmup(*args, grid=grid, **constexprs)
-        finally:
-            triton.runtime.driver.set_active(prev)
+        if isinstance(kernel, (str, bytes)):
+            return kernel
+
+        with driver_scope("npu"), config_context(compile_only=True):
+            compiled = kernel.warmup(*args, grid=grid, **constexprs)
         return compiled.asm["ttsharedir"]
 
     def _build(self):
@@ -570,8 +768,57 @@ class NPUChain:
                 actual_sizes=actual_sizes,
             )
         self._builder = b
-        self._elf_path, self._kernel_name = b.compile()
-        self._runner = MultiLaunchRunner(self._elf_path, self._kernel_name)
+        # Built for the launch runtime in effect: an ELF for XRT, a PDI and its
+        # instruction stream for HSA. A PDI holds one launch, though: a chain
+        # of several ops relies on the ELF's in-stream PDI loads to switch
+        # configuration between them, so under HSA it still runs on XRT.
+        self._runtime = npu_config.runtime
+        if self._runtime == "hsa" and len(self._specs) > 1:
+            self._runtime = "xrt"
+            fmt = "elf"
+        else:
+            fmt = _get_output_format(runtime=self._runtime)
+        self._elf_path, self._kernel_name = b.compile(output_format=fmt)
+
+    @staticmethod
+    def _close_stalest():
+        """Close the least recently dispatched open chain. False if none is."""
+        open_ = NPUChain._open
+        while open_:
+            _, ref = open_.popitem(last=False)
+            stale = ref()
+            if stale is not None and stale._runner is not None:
+                stale.close()
+                return True
+        return False
+
+    def _open_runner(self):
+        """Give this chain an ``hw_context``, closing the stalest to make room.
+
+        Ahead of time at ``max_open``, and again whenever the device refuses
+        one: how many it grants depends on the driver and firmware -- ~30 on
+        amdxdna 2.21, fewer on 2.25, which also reports it as EINVAL rather
+        than ENOENT -- so the cap alone cannot be the guarantee. Contexts
+        held outside the backend that their owner can reopen go first (see
+        ``driver.context_releasers``), then our own chains, stalest first.
+        Only a refusal with nothing left to release is raised.
+        """
+        open_ = NPUChain._open
+        while len(open_) >= NPUChain.max_open and NPUChain._close_stalest():
+            pass
+        if self._elf_path is None:
+            self._build()
+        while True:
+            try:
+                runner = HsaChainRunner if self._runtime == "hsa" else MultiLaunchRunner
+                self._runner = runner(self._elf_path, self._kernel_name)
+                break
+            except RuntimeError as e:
+                if "HWCTX" not in str(e) or not (
+                    release_external_contexts() or NPUChain._close_stalest()
+                ):
+                    raise
+        open_[id(self)] = weakref.ref(self)
 
     def run(
         self,
@@ -585,8 +832,18 @@ class NPUChain:
     ):
         """Build (first call) + dispatch the chain. Returns {idx: ndarray}."""
         if self._runner is None:
-            self._build()
-        return self._runner.run(
+            self._open_runner()
+        elif id(self) in NPUChain._open:
+            NPUChain._open.move_to_end(id(self))
+        # Pages bound for the HSA runtime mean nothing to a chain on XRT:
+        # stage them instead, and copy outputs back into the caller's pages,
+        # which is where a caller that bound them reads.
+        import numpy
+
+        staged = ()
+        if bound_buffers and npu_config.runtime == "hsa" and self._runtime == "xrt":
+            staged, bound_buffers = set(bound_buffers), None
+        got = self._runner.run(
             inputs,
             bo_key=bo_key or self.name,
             static_indices=static_indices,
@@ -594,6 +851,11 @@ class NPUChain:
             output_indices=output_indices,
             bound_buffers=bound_buffers,
         )
+        for idx in staged:
+            if idx in got:
+                numpy.copyto(inputs[idx], got[idx].reshape(inputs[idx].shape))
+                got[idx] = inputs[idx]
+        return got
 
     def close(self):
         """Release the chain's persistent XRT context/BOs (see
@@ -601,6 +863,7 @@ class NPUChain:
         if self._runner is not None:
             self._runner.unload()
             self._runner = None
+        NPUChain._open.pop(id(self), None)
 
     def __del__(self):
         try:

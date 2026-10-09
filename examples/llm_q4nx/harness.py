@@ -1,0 +1,1113 @@
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+"""The driver every Q4NX example shares: a Triton prefill feeding mlir-air's
+fused decode.
+
+A model's own directory supplies two things and nothing else -- a `ModelSpec`
+(what the decode build and mlir-air's driver need to be told) and a prefill
+class (the forward, and the constants it is written against). Everything here
+is the same for all of them: argument parsing, the KV handoff, the gate, the
+chat session, and the swap that puts our prefill under mlir-air's `generate()`.
+
+The prefill class must provide what mlir-air's `Session.run_turn` calls on its
+prefiller -- `prefill`, `kv_view`, `clear_context` -- plus `load_weights` and
+`save_kv_npz`. `model.py` in each example is that class.
+"""
+
+import argparse
+import importlib.util
+import os
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import airsrc  # noqa: E402
+import decode_build  # noqa: E402
+
+# run_tests.py grades this exit code as a skip, not a failure -- the autotools
+# convention, and what examples/gpt2 uses. These examples need a multi-gigabyte
+# weight bundle from the Hub, so a runner with no network declines the test
+# rather than reporting a defect it has not found.
+SKIP_EXIT_CODE = 77
+
+
+class ExampleUnavailable(Exception):
+    """The example cannot run here (weights, tokenizer or decode build)."""
+
+
+def _apply_engine_env(model):
+    """Put the build's engine-owned knobs in the environment, for the runtime.
+
+    Only for engines that read them; see the caller. Unrecorded knobs are
+    removed rather than left, because on such an engine an absent variable is
+    how a spec asks for the builder's own default, and an inherited value
+    would answer with something else on the host while the artifact was built
+    without it.
+
+    Not scoped: this is the process that goes on to run the decode, and the
+    driver reads these at import into module-level constants.
+    """
+    from triton.language.extra.npu import ENGINES
+
+    engine = ENGINES[model.engine]
+    if not engine.model_table:
+        # This engine reads the four from the environment (it has no table
+        # entry for them), so they are ours to set.
+        recorded = model.decode_env
+        for var in ("W_DUAL_CHAN", "VOCAB_CHUNK_I2", "DECODE_WGROUP", "DECODE_STACK"):
+            if var in recorded:
+                os.environ[var] = str(recorded[var])
+            else:
+                os.environ.pop(var, None)
+
+
+def air_inference_module(model):
+    """mlir-air's driver for this model, importable.
+
+    Unmodified but for its decoder classes, which release idle fused
+    prefills' hardware contexts before opening their own; see
+    `_releasing_fused_prefills`.
+    """
+    # Before the import: mlir-air's module reads its decode-shape selection at
+    # import time, so a later choice would not be seen. See
+    # airsrc.select_decode_artifact for why these examples fix it rather than
+    # taking mlir-air's default.
+    airsrc.select_decode_artifact()
+
+    # Also before the import, and for the same reason: the drivers that take
+    # this read it into a module-level constant. See `ModelSpec.decode_dir_env`.
+    if model.decode_dir_env:
+        os.environ[model.decode_dir_env] = airsrc.fused_decode_dir(model.engine)
+
+    # And before the import for a third reason, on the engines that need it:
+    # the knobs the BUILD was configured with.
+    #
+    # The shared engine needs nothing here. Since mlir-air `deffe6f1` it takes
+    # `W_DUAL_CHAN`, `VOCAB_CHUNK_I2`, `DECODE_WGROUP` and `DECODE_STACK` from
+    # the model's own `_MODELS` entry and does not consult the environment, so
+    # setting them would be inert -- `DecodeConfig` records them and
+    # `_check_model_table` verifies them against that entry instead.
+    #
+    # The PLE fork predates that commit and still reads all four from the
+    # environment, on BOTH sides: mlir-air's own `validate_layer_npu._load_fd`,
+    # which its Gemma4 driver imports the builder through, sets the eight knobs
+    # it cares about and leaves these four to the builder's defaults. So an
+    # exported `W_DUAL_CHAN=0` reaches the host's idea of the weight layout
+    # while the artifact on disk was built without it, and the two disagree
+    # about the shim channel split and the DDR cascade order. Nothing says so:
+    # the dispatch completes, the first token is right, and the rest is
+    # garbage. That is exactly the Qwen2.5-3B failure, from the other side.
+    #
+    # So on a PLE model the recorded knobs are applied and the unrecorded ones
+    # are CLEARED -- the same rule `tl.extra.npu`'s build scope follows, which
+    # is what makes the two sides agree by construction rather than by luck.
+    _apply_engine_env(model)
+
+    airsrc.add_air_paths(model.air_package, *model.extra_packages)
+    path = os.path.join(
+        str(airsrc.air_llms_root()), model.air_package, model.air_inference
+    )
+    spec = importlib.util.spec_from_file_location("q4nx_inference", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["q4nx_inference"] = mod
+    spec.loader.exec_module(mod)
+    for name in {"FusedDecoder", model.decoder_class} - {""}:
+        cls = getattr(mod, name, None)
+        if isinstance(cls, type):
+            setattr(mod, name, _releasing_fused_prefills(cls))
+    return mod
+
+
+def _releasing_fused_prefills(cls):
+    """`cls`, releasing idle fused prefills' contexts before it opens its own.
+
+    A decoder opens its hardware contexts after loading its weights, so one
+    refused by the device cannot be retried cheaply, and mlir-air's
+    `generate()` constructs it where no retry can reach.
+    """
+    from dense_fused_prefill import release_fused_prefills
+
+    def __init__(self, *a, **kw):
+        release_fused_prefills()
+        cls.__init__(self, *a, **kw)
+
+    return type(
+        cls.__name__,
+        (cls,),
+        {"__init__": __init__, "__doc__": cls.__doc__, "__module__": cls.__module__},
+    )
+
+
+def tokenizer_dir(air, model):
+    """The tokenizer mlir-air's driver uses, or this model's checkpoint.
+
+    The drivers spell it differently -- the 1B exports `_TOKENIZER`, the 3B
+    `TOKENIZER_DEFAULT` -- so try both before falling back. The tokenizer is a
+    convenience for printing text, never the gate, so an unknown spelling
+    degrades to the fallback rather than failing the run.
+    """
+    for attr in ("_TOKENIZER", "TOKENIZER_DEFAULT"):
+        if air is not None and hasattr(air, attr):
+            return getattr(air, attr)
+    return os.environ.get(
+        "Q4NX_TOKENIZER_DIR", os.path.expanduser(model.tokenizer_fallback)
+    )
+
+
+def check_host_memory(spec):
+    """Decline before allocating if this host cannot hold the weights.
+
+    The prefill dequantizes to bf16 on the host, and an undersized host does
+    not raise -- it gets SIGKILLed partway through the load, which no `except`
+    can turn into the skip this would otherwise report. So the check has to be
+    up front and approximate. Linux only; elsewhere it passes and the caller
+    takes its chances, as it did before.
+    """
+    if not spec.min_host_gib:
+        return
+    try:
+        with open("/proc/meminfo") as f:
+            avail_kib = next(
+                int(line.split()[1]) for line in f if line.startswith("MemAvailable:")
+            )
+    except (OSError, StopIteration):
+        return
+    avail = avail_kib / 1024 / 1024
+    if avail < spec.min_host_gib:
+        raise ExampleUnavailable(
+            f"{spec.name} needs about {spec.min_host_gib:.0f} GiB of host memory "
+            f"for its dequantized bf16 weights; this host has {avail:.1f} GiB "
+            f"available"
+        )
+
+
+def load_prefill_weights(m, backend, npu_resident=True):
+    """Load `m`'s weights, and free what a device-only run does not need.
+
+    Both entry points go through here rather than each remembering the second
+    step. They did not: `run_prefill` converted and the interactive session did
+    not, so a chat kept the full unpadded set alongside the padded one and saw
+    none of the saving -- which is invisible, because the only symptom is a
+    bigger process.
+
+    The conversion is one-way (see `LlamaPrefill.make_npu_resident`), so it is
+    conditional on this run never needing the torch path: the NPU backend, with
+    matmul actually on it. `--compare-cpu` and `--ops` subsets that leave matmul
+    on the CPU build their own model and do not come through here at all.
+    """
+    m.load_weights()
+    # Applies to every backend whose `PLACEMENT` puts matmul on the NPU,
+    # `hetero` as well as `npu`.
+    #
+    # `npu_resident=False` is how a GPU decode opts out. The conversion is
+    # ONE-WAY: it replaces each projection with a padded device-resident form
+    # and releases the torch tensor, so a decode that then wants to multiply
+    # with it gets `unsupported operand type(s) for @: Tensor and
+    # ResidentWeight`. The prefill pays for that -- it re-pads per call -- and
+    # that is the trade a hybrid run makes.
+    if npu_resident and m._device("matmul", backend) == "npu":
+        m.make_npu_resident()
+
+
+def make_prefiller(prefill_cls, cfg, backend, ops, max_seq, model, npu_resident=True):
+    """Construct `prefill_cls` for `cfg` and load its weights.
+
+    A failure to obtain the weights (no network, no bundle) is raised as
+    `ExampleUnavailable`, which the example reports as a skip (exit 77).
+    """
+    m = prefill_cls(
+        backend=backend,
+        ops=ops,
+        n_layers=cfg.N_LAYERS,
+        max_seq=max_seq,
+        model=model,
+        expect_model=cfg.MODEL_NAME,
+    )
+    try:
+        load_prefill_weights(m, backend, npu_resident=npu_resident)
+    except Exception as e:  # noqa: BLE001 -- any failure to obtain weights
+        raise ExampleUnavailable(f"cannot load the q4nx weights: {e}") from e
+    return m
+
+
+def report_prefill(m, cfg, backend, P, t_load, t_run, first):
+    """The one line every prefill prints.
+
+    The model is named here, not left to the caller's shell trace. Every Q4NX
+    gate otherwise prints identical text -- same P, same first token -- so a
+    loop that ran one model twice would read as two passes. A fused prefill
+    runs none of this repository's ops, whatever was asked.
+    """
+    engine = getattr(m, "ENGINE", None)
+    where = (
+        f"engine={engine}" if engine else f"backend={backend} ops={sorted(m.enabled)}"
+    )
+    print(
+        f"[{engine or 'triton'}-prefill] model={cfg.MODEL_NAME} {where} P={P} "
+        f"load {t_load:.1f}s prefill {t_run:.2f}s first={first}",
+        flush=True,
+    )
+
+
+def run_prefill(
+    prefill_cls,
+    cfg,
+    ids,
+    backend,
+    ops,
+    max_seq,
+    model,
+    kv_path,
+    profile=False,
+    npu_resident=True,
+):
+    """Our prefill -> the handoff npz.
+
+    Returns `(first_token, P, prefiller)`. The prefiller is returned because
+    mlir-air's per-model drivers do not agree on how the handoff is made: the
+    1B reads the npz, while the 3B is handed this object and calls
+    `kv_view()` on it. See `ModelSpec.driver_api`. `kv_path=None` skips the
+    npz, which is what the object-handoff models and `--prefill-only` want.
+    """
+    import torch
+
+    t0 = time.time()
+    m = make_prefiller(
+        prefill_cls, cfg, backend, ops, max_seq, model, npu_resident=npu_resident
+    )
+    t_load = time.time() - t0
+    m.timer.enabled = profile
+    if profile:  # one warm pass so timings exclude compilation
+        m.prefill(ids)
+        m.clear_context()
+        m.timer.reset()
+    t0 = time.time()
+    logits = m.prefill(ids)
+    t_run = time.time() - t0
+    if profile:
+        m.timer.report(t_run)
+    first = int(torch.argmax(logits))
+    if kv_path is not None:
+        m.save_kv_npz(kv_path, first, ids)
+    report_prefill(m, cfg, backend, len(ids), t_load, t_run, first)
+    return first, len(ids), m
+
+
+def make_session_class(air, prefill_cls, cfg, backend, ops, model):
+    """mlir-air's Session with OUR prefill in place of theirs.
+
+    `Session.run_turn` only ever calls `prefill`, `kv_view` and
+    `clear_context` on its prefiller, and the prefill class provides all three
+    with the same semantics, so nothing below run_turn needs to change. The
+    decode stays exactly as mlir-air builds it.
+    """
+
+    class TritonSession(air.Session):
+        def __init__(self, seq_len=2048):
+            import time
+
+            import numpy as np
+
+            self.np = np
+            self.seq_len = seq_len
+            t0 = time.perf_counter()
+            print("[session] loading prefill weights (once)...", flush=True)
+            self.prefiller = make_prefiller(
+                prefill_cls, cfg, backend, ops, seq_len, model
+            )
+            print(
+                f"[session] Triton prefill resident ({time.perf_counter() - t0:.2f}s); "
+                f"building decode...",
+                flush=True,
+            )
+            # `max_L`, positionally: the pinned mlir-air's `FusedDecoder` takes
+            # `(max_L=None)` and has no `_staircase_on` -- that name is from a
+            # different revision of its driver, and calling it made `--interactive`
+            # fail at construction on every model that supports it.
+            self.dec = air.FusedDecoder(seq_len)
+            self.attn_maxl = self.dec.ATTN_MAXL
+            # One throwaway prefill so the first real turn is warm: it compiles
+            # and caches every kernel and opens the XRT session the launcher
+            # now keeps alive. clear_context() either side leaves no state.
+            t_w = time.perf_counter()
+            self.prefiller.clear_context()
+            self.prefiller.prefill([cfg.BOS])
+            self.prefiller.clear_context()
+            # And one throwaway decode, for the same reason: the first dispatch
+            # of a process costs ~100 ms against a steady-state ~18 (the array
+            # is configured for this design for the first time), which on a
+            # short answer is most of the wall clock and reads as a slow
+            # runtime. Position 0 of the KV cache is the scratch, and every
+            # turn's seed_kv overwrites it before it is read.
+            self.dec.dispatch(cfg.BOS, 0)
+            print(
+                f"[session] ready: Triton prefill + AIR decode resident "
+                f"(ATTN_MAXL={self.attn_maxl}, warmup {time.perf_counter() - t_w:.2f}s).",
+                flush=True,
+            )
+
+    return TritonSession
+
+
+def make_decoder(air, spec, cfg, args, max_L=None):
+    """This model's mlir-air decoder, constructed per its `driver_api`.
+
+    The class is looked up on `air` by name, so an HSA adapter installed under
+    that name by `main` is the one constructed. Only the kv_arrays drivers take
+    `max_L`.
+    """
+    cls = getattr(air, spec.decoder_class or "FusedDecoder")
+    model = args.model or cfg.MODEL_DEFAULT
+    if spec.driver_api == "prefiller":
+        return cls(
+            model, airsrc.fused_decode_dir(spec.engine), model_type=spec.model_type
+        )
+    if spec.driver_api == "kv_arrays":
+        return cls(model=model) if max_L is None else cls(model=model, max_L=max_L)
+    return cls()
+
+
+def _xrt_shared_available():
+    """True if XRT<->HIP shared pages work here; prints why not when they don't.
+
+    The marker is unconditional (not behind a debug flag) so CI can tell a
+    genuine fallback -- no ROCm torch, no iGPU -- apart from a zero-copy path
+    that silently stopped engaging.
+    """
+    import torch
+
+    try:
+        from triton.backends.amd_triton_npu import shared
+
+        probe = shared.zeros(1, dtype=torch.bfloat16, device="xrt:0", share="hip:0")
+        if getattr(probe, "bo", None) is None:
+            print("[e2e] XRT zero-copy unavailable: no shared pages", flush=True)
+            return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[e2e] XRT zero-copy unavailable: {e}", flush=True)
+        return False
+
+
+def _hsa_kv_sink(dec, spec):
+    """The HSA decoder's own resident KV buffer, and how to publish into it."""
+    if not hasattr(dec, "kv_sink"):
+        raise ExampleUnavailable(
+            f"{spec.name}: the HSA decoder exposes no kv_sink; zero-copy needs it"
+        )
+    return dec.kv_sink(), dec.seed_direct
+
+
+def _xrt_kv_sink(dec, spec):
+    """A KV slab in pages XRT and HIP share, attached to the XRT decoder.
+
+    One row per decoder layer. The prefiller drivers keep their geometry on
+    an `fd` module and keep no host mirror of the cache, so the slab is synced
+    to the device explicitly after the prefill. The others use `dec.KV` as the
+    host mirror and write it to the device on their first dispatch, so `KV`
+    must point at the slab; otherwise that first write would overwrite the
+    prefill's K/V with the decoder's own empty cache.
+    """
+    import torch
+    from triton.backends.amd_triton_npu import shared
+
+    api = spec.driver_api
+    # The npz driver does not expose its layer count.
+    rows = {"npz": 16, "kv_arrays": "UNI_DEC", "prefiller": "N_LAYERS"}[api]
+    rows = rows if isinstance(rows, int) else getattr(dec, rows)
+    geom = dec.fd if api == "prefiller" else dec
+    slab = shared.zeros(
+        rows, dec.LREG, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
+    )
+    host = slab.numpy()
+    dec.kvc = slab.bo
+    if api == "prefiller":
+        publish = lambda P: dec.kvc.sync(dec.TO)  # noqa: E731
+    else:
+        dec.KV = host
+        publish = lambda P: None  # noqa: E731
+    sink = {
+        "buf": host.reshape(-1),
+        "region_w": geom.REGION_W,
+        "ngrp": geom.NGRP,
+        # The decoder's own seed_kv stride; the module REGION_STRIDE can differ.
+        "region_stride": dec.ATTN_MAXL * geom.REGION_W,
+        "lreg": dec.LREG,
+    }
+    return sink, publish
+
+
+def generate_zero_copy(air, spec, cfg, prefill_cls, args, ids, runtime):
+    """Prefill straight into the decode's KV cache, then decode from it.
+
+    The prefill is bound to the decode's own cache (`bind_kv_sink`) and writes
+    each layer's K/V where the decode reads it. `runtime` says where that cache
+    lives: "hsa", the HSA decoder's resident buffer, or "xrt", pages XRT and
+    HIP share. Returns None when "xrt" is asked for and the interop is absent.
+
+    The decode loop is greedy (argmax).
+    """
+    import numpy as np
+
+    # Probe interop before the decoder, whose construction loads weights.
+    if runtime == "xrt" and not _xrt_shared_available():
+        return None
+    dec = make_decoder(
+        air, spec, cfg, args, max_L=args.max_seq if runtime == "xrt" else None
+    )
+    sink, publish = (_hsa_kv_sink if runtime == "hsa" else _xrt_kv_sink)(dec, spec)
+
+    t0 = time.time()
+    prefiller = make_prefiller(
+        prefill_cls, cfg, args.backend, args.ops, args.max_seq, args.model
+    )
+    t_load = time.time() - t0
+    prefiller.bind_kv_sink(sink)
+
+    sink["buf"][:] = 0
+    prefiller.clear_context()
+    t0 = time.time()
+    logits = np.asarray(prefiller.prefill(list(ids)), np.float32)
+    t_run = time.time() - t0
+    first = int(logits.argmax())
+    P = prefiller.current_context_length
+    report_prefill(prefiller, cfg, args.backend, P, t_load, t_run, first)
+    publish(P)
+    print(
+        f"[e2e] KV handed over in place: {P} rows already in the decode's "
+        f"layout, nothing to rearrange",
+        flush=True,
+    )
+
+    n_eff = min(args.max_tokens, dec.ATTN_MAXL - P)
+    tokens = list(ids) + [first]
+    gen_ids = [first]
+    t0 = time.time()
+    for p in range(P, P + n_eff):
+        lg = dec.dispatch(tokens[p], p)
+        pred = int(np.asarray(lg).argmax())
+        gen_ids.append(pred)
+        if p + 1 >= len(tokens):
+            tokens.append(pred)
+    t_dec = time.time() - t0
+    n_gen = len(gen_ids) - 1
+    if n_gen > 0:
+        print(
+            f"Generated {n_gen} tokens in {t_dec:.2f}s ({n_gen / t_dec:.2f} tok/s)",
+            flush=True,
+        )
+    return gen_ids
+
+
+def generate_via_prefiller(air, spec, cfg, args, ids, prefiller):
+    """Generation for drivers that take the prefill object rather than a file.
+
+    mlir-air's 3B driver hands its `generate_stream` a prefiller and calls
+    `clear_context()`, `prefill()` and `kv_view()` on it -- the interface our
+    prefill already has, so it goes in directly with nothing to neutralize.
+
+    Two details that are easy to get wrong and silent when wrong:
+
+    * `min_prefill=1`. Their default is `PREFILL_MIN_TOKENS` (96), below which
+      the prompt is replayed token-by-token through the decode and the
+      prefiller is never touched. That is the right default for them -- it is
+      faster for short prompts -- but it would mean the six-token gate prompt
+      exercised none of the Triton prefill this example exists to test, and
+      still printed a plausible answer.
+    * `stop_on_eos=False`. The npz path generates a fixed count, so leaving
+      their EOS stop on would make the two paths' token counts differ for
+      reasons that have nothing to do with the kernels.
+    """
+    dec = make_decoder(air, spec, cfg, args)
+    gen, t_prompt, t_gen = air.generate_stream(
+        dec,
+        None,  # tokenizer: only used for streaming output, which we do not do
+        ids,
+        args.max_tokens,
+        stream=False,
+        prefiller=prefiller,
+        min_prefill=1,
+        stop_on_eos=False,
+    )
+    print(
+        f"[e2e] prompt {t_prompt:.2f}s, decode {t_gen:.2f}s "
+        f"({len(gen) / t_gen:.2f} tok/s)",
+        flush=True,
+    )
+    return gen
+
+
+def _install_shared_kv(air, prefiller):
+    """Point the driver's decoder at the prefill's KV cache, if it can be.
+
+    A prefiller that writes mlir-air's own device layout has nothing to hand
+    over: the decoder reads the cache where it lies. Swapping the driver's
+    `FusedDecoder` for the subclass that knows this is the same move
+    `hsa_decode` makes for the dispatch, and for the same reason -- it is the
+    only channel their `generate()` offers, since it constructs the decoder
+    itself.
+
+    Returns the `(K, V)` to hand `_prefill_npu`: placeholders that carry the
+    shape their `generate()` reads `P` from and raise if anything reads a
+    value, or `(None, None)` when this model has no shared layout and the
+    caller should build the arrays the old way.
+    """
+    make = getattr(prefiller, "make_npu_decoder_class", None)
+    if make is None or getattr(prefiller, "_kv_slab", None) is None:
+        return None, None
+    air.FusedDecoder = make(air, prefiller)
+    p = prefiller.current_context_length
+    ks, vs = prefiller.kv_placeholders(p)
+    import kernels
+
+    shared = kernels.xrt_bo(prefiller._kv_slab) is not None
+    print(
+        f"[e2e] KV handed over in place: {p} rows already in the decode's "
+        f"layout, nothing to rearrange"
+        + ("" if shared else " (copied once: no shared pages here)"),
+        flush=True,
+    )
+    return ks, vs
+
+
+def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
+    """Generation for drivers whose `generate()` has no handoff parameter.
+
+    Qwen3-4B's and Gemma3-4B's drivers do their own prefill unconditionally and
+    hand the result to the decode loop, so there is nothing to pass in -- but
+    the prefill each calls is one function, `_prefill_npu(prompt, model,
+    seq_len=None) -> (K, V, first, ttft)`, and replacing it puts our KV in front
+    of their decode without reaching past their public `generate()`. That is the
+    same move the npz path makes on `run_prefill`, and it is preferred to
+    calling their `_decode_loop` directly: `generate()` also builds the decoder,
+    checks P against ATTN_MAXL and prints the throughput lines the benchmark
+    scrapes.
+
+    `stop_on_eos=False` where it is accepted, for the same reason as the
+    prefiller path: the other routes generate a fixed count, and an EOS stop
+    would make the token counts differ for reasons unrelated to the kernels.
+    Qwen3's `generate` takes it and Gemma3's does not -- it stops on EOS
+    unconditionally -- so the argument is offered only when the signature has
+    somewhere to put it. Read off the function rather than recorded in the spec
+    because, unlike a build fact, this one cannot go stale: it is derived from
+    the very thing it describes.
+    """
+    import inspect
+
+    K, V = _install_shared_kv(air, prefiller)
+    if K is None:
+        # No shared layout for this model: build the handoff arrays as before.
+        K, V = prefiller.kv_stack()
+    # Their fourth return value is the time-to-first-token they print on a line
+    # the nightly benchmark scrapes. It is our prefill that spent it, so the
+    # measured wall clock goes back in rather than a zero that would read as a
+    # free prefill.
+    # Takes whatever the driver passes, `fused=` included: ours replaces their
+    # fused prefill too.
+    air._prefill_npu = lambda *a, **k: (K, V, first, ttft)
+    params = inspect.signature(air.generate).parameters
+    kwargs = dict(model=args.model or cfg.MODEL_DEFAULT)
+    # Both offered only where the signature has somewhere to put them. Qwen3
+    # takes the pair, Gemma3 takes `greedy` alone, and Gemma4-E2B takes
+    # neither -- it is greedy unconditionally and stops on EOS
+    # unconditionally, which is why its recorded continuation is two tokens.
+    for name, value in (("greedy", args.greedy), ("stop_on_eos", False)):
+        if name in params:
+            kwargs[name] = value
+    out = air.generate(list(ids), args.max_tokens, **kwargs)
+    # A driver that stops on EOS reports the token it stopped on, so its
+    # `generate` returns `(ids, eos)` where the others return the ids alone.
+    # The stop token goes back on the end, as the GPU decode returns it, so
+    # that the decode gate can require it.
+    if isinstance(out, tuple):
+        out, stop = out
+        return list(out) + ([stop] if stop is not None else [])
+    return list(out)
+
+
+#: Models with a `--decode gpu` implementation. One entry, deliberately: a
+#: registry with a single member is still clearer than the same string tested
+#: in two places that can drift apart.
+GPU_DECODE_MODELS = frozenset({"gemma4-e2b"})
+
+
+def fused_prefill_config(cfg):
+    """The `PrefillConfig` of this model's mlir-air fused NPU prefill
+    (`--prefill-engine air-fused`), or None if mlir-air has none."""
+    import triton.language as tl
+
+    npu = tl.extra.npu
+    try:
+        return npu.PrefillConfig(cfg.MODEL_NAME)
+    except npu.PrefillConfigError:
+        return None
+
+
+def fused_prefill_cls(cfg, prefill_cls, config):
+    """A `prefill_cls` that runs mlir-air's fused NPU prefill.
+
+    Builds it through `tl.extra.npu.fused_prefill` (a cache hit after the first
+    build) and returns a factory with `run_prefill`'s calling convention. The
+    prefiller's own host path runs on the CPU backend, so no Triton NPU chain
+    is built. Gemma4-E2B's keeps the embedding, norms and head its decoders
+    read; a dense model's (`dense_fused_prefill`) keeps nothing but the KV.
+    """
+    import triton.language as tl
+
+    built = tl.extra.npu.fused_prefill(config, airsrc.fused_prefill_dir(config.package))
+    print(
+        f"[fused-prefill] {built['build_dir']} "
+        f"({'cached' if built['cached'] else 'built'})",
+        flush=True,
+    )
+
+    if config.dense:
+        from dense_fused_prefill import fused_prefill_class
+
+        cls = fused_prefill_class(prefill_cls, config.dense)
+    else:
+        from gemma4_fused_prefill import Gemma4FusedPrefill as cls
+
+    def make(backend=None, **kw):
+        return cls(built["build_dir"], backend="cpu", **kw)
+
+    return make
+
+
+def generate_on_gpu(cfg, args, prefiller, first, ids):
+    """Greedy decode in torch on the iGPU, seeded by the NPU prefill.
+
+    The hybrid: prefill stays wherever `--backend` put it, and the decode that
+    would have been mlir-air's single fused NPU dispatch runs here instead, one
+    token at a time. Slower by construction -- 35 layers of small GEMMs against
+    one dispatch -- and useful for two things the NPU decode cannot do: running
+    generation without a built decode template, and giving the fused kernel a
+    reference to be scored against.
+
+    Model-specific, and deliberately not dressed up as general: only Gemma4
+    has a `Gemma4GpuDecode` today, and a base-class hook with one implementation
+    would claim more than it delivers.
+    """
+    if cfg.MODEL_NAME not in GPU_DECODE_MODELS:
+        raise ExampleUnavailable(
+            f"--decode gpu is implemented for "
+            f"{', '.join(sorted(GPU_DECODE_MODELS))} only; {cfg.MODEL_NAME} "
+            f"has no GPU decode. Use --decode npu."
+        )
+    from gemma4_prefill import Gemma4GpuDecode
+
+    # Built once and cached on the prefiller. The weights it moves to the iGPU
+    # -- 5.09 GiB, 0.55 s -- do not change between turns, so rebuilding per
+    # call spent that on every turn of a multi-turn session: measured 4842 ms
+    # for a turn against 5338 ms when rebuilt, a tenth of the latency for a
+    # transfer whose result was already sitting there.
+    #
+    # `max_L` is the prefiller's whole window rather than this turn's, so no
+    # turn can outgrow it and force a rebuild. Nothing else has to be reset:
+    # the KV lives in pages the prefill writes and this reads, so the new
+    # turn's context is already visible -- only `P`, which says how much of it
+    # is context, moves.
+    dec = getattr(prefiller, "_gpu_decoder", None)
+    if dec is None:
+        dec = Gemma4GpuDecode(prefiller, max_L=prefiller.max_seq)
+        prefiller._gpu_decoder = dec
+    eos = tuple(getattr(cfg, "EOS_IDS", ()) or ())
+    return dec.generate(first, args.max_tokens, eos=eos)
+
+
+def build_parser(doc, backends=("cpu", "npu", "hetero")):
+    """The example's arguments. `backends` is its prefill class's `PLACEMENT`
+    rows, which is what `--backend` chooses between."""
+    ap = argparse.ArgumentParser(description=doc)
+    ap.add_argument(
+        "--decode",
+        choices=("npu", "gpu"),
+        default="npu",
+        help="npu: mlir-air's fused decode, all layers in one dispatch. gpu: "
+        "Triton on the iGPU, token by token -- the hybrid half of a run whose "
+        "prefill is still on the NPU. Only Gemma4-E2B implements it.",
+    )
+    ap.add_argument(
+        "--prefill-engine",
+        choices=("auto", "triton", "air-fused"),
+        default="auto",
+        help="what runs the prefill. triton: this repository's prefill, its "
+        "operators placed by --backend and --ops. air-fused: mlir-air's "
+        "one-device chunked NPU prefill (tl.extra.npu.fused_prefill), handing "
+        "its KV to the decode the way the Triton prefill does; --backend, "
+        "--ops and --profile do not apply to it and are refused. auto "
+        "(default): air-fused where mlir-air has one for the model, except "
+        "with --interactive, which only hosts the Triton prefill; triton "
+        "otherwise.",
+    )
+    ap.add_argument(
+        "--backend",
+        choices=tuple(backends),
+        default=None,
+        help="where the Triton prefill's operators run (default: npu); needs "
+        "--prefill-engine triton on a model with a fused prefill. cpu: every "
+        "operator in torch on the host (this stack's own reference, not the "
+        "HuggingFace one examples/gpt2 calls reference). npu: the operators "
+        "--ops enables on the NPU, the rest in torch on the host. hetero: as "
+        "npu, but RoPE and attention as Triton kernels on the iGPU. The "
+        "model's PLACEMENT table has the per-operator detail. The decode's "
+        "device is --decode.",
+    )
+    ap.add_argument(
+        "--ops",
+        default=None,
+        help="NPU ops: all, or a comma-separated subset. Unset takes the "
+        "model's default, which is every operator with an NPU kernel unless "
+        "the model narrows it -- Gemma4-E2B leaves rms_norm on the host, see "
+        "`Gemma4Prefill.DEFAULT_OPS`.",
+    )
+    ap.add_argument("--prompt", default=None, help="token ids, comma separated")
+    ap.add_argument("--text", default=None, help="prompt text (needs transformers)")
+    ap.add_argument("--max-tokens", type=int, default=20)
+    ap.add_argument("--max-seq", type=int, default=256)
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--greedy", action="store_true")
+    ap.add_argument(
+        "--seq-len", type=int, default=2048, help="passed through to generate()"
+    )
+    ap.add_argument(
+        "--interactive",
+        action="store_true",
+        help="multi-turn chat REPL (/clear resets, /exit quits)",
+    )
+    ap.add_argument("--system", default=None, help="system prompt for --interactive")
+    ap.add_argument(
+        "--profile", action="store_true", help="per-operator prefill timing"
+    )
+    ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--top-k", type=int, default=5)
+    ap.add_argument("--top-p", type=float, default=0.9)
+    ap.add_argument(
+        "--prefill-only",
+        action="store_true",
+        help="run the prefill and check the gate, without the decode "
+        "(so it needs no `make compile-decode`)",
+    )
+    return ap
+
+
+def main(spec, cfg, prefill_cls, doc=None, argv=None):
+    """Run one model end to end.
+
+    Args:
+        spec: its `registry.ModelSpec`.
+        cfg: its `config` module -- N_LAYERS, PROMPT, EXPECT_FIRST.
+        prefill_cls: its prefill class, from `model.py`.
+    """
+    args = build_parser(doc, tuple(prefill_cls.PLACEMENT)).parse_args(argv)
+
+    # `--decode gpu` is implemented per model, and only Gemma4-E2B has one.
+    # Checked here rather than in `generate_on_gpu`, which runs after the
+    # weights have loaded -- minutes to say a flag combination was never going
+    # to work.
+    if args.decode == "gpu" and cfg.MODEL_NAME not in GPU_DECODE_MODELS:
+        raise SystemExit(
+            f"--decode gpu is implemented for "
+            f"{', '.join(sorted(GPU_DECODE_MODELS))} only; {cfg.MODEL_NAME} has "
+            f"none. Use --decode npu."
+        )
+
+    # The HSA runtime needs an AIE-capable ROCR in the process, and torch's HIP
+    # runs on the ROCR it ships with. One process holds one ROCR, so under HSA
+    # nothing may use the iGPU.
+    if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and (
+        args.decode == "gpu" or args.backend == "hetero"
+    ):
+        raise SystemExit(
+            "AMD_TRITON_NPU_RUNTIME=hsa cannot be combined with the iGPU "
+            "(--decode gpu, --backend hetero): the HSA runtime's ROCR and "
+            "torch's HIP cannot run in one process."
+        )
+
+    fused = fused_prefill_config(cfg)
+    asked = args.prefill_engine
+    if asked == "auto":
+        # Depends only on the model, and on --interactive: the interactive
+        # session builds its own prefiller and cannot host the fused one.
+        args.prefill_engine = (
+            "air-fused"
+            if fused is not None and not getattr(args, "interactive", False)
+            else "triton"
+        )
+    if args.prefill_engine == "air-fused":
+        # These only apply to the Triton prefill. Reject them instead of
+        # ignoring them, so a run cannot report on a configuration it did not
+        # use.
+        triton_only = [
+            flag
+            for flag, given in (
+                ("--backend", args.backend is not None),
+                ("--ops", args.ops is not None),
+                ("--profile", args.profile),
+            )
+            if given
+        ]
+        if triton_only:
+            why = "the default for this model" if asked == "auto" else "as asked"
+            raise SystemExit(
+                f"{', '.join(triton_only)} "
+                f"{'configures' if len(triton_only) == 1 else 'configure'} the "
+                f"Triton prefill, but "
+                f"the prefill engine is air-fused ({why}). Add --prefill-engine "
+                f"triton to run the Triton prefill."
+            )
+    args.backend = args.backend or "npu"
+    if args.prefill_engine == "air-fused":
+        if fused is None:
+            raise SystemExit(
+                f"--prefill-engine air-fused: mlir-air has no fused prefill "
+                f"for {cfg.MODEL_NAME}."
+            )
+        if getattr(args, "interactive", False):
+            raise SystemExit(
+                "--prefill-engine air-fused cannot be combined with --interactive "
+                "yet: the interactive session constructs its own prefiller."
+            )
+        prefill_cls = fused_prefill_cls(cfg, prefill_cls, fused)
+
+    # The interactive session comes from mlir-air and always drives its own
+    # fused NPU decoder; it never consults `--decode`. Accepting the pair would
+    # run a different decode than the one asked for and say nothing.
+    if args.decode == "gpu" and getattr(args, "interactive", False):
+        raise SystemExit(
+            "--decode gpu cannot be combined with --interactive: the "
+            "interactive session is mlir-air's and always uses its fused NPU "
+            "decode. Use --decode npu for a chat, or drop --interactive."
+        )
+
+    if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and not spec.supports_hsa:
+        # Checked before any weights load.
+        raise SystemExit(
+            f"AMD_TRITON_NPU_RUNTIME=hsa is not supported for {spec.name}: the "
+            f"HSA decode adapter has not been made to work with its driver "
+            f"(registry.ModelSpec.supports_hsa). Use the default XRT runtime."
+        )
+
+    if args.interactive and spec.driver_api != "npz":
+        # Before anything is imported or loaded: mlir-air's
+        # Session/interactive_chat pair exists only on the npz drivers. The
+        # prefiller ones ship their own `repl`, built around `generate_stream`
+        # and a decoder this harness constructs differently, so there is nothing
+        # to swap our prefill into. This is a property of the model, so say so
+        # before asking anyone to rebuild artifacts or wait for a weight load.
+        raise SystemExit(
+            f"--interactive is not supported for {spec.name}: mlir-air's driver "
+            f"for it exposes no Session/interactive_chat to host our prefill. "
+            f"Use --max-tokens for a single turn."
+        )
+
+    # Sized for the Triton prefill's bf16 weights. A dense fused prefill keeps
+    # them packed and loads no host copy; Gemma4's still does.
+    if not (args.prefill_engine == "air-fused" and fused.dense):
+        check_host_memory(spec)
+
+    air = None if args.prefill_only else air_inference_module(spec)
+
+    if air is not None:
+        # One model's artifacts under another's name decode to fluent nonsense
+        # rather than failing, so check before the decoder loads them.
+        decode_build.check_stamp(spec)
+
+    # On HSA the decode is ours too: mlir-air's decoder dispatches through
+    # pyxrt, and HSA needs the instruction stream patched per token instead.
+    # See hsa_decode.py.
+    if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and air is not None:
+        from hsa_decode import make_hsa_decoder_class
+
+        # Wrap whichever decoder this driver names (3B/8B are not FusedDecoder).
+        dc = spec.decoder_class or "FusedDecoder"
+        setattr(
+            air,
+            dc,
+            make_hsa_decoder_class(
+                air, airsrc.fused_decode_dir(spec.engine), dc, engine=spec.engine
+            ),
+        )
+
+    if args.interactive:
+        # Swap our prefill into mlir-air's Session, then hand off to its REPL.
+        air.Session = make_session_class(
+            air, prefill_cls, cfg, args.backend, args.ops, args.model
+        )
+        air.interactive_chat(
+            system=args.system,
+            seq_len=args.seq_len,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            greedy=args.greedy,
+        )
+        return 0
+
+    if args.text is not None:
+        from transformers import AutoTokenizer
+
+        ids = AutoTokenizer.from_pretrained(tokenizer_dir(air, spec)).encode(args.text)
+    elif args.prompt:
+        ids = [int(t) for t in args.prompt.split(",")]
+    else:
+        ids = list(cfg.PROMPT)
+
+    def gate(first):
+        """The canonical prompt's first token. Returns True if it holds."""
+        ok = first == cfg.EXPECT_FIRST
+        print(
+            f"[{args.prefill_engine}-prefill] first token {first} "
+            f"(expect {cfg.EXPECT_FIRST}) for {cfg.MODEL_NAME} "
+            f"-- {'PASS' if ok else 'FAIL'}",
+            flush=True,
+        )
+        return ok
+
+    if args.prefill_only:
+        first, _, _ = run_prefill(
+            prefill_cls,
+            cfg,
+            ids,
+            args.backend,
+            args.ops,
+            args.max_seq,
+            args.model,
+            None,
+            profile=args.profile,
+        )
+        if ids != list(cfg.PROMPT):
+            return 0
+        return 0 if gate(first) else 1
+
+    # Zero-copy: the prefill writes the decode's KV cache in place. On XRT it
+    # returns None when the XRT/HIP interop is missing, and the staged path
+    # below runs instead. Its loop is argmax only, so sampled runs and
+    # `--profile` take the staged path.
+    runtime = "hsa" if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" else "xrt"
+    if (
+        air is not None
+        and args.decode == "npu"
+        and args.greedy
+        and not args.profile
+        and (spec.supports_hsa if runtime == "hsa" else spec.supports_xrt_zero_copy)
+    ):
+        out = generate_zero_copy(air, spec, cfg, prefill_cls, args, ids, runtime)
+        if out is not None:
+            print(f"[e2e] ids {out}", flush=True)
+            if ids == list(cfg.PROMPT) and not gate(out[0]):
+                return 1
+            return _decode_gate(air, spec, cfg, args, ids, out)
+
+    # Only the npz drivers read a handoff file. Writing one for the others
+    # would be a large K/V dump nothing opens -- [N_LAYERS, P, DK] per tensor.
+    if spec.driver_api == "npz":
+        tmp = tempfile.NamedTemporaryFile(suffix=".npz", delete=False)
+        tmp.close()
+        kv_path = tmp.name
+    else:
+        kv_path = None
+    try:
+        t_pf = time.time()
+        first, P, prefiller = run_prefill(
+            prefill_cls,
+            cfg,
+            ids,
+            args.backend,
+            args.ops,
+            args.max_seq,
+            args.model,
+            kv_path,
+            profile=args.profile,
+            # A GPU decode reads the torch weights this would have released.
+            npu_resident=args.decode != "gpu",
+        )
+        ttft = time.time() - t_pf
+        # Stop rather than decode from a prefill already known to be wrong.
+        # Generation would still produce fluent text -- the decode is fed a KV
+        # cache, not a verdict -- so a caller reading the exit status would be
+        # told the run succeeded. --prefill-only gates the same way.
+        if ids == list(cfg.PROMPT) and not gate(first):
+            return 1
+
+        t0 = time.time()
+        if args.decode == "gpu":
+            out = generate_on_gpu(cfg, args, prefiller, first, ids)
+        elif spec.driver_api == "prefiller":
+            out = generate_via_prefiller(air, spec, cfg, args, ids, prefiller)
+        elif spec.driver_api == "kv_arrays":
+            out = generate_via_kv_arrays(
+                air, spec, cfg, args, ids, prefiller, first, ttft
+            )
+        else:
+            # The npz is already written, so the decode's own prefill step has
+            # nothing left to do. Everything after it -- seed_kv, the dispatch
+            # loop, sampling -- is mlir-air's, untouched.
+            air.run_prefill = lambda *a, **k: None
+            out = air.generate(
+                ids, args.max_tokens, args.seq_len, kv_path, greedy=args.greedy
+            )
+        dt = time.time() - t0
+        print(f"[e2e] {len(out)} tokens in {dt:.2f}s", flush=True)
+        print(f"[e2e] ids {out}", flush=True)
+
+        # The decode gate. Everything above this line is prefill: the
+        # first-token check cannot see the builder environment, -DMODEL_TYPE,
+        # GLU_SLICE, the core stack, or which driver API was used, because all
+        # of those live in the artifact this generation just ran.
+        rc = _decode_gate(air, spec, cfg, args, ids, out)
+    finally:
+        if kv_path is not None:
+            os.unlink(kv_path)
+    return rc
+
+
+def _decode_gate(air, spec, cfg, args, ids, out):
+    """Gate a generated sequence against the recorded continuation.
+
+    Factored out so the zero-copy path, which runs prefill and decode together
+    and cannot reach the npz block above, gates the same way. Returns the
+    process exit code (0 pass / 1 mismatch).
+
+    mlir-air's fused prefill computes in lower precision than the Triton one,
+    which moves a later greedy token on some models. Those record
+    `EXPECT_IDS_AIR_FUSED`, what mlir-air's own driver generates from the same
+    build; the rest gate on `EXPECT_IDS`.
+    """
+    golden = getattr(cfg, "EXPECT_IDS", None)
+    if getattr(args, "prefill_engine", None) == "air-fused":
+        golden = getattr(cfg, "EXPECT_IDS_AIR_FUSED", golden)
+    if golden and args.greedy and ids == list(cfg.PROMPT):
+        got = list(out)[: len(golden)]
+        if got != list(golden):
+            print(
+                f"[e2e] decode MISMATCH for {cfg.MODEL_NAME}\n"
+                f"  expected {list(golden)}\n"
+                f"  got      {got}",
+                flush=True,
+            )
+            return 1
+        print(
+            f"[e2e] decode ids match the recorded {len(golden)} for "
+            f"{cfg.MODEL_NAME} -- PASS",
+            flush=True,
+        )
+    try:
+        from transformers import AutoTokenizer
+
+        tk = AutoTokenizer.from_pretrained(tokenizer_dir(air, spec))
+        print(f"[e2e] {tk.decode(ids)!r} ->  {tk.decode(out)!r}", flush=True)
+    except Exception as e:  # tokenizer is a convenience, not the gate
+        print(f"[e2e] (no tokenizer: {e})", flush=True)
+    return 0
+
+
+def run(spec, cfg, prefill_cls, doc=None, argv=None):
+    """`main`, with the skip convention applied. For an example's __main__."""
+    try:
+        return main(spec, cfg, prefill_cls, doc=doc, argv=argv)
+    except ExampleUnavailable as e:
+        print(f"SKIP: {e}", flush=True)
+        return SKIP_EXIT_CODE

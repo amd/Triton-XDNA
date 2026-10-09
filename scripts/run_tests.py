@@ -28,9 +28,22 @@ DEFAULT_SKIPPED_EXAMPLES = {
     "gpt2",
     "qwen2_5",
     # Same as above, and additionally: the no-argument run generates, which
-    # needs a one-time `make compile-decode`. CI gates it on --prefill-only
-    # instead, in its own step, which needs no decode build.
+    # needs a one-time `make compile-decode`. CI runs them in their own step,
+    # with per-model arguments.
     "llama32_1b_q4nx",
+    "llama32_3b_q4nx",
+    "llama31_8b_q4nx",
+    "qwen3_4b_q4nx",
+    "qwen3_8b_q4nx",
+    "qwen25_7b_q4nx",
+    "qwen25_3b_q4nx",
+    "phi4_mini_q4nx",
+    "gemma3_4b_q4nx",
+    "gemma4_e2b_q4nx",
+    # Not an example: the harness the *_q4nx examples share. Its files are
+    # libraries, and the two with a __main__ are build steps -- running
+    # decode_build.py as a "test" lowers the whole decode.
+    "llm_q4nx",
 }
 
 # Examples that cannot run without a transform script on a given device, keyed
@@ -55,6 +68,15 @@ SCRIPTLESS_UNSUPPORTED = {
         "gpt2": "npu2-only example",
         "qwen2_5": "npu2-only example",
         "llama32_1b_q4nx": "npu2-only example",
+        "llama32_3b_q4nx": "npu2-only example",
+        "llama31_8b_q4nx": "npu2-only example",
+        "qwen3_4b_q4nx": "npu2-only example",
+        "qwen3_8b_q4nx": "npu2-only example",
+        "qwen25_7b_q4nx": "npu2-only example",
+        "qwen25_3b_q4nx": "npu2-only example",
+        "phi4_mini_q4nx": "npu2-only example",
+        "gemma3_4b_q4nx": "npu2-only example",
+        "gemma4_e2b_q4nx": "npu2-only example",
     },
     "aie2p": {},
 }

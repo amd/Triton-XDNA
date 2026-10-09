@@ -178,10 +178,122 @@ EXAMPLES = [
             "across iGPU and NPU."
         ),
     },
+    {
+        "kind": "model",
+        "name": "Llama-3.2-1B (Q4NX)",
+        "path": "llama32_1b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "End-to-end Llama-3.2-1B on the NPU: a Triton prefill built from "
+            "this repo's kernels, feeding mlir-air's fused Q4NX decode."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Llama-3.2-3B (Q4NX)",
+        "path": "llama32_3b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "The Llama-3.2-3B configuration of the same Triton-prefill / "
+            "AIR-decode split, sharing the llm_q4nx harness."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Llama-3.1-8B (Q4NX)",
+        "path": "llama31_8b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "The Llama-3.1-8B configuration of the same split. The same block "
+            "as the 1B -- SwiGLU, one norm pair, no qk-norm -- but 32 layers "
+            "of 4096 against the 1B's 16 of 2048, and an untied LM head."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Qwen3-4B (Q4NX)",
+        "path": "qwen3_4b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Qwen3-4B on the same Triton-prefill / AIR-decode split, and the "
+            "first Q4NX model here that is not Llama-shaped: each head is "
+            "RMS-normalized between the QKV projection and RoPE."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Qwen3-8B (Q4NX)",
+        "path": "qwen3_8b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Qwen3-4B's block at 4096, reusing its forward unchanged. What it "
+            "adds is size: an untied LM head, and a decode whose weights no "
+            "longer fit one buffer."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Qwen2.5-7B (Q4NX)",
+        "path": "qwen25_7b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Llama-shaped but for a bias on the q, k and v projections, which "
+            "nothing else here has. Its weights are not a bundle either: an "
+            "upstream checkpoint is quantized on load."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Qwen2.5-3B (Q4NX)",
+        "path": "qwen25_3b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Qwen2.5-7B's block at 2048, on the same biased-QKV forward. The "
+            "only model here whose decode runs with the dual-channel weight "
+            "feed off."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Phi-4-mini (Q4NX)",
+        "path": "phi4_mini_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Llama-shaped but for the rotation: RoPE covers 96 of each head's "
+            "128 lanes, on frequencies read from a LongRoPE table in the "
+            "bundle. The first model here whose delta is in the operator."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Gemma3-4B (Q4NX)",
+        "path": "gemma3_4b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Gemma3-4B on the same split, and the furthest from the Llama "
+            "block: a four-norm sandwich, two RoPE thetas chosen per layer, a "
+            "1024-token sliding window, and a GELU-tanh GLU."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Gemma4-E2B (Q4NX)",
+        "path": "gemma4_e2b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Gemma3's block plus per-layer embeddings, layers that differ in "
+            "shape from each other, and twenty that carry no KV cache of "
+            "their own. The only model here whose decode runs on mlir-air's "
+            "per-layer-embedding engine rather than the shared one."
+        ),
+    },
 ]
 
-# Directories to ignore when verifying registry completeness
-VERIFY_IGNORE = {"__pycache__"}
+# Directories under examples/ that are not examples. Keep in step with
+# DEFAULT_SKIPPED_EXAMPLES in scripts/run_tests.py, which already excludes
+# llm_q4nx for the same reason: it is the harness the *_q4nx examples share,
+# its files are libraries, and the two with a __main__ are build steps.
+VERIFY_IGNORE = {"__pycache__", "llm_q4nx"}
 
 
 def get_device_support(example_dir):
@@ -368,5 +480,7 @@ if __name__ == "__main__":
 
     content = generate_readme(base_url=args.base_url)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(content)
+    # Explicit encoding: the dashboard is full of status emoji, and the
+    # platform default (cp1252 on Windows) cannot represent them.
+    args.output.write_text(content, encoding="utf-8")
     print(f"Generated {args.output}")

@@ -6,7 +6,9 @@ import functools
 import hashlib
 import json
 import logging
+import re
 import tempfile
+import threading
 import sys
 import functools
 
@@ -37,8 +39,52 @@ from .codegen import (
     format_of,
     ty_to_cpp,
 )
+from .transform_inject import _inject_transform_library
 
 IS_WINDOWS = sys.platform == "win32"
+
+
+def _make_active_driver_per_thread():
+    """Keep Triton's active driver per thread instead of per process.
+
+    Triton holds one active driver for the whole process, and a hetero model
+    switches it per scope: the NPU driver around NPU launches and NPUChain
+    warmups, the AMD one around iGPU work. With those in two threads, a switch
+    in one thread changes the backend the other compiles and launches for.
+
+    Triton's ``DriverConfig`` keeps the choice in ``_active``. Its one instance
+    gets a subclass that keeps the choice in a ContextVar instead. A thread
+    that has not chosen a driver since then sees the one that was active
+    process-wide when this ran.
+
+    Called from ``NPUDriver.__init__``, which every switch to the NPU goes
+    through, rather than at import: this module is imported while Triton is
+    still discovering backends, before ``triton.runtime.driver`` can load.
+    """
+    import contextvars
+
+    from triton.runtime.driver import driver as config
+
+    if getattr(type(config), "per_thread", False):
+        return
+    unset = object()
+    active = contextvars.ContextVar("triton_active_driver", default=unset)
+    shared = config.__dict__.pop("_active", None)
+
+    class PerThreadDriverConfig(type(config)):
+        per_thread = True
+
+        @property
+        def _active(self):
+            driver = active.get()
+            return shared if driver is unset else driver
+
+        @_active.setter
+        def _active(self, driver):
+            active.set(driver)
+
+    config.__class__ = PerThreadDriverConfig
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.CRITICAL)
@@ -616,6 +662,99 @@ def _run_compile(cmd, env=None):
         raise subprocess.CalledProcessError(
             result.returncode, cmd, output=result.stdout
         )
+
+
+_npu_wait = None
+_npu_wait_lock = threading.Lock()
+
+
+def npu_wait_module():
+    """The ``npu_wait`` extension, built once and cached; None where unusable.
+
+    Its ``wait(run)`` is ``pyxrt.run.wait2`` with the GIL released, so other
+    Python threads, such as one driving the iGPU, keep running while the NPU
+    executes. See ``include/NpuWait/NpuWait.cpp`` for how it reaches the
+    ``xrt::run`` and when pyxrt declines to hand it over. Linux only: the
+    Windows pyxrt is built by MSVC, whose ABI id the helper does not form.
+    """
+    global _npu_wait
+    # Locked so that a thread arriving mid-build waits for the result rather
+    # than reading an unfinished one: the build releases the GIL.
+    with _npu_wait_lock:
+        if _npu_wait is None:
+            module = False
+            if not IS_WINDOWS:
+                try:
+                    module = _build_npu_wait()
+                except Exception as e:  # noqa: BLE001 -- fall back to pyxrt's wait
+                    logger.warning(
+                        "npu_wait unavailable, NPU waits hold the GIL: %s", e
+                    )
+            _npu_wait = module
+    return _npu_wait or None
+
+
+def _build_npu_wait():
+    import sysconfig
+    import importlib.machinery
+
+    include_dir = os.path.join(Path(__file__).resolve().parent, "include")
+    src_path = os.path.join(include_dir, "NpuWait", "NpuWait.cpp")
+    xrt_dir = _get_xrt_path()
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    gxx = subprocess.run(
+        ["g++", "-dumpfullversion"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    with open(src_path, "rb") as f:
+        key_src = f.read() + f"_xrt_{xrt_dir}_{suffix}_gxx_{gxx}_npuwait".encode()
+    cache = get_cache_manager(hashlib.md5(key_src).hexdigest())
+    name = "npu_wait" + suffix
+    path = cache.get_file(name)
+    if path is None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, name)
+            _run_compile(
+                [
+                    "g++",
+                    "-std=c++17",
+                    "-shared",
+                    "-fPIC",
+                    "-O2",
+                    src_path,
+                    f"-I{sysconfig.get_paths()['include']}",
+                    f"-I{os.path.join(xrt_dir, 'include')}",
+                    f"-L{os.path.join(xrt_dir, 'lib')}",
+                    f"-Wl,-rpath,{os.path.join(xrt_dir, 'lib')}",
+                    "-lxrt_coreutil",
+                    "-o",
+                    out_path,
+                ]
+            )
+            with open(out_path, "rb") as f:
+                path = cache.put(f.read(), name, binary=True)
+    loader = importlib.machinery.ExtensionFileLoader("npu_wait", path)
+    spec = importlib.util.spec_from_file_location("npu_wait", path, loader=loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    # pybind11 before 3.0 names g++'s ABI version in the spelling, and pyxrt
+    # may come from another g++ release than this one. pybind11 3.0 counts
+    # every 1xxx version as one ABI, so pyxrt's own spelling is offered too.
+    for abi in pyxrt_abi_ids():
+        if re.fullmatch(r"_gcc_libstdcpp_cxxabi1\d{3}", abi):
+            mod.add_abi_id(abi)
+    return mod
+
+
+def pyxrt_abi_ids():
+    """The platform ABI ids pyxrt's pybind11 was built for, from its internals key."""
+    import pyxrt
+
+    with open(pyxrt.__file__, "rb") as f:
+        found = re.findall(rb"__pybind11_internals_v\d+(_\w+?)__", f.read())
+    # From pybind11 3.0 the key puts an underscore before an id that does not
+    # start with one ("system_..."); before it the id itself starts with one.
+    ids = {k.decode() for k in found}
+    return sorted(i[1:] if i.startswith("_system") else i for i in ids)
 
 
 def _build_hsa_runtime_lib(include_dir: str, rocr: _RocrInstall) -> str:
@@ -1197,168 +1336,6 @@ def _extract_elf_kernel_name(config_json_path):
     return f"{last_kernel['name']}:{instance_id}"
 
 
-def _inject_transform_library(user_script):
-    """
-    Process library references in a user transform script.
-
-    Two mechanisms:
-    1. transform.include calls are expanded inline (parameter substitution,
-       SSA renaming) to avoid segfaults in mlir-air's transform interpreter
-       when resolving transform.include across region boundaries.
-    2. foreach_match @name symbol references are resolved by injecting the
-       referenced named_sequence definitions into the module (these cannot
-       be inlined because foreach_match resolves symbols at runtime).
-
-    Args:
-        user_script: The user's transform script as a string
-
-    Returns:
-        str: The processed script
-    """
-    has_includes = "transform.include" in user_script
-    has_foreach_match = "foreach_match" in user_script
-    if not has_includes and not has_foreach_match:
-        return user_script
-
-    # Load library content from transform_library/ directory
-    lib_dir = os.path.join(os.path.dirname(__file__), "transform_library")
-    if not os.path.isdir(lib_dir):
-        return user_script
-    parts = []
-    for fname in sorted(os.listdir(lib_dir)):
-        if fname.endswith(".mlir"):
-            with open(os.path.join(lib_dir, fname), "r") as f:
-                parts.append(f.read())
-    lib_content = "\n".join(parts)
-
-    import re
-
-    # Parse all named sequences: full text (for injection) and decomposed (for inlining)
-    full_seq_pattern = re.compile(
-        r"((?://[^\n]*\n)*"
-        r"transform\.named_sequence\s+@(\w+)\s*\([^)]*\)"
-        r"(?:\s*->\s*!transform\.any_op)?"
-        r"\s*\{.*?\n\})",
-        re.DOTALL,
-    )
-    full_sequences = {}
-    for m in full_seq_pattern.finditer(lib_content):
-        full_sequences[m.group(2)] = m.group(1)
-
-    # Parse inlinable sequences (readonly or consumed param, for transform.include)
-    inline_seq_pattern = re.compile(
-        r"transform\.named_sequence\s+@(\w+)\s*\(\s*"
-        r"%(\w+)\s*:\s*!transform\.any_op\s*\{transform\.(?:readonly|consumed)\}\s*\)"
-        r"(\s*->\s*!transform\.any_op)?"
-        r"\s*\{(.*?)\n\}",
-        re.DOTALL,
-    )
-    sequences = {}
-    for match in inline_seq_pattern.finditer(lib_content):
-        name = match.group(1)
-        param = match.group(2)
-        has_result = match.group(3) is not None
-        body = match.group(4)
-        sequences[name] = (param, body, has_result)
-
-    if not sequences and not full_sequences:
-        return user_script
-
-    # Inline transform.include calls to avoid mlir-air segfaults
-    include_pattern = re.compile(
-        r"(?:(%\w+)\s*=\s*)?"
-        r"transform\.include\s+@(\w+)\s+"
-        r"failures\(\w+\)\s*"
-        r"\((%\w+)\)\s*"
-        r":\s*\(!transform\.any_op\)\s*->\s*"
-        r"(?:!transform\.any_op|\(\s*\))"
-    )
-
-    _counter = [0]
-
-    def _expand(text, depth=0):
-        if depth > 20 or "transform.include" not in text:
-            return text
-
-        def _replace_include(m):
-            result_var = m.group(1)
-            seq_name = m.group(2)
-            actual_arg = m.group(3)
-
-            if seq_name not in sequences:
-                return m.group(0)
-
-            param, body, has_result = sequences[seq_name]
-            expanded = body.replace(f"%{param}", actual_arg)
-
-            yield_match = re.search(
-                r"transform\.yield(?:\s+(%\w+)\s*:\s*!transform\.any_op)?",
-                expanded,
-            )
-            if yield_match:
-                yielded_var = yield_match.group(1)
-                expanded = expanded[: yield_match.start()].rstrip()
-                if result_var and yielded_var:
-                    expanded = expanded.replace(yielded_var, result_var)
-
-            suffix = f"_lib{_counter[0]}"
-            _counter[0] += 1
-            local_vars = set(re.findall(r"%(\w+)", expanded))
-            actual_name = actual_arg.lstrip("%")
-            result_name = result_var.lstrip("%") if result_var else ""
-            skip = {actual_name, result_name, "__", ""}
-            for var in local_vars:
-                if var not in skip and not var.startswith("_lib"):
-                    expanded = re.sub(
-                        rf"(?<!\w)%{re.escape(var)}(?!\w)",
-                        f"%{var}{suffix}",
-                        expanded,
-                    )
-
-            return expanded
-
-        text = include_pattern.sub(_replace_include, text)
-        return _expand(text, depth + 1)
-
-    result = _expand(user_script) if has_includes else user_script
-
-    # Inject named sequences referenced by foreach_match (symbol references
-    # that cannot be inlined — they must exist as definitions in the module).
-    if has_foreach_match or "foreach_match" in result:
-        all_refs = set(re.findall(r"@(\w+)", result))
-        all_refs.discard("__transform_main")
-        # Transitively resolve dependencies
-        needed = set()
-        worklist = [n for n in all_refs if n in full_sequences]
-        while worklist:
-            name = worklist.pop()
-            if name in needed:
-                continue
-            needed.add(name)
-            for dep in re.findall(r"@(\w+)", full_sequences[name]):
-                if dep in full_sequences and dep not in needed:
-                    worklist.append(dep)
-        # Inject definitions for all unresolved @name references
-        # (matchers/actions referenced by foreach_match, plus their deps)
-        if needed:
-            module_marker = "module attributes {transform.with_named_sequence} {"
-            idx = result.find(module_marker)
-            if idx != -1:
-                insert_pos = idx + len(module_marker)
-                injection = "\n\n".join(
-                    full_sequences[n] for n in full_sequences if n in needed
-                )
-                result = (
-                    result[:insert_pos]
-                    + "\n\n"
-                    + injection
-                    + "\n\n"
-                    + result[insert_pos:]
-                )
-
-    return result
-
-
 def _detect_matmul(asm_src_text):
     """Detect a single plain matmul in the TritonShared IR.
 
@@ -1366,6 +1343,12 @@ def _detect_matmul(asm_src_text):
     exactly one ``linalg.matmul`` and no linalg compute ops other than
     ``fill`` (fused epilogues are out of scope). Returns None otherwise, in
     which case the caller keeps the built-in default tiling.
+
+    A ``tt.dot`` carrying a live accumulator is declined: it lowers to a
+    contraction plus a ``linalg.generic`` add, which fails the subset test
+    above. ``@fold_add_into_matmul_init`` removes that generic, but schedules
+    are selected after this runs, so such a kernel needs an explicit
+    ``transform_script``.
     """
     import re
 
@@ -1507,7 +1490,10 @@ def _get_transform_ir_string(matmul_info=None):
         from .matmul_transform import generate_matmul_transform
 
         logger.debug("Auto-generating matmul transform with params: %s", matmul_info)
-        script = generate_matmul_transform(**matmul_info)
+        # The generated schedule opens with a transform.include, so it needs
+        # the same library inlining a user script gets. Without it the parse
+        # fails on an unresolved symbol.
+        script = _inject_transform_library(generate_matmul_transform(**matmul_info))
         try:
             air_proj_path = npu_config.air_project_path
             os.makedirs(air_proj_path, exist_ok=True)
@@ -1529,22 +1515,22 @@ def _get_transform_ir_string(matmul_info=None):
           transform.named_sequence @__transform_main(%arg1: !transform.any_op {{transform.readonly}}) {{
                 %mul = transform.structured.match ops{{["linalg.mul"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
                 %mul_1, %loop = transform.air.linalg_tile %mul [{elemwise_tiling_size_l1_m}, {elemwise_tiling_size_l1_n}]
-                transform.air.linalg_promote %mul_1 {{"operands_to_promote"=[2], "memory_space"="L1"}} : (!transform.any_op) -> !transform.any_op
-                transform.air.linalg_promote %mul_1 {{"operands_to_promote"=[0,1], "memory_space"="L1"}} : (!transform.any_op) -> !transform.any_op
+                transform.air.linalg_promote %mul_1 <{{"operands_to_promote"=[2], "memory_space"="L1"}}> : (!transform.any_op) -> !transform.any_op
+                transform.air.linalg_promote %mul_1 <{{"operands_to_promote"=[0,1], "memory_space"="L1"}}> : (!transform.any_op) -> !transform.any_op
 
                 %add = transform.structured.match ops{{["linalg.add"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
                 %add_1, %add_loop = transform.air.linalg_tile %add [{elemwise_tiling_size_l1_m}, {elemwise_tiling_size_l1_n}]
-                transform.air.linalg_promote %add_1 {{"operands_to_promote"=[2], "memory_space"="L1"}} : (!transform.any_op) -> !transform.any_op
-                transform.air.linalg_promote %add_1 {{"operands_to_promote"=[0,1], "memory_space"="L1"}} : (!transform.any_op) -> !transform.any_op
+                transform.air.linalg_promote %add_1 <{{"operands_to_promote"=[2], "memory_space"="L1"}}> : (!transform.any_op) -> !transform.any_op
+                transform.air.linalg_promote %add_1 <{{"operands_to_promote"=[0,1], "memory_space"="L1"}}> : (!transform.any_op) -> !transform.any_op
 
                 %matmul = transform.structured.match ops{{["linalg.matmul"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
                 %fill = transform.structured.match ops{{["linalg.fill"]}} in %arg1  : (!transform.any_op) -> !transform.any_op
                 %matmul_1, %matmul_loop = transform.air.linalg_tile %matmul [{matmul_tiling_size_l1_m}, {matmul_tiling_size_l1_n}]
                 %fill_1 = transform.air.fuse_into_containing_op %fill into %matmul_loop : (!transform.any_op, !transform.any_op) -> !transform.any_op
-                transform.air.linalg_promote %fill_1 {{"operands_to_promote"=[1], "memory_space"="L1"}} : (!transform.any_op) -> !transform.any_op
-                transform.air.linalg_promote %matmul_1 {{"operands_to_promote"=[2], "memory_space"="L1"}} : (!transform.any_op) -> !transform.any_op
+                transform.air.linalg_promote %fill_1 <{{"operands_to_promote"=[1], "memory_space"="L1"}}> : (!transform.any_op) -> !transform.any_op
+                transform.air.linalg_promote %matmul_1 <{{"operands_to_promote"=[2], "memory_space"="L1"}}> : (!transform.any_op) -> !transform.any_op
                 %matmul_2, %reduction_loop = transform.air.linalg_tile %matmul_1 [0, 0, {matmul_tiling_size_l1_k}]
-                transform.air.linalg_promote %matmul_2 {{"operands_to_promote"=[0,1], "memory_space"="L1"}} : (!transform.any_op) -> !transform.any_op
+                transform.air.linalg_promote %matmul_2 <{{"operands_to_promote"=[0,1], "memory_space"="L1"}}> : (!transform.any_op) -> !transform.any_op
             transform.yield
           }}
         }}
@@ -1639,6 +1625,7 @@ def _generate_launcher(constants, signature, kernel_name):
 #include <cstdlib>
 #include <ctime>
 #include <sstream>
+#include <string>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -1664,7 +1651,7 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 }}
 
 // Call to XRT goes here:
-static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {arg_decls}) {{
+static void _launch(std::string &err, int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
     try {{
 
@@ -1779,8 +1766,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
         std::cout << "Launch finished." << std::endl;
 
     }} catch (const std::exception& e) {{
-        std::string msg = std::string("XRT runtime error: ") + e.what();
-        PyErr_SetString(PyExc_RuntimeError, msg.c_str());
+        err = std::string("XRT runtime error: ") + e.what();
     }}
   }}
 }}
@@ -1812,7 +1798,16 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
   {"; ".join([f"long nelem{i} = getNumElements(_arg{i}); long ebytes{i} = getElementSizeInBytes(_arg{i}); if (nelem{i} == -1 || ebytes{i} == -1) return NULL; long tensor_volume{i} = nelem{i} * ebytes{i};" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  _launch(gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+  // The device work runs without the GIL, as a GPU wait does, so other
+  // Python threads keep running while the NPU executes.
+  std::string launch_err;
+  Py_BEGIN_ALLOW_THREADS
+  _launch(launch_err, gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+  Py_END_ALLOW_THREADS
+  if (!launch_err.empty()) {{
+    PyErr_SetString(PyExc_RuntimeError, launch_err.c_str());
+    return NULL;
+  }}
 
   if (PyErr_Occurred()) {{
     return NULL;
@@ -1899,7 +1894,9 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -1947,10 +1944,17 @@ static Session& session() {{
     return s;
 }}
 
+// Launches run without the GIL, so two threads can reach the same session.
+static std::mutex& session_mutex() {{
+    static std::mutex m;
+    return m;
+}}
+
 // Give the session back. The device is kept: opening it costs ~11 ms and it is
 // not rationed, so there is nothing to gain by releasing it. Everything built
 // from it goes, innermost first, and the next launch rebuilds what it needs.
 static PyObject* py_release_session(PyObject* self, PyObject* args) {{
+    std::lock_guard<std::mutex> lock(session_mutex());
     Session& s = session();
     {' '.join(f's.bo_{i} = xrt::bo(); s.cap{i} = -1;' for i, ty in ptr_args)}
     s.kernel = xrt::kernel();
@@ -1968,6 +1972,7 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
         return NULL;
     }}
 
+    std::lock_guard<std::mutex> lock(session_mutex());
     strncpy(elf_path, elf, sizeof(elf_path) - 1);
     elf_path[sizeof(elf_path) - 1] = '\\0';
     strncpy(elf_kernel_name, kname, sizeof(elf_kernel_name) - 1);
@@ -1977,7 +1982,8 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 }}
 
 // ELF-based XRT launch:
-static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in ptr_args)}, {arg_decls}) {{
+static void _launch(std::string &err, int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in ptr_args)}, {arg_decls}) {{
+  std::lock_guard<std::mutex> lock(session_mutex());
   if (gridX*gridY*gridZ > 0) {{
     try {{
 
@@ -2043,8 +2049,7 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
         std::cout << "Launch finished." << std::endl;
 
     }} catch (const std::exception& e) {{
-        std::string msg = std::string("XRT runtime error: ") + e.what();
-        PyErr_SetString(PyExc_RuntimeError, msg.c_str());
+        err = std::string("XRT runtime error: ") + e.what();
     }}
   }}
 }}
@@ -2076,7 +2081,16 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
   {"; ".join([f"long nelem{i} = getNumElements(_arg{i}); long ebytes{i} = getElementSizeInBytes(_arg{i}); if (nelem{i} == -1 || ebytes{i} == -1) return NULL; long tensor_volume{i} = nelem{i} * ebytes{i};" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  _launch(gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+  // The device work runs without the GIL, as a GPU wait does, so other
+  // Python threads keep running while the NPU executes.
+  std::string launch_err;
+  Py_BEGIN_ALLOW_THREADS
+  _launch(launch_err, gridX, gridY, gridZ, {', '.join(f"tensor_volume{i}" for i, ty in signature.items() if i not in constants and ty[0]=="*")}, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+  Py_END_ALLOW_THREADS
+  if (!launch_err.empty()) {{
+    PyErr_SetString(PyExc_RuntimeError, launch_err.c_str());
+    return NULL;
+  }}
 
   if (PyErr_Occurred()) {{
     return NULL;
@@ -2356,6 +2370,18 @@ def _release_all_sessions(keep=None):
         del _live_sessions[key]
 
 
+#: Callables that release hardware contexts held outside this backend by an
+#: owner that reopens them on its next use, such as mlir-air's fused prefill
+#: between prompts. Each returns whether it released any. Tried when the device
+#: refuses a context to a launch or an ``NPUChain``.
+context_releasers = []
+
+
+def release_external_contexts():
+    """Run every ``context_releasers`` entry. True if any released a context."""
+    return any([release() for release in context_releasers])
+
+
 # What the driver reports when no hw_context is available. Matched on text
 # because XRT raises a plain std::runtime_error here, with no error code to
 # test; a miss only costs the retry, since the exception is re-raised either
@@ -2377,6 +2403,7 @@ def _launch_with_session(key, mod, *launch_args):
         # if it still fails, the device is genuinely full and the caller
         # should hear about it.
         logger.debug("no hw_context available; releasing %d", len(_live_sessions))
+        release_external_contexts()
         _release_all_sessions(keep=key)
         mod.release_session()
         return mod.launch(*launch_args)
@@ -2555,6 +2582,16 @@ def compile_module(
         npu_version = detect_npu_version(link_profile)
         key_data = (
             str(air_output)
+            # This cache holds the compiled launcher, and the AIR IR above does
+            # not determine it: the launcher is generated from the kernel's
+            # signature and constants, and a constexpr that folds to a value an
+            # existing one already had lowers to byte-identical IR while
+            # changing the launcher's arity. Without this the stale .so is
+            # reused and called with the wrong number of arguments -- surfacing
+            # as "function takes exactly N arguments (N+1 given)" from a module
+            # the caller never built, only for those with a warm cache, so it
+            # reproduces on upgrade and never in CI.
+            + f"_launcher_{hashlib.md5(launcher_src.encode()).hexdigest()}"
             + f"_timing_{autotune_time}"
             + f"_format_{output_format}"
             + f"_link_{link_profile}"
@@ -2934,6 +2971,7 @@ class NPUDriver(DriverBase):
         var, itself defaulting to ``"xrt"``), so ``NPUDriver()`` honors the
         environment while ``NPUDriver("hsa")`` / ``NPUDriver("xrt")`` force it.
         """
+        _make_active_driver_per_thread()
         super().__init__()
         if runtime is None:
             # Already validated + normalized by the config property.

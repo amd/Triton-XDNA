@@ -39,6 +39,7 @@ def generate_matmul_transform(
     l1_m: int = 64,
     l1_n: int = 64,
     l2_k: int = 64,
+    l1_k: int = None,
     pack_sizes: tuple = (8, 8, 8),
     accum_type: str = "f32",
     contract_input_type: str = None,
@@ -52,8 +53,15 @@ def generate_matmul_transform(
             block.
         l1_n: Per-core L1 tile size in raw N elements. Must be divisible
             by pack_sizes[1].
-        l2_k: L3-to-L2 copy tile size along K dimension. Also determines
-            the K-reduction tile in packed space (l2_k // pack_sizes[2]).
+        l2_k: L3-to-L2 copy tile size along K dimension, and the outer
+            K-reduction tile in packed space (l2_k // pack_sizes[2]).
+        l1_k: Per-core K tile, mlir-air's `tile_k_l1` against its `tile_k_l2`.
+            Defaults to `l2_k`, which emits exactly the single-level schedule.
+            Splitting needs K tiled TWICE, in order: tile at `l2_k`, fuse the
+            packs into that loop, then tile the remainder at `l1_k` and fuse
+            the packs down again. Tiling once at `l1_k` leaves the packs a
+            level from their loop ("operations cannot be fused"). Needs
+            mlir-air #2029, which the pin includes.
         pack_sizes: Pack sizes for (M, N, K) dimensions matching the
             hardware MAC shape. Note the orderings differ: a MAC shape is
             written (M, K, N), so (4, 4, 8) here is a 4x8 x 8x4 -> 4x4 MAC.
@@ -90,7 +98,34 @@ def generate_matmul_transform(
     forall_l1_m = l1_m // pack_m
     forall_l1_n = l1_n // pack_n
     packed_k_tile = l2_k // pack_k
+    if l1_k is None:
+        l1_k = l2_k
+    assert l2_k % l1_k == 0 and l1_k % pack_k == 0, (l2_k, l1_k, pack_k)
+    packed_k_tile_l1 = l1_k // pack_k
+    l1_k_param = f"l1_k={l1_k}, " if l1_k != l2_k else ""
+    # A pack fuses down ONE level at a time, so a second K level needs a second
+    # fuse before Phase 5 can pull the packs into the herd forall. Emitted only
+    # when the levels differ, so l1_k == l2_k keeps the IR byte-identical.
+    lhs_pack, rhs_pack, k_l1_tiling = "%fused_lhs_l1_pack", "%fused_rhs_l1_pack", ""
+    if packed_k_tile_l1 != packed_k_tile:
+        lhs_pack, rhs_pack = "%fused_lhs_l1_pack_l1", "%fused_rhs_l1_pack_l1"
+        k_l1_tiling = f"""
+        // Inner K tile: {l1_k} raw K elements per core reduction step, inside
+        // the {l2_k}-deep L2 reduction the packs were just fused into.
+        %tiled_reduction_l1, %inner_k_loop =
+          transform.structured.tile_using_for %tiled_reduction tile_sizes [0, 0, {packed_k_tile_l1}]
+          : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+        transform.annotate %inner_k_loop "k_l1_loop" : !transform.any_op
 
+        {lhs_pack}, %4 = transform.structured.fuse_into_containing_op %fused_lhs_l1_pack into %inner_k_loop : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+        {rhs_pack}, %5 = transform.structured.fuse_into_containing_op %fused_rhs_l1_pack into %inner_k_loop : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+"""
+
+    unpack_match = (
+        '        %unpack_op = transform.structured.match ops{["linalg.unpack"]}'
+        " in %arg1 : (!transform.any_op) -> !transform.any_op\n"
+    )
+    unpack_target = "%unpack_op"
     # Contract input type cast: cast vector.contract inputs 0,1 to the
     # target type. This matches the hardware MAC unit's native input type.
     # - bf16 matmul: inputs stay bf16 (no cast needed)
@@ -104,12 +139,56 @@ def generate_matmul_transform(
         // Cast vector.contract inputs 0,1 to {contract_input_type}
         // (matches hardware MAC unit native input type)
         %vector_contracts_2 = transform.structured.match ops{{["vector.contract"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %result11b = transform.air.vector_type_cast %vector_contracts_2 {{target_element_type = {contract_input_type}, input_indices = [0, 1], output_indices = []}} : (!transform.any_op) -> !transform.any_op
+        %result11b = transform.air.vector_type_cast %vector_contracts_2 <{{target_element_type = {contract_input_type}, input_indices = [0, 1], output_indices = []}}> : (!transform.any_op) -> !transform.any_op
+"""
+
+    # The compute herd's inner loop: 2x2 register blocking over the packed
+    # contraction, then both loops unrolled, so four `vector.contract` share
+    # their operand loads. Built here, after `input_cast`, because it
+    # interpolates it.
+    matmul_vector_tiling = """\
+        %generic2 = transform.structured.match ops{["linalg.generic"]} attributes{matmul_compute} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %inner_most_generics, %vec_loops:3 =
+          transform.structured.tile_using_for %generic2 tile_sizes [2, 2, 1, 0, 0, 0]
+          : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+
+        %inner_most_matmul_to_unroll, %vec_loops_to_unroll:2 =
+          transform.structured.tile_using_for %inner_most_generics tile_sizes [1, 1, 0, 0, 0, 0]
+          : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+        transform.loop.unroll %vec_loops_to_unroll#1 factor = 2 : !transform.any_op
+        transform.loop.unroll %vec_loops_to_unroll#0 factor = 2 : !transform.any_op
+
+"""
+    # Phase 10 takes every herd; there is no herd to leave alone.
+    herd_vectorize_filter = ""
+    phase_11_12 = f"""\
+    //==========================================================================
+    // PHASE 11: HOIST LOOP-INVARIANT VECTOR TRANSFERS
+    //==========================================================================
+
+        %herd2_1 = transform.structured.match ops{{["air.herd"]}} attributes{{compute_herd}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %scf_fors_1 = transform.structured.match ops{{["scf.for"]}} in %herd2_1 : (!transform.any_op) -> !transform.any_op
+        %innermost_for, %outer_fors = transform.split_handle %scf_fors_1 overflow_result = 1 : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+
+        // Cast accumulator (input[2]) and output[0] to {accum_type}
+        %vector_contracts = transform.structured.match ops{{["vector.contract"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %result11 = transform.air.vector_type_cast %vector_contracts <{{target_element_type = {accum_type}, input_indices = [2], output_indices = [0]}}> : (!transform.any_op) -> !transform.any_op
+{input_cast}\
+
+        %innermost_for_updated_3 = transform.air.hoist_loop_invariant_transfers %herd2_1, %innermost_for : (!transform.any_op, !transform.any_op) -> !transform.any_op
+
+    //==========================================================================
+    // PHASE 12: FINAL LOOP OPTIMIZATIONS
+    //==========================================================================
+
+        %innermost_for_updated_4 = transform.air.flatten_for_iter_args %innermost_for_updated_3 : (!transform.any_op) -> !transform.any_op
+        %innermost_for_updated_5 = transform.air.hoist_vector_transfer_pointers %innermost_for_updated_4 : (!transform.any_op) -> !transform.any_op
+
 """
 
     return f"""\
 // Auto-generated by matmul_transform.py — do not edit manually.
-// Parameters: l1_m={l1_m}, l1_n={l1_n}, l2_k={l2_k}, \
+// Parameters: l1_m={l1_m}, l1_n={l1_n}, l2_k={l2_k}, {l1_k_param}\
 pack=[{pack_m},{pack_n},{pack_k}], accum={accum_type}, contract_in={contract_input_type}
 //
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -117,6 +196,16 @@ pack=[{pack_m},{pack_n},{pack_k}], accum={accum_type}, contract_in={contract_inp
 
 module attributes {{transform.with_named_sequence}} {{
   transform.named_sequence @__transform_main(%arg1: !transform.any_op {{transform.readonly}}) {{
+
+    //==========================================================================
+    // PHASE 0: FOLD A TRAILING ADD INTO THE CONTRACTION'S ACCUMULATOR
+    // A `tt.dot` that carries a live accumulator arrives as a contraction into
+    // a zero fill plus a separate add; every phase below assumes the folded
+    // form. A no-op otherwise. See transform_library/fold_add.mlir.
+    //==========================================================================
+
+        transform.include @fold_add_into_matmul_init failures(propagate) (%arg1)
+          : (!transform.any_op) -> ()
 
     //==========================================================================
     // PHASE 1: TILE L3->L2 MEMORY COPIES
@@ -143,7 +232,7 @@ module attributes {{transform.with_named_sequence}} {{
 
         %result_l2 = transform.structured.match ops{{["linalg.fill"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
         %result_l2_buffer, %result_t2_new = transform.structured.bufferize_to_allocation %result_l2
-            {{memory_space = 1, bufferize_destination_only, mempcy = "linalg.copy", emit_dealloc}} : !transform.any_op
+            <{{memory_space = 1, bufferize_destination_only, emit_dealloc}}> : !transform.any_op
 
     //==========================================================================
     // PHASE 3: PACK MATMUL FOR VECTORIZED COMPUTATION
@@ -180,7 +269,7 @@ module attributes {{transform.with_named_sequence}} {{
 
         // Promote C pack to L1
         %output_l1_pack_op_source_buffer, %output_l1_pack_op_new = transform.structured.bufferize_to_allocation %pack_c
-            {{memory_space = 2, bufferize_destination_only, memcpy_op = "linalg.copy", emit_dealloc}} : !transform.any_op
+            <{{memory_space = 2, bufferize_destination_only, memcpy_op = "linalg.copy", emit_dealloc}}> : !transform.any_op
 
         // Annotate for robust matching after K-tiling
         transform.annotate %packed_c "packed_matmul" : !transform.any_op
@@ -197,7 +286,7 @@ module attributes {{transform.with_named_sequence}} {{
 
         %fused_lhs_l1_pack, %2 = transform.structured.fuse_into_containing_op %pack_a into %outer_for_loop : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
         %fused_rhs_l1_pack, %3 = transform.structured.fuse_into_containing_op %pack_b into %outer_for_loop : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-
+{k_l1_tiling}
     //==========================================================================
     // PHASE 5: TILE FOR MULTI-CORE PARALLELISM
     // Tile [{forall_l1_m}, {forall_l1_n}, 0] for herd distribution.
@@ -209,8 +298,8 @@ module attributes {{transform.with_named_sequence}} {{
         transform.annotate %inner_forall "compute_forall" : !transform.any_op
         transform.annotate %tiled_matmul_1 "matmul_compute" : !transform.any_op
 
-        %fused_lhs_l1_pack2, %6 = transform.structured.fuse_into_containing_op %fused_lhs_l1_pack into %inner_forall : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-        %fused_rhs_l1_pack2, %7 = transform.structured.fuse_into_containing_op %fused_rhs_l1_pack into %inner_forall : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+        %fused_lhs_l1_pack2, %6 = transform.structured.fuse_into_containing_op {lhs_pack} into %inner_forall : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+        %fused_rhs_l1_pack2, %7 = transform.structured.fuse_into_containing_op {rhs_pack} into %inner_forall : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
         %func_2 = transform.structured.match ops{{["func.func"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
         transform.apply_patterns to %func_2 {{
@@ -226,9 +315,9 @@ module attributes {{transform.with_named_sequence}} {{
 
         // Promote A and B to L1
         %buffer_a, %new_a = transform.structured.bufferize_to_allocation %fused_lhs_l1_pack2
-          {{memory_space = 2, bufferize_destination_only, emit_dealloc}} : !transform.any_op
+          <{{memory_space = 2, bufferize_destination_only, emit_dealloc}}> : !transform.any_op
         %buffer_b, %new_b = transform.structured.bufferize_to_allocation %fused_rhs_l1_pack2
-          {{memory_space = 2, bufferize_destination_only, emit_dealloc}} : !transform.any_op
+          <{{memory_space = 2, bufferize_destination_only, emit_dealloc}}> : !transform.any_op
 
         // Prologue: fill -> generalize -> interchange -> tile for herd
         %fill_op = transform.structured.match ops{{["linalg.fill"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
@@ -244,9 +333,8 @@ module attributes {{transform.with_named_sequence}} {{
         transform.annotate %prologue_forall "prologue_forall" : !transform.any_op
 
         // Epilogue: unpack -> tile for L2 write-back
-        %unpack_op = transform.structured.match ops{{["linalg.unpack"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %epilogue_tiled_unpack, %epilogue_forall =
-          transform.structured.tile_using_forall %unpack_op tile_sizes [{l1_m}, {l1_n}]
+{unpack_match}        %epilogue_tiled_unpack, %epilogue_forall =
+          transform.structured.tile_using_forall {unpack_target} tile_sizes [{l1_m}, {l1_n}]
             : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         transform.annotate %epilogue_forall "epilogue_forall" : !transform.any_op
 
@@ -297,18 +385,7 @@ module attributes {{transform.with_named_sequence}} {{
     //==========================================================================
 
         %generic1 = transform.structured.match ops{{["linalg.generic"]}} attributes{{init_fill}} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %generic2 = transform.structured.match ops{{["linalg.generic"]}} attributes{{matmul_compute}} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %inner_most_generics, %vec_loops:3 =
-          transform.structured.tile_using_for %generic2 tile_sizes [2, 2, 1, 0, 0, 0]
-          : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
-
-        %inner_most_matmul_to_unroll, %vec_loops_to_unroll:2 =
-          transform.structured.tile_using_for %inner_most_generics tile_sizes [1, 1, 0, 0, 0, 0]
-          : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
-        transform.loop.unroll %vec_loops_to_unroll#1 {{factor = 2}} : !transform.any_op
-        transform.loop.unroll %vec_loops_to_unroll#0 {{factor = 2}} : !transform.any_op
-
-        %inner_most_fills, %vec_fill_loops:2 =
+{matmul_vector_tiling}        %inner_most_fills, %vec_fill_loops:2 =
           transform.structured.tile_using_for %generic1 tile_sizes [1, 1, 0, 0]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
 
@@ -329,7 +406,7 @@ module attributes {{transform.with_named_sequence}} {{
         %herd3 = transform.air.par_to_herd %parallel3 : (!transform.any_op) -> !transform.any_op
         transform.annotate %herd3 "epilogue_herd" : !transform.any_op
 
-        %herds = transform.structured.match ops{{["air.herd"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %herds = transform.structured.match ops{{["air.herd"]}}{herd_vectorize_filter} in %arg1 : (!transform.any_op) -> !transform.any_op
         %vectorized_herds = transform.air.herd_vectorize %herds : (!transform.any_op) -> !transform.any_op
 
         %func7 = transform.structured.match ops{{["func.func"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
@@ -345,29 +422,7 @@ module attributes {{transform.with_named_sequence}} {{
         %func7_rematch = transform.structured.match ops{{["func.func"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
         %func1_optimized = transform.air.eliminate_redundant_vector_transfers %func7_rematch : (!transform.any_op) -> !transform.any_op
 
-    //==========================================================================
-    // PHASE 11: HOIST LOOP-INVARIANT VECTOR TRANSFERS
-    //==========================================================================
-
-        %herd2_1 = transform.structured.match ops{{["air.herd"]}} attributes{{compute_herd}} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %scf_fors_1 = transform.structured.match ops{{["scf.for"]}} in %herd2_1 : (!transform.any_op) -> !transform.any_op
-        %innermost_for, %outer_fors = transform.split_handle %scf_fors_1 {{overflow_result = 1}} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-
-        // Cast accumulator (input[2]) and output[0] to {accum_type}
-        %vector_contracts = transform.structured.match ops{{["vector.contract"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %result11 = transform.air.vector_type_cast %vector_contracts {{target_element_type = {accum_type}, input_indices = [2], output_indices = [0]}} : (!transform.any_op) -> !transform.any_op
-{input_cast}\
-
-        %innermost_for_updated_3 = transform.air.hoist_loop_invariant_transfers %herd2_1, %innermost_for : (!transform.any_op, !transform.any_op) -> !transform.any_op
-
-    //==========================================================================
-    // PHASE 12: FINAL LOOP OPTIMIZATIONS
-    //==========================================================================
-
-        %innermost_for_updated_4 = transform.air.flatten_for_iter_args %innermost_for_updated_3 : (!transform.any_op) -> !transform.any_op
-        %innermost_for_updated_5 = transform.air.hoist_vector_transfer_pointers %innermost_for_updated_4 : (!transform.any_op) -> !transform.any_op
-
-        %func9 = transform.structured.match ops{{["func.func"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
+{phase_11_12}        %func9 = transform.structured.match ops{{["func.func"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
         transform.apply_patterns to %func9 {{
             transform.apply_patterns.linalg.tiling_canonicalization
             transform.apply_patterns.scf.for_loop_canonicalization
@@ -396,6 +451,9 @@ if __name__ == "__main__":
         "--l1-n", type=int, default=64, help="L1 per-core tile N (default: 64)"
     )
     parser.add_argument("--l2-k", type=int, default=64, help="L2 tile K (default: 64)")
+    parser.add_argument(
+        "--l1-k", type=int, default=None, help="L1 per-core tile K (default: --l2-k)"
+    )
     parser.add_argument(
         "--pack-sizes",
         type=int,
@@ -433,6 +491,7 @@ if __name__ == "__main__":
         l1_m=args.l1_m,
         l1_n=args.l1_n,
         l2_k=args.l2_k,
+        l1_k=args.l1_k,
         pack_sizes=tuple(args.pack_sizes),
         accum_type=args.accum_type,
         contract_input_type=args.contract_input_type,

@@ -14,7 +14,7 @@ Generated 6 tokens in 0.13s (47.24 tok/s)
 ```
 
 ```
-$ python llama32_1b_q4nx_inference.py --backend npu --max-tokens 12 --greedy
+$ python llama32_1b_q4nx_inference.py --prefill-engine triton --backend npu --max-tokens 12 --greedy
 [triton-prefill] backend=npu ops={'matmul', 'rms_norm', 'swiglu'} P=6 ... first=12366
 [triton-prefill] first token 12366 (expect 12366) -- PASS
 Generated 12 tokens in 0.22s (55.76 tok/s)
@@ -42,8 +42,8 @@ np.savez(path, k=K, v=V, first=first, prompt=prompt)   # K, V: [16, P, 512] f32
 ```
 
 No shared weight format, no buffer plumbing, no ELF coupling. Any prefill that
-emits that npz drops into mlir-air's `generate()`. `save_kv_npz` in `model.py`
-states the layout — head order, the half-split RoPE convention, and the llama3
+emits that npz drops into mlir-air's `generate()`. `save_kv_npz` in
+`../llm_q4nx/llama_prefill.py` states the layout — head order, the half-split RoPE convention, and the llama3
 frequency scaling that a reimplementation silently gets wrong.
 
 `llama32_1b_q4nx_inference.py` writes the npz and then neutralizes the one
@@ -55,7 +55,7 @@ that — `seed_kv`, the dispatch loop, sampling — is mlir-air's code untouched
 The decode superkernel does not fit the Triton compiler path: one dispatch
 spans every decoder layer, weights are resident across tokens, and the
 per-token work is an instruction patch rather than a launch. So it enters from
-the other end. `decode_build.py` takes mlir-air's `fused_decode.build_module()`
+the other end. `../llm_q4nx/decode_build.py` takes mlir-air's `fused_decode.build_module()`
 for the AIR IR and hands it to `FusedDecodeOp`
 (`amd_triton_npu/backend/fused_decode_op.py`), which calls the same
 `_aircc_compile` every other kernel in this backend uses — same aircc
@@ -147,7 +147,7 @@ make compile-decode      # ~22 s; the decode's AIE kernels, then its xclbins
 Iterating on the AIR builder or the lowering afterwards only needs
 `make recompile-decode` (~9 s) — the AIE kernels are C++ and rarely change.
 
-Both steps are owned here. `decode_kernels.py` compiles the six AIE kernels
+Both steps are owned here. `../llm_q4nx/decode_kernels.py` compiles the six AIE kernels
 with Peano, byte-identically to mlir-air's Makefile and cached on the source
 and flags; `decode_build.py` lowers the xclbins through `FusedDecodeOp`. What
 is needed from mlir-air is now *source* — `fused_decode.py` and `kernels/` —
@@ -179,7 +179,8 @@ Underneath:
 python llama32_1b_q4nx_inference.py --prefill-only
 
 # End to end
-python llama32_1b_q4nx_inference.py --backend npu --max-tokens 20 --greedy
+python llama32_1b_q4nx_inference.py --max-tokens 20 --greedy   # mlir-air's fused prefill
+python llama32_1b_q4nx_inference.py --prefill-engine triton --backend npu --max-tokens 20 --greedy
 python llama32_1b_q4nx_inference.py --text "The theory of relativity was developed by"
 
 # The prefill on its own, with per-op routing and a CPU cross-check
@@ -191,7 +192,7 @@ python prefill.py --backend cpu --kv-out /tmp/kv.npz
 ### Running on the HSA runtime
 
 ```bash
-make compile-decode RUNTIME=hsa   # the decode as one full ELF, not xclbin
+make compile-decode RUNTIME=hsa   # the decode for HSA (ELF or PDI, see below)
 make chat RUNTIME=hsa
 ```
 
@@ -202,53 +203,34 @@ It is not as fast. Measured on Strix, 60 tokens, runtimes alternated:
 
 | | tok/s |
 |---|---|
-| XRT | 54.5 |
-| HSA | 48.9 – 50.4 |
+| XRT | 54.5 – 54.8 |
+| HSA | 49.1 – 51.5 |
 
-The token ids are identical between the two, so this is a throughput gap and
-not a correctness one.
-
-Take any single reading here with salt: this NPU is shared, and the same build
-measured 47.3 and 50.1 tok/s an hour apart. Only numbers from runs interleaved
-in one session are worth comparing.
+a stable gap of about 9%, reproducible across runs rather than noise. It is
+not the per-dispatch cache flush -- that is what resident regions removed, and
+without them the gap is roughly three times larger. What remains has not been
+attributed, so treat the HSA path as correct and close, not as a replacement.
 
 The interesting part is how the context length gets to the device. There are
-two ways, and which one runs is decided by what the loaded ROCR can do:
+two ways, and the loaded ROCR decides which one runs:
 
-**A scratchpad parameter** — two scalars in device memory that the design reads
+**Scratchpad parameters** — two scalars in device memory that the design reads
 in its dispatch preamble, so one full ELF serves every context length and
-nothing rewrites the instruction stream per token. This needs a ROCR whose
-`hsa_amd_pointer_info` reports a device address for an AIE allocation: a
-full-ELF design reaches its scratchpad through an address patched into its
-control code, and that is the address the NPU sees, not the host address the
-allocation is known by. Released ROCRs resolve pointers through the KFD thunk,
-which has never heard of an XDNA buffer object, so they report an AIE pointer
-as `HSA_EXT_POINTER_TYPE_UNKNOWN` with every field nil.
+nothing rewrites the instruction stream per token. The control code reaches the
+scratchpad through an address the host patches in, so this needs a ROCR whose
+`hsa_amd_pointer_info` reports an AIE allocation's device address.
 
-**A patched instruction stream** — the fallback, and what every released ROCR
-gets. Two builds at adjacent L differ only in the words encoding it, so a diff
-gives base and slope, and 248 words are patched in per token. One PDI serves
-every context length; the L=2048 and L=2047 builds are byte-identical.
+**A patched instruction stream** — the fallback. Two builds at adjacent L differ
+only in the words encoding it, so a diff gives base and slope, and 248 words are
+patched per token. One PDI serves every context length.
 
-`hsa_decode.use_scratchpad()` asks the question and the Makefile builds
-whichever artifact the answer calls for. `AMD_TRITON_NPU_HSA_DECODE=elf|insts`
-forces one, which is how the two are compared on a machine that could run
-either.
+`../llm_q4nx/hsa_decode.py`'s `use_scratchpad()` asks the question, and
+`make compile-decode RUNTIME=hsa` builds whichever artifact the answer calls
+for. `AMD_TRITON_NPU_HSA_DECODE=elf|insts` forces one.
 
-The scratchpad is slightly slower, by about 1.5%. Ten pairs alternated in one
-session, patched stream first or ELF first, the patched stream won all ten: at
-60 tokens 49.7 – 50.5 tok/s for the ELF against 50.1 – 50.9, and at 120 tokens
-51.3 – 51.9 against 52.1 – 52.7. That is roughly 0.3 ms on a 20 ms token.
-
-The likely cause is that there is simply more control code to fetch. aiecc
-builds the full ELF with `--expand-load-pdis`, which replaces each `load_pdi`
-with the configuration writes inlined, so the decode ELF's `.ctrltext.1` is
-354 KiB against the 158 KiB instruction stream it replaces — 2.24x. Nothing
-about resolving the scratchpad's address is on the hot path: that happens once,
-at load.
-
-The remaining gap to XRT is the same one the HSA path has always had, and it is
-still unattributed. Of a 20.2 ms token, 18.3 ms is inside the dispatch.
+On Strix the ELF measured about 1.5% slower than the patched stream (ten
+alternated pairs at 60 and 120 tokens). Its control code is larger — aiecc
+inlines each `load_pdi` — so there is more of it to fetch per token.
 
 `--ops` takes `all` or a comma list of `matmul,rms_norm,swiglu`, so a
 numerical regression can be bisected to a single kernel against the same CPU
@@ -256,12 +238,26 @@ reference.
 
 ## Files
 
+Llama-3.2-1B-specific, and that is all this directory holds:
+
 ```
-llama32_1b_q4nx_inference.py  # end to end: our prefill -> mlir-air's decode
+llama32_1b_q4nx_inference.py  # entry point: spec + prefill class -> the harness
 prefill.py                    # prefill alone, with the Paris gate
-model.py                      # the 16-layer forward pass and its operators
-kernels.py                    # the Triton kernels + NPU dispatch plumbing
 config.py                     # dims; re-exports mlir-air's loader and RoPE table
+
+(the 16-layer forward itself is ../llm_q4nx/llama_prefill.py, shared with the 3B)
+```
+
+Shared with the other Q4NX model families, in `../llm_q4nx/`:
+
+```
+harness.py                    # the driver: args, KV handoff, gate, chat session
+kernels.py                    # the Triton kernels + NPU dispatch plumbing
+registry.py                   # per-model build facts, verbatim from mlir-air
+airsrc.py                     # finding mlir-air's sources; the decode-shape choice
+decode_kernels.py             # the six AIE kernels, compiled with Peano
+decode_build.py               # the templates, lowered through FusedDecodeOp
+hsa_decode.py                 # the decode on HsaRuntime instead of pyxrt
 transform_rms_norm_aie2p.mlir # f32 row reduction (see above)
 ```
 

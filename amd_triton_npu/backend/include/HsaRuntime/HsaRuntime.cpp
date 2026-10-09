@@ -391,15 +391,18 @@ struct SharedRegion {
 //
 // Two shapes, distinguished by `full_elf`:
 //
-//   * PDI plus instruction sequence -- `pdi` and `insts`, the only shape until
-//     now. The hardware patches the arguments into the stream as it runs.
+//   * PDI plus instruction sequence -- `pdi` and `insts`. The hardware patches
+//     the arguments into the stream as it runs. The PDI is shared by every
+//     program prepared from the same file: the device reconfigures the array
+//     whenever a dispatch names a different PDI address, so programs that
+//     alternate on one design must name the same one.
 //   * full ELF -- everything below it. The control code is the stream, it
 //     loads its own configuration, and the *application* patches the argument
 //     addresses into it before enqueuing. In exchange the design can carry a
 //     scratchpad, which is how a runtime value reaches the device without
 //     rewriting the stream per dispatch.
 struct triton_npu_hsa_program {
-  PoolBuffer pdi;
+  std::shared_ptr<PoolBuffer> pdi;
   PoolBuffer insts;
 
   bool full_elf = false;
@@ -496,8 +499,13 @@ public:
     if (it != programs_.end())
       return it->second.get();
     auto prog = std::make_unique<triton_npu_hsa_program>();
-    // If the second load throws, ~PoolBuffer releases the first.
-    prog->pdi = load_binary(pdi_path);
+    auto pdi = pdis_.find(pdi_path);
+    if (pdi == pdis_.end())
+      pdi = pdis_
+                .emplace(pdi_path,
+                         std::make_shared<PoolBuffer>(load_binary(pdi_path)))
+                .first;
+    prog->pdi = pdi->second;
     prog->insts = load_binary(insts_path);
     triton_npu_hsa_program *raw = prog.get();
     programs_.emplace(std::move(key), std::move(prog));
@@ -826,7 +834,7 @@ public:
         pdi_patch_field(pkt) = program->kernel->pdi_patch_offset();
       } else {
         pkt.insts_size = program->insts.size();
-        pkt.pdi_addr = program->pdi.va();
+        pkt.pdi_addr = program->pdi->va();
       }
 
       // Arm the signal to 1 (device decrements to 0 on success, or sets a
@@ -1085,6 +1093,9 @@ private:
   // destructor freeing them all. Unlike regions_ below, which cannot be.
   std::unordered_map<std::string, std::unique_ptr<triton_npu_hsa_program>>
       programs_;
+  // Loaded PDIs by path, shared by the programs prepared from each. Guarded by
+  // programs_mtx_.
+  std::unordered_map<std::string, std::shared_ptr<PoolBuffer>> pdis_;
   std::mutex programs_mtx_;
 
   // One entry in the address table: the region reached through this key, and
@@ -1232,6 +1243,7 @@ private:
         vmem_free(b);
     vmem_pool_.clear();
     programs_.clear();
+    pdis_.clear();
     kernarg_buffer_ = PoolBuffer{};
     if (signal_.handle) {
       log_status("hsa_signal_destroy", hsa_signal_destroy(signal_));

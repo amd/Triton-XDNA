@@ -10,7 +10,15 @@ packages on sys.path and re-exports what the prefill needs.
 
 import os
 import sys
-from pathlib import Path
+
+#: The harness every Q4NX example shares.
+_SHARED = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "llm_q4nx"
+)
+
+#: This example's model, and the key into llm_q4nx/registry.py. The shared
+#: Llama forward asserts against it (llm_q4nx/llama_prefill.py::bound_model).
+MODEL_NAME = "llama-3.2-1b"
 
 # Llama-3.2-1B. Mirrors mlir-air's llama32_1b_q4nx_weights; kept here so the
 # kernels can be read without chasing an import.
@@ -34,100 +42,40 @@ RMS_EPS = 1e-6
 # The Paris gate, from llama32_1b_q4nx_prefill.py.
 PROMPT = [128000, 791, 6864, 315, 9822, 374]  # "The capital of France is"
 EXPECT_FIRST = 12366  # " Paris"
+BOS = 128000  # <|begin_of_text|>, for the session warmup
+
+#: What `--greedy` must generate from PROMPT, first token included. Recorded
+#: from a verified run; the decode is deterministic given the same artifacts,
+#: so a change here means the decode changed, not that the model drifted.
+#:
+#: This is the only assertion that covers the decode at all -- the first-token
+#: gate above is pure prefill, and every decode-side fact these examples carry
+#: (the builder environment, -DMODEL_TYPE, GLU_SLICE, the core stack, which
+#: driver API is used) is invisible to it. Regenerate with `--prefill-engine
+#: triton --max-tokens 8 --greedy` if the decode legitimately changes.
+EXPECT_IDS = [12366, 13, 578, 6864, 315, 10057, 374, 20437, 13]
+
+#: The same after mlir-air's fused prefill, the default engine. Its numerics
+#: move a later greedy token on this model; these are what mlir-air's own
+#: driver generates from the same build.
+EXPECT_IDS_AIR_FUSED = [12366, 13, 578, 6864, 315, 279, 3723, 4273, 374]
 
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Llama-3.2-1B-NPU2")
 
 
-#: Where mlir-air's sources may be, in priority order. The first is a
-#: developer's own working clone; the second is the sparse checkout
-#: `utils/fetch_mlir_air_src.py` makes at the pinned commit. Checking the
-#: working clone first means someone editing mlir-air sees their edits.
-_AIR_CHECKOUTS = ("mlir-air-local", "third_party/mlir-air-src")
+if _SHARED not in sys.path:
+    sys.path.insert(0, _SHARED)
 
+import airsrc  # noqa: E402
 
-def _air_llms_root():
-    """The mlir-air programming_examples/llms directory.
-
-    AIR_LLMS_ROOT overrides everything. Otherwise walk up looking for either
-    checkout; if neither exists, say how to get one rather than failing later
-    on an import of `fused_decode`.
-    """
-    env = os.environ.get("AIR_LLMS_ROOT")
-    if env:
-        return Path(env)
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        for rel in _AIR_CHECKOUTS:
-            cand = parent / rel / "programming_examples" / "llms"
-            if cand.is_dir():
-                return cand
-    raise RuntimeError(
-        "cannot find mlir-air's sources (programming_examples/llms).\n"
-        "  Fetch them at the pinned commit:\n"
-        "      python3 utils/fetch_mlir_air_src.py\n"
-        "  or point AIR_LLMS_ROOT at your own checkout."
-    )
-
-
-class DecodeArtifactError(RuntimeError):
-    """Raised when the decode shape asked for is not one this example drives."""
-
-
-def select_decode_artifact(env=None):
-    """Keep mlir-air's decoder off *its own* full-ELF dispatch.
-
-    ``DECODE_ELF`` (``fused_decode/decode_elf.py``) does not select a decode
-    shape so much as select *who dispatches it*: set, ``FusedDecoder`` loads a
-    full ELF and runs it through pyxrt itself. That is the one thing this
-    example never wants, on either runtime:
-
-    * on XRT, because ``decode_build.py`` builds the xclbin templates and the
-      decode runs from those;
-    * on HSA, because the full ELF **is** what we run -- but we load and
-      dispatch it ourselves, through ``HsaElfProgram`` and a scratchpad (see
-      ``hsa_decode.py``). Letting mlir-air do it too would do it twice.
-
-    And in both cases it would not get that far: mlir-air's ELF path brings up
-    a second LLVM and re-registers an option Triton has already registered
-    ("Option 'print-inst-addrs' registered more than once!"), which aborts the
-    process rather than raising. That is a bug to fix, not a shape rejected on
-    taste.
-
-    So the variable is written here rather than left to its default -- it is
-    the only channel ``FusedDecoder`` offers, its ``__init__`` taking no such
-    argument -- and an explicit request for it is refused with the reason,
-    which beats aborting later inside mlir-air.
-
-    Note this says nothing about whether *we* use a full ELF. On HSA we
-    normally do; ``AMD_TRITON_NPU_HSA_DECODE`` selects that, not this.
-
-    Returns the value written, so a caller (and a test) can check it.
-    """
-    env = os.environ if env is None else env
-    asked = env.get("DECODE_ELF")
-    if asked is not None and asked != "0":
-        raise DecodeArtifactError(
-            f"DECODE_ELF={asked!r} hands the decode to mlir-air's own full-ELF "
-            "dispatch, which this example never uses: on XRT it runs the "
-            "xclbin templates, and on HSA it loads and dispatches the ELF "
-            "itself. mlir-air's route also aborts in-process on a duplicate "
-            "LLVM option registration. Unset DECODE_ELF; to choose the HSA "
-            "decode's shape use AMD_TRITON_NPU_HSA_DECODE=elf|insts."
-        )
-    env["DECODE_ELF"] = "0"
-    return env["DECODE_ELF"]
+#: mlir-air llms packages this model needs on sys.path: its own q4nx package
+#: (the weight reader) and the base llama32_1b package (LlamaConfig and the
+#: RoPE table).
+AIR_PACKAGES = ("llama32_1b_q4nx", "llama32_1b")
 
 
 def _add_air_paths():
-    llms = _air_llms_root()
-    for p in (
-        str(llms),
-        str(llms / "llama32_1b"),
-        str(llms / "llama32_1b_q4nx"),
-        str(llms.parent),  # programming_examples, for `shared.*`
-    ):
-        if p not in sys.path:
-            sys.path.insert(0, p)
+    airsrc.add_air_paths(*AIR_PACKAGES)
 
 
 def load_q4nx(model=None):
