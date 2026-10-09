@@ -775,9 +775,10 @@ class NPUChain:
         self._runtime = npu_config.runtime
         if self._runtime == "hsa" and len(self._specs) > 1:
             self._runtime = "xrt"
-        self._elf_path, self._kernel_name = b.compile(
-            output_format=_get_output_format(runtime=self._runtime)
-        )
+            fmt = "elf"
+        else:
+            fmt = _get_output_format(runtime=self._runtime)
+        self._elf_path, self._kernel_name = b.compile(output_format=fmt)
 
     @staticmethod
     def _close_stalest():

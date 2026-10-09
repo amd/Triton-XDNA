@@ -426,7 +426,7 @@ def bind_ref(buf):
 
     try:
         if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa":
-            return buf if buf.aie_ptr is not None else None
+            return buf if buf.aie_ptr() is not None else None
         return getattr(buf, "bo", None)
     except SharedBufferError:
         return None

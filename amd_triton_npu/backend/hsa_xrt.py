@@ -81,13 +81,23 @@ def _xclbinutil():
 
 
 def extract_pdi(xclbin_path):
-    """The PDI inside `xclbin_path`, extracted once to `<xclbin>.pdi`."""
+    """The PDI inside `xclbin_path`, extracted to `<xclbin>.pdi`.
+
+    Extracted again whenever the xclbin is newer than the extracted PDI, so a
+    rebuild in place is not paired with the old design.
+    """
     out = xclbin_path + ".pdi"
-    if os.path.exists(out):
+
+    def current():
+        return os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(
+            xclbin_path
+        )
+
+    if current():
         return out
     with open(xclbin_path + ".pdi.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if os.path.exists(out):
+        if current():
             return out
         # Beside the xclbin, so the result can be renamed into place.
         with tempfile.TemporaryDirectory(dir=os.path.dirname(xclbin_path)) as tmp:
@@ -243,18 +253,22 @@ class bo:
         """This BO as the instruction stream of an HSA program over `pdi`."""
         words = np.frombuffer(self.map(), np.uint32, count=nwords)
         if self._program is None or self._program[0] != pdi:
+            # The runtime reads the stream from a file once, at prepare.
             fd, path = tempfile.mkstemp(suffix=".insts.bin")
-            with os.fdopen(fd, "wb") as f:
-                f.write(words.tobytes())
-            buf, n = _errbuf()
-            handle = _runtime().triton_npu_hsa_prepare(
-                pdi.encode(), path.encode(), buf, n
-            )
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(words.tobytes())
+                buf, n = _errbuf()
+                handle = _runtime().triton_npu_hsa_prepare(
+                    pdi.encode(), path.encode(), buf, n
+                )
+            finally:
+                os.unlink(path)
             if not handle:
                 raise HsaXrtError(buf.value.decode())
-            self._program = (pdi, handle, words.copy(), path)
+            self._program = (pdi, handle, words.copy())
             return handle
-        _, handle, sent, _ = self._program
+        _, handle, sent = self._program
         if not np.array_equal(sent, words):
             buf, n = _errbuf()
             _check(
