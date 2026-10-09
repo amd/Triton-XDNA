@@ -206,21 +206,41 @@ class InstsForL:
         return out
 
 
-def make_hsa_decoder_class(air, artifact_dir, decoder_class="FusedDecoder"):
+def _programs(artifact_dir, attn_maxl):
+    """The PDI and the L-patching generator for a template built at `attn_maxl`."""
+    pdi = os.path.join(artifact_dir, f"decode_L{attn_maxl}.pdi")
+    lo = os.path.join(artifact_dir, f"decode_L{attn_maxl - 1}.insts.bin")
+    hi = os.path.join(artifact_dir, f"decode_L{attn_maxl}.insts.bin")
+    for f in (pdi, lo, hi):
+        if not os.path.exists(f):
+            raise HsaDecodeError(
+                f"{f} is missing; build the PDI templates with\n"
+                "    make compile-decode RUNTIME=hsa"
+            )
+    return InstsForL(lo, hi, attn_maxl - 1, attn_maxl), HsaProgram(pdi, hi)
+
+
+def make_hsa_decoder_class(
+    air, artifact_dir, decoder_class="FusedDecoder", engine="fused_decode"
+):
     """mlir-air's fused decoder with the dispatch moved onto HSA.
 
     Everything host-side stays theirs -- weight load, the region-major KV
     layout, `seed_kv`, sampling. Only `dispatch` changes: instead of handing
     XRT an instruction-stream BO as a kernel argument, it patches the stream
-    the HSA program already owns and enqueues the five tensors.
+    the HSA program already owns and enqueues the kernel's tensors.
 
     Their `__init__` still runs, so the XRT BOs it builds exist and go unused.
     That costs the weight allocation twice. Worth fixing before this is more
     than a demonstration; not worth forking their setup to avoid today.
 
     `decoder_class` names the base to wrap (3B/8B are not `FusedDecoder`).
+    `engine` is the decode engine the model was built with; the per-layer
+    embedding engine ("ple", Gemma4-E2B) has its own operand set.
     """
     base = getattr(air, decoder_class)
+    if engine == "ple":
+        return _make_hsa_ple_decoder_class(base, artifact_dir)
 
     class HsaFusedDecoder(base):
         def _g(self, name):
@@ -235,17 +255,7 @@ def make_hsa_decoder_class(air, artifact_dir, decoder_class="FusedDecoder"):
 
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
-            pdi = os.path.join(artifact_dir, f"decode_L{self.ATTN_MAXL}.pdi")
-            lo = os.path.join(artifact_dir, f"decode_L{self.ATTN_MAXL - 1}.insts.bin")
-            hi = os.path.join(artifact_dir, f"decode_L{self.ATTN_MAXL}.insts.bin")
-            for f in (pdi, lo, hi):
-                if not os.path.exists(f):
-                    raise HsaDecodeError(
-                        f"{f} is missing; build the PDI templates with\n"
-                        "    python decode_build.py --format pdi"
-                    )
-            self._gen = InstsForL(lo, hi, self.ATTN_MAXL - 1, self.ATTN_MAXL)
-            self._prog = HsaProgram(pdi, hi)
+            self._gen, self._prog = _programs(artifact_dir, self.ATTN_MAXL)
             # Host mirrors of the five kernel tensors. The XRT path keeps these
             # in BOs; HSA takes plain pointers and stages them itself.
             lib = self._prog.lib
@@ -395,3 +405,109 @@ def make_hsa_decoder_class(air, artifact_dir, decoder_class="FusedDecoder"):
             return voc[: self.VOCAB_SIZE].astype(np.float32)
 
     return HsaFusedDecoder
+
+
+def _make_hsa_ple_decoder_class(base, artifact_dir):
+    """The per-layer-embedding decoder (Gemma4-E2B) on HSA.
+
+    Its kernel takes seven tensors: x, the weights, the norm/rope buffer, y,
+    the KV cache, the PLE slab and px (the token embedding again, which the PLE
+    branch reads). Per token the host writes x and px, this token's embedding
+    rows into the PLE slab, and the position's rope into the norm buffer. The
+    logits come back softcapped, as the base's do.
+    """
+
+    class HsaPleDecoder(base):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._gen, self._prog = _programs(artifact_dir, self.ATTN_MAXL)
+            lib = self._prog.lib
+            bf16 = self.bf16
+
+            def copy_of(arr):
+                out = shared_array(lib, arr.shape, arr.dtype)
+                out[:] = arr
+                return out
+
+            self._x = shared_array(lib, (self.K,), bf16)
+            self._px = shared_array(lib, (self.K,), bf16)
+            self._w = copy_of(np.frombuffer(self.w_bo.map(), dtype=np.int16))
+            norms = np.concatenate(
+                [
+                    self.rms_slabs,
+                    np.zeros(self._RMS_SIZE - self._rope_base - self.K, bf16),
+                    self.final_norm,
+                ]
+            )
+            self._r = copy_of(norms)
+            self._y = shared_array(lib, (self.ny,), bf16)
+            self._kv = shared_array(lib, (self.UNI * self.KV_LAYER,), bf16)
+            self._kv[:] = 0
+            self._pw = copy_of(self.ple.reshape(-1))
+            # The weights and the KV cache are the device's once written. The
+            # PLE slab is too, apart from the embedding rows patched per token,
+            # which `dispatch` marks dirty.
+            for buf in (self._w, self._kv, self._pw):
+                mark_resident(lib, buf)
+            # The XRT copies of the two big buffers are not read again.
+            self.w_bo = None
+            self.pw_bo = None
+            print(
+                f"[hsa-decode] gemma4 PLE: ONE PDI + patched insts, "
+                f"ATTN_MAXL={self.ATTN_MAXL}, {self._gen.ld.size} L-dependent words",
+                flush=True,
+            )
+
+        def seed_kv(self, ks, vs, P):
+            super().seed_kv(ks, vs, P)
+            self._kv[:] = np.ascontiguousarray(self.KV).reshape(-1)
+            mark_dirty(self._prog.lib, self._kv)
+
+        def kv_sink(self):
+            """The resident KV buffer and its geometry, for a producer to fill."""
+            return dict(
+                buf=self._kv,
+                n_layers=self.UNI,
+                lreg=self.KV_LAYER,
+                region_stride=self.ATTN_MAXL * self.REGION_W,
+                region_w=self.REGION_W,
+                ngrp=self.NGRP,
+                dtype=self.bf16,
+            )
+
+        def seed_direct(self, P):
+            """Mark the KV a producer wrote through `kv_sink`."""
+            self.current_seed_P = P
+            mark_dirty(self._prog.lib, self._kv)
+
+        def dispatch(self, tok, p):
+            L = p + 1
+            if not (1 <= L <= self.maxL):
+                raise ValueError(f"position {p} is outside [0,{self.maxL - 1}]")
+            self._prog.patch_insts(self._gen.lo, self._gen.slice_for(L))
+            x0 = np.asarray(
+                self.qm.embed_rows("model.embed_tokens.weight", [tok])[0], self.bf16
+            )
+            self._x[:] = x0
+            self._px[:] = x0
+            emb = self._ple_embed(tok)
+            for i in range(self.UNI):
+                off = i * self.PLE_LAYER + self.PLE_EMB_OFF
+                self._pw[off : off + emb[i].size] = emb[i]
+            mark_dirty(self._prog.lib, self._pw)
+            rope = self._rope_slab(p)
+            self._r[self._rope_base : self._rope_base + rope.size] = rope
+            self._prog.dispatch(
+                [self._x, self._w, self._r, self._y, self._kv, self._pw, self._px]
+            )
+            n = self.UNI_LM * self.VP
+            yv = self._y[self.decode_y : self.decode_y + n].astype(np.float32)
+            yv = yv[: self.VOCAB_SIZE]
+            cap = self.gw.FINAL_LOGIT_SOFTCAP
+            if cap:
+                yv /= cap
+                np.tanh(yv, out=yv)
+                yv *= cap
+            return yv
+
+    return HsaPleDecoder

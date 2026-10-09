@@ -560,7 +560,9 @@ def _install_shared_kv(air, prefiller):
     air.FusedDecoder = make(air, prefiller)
     p = prefiller.current_context_length
     ks, vs = prefiller.kv_placeholders(p)
-    shared = getattr(prefiller._kv_slab, "bo", None) is not None
+    import kernels
+
+    shared = kernels.xrt_bo(prefiller._kv_slab) is not None
     print(
         f"[e2e] KV handed over in place: {p} rows already in the decode's "
         f"layout, nothing to rearrange"
@@ -812,6 +814,18 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             f"none. Use --decode npu."
         )
 
+    # The HSA runtime needs an AIE-capable ROCR in the process, and torch's HIP
+    # runs on the ROCR it ships with. One process holds one ROCR, so under HSA
+    # nothing may use the iGPU.
+    if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and (
+        args.decode == "gpu" or args.backend == "hetero"
+    ):
+        raise SystemExit(
+            "AMD_TRITON_NPU_RUNTIME=hsa cannot be combined with the iGPU "
+            "(--decode gpu, --backend hetero): the HSA runtime's ROCR and "
+            "torch's HIP cannot run in one process."
+        )
+
     fused = fused_prefill_config(cfg)
     asked = args.prefill_engine
     if asked == "auto":
@@ -912,7 +926,9 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         setattr(
             air,
             dc,
-            make_hsa_decoder_class(air, airsrc.fused_decode_dir(spec.engine), dc),
+            make_hsa_decoder_class(
+                air, airsrc.fused_decode_dir(spec.engine), dc, engine=spec.engine
+            ),
         )
 
     if args.interactive:

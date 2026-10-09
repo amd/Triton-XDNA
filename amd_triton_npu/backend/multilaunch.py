@@ -500,6 +500,117 @@ class MultiLaunchRunner:
             pass
 
 
+class HsaChainRunner:
+    """``MultiLaunchRunner``'s contract on the HSA runtime.
+
+    The chain is compiled to one PDI and instruction stream and dispatched as
+    one HSA program. Each ``bo_key`` owns a shared region per operand the
+    caller does not bind; a static operand is written on the first call and
+    made resident, an intermediate is zeroed on the first call, and every
+    other operand is copied in per call. A bound operand is the caller's own
+    shared pages: whatever ``bound_buffers`` maps it to, the caller's array is
+    what the dispatch runs on, in place.
+    """
+
+    def __init__(self, pdi_path, insts_path):
+        from .hsa_xrt import HsaXrtError, _errbuf, _runtime
+
+        buf, n = _errbuf()
+        self._handle = _runtime().triton_npu_hsa_prepare(
+            pdi_path.encode(), insts_path.encode(), buf, n
+        )
+        if not self._handle:
+            raise HsaXrtError(buf.value.decode())
+        self._sets = {}
+
+    def run(
+        self,
+        inputs,
+        *,
+        bo_key,
+        static_indices=(),
+        intermediate_indices=(),
+        output_indices=None,
+        bound_buffers=None,
+    ):
+        """Execute the chain. Same arguments and result as ``MultiLaunchRunner``."""
+        import ctypes
+
+        import numpy as np
+
+        from .hsa_xrt import _Region, _check, _errbuf, _runtime
+
+        bound = set(bound_buffers or ())
+        readback = {len(inputs) - 1} if output_indices is None else set(output_indices)
+        scratch = set(intermediate_indices)
+        static = set(static_indices)
+        sizes = [a.size * a.itemsize for a in inputs]
+        first_call = bo_key not in self._sets
+        if first_call:
+            for i in bound:
+                if not 0 <= i < len(inputs):
+                    raise ValueError(
+                        f"bound buffer index {i} is out of range for "
+                        f"{len(inputs)} args"
+                    )
+            regions = {
+                i: _Region(max(s, 64)) for i, s in enumerate(sizes) if i not in bound
+            }
+            self._sets[bo_key] = (sizes, bound, regions)
+        cached_sizes, cached_bound, regions = self._sets[bo_key]
+        if sizes != cached_sizes or bound != cached_bound:
+            raise ValueError(
+                f"bo_key '{bo_key}' was set up for sizes {cached_sizes} and bound "
+                f"{sorted(cached_bound)}; use a distinct bo_key per operand set"
+            )
+        ptrs = []
+        for i, a in enumerate(inputs):
+            if i in bound:
+                if not a.flags["C_CONTIGUOUS"]:
+                    raise ValueError(f"bound arg {i} is not contiguous")
+                ptrs.append(a.ctypes.data)
+                continue
+            r = regions[i]
+            ptrs.append(r.va)
+            if not first_call and (i in static or i in scratch):
+                continue
+            if i in scratch and i not in static:
+                r.host[: sizes[i]] = 0
+                continue
+            r.host[: sizes[i]] = np.frombuffer(a.tobytes(), np.uint8)
+            if i in static:
+                r.make_resident()
+        n = len(inputs)
+        cptrs = (ctypes.c_void_p * n)(*ptrs)
+        csizes = (ctypes.c_uint64 * n)(*sizes)
+        buf, nb = _errbuf()
+        _check(
+            _runtime().triton_npu_hsa_dispatch(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_uint32(n),
+                cptrs,
+                csizes,
+                buf,
+                nb,
+            ),
+            buf,
+        )
+        results = {}
+        for idx in readback:
+            a = inputs[idx]
+            if idx in bound:
+                results[idx] = a
+                continue
+            results[idx] = np.frombuffer(
+                regions[idx].host, dtype=a.dtype, count=a.size
+            ).reshape(a.shape)
+        return results
+
+    def unload(self):
+        """Drop the operand regions. The program stays cached by the runtime."""
+        self._sets = {}
+
+
 class NPUChain:
     """Model-facing wrapper: declare a chain of NPU ops, dispatch as one ELF.
 
@@ -563,6 +674,8 @@ class NPUChain:
         self._runner = None
         self._elf_path = None
         self._kernel_name = None
+        # The runtime the built artifact runs on; `_build` decides it.
+        self._runtime = "xrt"
 
     def add(
         self,
@@ -655,7 +768,17 @@ class NPUChain:
                 actual_sizes=actual_sizes,
             )
         self._builder = b
-        self._elf_path, self._kernel_name = b.compile()
+        # Built for the launch runtime in effect: an ELF for XRT, a PDI and its
+        # instruction stream for HSA. A PDI holds one launch, though: a chain
+        # of several ops relies on the ELF's in-stream PDI loads to switch
+        # configuration between them, so under HSA it still runs on XRT.
+        self._runtime = npu_config.runtime
+        if self._runtime == "hsa" and len(self._specs) > 1:
+            self._runtime = "xrt"
+            fmt = "elf"
+        else:
+            fmt = _get_output_format(runtime=self._runtime)
+        self._elf_path, self._kernel_name = b.compile(output_format=fmt)
 
     @staticmethod
     def _close_stalest():
@@ -687,7 +810,8 @@ class NPUChain:
             self._build()
         while True:
             try:
-                self._runner = MultiLaunchRunner(self._elf_path, self._kernel_name)
+                runner = HsaChainRunner if self._runtime == "hsa" else MultiLaunchRunner
+                self._runner = runner(self._elf_path, self._kernel_name)
                 break
             except RuntimeError as e:
                 if "HWCTX" not in str(e) or not (
@@ -711,7 +835,15 @@ class NPUChain:
             self._open_runner()
         elif id(self) in NPUChain._open:
             NPUChain._open.move_to_end(id(self))
-        return self._runner.run(
+        # Pages bound for the HSA runtime mean nothing to a chain on XRT:
+        # stage them instead, and copy outputs back into the caller's pages,
+        # which is where a caller that bound them reads.
+        import numpy
+
+        staged = ()
+        if bound_buffers and npu_config.runtime == "hsa" and self._runtime == "xrt":
+            staged, bound_buffers = set(bound_buffers), None
+        got = self._runner.run(
             inputs,
             bo_key=bo_key or self.name,
             static_indices=static_indices,
@@ -719,6 +851,11 @@ class NPUChain:
             output_indices=output_indices,
             bound_buffers=bound_buffers,
         )
+        for idx in staged:
+            if idx in got:
+                numpy.copyto(inputs[idx], got[idx].reshape(inputs[idx].shape))
+                got[idx] = inputs[idx]
+        return got
 
     def close(self):
         """Release the chain's persistent XRT context/BOs (see

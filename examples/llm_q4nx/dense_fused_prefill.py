@@ -15,6 +15,7 @@ them to `_kv_store`, so the host cache, `kv_view`, `kv_stack`, the npz and a
 bound decoder sink all see them exactly as they see the Triton prefill's.
 """
 
+import os
 import weakref
 
 import numpy as np
@@ -27,7 +28,22 @@ def _dense():
     airsrc.register_air_examples()
     from air_examples.llms.shared.fused_prefill import dense, models
 
+    engine_on_launch_runtime()
     return dense, models
+
+
+def engine_on_launch_runtime():
+    """Run mlir-air's fused prefill engine on this process's launch runtime.
+
+    The engine is written against pyxrt. Under `AMD_TRITON_NPU_RUNTIME=hsa` its
+    `xrt` is swapped for `hsa_xrt`, the same calls on the HSA runtime.
+    """
+    if os.environ.get("AMD_TRITON_NPU_RUNTIME") != "hsa":
+        return
+    from air_examples.llms.shared.fused_prefill import engine
+    from triton.backends.amd_triton_npu import hsa_xrt
+
+    engine.xrt = hsa_xrt
 
 
 #: Fused prefills that may hold their hardware contexts between prompts.

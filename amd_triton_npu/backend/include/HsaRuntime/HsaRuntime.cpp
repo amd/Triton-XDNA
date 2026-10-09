@@ -318,12 +318,14 @@ struct SharedRegion {
 
 } // namespace
 
-// A prepared program is just its two pool allocations; the opaque handle in the
-// C ABI points at one of these, owned by the runtime's program cache. Both
-// members free themselves, so a prepare() that loads the PDI and then fails on
-// the instructions releases the PDI on the way out.
+// A prepared program is its instruction stream and the PDI it runs on; the
+// opaque handle in the C ABI points at one of these, owned by the runtime's
+// program cache. The PDI is shared by every program prepared from the same
+// file: the device reconfigures the array whenever a dispatch names a
+// different PDI address, so programs that alternate on one design must name
+// the same one.
 struct triton_npu_hsa_program {
-  PoolBuffer pdi;
+  std::shared_ptr<PoolBuffer> pdi;
   PoolBuffer insts;
 };
 
@@ -386,8 +388,13 @@ public:
     if (it != programs_.end())
       return it->second.get();
     auto prog = std::make_unique<triton_npu_hsa_program>();
-    // If the second load throws, ~PoolBuffer releases the first.
-    prog->pdi = load_binary(pdi_path);
+    auto pdi = pdis_.find(pdi_path);
+    if (pdi == pdis_.end())
+      pdi = pdis_
+                .emplace(pdi_path,
+                         std::make_shared<PoolBuffer>(load_binary(pdi_path)))
+                .first;
+    prog->pdi = pdi->second;
     prog->insts = load_binary(insts_path);
     triton_npu_hsa_program *raw = prog.get();
     programs_.emplace(std::move(key), std::move(prog));
@@ -530,7 +537,7 @@ public:
       // The ABI requires kernarg_address to be NULL when num_kernargs is 0.
       pkt.kernarg_address = (num_tensors > 0) ? kernargs : nullptr;
       pkt.insts_size = program->insts.size();
-      pkt.pdi_addr = program->pdi.va();
+      pkt.pdi_addr = program->pdi->va();
 
       // Arm the signal to 1 (device decrements to 0 on success, or sets a
       // negative error code) and write the packet into the slot. Nothing from
@@ -788,6 +795,9 @@ private:
   // destructor freeing them all. Unlike regions_ below, which cannot be.
   std::unordered_map<std::string, std::unique_ptr<triton_npu_hsa_program>>
       programs_;
+  // Loaded PDIs by path, shared by the programs prepared from each. Guarded by
+  // programs_mtx_.
+  std::unordered_map<std::string, std::shared_ptr<PoolBuffer>> pdis_;
   std::mutex programs_mtx_;
 
   // One entry in the address table: the region reached through this key, and
@@ -935,6 +945,7 @@ private:
         vmem_free(b);
     vmem_pool_.clear();
     programs_.clear();
+    pdis_.clear();
     kernarg_buffer_ = PoolBuffer{};
     if (signal_.handle) {
       log_status("hsa_signal_destroy", hsa_signal_destroy(signal_));

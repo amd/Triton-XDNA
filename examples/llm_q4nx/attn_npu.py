@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
@@ -90,22 +91,30 @@ class _Chain:
             self.b.append(_page((K, N), torch.bfloat16))
             self.c.append(_page((M, N), torch.float32))
         self.bufs = [*self.a, *self.b, *self.c]
-        self.io = {i: kn.shared_bo(t) for i, t in enumerate(self.bufs)}
+        # Pages XRT does not map (HSA-runtime pages) are staged instead.
+        bos = {i: kn.shared_bo(t) for i, t in enumerate(self.bufs)}
+        self.io = {i: bo for i, bo in bos.items() if bo is not None} or None
 
     def close(self):
         self.chain.close()
 
     def run(self):
         n = self.n
-        self.chain.run(
+        outs = range(2 * n, 3 * n)
+        got = self.chain.run(
             [kn._np(t) for t in self.bufs],
             bo_key="attn",
             static_indices=set(),
             # Kernel outputs; the host only reads them.
-            intermediate_indices=set(range(2 * n, 3 * n)),
-            output_indices=set(range(2 * n, 3 * n)),
+            intermediate_indices=set(outs),
+            output_indices=set(outs),
             bound_buffers=self.io,
         )
+        # A bound output is already in its page; a staged one comes back here.
+        for i in outs:
+            if i not in (self.io or {}):
+                c = self.c[i - 2 * n]
+                c.copy_(torch.from_numpy(np.asarray(got[i])).reshape(c.shape))
 
 
 #: Plans (block counts) one instance keeps. Each holds two chains and every

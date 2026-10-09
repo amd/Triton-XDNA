@@ -101,8 +101,11 @@ from kernels import (
     _GELU_2C,
     _GELU_K,
     col_tier,
+    bind_ref,
     elem_block,
+    igpu_share,
     matmul_script,
+    npu_device,
     narrow_k,
     row_tier,
     script,
@@ -135,8 +138,8 @@ def _host(w):
 
 
 def _bo(w):
-    """The XRT buffer object to bind, or None when the weight is not shared."""
-    return getattr(w, "bo", None)
+    """What to bind for a weight, or None when it is a plain array."""
+    return bind_ref(w) if hasattr(w, "numpy") else None
 
 
 def _pow2(n):
@@ -424,9 +427,10 @@ class FusedMLP:
         try:
             from triton.backends.amd_triton_npu import shared
 
-            a = shared.zeros(M, self.K_stride, dtype=torch.bfloat16, device="xrt:0")
-            out = shared.zeros(M, self.D_pad, dtype=torch.float32, device="xrt:0")
-            if a.bo is None or out.bo is None:
+            dev = npu_device()
+            a = shared.zeros(M, self.K_stride, dtype=torch.bfloat16, device=dev)
+            out = shared.zeros(M, self.D_pad, dtype=torch.float32, device=dev)
+            if bind_ref(a) is None or bind_ref(out) is None:
                 raise SharedBufferUnavailable
             pages = (a, out)
         except Exception as e:  # noqa: BLE001 -- see the docstring
@@ -453,8 +457,10 @@ class FusedMLP:
         try:
             from triton.backends.amd_triton_npu import shared
 
+            if npu_device() == "hsa:0":
+                return shared.zeros(rows, cols, dtype=torch.bfloat16, device="hsa:0")
             return shared.zeros(
-                rows, cols, dtype=torch.bfloat16, device="xrt:0", share="hip:0"
+                rows, cols, dtype=torch.bfloat16, device="xrt:0", share=igpu_share()
             )
         except Exception as e:  # noqa: BLE001 -- see the docstring
             if os.environ.get("AMD_TRITON_NPU_DEBUG"):
@@ -693,9 +699,9 @@ class FusedMLP:
                 # bound or not, they carry no new host data per call.
                 io_bound = dict(bound or {})
                 if A_pg is not None:
-                    io_bound[self.A_I] = A_pg.bo
+                    io_bound[self.A_I] = bind_ref(A_pg)
                 if OUT_pg is not None:
-                    io_bound[self.OUT_I] = OUT_pg.bo
+                    io_bound[self.OUT_I] = bind_ref(OUT_pg)
                 got = chain.run(
                     args,
                     bo_key=f"q4nx_mlp_{self.H}_L{layer_idx}",
