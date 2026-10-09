@@ -200,10 +200,10 @@ what porting it would need (a per-context-length packed-executable cache,
 unmeasured). The rest of this section is kept as a record of what worked
 under the old (PDI + instruction-stream address) HSA dispatch ABI.
 
-~~~bash
+```bash
 make compile-decode RUNTIME=hsa   # the decode as PDI, not xclbin
 make chat RUNTIME=hsa
-~~~
+```
 
 Both halves used to dispatch through `HsaRuntime` rather than XRT, and the
 decode's logits were bit-identical to the XRT path.
