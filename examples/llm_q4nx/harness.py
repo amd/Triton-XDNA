@@ -1005,13 +1005,18 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and not spec.supports_hsa:
         # Up front, for the same reason --interactive is below: a property of
         # the model, not of anything on disk. Without this the run loads
-        # weights for minutes and then dies inside hsa_decode.py on
-        # `air.FusedDecoder`, an attribute this model's driver does not define.
+        # weights for minutes and then dies inside hsa_decode.py -- either on
+        # `air.FusedDecoder`, an attribute some drivers don't define, or (for
+        # every model that used to support this) on HsaProgram's fail-fast
+        # raise, since per-token instruction-stream patching has no home
+        # under the hsaco/kernel-object HSA dispatch model.
         raise SystemExit(
-            f"AMD_TRITON_NPU_RUNTIME=hsa is not supported for {spec.name}. The "
-            f"HSA decode adapter subclasses mlir-air's `FusedDecoder`, which "
-            f"only its npz-API drivers define; this model's driver names its "
-            f"decoder {spec.decoder_class or 'something else'}. Use the "
+            f"AMD_TRITON_NPU_RUNTIME=hsa is not supported for {spec.name}. "
+            f"Either its driver's decoder ({spec.decoder_class or 'something else'}) "
+            f"isn't mlir-air's `FusedDecoder`-API, which the HSA adapter "
+            f"subclasses, or its decode depends on per-token instruction-"
+            f"stream patching (triton_npu_hsa_patch_insts), which the current "
+            f"hsaco/kernel-object HSA dispatch does not support. Use the "
             f"default XRT runtime."
         )
 

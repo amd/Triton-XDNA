@@ -190,32 +190,43 @@ python prefill.py --backend cpu --kv-out /tmp/kv.npz
 
 ### Running on the HSA runtime
 
-```bash
+**Currently unsupported** (`AMD_TRITON_NPU_RUNTIME=hsa make chat` fails fast
+with a clear error; `registry.py`'s `supports_hsa=False` for this model
+reflects it). ROCr's AIE hsaco/kernel-object dispatch removed
+`triton_npu_hsa_patch_insts`, and the decode below depended on it. See
+`../llm_q4nx/hsa_decode.py`'s `HsaProgram` docstring and
+`docs/superpowers/specs/2026-10-08-hsa-hsaco-dispatch-design.md` for why, and
+what porting it would need (a per-context-length packed-executable cache,
+unmeasured). The rest of this section is kept as a record of what worked
+under the old (PDI + instruction-stream address) HSA dispatch ABI.
+
+~~~bash
 make compile-decode RUNTIME=hsa   # the decode as PDI, not xclbin
 make chat RUNTIME=hsa
-```
+~~~
 
-Both halves then dispatch through `HsaRuntime` rather than XRT, and the
-decode's logits are bit-identical to the XRT path.
+Both halves used to dispatch through `HsaRuntime` rather than XRT, and the
+decode's logits were bit-identical to the XRT path.
 
-It is not as fast. Measured on Strix, 60 tokens, runtimes alternated:
+It was not as fast. Measured on Strix, 60 tokens, runtimes alternated:
 
 | | tok/s |
 |---|---|
 | XRT | 54.5 – 54.8 |
 | HSA | 49.1 – 51.5 |
 
-a stable gap of about 9%, reproducible across runs rather than noise. It is
+a stable gap of about 9%, reproducible across runs rather than noise. It was
 not the per-dispatch cache flush -- that is what resident regions removed, and
-without them the gap is roughly three times larger. What remains has not been
-attributed, so treat the HSA path as correct and close, not as a replacement.
+without them the gap was roughly three times larger. What remained was never
+attributed.
 
-The interesting part is how the context length gets to the device. HSA has no
-scratchpad parameters, so the full-ELF mechanism is unavailable; but the AIE
-dispatch packet carries the instruction stream's address per enqueue, so
-`../llm_q4nx/hsa_decode.py` patches the 248 L-dependent words per token — the same words
-mlir-air's xclbin path rewrites. One PDI serves every context length; the
-L=2048 and L=2047 builds are byte-identical.
+The interesting part was how the context length got to the device. HSA has no
+scratchpad parameters, so the full-ELF mechanism was unavailable; but the old
+AIE dispatch packet carried the instruction stream's address per enqueue, so
+`../llm_q4nx/hsa_decode.py` patched the 248 L-dependent words per token — the
+same words mlir-air's xclbin path rewrites. One PDI served every context
+length; the L=2048 and L=2047 builds are byte-identical. That observation
+still holds; only the per-token patch mechanism it relied on is gone.
 
 `--ops` takes `all` or a comma list of `matmul,rms_norm,swiglu`, so a
 numerical regression can be bisected to a single kernel against the same CPU

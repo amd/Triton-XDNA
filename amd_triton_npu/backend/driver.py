@@ -1287,6 +1287,13 @@ def _get_output_format(runtime=None):
     the ``AMD_TRITON_NPU_OUTPUT_FORMAT`` env var).
     If not set, defaults to "elf" on npu2 and "xclbin" on npu1.
     ELF format is only supported on npu2 (AIE2P) devices.
+
+    Under the HSA runtime, "pdi" is rejected: a raw ``aie.pdi`` has no
+    ``AIE_PARTITION`` section, so the hsaco packer (which needs the PDI's
+    partition/column-count metadata, not just its bytes) has nothing to read
+    it from. Unlike XRT, which can dispatch a raw PDI + insts.bin directly,
+    HSA always packs through ``aie.compiler.hsaco.pack``, which only
+    understands the xclbin and full-ELF shapes.
     """
     if runtime is None:
         runtime = npu_config.runtime
@@ -1298,6 +1305,14 @@ def _get_output_format(runtime=None):
                 "ELF output format is not supported on npu1 (AIE2) devices. "
                 "Unset or change AMD_TRITON_NPU_OUTPUT_FORMAT, or set "
                 "npu_config.output_format to 'xclbin', 'pdi', or None."
+            )
+        if configured_format == "pdi" and runtime == "hsa":
+            raise RuntimeError(
+                "output_format='pdi' is not supported under the HSA runtime: "
+                "a raw PDI carries no partition/column-count metadata, which "
+                "the hsaco packer needs. Unset AMD_TRITON_NPU_OUTPUT_FORMAT "
+                "(or npu_config.output_format) to auto-detect xclbin/elf, or "
+                "set it to one of those explicitly."
             )
         return configured_format
     # Auto-detect: ELF for npu2, xclbin for npu1.
@@ -2457,10 +2472,22 @@ def _pack_hsaco(output_format, artifacts, arch, kernel_name):
         bytes: the packed hsaco.
 
     Raises:
+        ValueError: via aie.compiler.hsaco.pack, if the xclbin/full-ELF
+            artifacts are malformed (e.g. a missing partition column count, or
+            ``kernel_name`` not found in a full ELF's kernel list).
         RuntimeError: via aie.compiler.hsaco.pack, if xclbinutil/llvm-objcopy
-            fail or the artifacts are malformed.
+            cannot be located or fail.
     """
-    from aie.compiler.hsaco import pack
+    try:
+        from aie.compiler.hsaco import pack
+    except ImportError as e:
+        raise RuntimeError(
+            "could not import aie.compiler.hsaco: the installed mlir-aie "
+            "does not have hsaco packing support yet. This needs an "
+            "mlir-aie build from (or after) branch "
+            "ypapadop-amd/hsa-hsaco-loading -- utils/mlir-air-hash.txt is not "
+            "yet pinned to one (see this change's PR description)."
+        ) from e
 
     if output_format == "elf":
         (kernel,) = pack.kernels_from_full_elf(
@@ -2881,8 +2908,9 @@ class NPULauncher(object):
         """
         constants, signature = extract_signature_and_constants(src)
         if runtime == "hsa":
-            # HSA consumes PDI + insts and links ROCR. Import lazily so the
-            # (large) HSA codegen module is only loaded when the HSA path is used.
+            # HSA consumes a packed hsaco (xclbin/PDI+insts or full ELF) and
+            # links ROCR. Import lazily so the (large) HSA codegen module is
+            # only loaded when the HSA path is used.
             from .hsa_launcher import _generate_hsa_launcher
 
             # Detect output format the same way the XRT branch does: ELF for
@@ -2944,11 +2972,14 @@ def get_npu_cache_dir(compiled_kernel):
 
     The NPU backend stores hardware-specific artifacts in a separate cache
     directory from Triton's main compiler cache. Depending on the selected
-    output format, the directory contains either:
+    output format and link profile, the directory contains:
 
-    * xclbin output: ``aie.xclbin``, ``insts.bin``, and
+    * xclbin output (xrt): ``aie.xclbin``, ``insts.bin``, and
       ``__npu_dispatch.so``
-    * elf output: ``aie.elf``, ``elf_kernel_name.txt``, and
+    * elf output (xrt): ``aie.elf``, ``elf_kernel_name.txt``, and
+      ``__npu_dispatch.so``
+    * hsa (either output format, packed into one hsaco): the above
+      format-specific artifacts, plus ``kernel.hsaco`` and
       ``__npu_dispatch.so``
 
     This function returns the path to that directory.

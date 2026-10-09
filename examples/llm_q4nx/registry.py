@@ -207,7 +207,13 @@ LLAMA_3_2_1B = ModelSpec(
     air_inference="llama32_1b_q4nx_inference.py",
     tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.2-1B",
     extra_packages=("llama32_1b",),
-    supports_hsa=True,
+    # HSA decode needs per-token instruction-stream patching
+    # (triton_npu_hsa_patch_insts), which the hsaco/kernel-object HSA dispatch
+    # model does not support -- the instruction stream now lives inside a
+    # frozen ROCr executable rather than a runtime-owned buffer. See
+    # examples/llm_q4nx/hsa_decode.py's HsaProgram and
+    # docs/superpowers/specs/2026-10-08-hsa-hsaco-dispatch-design.md.
+    supports_hsa=False,
 )
 
 
@@ -248,7 +254,9 @@ LLAMA_3_2_3B = ModelSpec(
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",
     decoder_class="FusedDecode3B",
-    supports_hsa=True,
+    # See the 1B entry above: HSA decode needs per-token instruction-stream
+    # patching, which the hsaco/kernel-object HSA dispatch model dropped.
+    supports_hsa=False,
 )
 
 
@@ -338,7 +346,9 @@ QWEN3_4B = ModelSpec(
     # resident at once.
     min_host_gib=14.0,
     extra_packages=("qwen3_8b_q4nx", "qwen3_4b"),
-    supports_hsa=True,
+    # See the 1B entry above: HSA decode needs per-token instruction-stream
+    # patching, which the hsaco/kernel-object HSA dispatch model dropped.
+    supports_hsa=False,
 )
 
 
@@ -381,7 +391,9 @@ GEMMA3_4B = ModelSpec(
     # because its 262208-row LM head is a separate tensor where Qwen3-4B's is
     # tied.
     min_host_gib=17.0,
-    supports_hsa=True,
+    # See the 1B entry above: HSA decode needs per-token instruction-stream
+    # patching, which the hsaco/kernel-object HSA dispatch model dropped.
+    supports_hsa=False,
 )
 
 #: `DECODE_ENV` in `fused_decode_ple/Makefile` -- the ENGINE's, not the model's:

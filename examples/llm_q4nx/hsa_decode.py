@@ -2,8 +2,13 @@
 # SPDX-License-Identifier: MIT
 """The fused Q4NX decode on the HSA runtime.
 
-mlir-air's decoder dispatches through pyxrt. This runs the same design on
-HsaRuntime instead, which is what makes a fully-HSA chatbot possible.
+**Currently disabled** (`HsaProgram` raises on construction, before any
+weight loading) -- see its docstring below for why. This file is kept for the
+host-side plumbing (shared KV/weight buffers, geometry, sampling) and the
+record of a design that worked under the old HSA ABI, not as a runnable path.
+
+mlir-air's decoder dispatches through pyxrt. This ran the same design on
+HsaRuntime instead, which is what made a fully-HSA chatbot possible.
 
 The whole problem is the context length. It changes every token, and an AIE
 dispatch has only two ways to hear about it:
@@ -15,17 +20,20 @@ dispatch has only two ways to hear about it:
   `xrt::run::get_ctrl_scratchpad_bo`, an XRT API with no HSA counterpart
   (`grep -ic scratch hsa_ext_amd_aie.h` is 0).
 
-So on HSA it has to be the first, and the AIE dispatch packet does carry
-`insts_addr_low/high` and `insts_size` per enqueue -- the stream is an input to
-each dispatch, not a property of the program. What blocked it was only that
-`triton_npu_hsa_prepare` read the stream from a file once. `patch_insts` (added
-to HsaRuntime for this) writes into the very buffer the packet already points
-at, so the 248 L-dependent words are rewritten per token exactly as the xclbin
-path rewrites them.
+So on HSA it had to be the first. Under the old (PDI + instruction-stream
+address) dispatch ABI, the AIE dispatch packet carried `insts_addr_low/high`
+and `insts_size` per enqueue -- the stream was an input to each dispatch, not
+a property of the program -- so `triton_npu_hsa_patch_insts` could rewrite the
+248 L-dependent words in place, in the very buffer the packet already pointed
+at, exactly as mlir-air's xclbin path rewrites them. Under the newer hsaco/
+kernel-object ABI there is no such buffer: the instruction stream lives inside
+a frozen ROCr executable, resolved to an opaque kernel object at load time, and
+`triton_npu_hsa_patch_insts` does not exist any more. See `HsaProgram` below.
 
 The design itself is L-independent: the L=2048 and L=2047 builds produce a
 BYTE-IDENTICAL PDI and differ only in those insts words. One PDI serves every
-context length.
+context length -- this part of the design is unaffected by the ABI change and
+would still apply to whatever ports it.
 
 Weights and the KV cache live in shared regions, so they are dispatched on in
 place. Copying 0.7 GB of weights per token would cap throughput near 23 tok/s
@@ -130,50 +138,36 @@ def mark_resident(lib, arr):
 
 
 class HsaProgram:
-    """A prepared PDI + instruction stream, with the stream patchable per token."""
+    """Disabled: per-token instruction-stream patching has no home under the
+    hsaco/kernel-object HSA dispatch model.
+
+    This class used to `triton_npu_hsa_prepare(pdi_path, insts_path)` once and
+    `triton_npu_hsa_patch_insts` the 248 L-dependent words per token, in place,
+    in the runtime-owned buffer the dispatch packet pointed at. ROCr's AIE
+    hsaco support removed that buffer: `triton_npu_hsa_prepare` now takes
+    `(hsaco_path, kernel_name)`, loads the instruction stream into a frozen
+    ROCr executable, and dispatches it by an opaque kernel object --
+    `triton_npu_hsa_patch_insts` no longer exists, because there is nothing
+    left to patch in place.
+
+    Porting this decode path means packing and loading a fresh executable per
+    distinct context length L (mirroring mlir-aie's own per-call-sequence
+    executable LRU), which has not been built or measured -- in a normal
+    single-sequence chat decode L increments by one every token, so an LRU
+    buys nothing and every token would pay a full ROCr executable load instead
+    of this class's in-place memcpy. Fails here, before any weight loading,
+    rather than building a program that silently does the wrong thing. See
+    docs/superpowers/specs/2026-10-08-hsa-hsaco-dispatch-design.md.
+    """
 
     def __init__(self, pdi_path, insts_path):
-        from triton.backends.amd_triton_npu.driver import load_hsa_runtime
-
-        self.lib = load_hsa_runtime()
-        buf, n = _errbuf()
-        self.lib.triton_npu_hsa_prepare.restype = ctypes.c_void_p
-        self.handle = self.lib.triton_npu_hsa_prepare(
-            pdi_path.encode(), insts_path.encode(), buf, n
+        raise HsaDecodeError(
+            "HSA decode (per-token instruction-stream patching via "
+            "triton_npu_hsa_patch_insts) is not supported under the hsaco/"
+            "kernel-object HSA dispatch model -- that C ABI entry point no "
+            "longer exists. Use the default XRT runtime for this model's "
+            "chat/decode path."
         )
-        if not self.handle:
-            raise HsaDecodeError(buf.value.decode())
-        self.insts_words = os.path.getsize(insts_path) // 4
-
-    def patch_insts(self, word_offset, words):
-        """Overwrite `words` (uint32) at `word_offset` in the live stream."""
-        a = np.ascontiguousarray(words, dtype=np.uint32)
-        buf, n = _errbuf()
-        rc = self.lib.triton_npu_hsa_patch_insts(
-            ctypes.c_void_p(self.handle),
-            ctypes.c_uint64(word_offset * 4),
-            a.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_uint64(a.nbytes),
-            buf,
-            n,
-        )
-        if rc != 0:
-            raise HsaDecodeError(buf.value.decode())
-
-    def dispatch(self, arrays):
-        """One enqueue over `arrays` in kernel-argument order."""
-        n = len(arrays)
-        ptrs = (ctypes.c_void_p * n)()
-        sizes = (ctypes.c_uint64 * n)()
-        for i, a in enumerate(arrays):
-            ptrs[i] = ctypes.c_void_p(a.ctypes.data)
-            sizes[i] = ctypes.c_uint64(a.nbytes)
-        buf, nb = _errbuf()
-        rc = self.lib.triton_npu_hsa_dispatch(
-            ctypes.c_void_p(self.handle), ctypes.c_uint32(n), ptrs, sizes, buf, nb
-        )
-        if rc != 0:
-            raise HsaDecodeError(buf.value.decode())
 
 
 class InstsForL:
