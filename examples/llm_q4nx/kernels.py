@@ -403,8 +403,7 @@ def shared_bo(t):
     """What a chain's `bound_buffers` takes for a `shared_empty` tensor, or None.
 
     The chain then dispatches on the caller's own pages instead of staging a
-    copy in and copying the result back out. At qkv's shape that is 6 MiB in
-    and 42 MiB out, on every one of 35 layers. See `bind_ref`.
+    copy in and copying the result back out. See `bind_ref`.
     """
     return bind_ref(getattr(t, "_shared_buffer", None))
 
@@ -447,8 +446,8 @@ def xrt_bo(buf):
 
 def igpu_share():
     """The `share=` for pages the iGPU may also read: "hip:0", or none at all
-    under the HSA runtime. That runtime loads its own ROCR, and torch's HIP
-    cannot run kernels on top of it, so nothing on that path uses the iGPU."""
+    under the HSA runtime, where the process cannot use the iGPU (see the check
+    in `harness.main`)."""
     return () if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" else "hip:0"
 
 
@@ -820,9 +819,7 @@ def triton_matmul(
         # The activation and the result are the caller's own pages where the
         # interop allows it, so neither is staged in nor copied back.
         io = {
-            i: bo
-            for i, bo in ((0, shared_bo(a)), (2, shared_bo(c)))
-            if bo is not None
+            i: bo for i, bo in ((0, shared_bo(a)), (2, shared_bo(c))) if bo is not None
         }
         # The build too, not just the dispatch: it warmup-compiles the kernel,
         # which needs a driver, and with no iGPU visible there is no default

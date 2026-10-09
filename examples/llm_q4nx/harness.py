@@ -814,8 +814,9 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             f"none. Use --decode npu."
         )
 
-    # The HSA runtime loads its own ROCR, on which torch's HIP cannot run
-    # kernels, so nothing may use the iGPU in the same process.
+    # The HSA runtime needs an AIE-capable ROCR in the process, and torch's HIP
+    # runs on the ROCR it ships with. One process holds one ROCR, so under HSA
+    # nothing may use the iGPU.
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and (
         args.decode == "gpu" or args.backend == "hetero"
     ):
