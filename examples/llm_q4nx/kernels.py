@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _EXAMPLES = os.path.dirname(_HERE)
@@ -64,7 +65,7 @@ def launch(kernel, grid, *args, transform_script=None, **constexprs):
     error instead of leaving it to this comment.
     """
     _check_script(kernel, constexprs, transform_script)
-    with _npu_driver(), _tiling_script(transform_script):
+    with driver_scope("npu"), _tiling_script(transform_script):
         kernel[grid](*args, **constexprs)
 
 
@@ -90,26 +91,6 @@ def _check_script(kernel, constexprs, transform_script):
             f"does not key on the script, so {transform_script!r} would be "
             f"ignored and the first schedule used instead."
         )
-
-
-class _npu_driver:
-    """Make the NPU driver active for the duration of a launch.
-
-    Restores whatever was active on entry rather than resetting: on a host with
-    no iGPU there is no driver to auto-detect back to. Reading `.active` is
-    itself what resolves the default, and on an iGPU-free host that raises
-    "0 active drivers" -- so only read it if one has already been chosen.
-    """
-
-    def __enter__(self):
-        from triton.backends.amd_triton_npu.driver import NPUDriver
-
-        self._prev = getattr(triton.runtime.driver, "_active", None)
-        triton.runtime.driver.set_active(NPUDriver())
-
-    def __exit__(self, *exc):
-        if self._prev is not None:
-            triton.runtime.driver.set_active(self._prev)
 
 
 class _tiling_script:
@@ -386,8 +367,7 @@ def shared_empty(shape, dtype):
     try:
         from triton.backends.amd_triton_npu import shared
 
-        dev = "hsa:0" if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" else "xrt:0"
-        buf = shared.empty(tuple(shape), dtype=dtype, device=dev)
+        buf = shared.empty(tuple(shape), dtype=dtype, device=npu_device())
         t = buf.torch()
         # The caller binds it (`shared_bo`); without that the pages are still
         # staged and copied back like any other array, and the only thing this
@@ -420,14 +400,55 @@ def io_page(shape, dtype):
 
 
 def shared_bo(t):
-    """The XRT buffer object behind a `shared_empty` tensor, or None.
+    """What a chain's `bound_buffers` takes for a `shared_empty` tensor, or None.
 
-    `bound_buffers` takes these: the chain then dispatches on the caller's own
-    pages instead of staging a copy in and copying the result back out. At
-    qkv's shape that is 6 MiB in and 42 MiB out, on every one of 35 layers.
+    The chain then dispatches on the caller's own pages instead of staging a
+    copy in and copying the result back out. See `bind_ref`.
     """
-    buf = getattr(t, "_shared_buffer", None)
-    return None if buf is None else buf.bo
+    return bind_ref(getattr(t, "_shared_buffer", None))
+
+
+def npu_device():
+    """The `shared` device string for pages the NPU runs on in place."""
+    return "hsa:0" if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" else "xrt:0"
+
+
+def bind_ref(buf):
+    """What a chain's `bound_buffers` takes for shared buffer `buf`.
+
+    Its XRT BO on the XRT runtime; the buffer itself on HSA, where the chain
+    dispatches on the caller's array in place; None when `buf` is not shared
+    with the runtime in use, and the chain stages it.
+    """
+    if buf is None:
+        return None
+    from triton.backends.amd_triton_npu.shared import SharedBufferError
+
+    try:
+        if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa":
+            return buf if buf.aie_ptr() is not None else None
+        return getattr(buf, "bo", None)
+    except SharedBufferError:
+        return None
+
+
+def xrt_bo(buf):
+    """`buf.bo` for a shared buffer XRT maps; None for anything else."""
+    if buf is None:
+        return None
+    from triton.backends.amd_triton_npu.shared import SharedBufferError
+
+    try:
+        return getattr(buf, "bo", None)
+    except SharedBufferError:
+        return None
+
+
+def igpu_share():
+    """The `share=` for pages the iGPU may also read: "hip:0", or none at all
+    under the HSA runtime, where the process cannot use the iGPU (see the check
+    in `harness.main`)."""
+    return () if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" else "hip:0"
 
 
 class ResidentWeight:
@@ -797,11 +818,13 @@ def triton_matmul(
         key = f"{stage_key or 'mm'}_{b.data_ptr():x}_{Mp}x{Kp}x{Np}"
         # The activation and the result are the caller's own pages where the
         # interop allows it, so neither is staged in nor copied back.
-        io = {i: bo for i, bo in ((0, shared_bo(a)), (2, shared_bo(c))) if bo}
+        io = {
+            i: bo for i, bo in ((0, shared_bo(a)), (2, shared_bo(c))) if bo is not None
+        }
         # The build too, not just the dispatch: it warmup-compiles the kernel,
         # which needs a driver, and with no iGPU visible there is no default
         # one to fall back on ("0 active drivers") -- as `FusedMLP.run` scopes.
-        with _npu_driver():
+        with driver_scope("npu"):
             chain = _proj_chain(
                 block_m, block_n, Mp, Np, Kp, a_stride, transform_script
             )

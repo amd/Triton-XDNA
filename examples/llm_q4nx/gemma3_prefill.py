@@ -58,6 +58,19 @@ class Gemma3Prefill(LlamaPrefill):
     #: schedule. Named as its own operator so `--ops` can bisect it.
     NPU_OPS = ("matmul", "rms_norm", "geglu")
 
+    #: Llama's placement with `geglu` for `swiglu`. See `LlamaPrefill.PLACEMENT`.
+    PLACEMENT = {
+        "cpu": dict(
+            matmul="cpu", rms_norm="cpu", geglu="cpu", rope="cpu", attention="cpu"
+        ),
+        "npu": dict(
+            matmul="npu", rms_norm="npu", geglu="npu", rope="cpu", attention="cpu"
+        ),
+        "hetero": dict(
+            matmul="npu", rms_norm="npu", geglu="npu", rope="gpu", attention="gpu"
+        ),
+    }
+
     #: The two post-norms and the per-head q/k norms. Float32 for the same
     #: reason Qwen3's are: they are applied inside an f32 RMSNorm.
     EXTRA_LAYER_WEIGHTS = {
@@ -91,7 +104,7 @@ class Gemma3Prefill(LlamaPrefill):
     def _geglu(self, gate, up, backend=None):
         """gelu_tanh(gate) * up, elementwise."""
         with self.timer.track("geglu"):
-            if self._on_npu("geglu", backend):
+            if self._device("geglu", backend) == "npu":
                 import kernels
 
                 return kernels.triton_geglu(gate, up)

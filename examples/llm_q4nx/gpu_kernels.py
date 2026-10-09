@@ -41,37 +41,6 @@ def _pow2(n):
     return 1 << (max(int(n), 1) - 1).bit_length()
 
 
-class gpu_driver:
-    """Make Triton's AMD GPU backend active for the duration.
-
-    Required, not hygiene. `kernels._npu_driver` restores the previously active
-    driver only when there *was* one, and on the first NPU launch of a process
-    there is not -- so after any prefill the NPU driver stays active, and a
-    kernel launched here would be handed to `amd_triton_npu` and fail in aircc
-    (`failed to legalize operation 'memref.copy'`) rather than compiling for
-    gfx1151.
-
-    Enter it once around a whole generation, not per step. Re-entering is free;
-    it no-ops when the GPU backend is already active. Switching is not:
-    `set_active` drops Triton's compiled-kernel cache, so a scope entered per
-    token recompiles everything that token touches.
-    """
-
-    _AMD = "triton.backends.amd.driver"
-
-    def __enter__(self):
-        from triton.backends import backends
-
-        self._prev = getattr(triton.runtime.driver, "_active", None)
-        self._switched = self._prev is None or type(self._prev).__module__ != self._AMD
-        if self._switched:
-            triton.runtime.driver.set_active(backends["amd"].driver())
-
-    def __exit__(self, *exc):
-        if self._switched and self._prev is not None:
-            triton.runtime.driver.set_active(self._prev)
-
-
 # ---------------------------------------------------------------------------
 # Projections
 # ---------------------------------------------------------------------------

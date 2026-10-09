@@ -14,7 +14,7 @@ Generated 6 tokens in 0.13s (47.24 tok/s)
 ```
 
 ```
-$ python llama32_1b_q4nx_inference.py --backend npu --max-tokens 12 --greedy
+$ python llama32_1b_q4nx_inference.py --prefill-engine triton --backend npu --max-tokens 12 --greedy
 [triton-prefill] backend=npu ops={'matmul', 'rms_norm', 'swiglu'} P=6 ... first=12366
 [triton-prefill] first token 12366 (expect 12366) -- PASS
 Generated 12 tokens in 0.22s (55.76 tok/s)
@@ -179,7 +179,8 @@ Underneath:
 python llama32_1b_q4nx_inference.py --prefill-only
 
 # End to end
-python llama32_1b_q4nx_inference.py --backend npu --max-tokens 20 --greedy
+python llama32_1b_q4nx_inference.py --max-tokens 20 --greedy   # mlir-air's fused prefill
+python llama32_1b_q4nx_inference.py --prefill-engine triton --backend npu --max-tokens 20 --greedy
 python llama32_1b_q4nx_inference.py --text "The theory of relativity was developed by"
 
 # The prefill on its own, with per-op routing and a CPU cross-check
@@ -194,11 +195,11 @@ python prefill.py --backend cpu --kv-out /tmp/kv.npz
 with a clear error; `registry.py`'s `supports_hsa=False` for this model
 reflects it). ROCr's AIE hsaco/kernel-object dispatch removed
 `triton_npu_hsa_patch_insts`, and the decode below depended on it. See
-`../llm_q4nx/hsa_decode.py`'s `HsaProgram` docstring and
-`docs/superpowers/specs/2026-10-08-hsa-hsaco-dispatch-design.md` for why, and
-what porting it would need (a per-context-length packed-executable cache,
-unmeasured). The rest of this section is kept as a record of what worked
-under the old (PDI + instruction-stream address) HSA dispatch ABI.
+`../llm_q4nx/hsa_decode.py`'s `_check_hsa_decode_supported` and `HsaProgram`
+docstrings for why, and what porting it would need (a per-context-length
+packed-executable cache, unmeasured). The rest of this section is kept as a
+record of what worked under the old (PDI + instruction-stream address) HSA
+dispatch ABI.
 
 ```bash
 make compile-decode RUNTIME=hsa   # the decode as PDI, not xclbin

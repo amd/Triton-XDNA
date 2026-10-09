@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """End to end: a Triton prefill feeding mlir-air's Q4NX fused decode.
 
-    python phi4_mini_q4nx_inference.py --backend npu --max-tokens 20
+    python phi4_mini_q4nx_inference.py --prefill-engine triton --backend npu --max-tokens 20
     python phi4_mini_q4nx_inference.py --prefill-only     # no decode build needed
 
 The prefill is this repo's -- Triton kernels on XDNA (prefill.py, and

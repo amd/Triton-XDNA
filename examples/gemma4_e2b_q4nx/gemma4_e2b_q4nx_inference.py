@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """End to end: a Triton prefill feeding mlir-air's Q4NX fused decode.
 
-    python gemma4_e2b_q4nx_inference.py --backend npu --max-tokens 4
+    python gemma4_e2b_q4nx_inference.py --prefill-engine triton --backend npu --max-tokens 4
     python gemma4_e2b_q4nx_inference.py --prefill-only     # no decode build needed
 
 The prefill is this repo's -- Triton kernels on XDNA (prefill.py, and

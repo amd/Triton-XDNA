@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 import fused_mlp
 import kernels as kn
@@ -89,22 +91,30 @@ class _Chain:
             self.b.append(_page((K, N), torch.bfloat16))
             self.c.append(_page((M, N), torch.float32))
         self.bufs = [*self.a, *self.b, *self.c]
-        self.io = {i: kn.shared_bo(t) for i, t in enumerate(self.bufs)}
+        # Pages XRT does not map (HSA-runtime pages) are staged instead.
+        bos = {i: kn.shared_bo(t) for i, t in enumerate(self.bufs)}
+        self.io = {i: bo for i, bo in bos.items() if bo is not None} or None
 
     def close(self):
         self.chain.close()
 
     def run(self):
         n = self.n
-        self.chain.run(
+        outs = range(2 * n, 3 * n)
+        got = self.chain.run(
             [kn._np(t) for t in self.bufs],
             bo_key="attn",
             static_indices=set(),
             # Kernel outputs; the host only reads them.
-            intermediate_indices=set(range(2 * n, 3 * n)),
-            output_indices=set(range(2 * n, 3 * n)),
+            intermediate_indices=set(outs),
+            output_indices=set(outs),
             bound_buffers=self.io,
         )
+        # A bound output is already in its page; a staged one comes back here.
+        for i in outs:
+            if i not in (self.io or {}):
+                c = self.c[i - 2 * n]
+                c.copy_(torch.from_numpy(np.asarray(got[i])).reshape(c.shape))
 
 
 #: Plans (block counts) one instance keeps. Each holds two chains and every
@@ -139,7 +149,7 @@ class NPUAttention:
             rows, dh = self.n_q * QB, self.dh
             spans = self._spans(nblk)
             tag = f"{dh}_{self.window or 0}_{nblk}"
-            with kn._npu_driver():
+            with driver_scope("npu"):
                 qk = _Chain(f"attn_qk_{tag}", [(rows, dh, nc) for _, nc in spans])
                 pv = _Chain(f"attn_pv_{tag}", [(rows, nc, dh) for _, nc in spans])
             plan = self._plans[nblk] = (qk, pv, spans)
@@ -184,13 +194,13 @@ class NPUAttention:
                 pv.b[b].zero_()
             qk.b[b][:, k0 - lo : k1 - lo] = k[k0:k1].T
             pv.b[b][k0 - lo : k1 - lo] = v[k0:k1]
-        with kn._npu_driver():
+        with driver_scope("npu"):
             qk.run()
         for b, (lo, nc) in enumerate(spans):
             # Out of place: the score pages are intermediates (see run()).
             S = qk.c[b].view(n_q, QB, nc) + masks[b]
             pv.a[b][:, :nc].view(n_q, QB, nc).copy_(torch.softmax(S, -1))
-        with kn._npu_driver():
+        with driver_scope("npu"):
             pv.run()
         out = torch.empty(N, n_q, dh)
         for b in range(nblk):

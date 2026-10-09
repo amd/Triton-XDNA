@@ -72,13 +72,15 @@ class ModelSpec:
     #: `FusedDecoder` for the kv_arrays ones), so it is recorded rather than
     #: derived from the model name.
     decoder_class: str = ""
-    #: Whether `AMD_TRITON_NPU_RUNTIME=hsa` works for this model. The HSA
-    #: adapter subclasses `air.FusedDecoder`, which only the npz-API drivers
-    #: define -- the prefiller ones name theirs `FusedDecode3B` -- so asking
-    #: for HSA elsewhere raises AttributeError from inside hsa_decode.py.
-    #: Generalizing it belongs with the HSA scratchpad work, not with adding
-    #: models.
+    #: Whether the HSA decode (`AMD_TRITON_NPU_RUNTIME=hsa`) has been verified
+    #: for this model. `hsa_decode.make_hsa_decoder_class` wraps whichever class
+    #: `decoder_class` names, so the driver API alone does not rule a model out.
     supports_hsa: bool = False
+    #: Whether `harness.generate_zero_copy` may run this model over XRT, with the
+    #: prefill writing the decode's KV cache into pages XRT and HIP share. The
+    #: prefill must store K/V through `_kv_store`; set only where the decode has
+    #: been verified on hardware.
+    supports_xrt_zero_copy: bool = False
     #: Host memory the prefill needs to hold this model's dequantized bf16
     #: weights, in GiB. Checked before anything is allocated: an undersized
     #: host is SIGKILLed partway through the load, and a process cannot catch
@@ -211,9 +213,9 @@ LLAMA_3_2_1B = ModelSpec(
     # (triton_npu_hsa_patch_insts), which the hsaco/kernel-object HSA dispatch
     # model does not support -- the instruction stream now lives inside a
     # frozen ROCr executable rather than a runtime-owned buffer. See
-    # examples/llm_q4nx/hsa_decode.py's HsaProgram and
-    # docs/superpowers/specs/2026-10-08-hsa-hsaco-dispatch-design.md.
+    # examples/llm_q4nx/hsa_decode.py's HsaProgram docstring.
     supports_hsa=False,
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -257,6 +259,7 @@ LLAMA_3_2_3B = ModelSpec(
     # See the 1B entry above: HSA decode needs per-token instruction-stream
     # patching, which the hsaco/kernel-object HSA dispatch model dropped.
     supports_hsa=False,
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -298,6 +301,7 @@ LLAMA_3_1_8B = ModelSpec(
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",
     decoder_class="FusedDecode8B",
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -349,6 +353,7 @@ QWEN3_4B = ModelSpec(
     # See the 1B entry above: HSA decode needs per-token instruction-stream
     # patching, which the hsaco/kernel-object HSA dispatch model dropped.
     supports_hsa=False,
+    supports_xrt_zero_copy=True,
 )
 
 
@@ -394,6 +399,7 @@ GEMMA3_4B = ModelSpec(
     # See the 1B entry above: HSA decode needs per-token instruction-stream
     # patching, which the hsaco/kernel-object HSA dispatch model dropped.
     supports_hsa=False,
+    supports_xrt_zero_copy=True,
 )
 
 #: `DECODE_ENV` in `fused_decode_ple/Makefile` -- the ENGINE's, not the model's:
@@ -437,6 +443,10 @@ GEMMA4_E2B = ModelSpec(
     # Gemma3-4B's 15.1 despite the extra 35-layer depth -- this model's D is
     # 1536 against Gemma3's 2560, and its LM head is the same 262144 rows.
     min_host_gib=16.0,
+    # Routes through the same HsaProgram as the other FusedDecoder models
+    # (via engine="ple"'s _make_hsa_ple_decoder_class, which still calls
+    # _programs() -> HsaProgram): per-token instruction-stream patching has
+    # no home under the hsaco/kernel-object HSA dispatch model.
     supports_hsa=False,
 )
 
@@ -616,6 +626,7 @@ PHI4_MINI = ModelSpec(
     min_host_gib=14.0,
     extra_packages=("llama32_1b_q4nx", "llama32_3b"),
     supports_hsa=False,
+    supports_xrt_zero_copy=True,
 )
 
 

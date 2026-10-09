@@ -24,7 +24,7 @@ import torch
 import airsrc
 import kv_layout
 from config import head_dim
-from dense_fused_prefill import run_fused
+from dense_fused_prefill import engine_on_launch_runtime, run_fused
 from gemma4_prefill import Gemma4Prefill, _bf16_np
 
 
@@ -32,6 +32,7 @@ def _fused_prefill_class():
     airsrc.add_air_paths("gemma4_e2b_q4nx")
     from air_examples.llms.gemma4_e2b_q4nx.fused_prefill import runtime
 
+    engine_on_launch_runtime()
     return runtime.FusedPrefill
 
 

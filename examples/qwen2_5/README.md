@@ -87,7 +87,7 @@ on the NPU) — a vocab-sized NPU matmul is far slower there than on the CPU.
 |----|-------|-------|----------|----------------------|---------------------|
 | RMSNorm (input) | GPU | NPU | NPU | NPU | **GPU** |
 | Q/K/V projection | GPU | NPU | GPU | GPU | GPU |
-| RoPE | GPU | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
+| RoPE (torch) | GPU | CPU | GPU | GPU | GPU |
 | Attention scores (Q·Kᵀ) | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
 | Softmax | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
 | Attention · V | GPU (fused) | CPU | GPU (fused) | GPU (fused) | GPU (fused) |
@@ -101,10 +101,13 @@ on the NPU) — a vocab-sized NPU matmul is far slower there than on the CPU.
 | Final RMSNorm | GPU | NPU | NPU | NPU | **GPU** |
 | LM head | GPU | CPU | GPU | GPU | GPU |
 
-Attention (Q/K/V/O, RoPE, the fused attention kernel) always runs on the iGPU:
-the fused FlashAttention-style kernel is GPU-only, and Qwen's grouped-query
-attention is expanded to full heads before the kernel. The LM head also always
-runs on the iGPU.
+The model reads this placement from `PLACEMENT` in `model.py`, which is
+authoritative and also records which cells run torch rather than a Triton
+kernel. Outside `npu`, attention (Q/K/V/O, RoPE, the fused attention kernel)
+runs on the iGPU: the fused FlashAttention-style kernel is GPU-only, and
+Qwen's grouped-query attention is expanded to full heads before the kernel.
+In `hetero`, each layer's input RMSNorm is produced by the previous layer's
+fused NPU tail when that ran.
 
 ## Architecture
 
@@ -161,7 +164,7 @@ kernels/
     rope.py                         # Rotary position embeddings (torch, applied pre-attention)
     add.py                          # Elementwise addition (GPU + NPU)
     attention.py                    # Fused multi-head attention (GPU only)
-    backend_utils.py                # CachedNPUKernel, npu_driver_scope
+    backend_utils.py                # CachedNPUKernel
 transform_matmul_aie2p.mlir         # NPU tiling recipe for matmul
 transform_rmsnorm_aie2p.mlir        # NPU tiling recipe for RMSNorm (single reduction)
 transform_elementwise_aie2p.mlir    # NPU tiling recipe for SiLU

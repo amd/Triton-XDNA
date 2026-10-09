@@ -40,6 +40,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import torch
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 from config import (
     D,
@@ -172,9 +173,10 @@ class OpTimer:
 class LlamaPrefill:
     """Q4NX Llama prefill producing the decode's KV handoff.
 
-    backend: "cpu" runs every operator in torch, which is the reference the NPU
-    path is checked against; "npu" runs the operators named by `ops` as Triton
-    kernels and leaves the rest in torch.
+    backend: a row of `PLACEMENT` -- "cpu" runs every operator in torch, which
+    is the reference the device paths are checked against; "npu" runs the
+    operators `ops` enables as Triton kernels on the NPU and leaves the rest in
+    torch; "hetero" is "npu" with RoPE and attention on the iGPU.
 
     Which Llama is decided by which example's `config` is on `sys.path` -- see
     the module docstring and `bound_model`.
@@ -199,6 +201,10 @@ class LlamaPrefill:
     #: written before it existed. Gemma3's second RoPE table did exactly that.
     WEIGHT_ATTRS = ("_w", "embed", "final_norm", "lm_head", "_lut", "fingerprint")
 
+    #: Whether `save_kv_npz` can write this model's cache as one npz, which
+    #: `prefill.py --kv-out` offers. It needs every layer's cache the same width.
+    SAVES_KV_NPZ = True
+
     def __init__(
         self,
         backend="cpu",
@@ -218,6 +224,11 @@ class LlamaPrefill:
                 "example directory first on sys.path"
             )
         _keep_freed_blocks_in_heap()
+        if backend not in self.PLACEMENT:
+            raise ValueError(
+                f"backend {backend!r}: {type(self).__name__} places its operators "
+                f"for {sorted(self.PLACEMENT)}"
+            )
         self.backend = backend
         self.enabled = self._resolve_ops(ops)
         self.timer = OpTimer(enabled=False)
@@ -308,38 +319,53 @@ class LlamaPrefill:
             raise ValueError(f"unknown ops {sorted(unknown)}; known: {cls.NPU_OPS}")
         return enabled
 
-    #: Backends that put the NPU-capable operators on the NPU. `hetero` does
-    #: too -- it differs only in where the REST go, which is `_gpu_device`.
-    _NPU_BACKENDS = ("npu", "hetero")
+    #: Where each operator runs, per `--backend`: "npu" is a Triton kernel on
+    #: the NPU, "gpu" a Triton kernel on the iGPU, "cpu" torch on the host
+    #: (the reference `--compare-cpu` checks against). Operators look their
+    #: device up through `_device`; a subclass with other operators replaces
+    #: the table.
+    #:
+    #: `_device` adjusts a cell in two cases:
+    #:
+    #: * an "npu" operator that `--ops` does not enable runs on the CPU;
+    #: * a "gpu" cell, when torch sees no iGPU, takes the "npu" row's value,
+    #:   so `hetero` without an iGPU runs as `npu`.
+    #:
+    #: RoPE and attention have no NPU kernel here, so they run on the host or
+    #: the iGPU. The LM head is always torch on the host and is not listed.
+    PLACEMENT = {
+        "cpu": dict(
+            matmul="cpu", rms_norm="cpu", swiglu="cpu", rope="cpu", attention="cpu"
+        ),
+        "npu": dict(
+            matmul="npu", rms_norm="npu", swiglu="npu", rope="cpu", attention="cpu"
+        ),
+        "hetero": dict(
+            matmul="npu", rms_norm="npu", swiglu="npu", rope="gpu", attention="gpu"
+        ),
+    }
 
-    def _on_npu(self, op, backend):
-        """True when `op` should run as a Triton kernel for this call."""
-        return (backend or self.backend) in self._NPU_BACKENDS and op in self.enabled
+    def _device(self, op, backend=None):
+        """Where `op` runs for this call: "npu", "gpu" or "cpu". See PLACEMENT."""
+        table = self.PLACEMENT
+        dev = table[backend or self.backend][op]
+        if dev == "gpu" and not self._has_gpu():
+            dev = table["npu"][op]
+        if dev == "npu" and op not in self.enabled:
+            dev = "cpu"
+        return dev
 
-    def _gpu_device(self, backend=None):
-        """Where an operator that is NOT on the NPU should run.
-
-        `None` means torch on the CPU, which is what `cpu` and `npu` both do:
-        under `npu` the operators without an NPU kernel -- RoPE and attention --
-        stay on the host. Under `hetero` they go to the iGPU instead, which is
-        the whole of what that backend means here. The same split
-        `examples/qwen2_5` calls hetero, named the same way on purpose.
-
-        Returns None rather than raising when there is no ROCm device, so a
-        host without one degrades to the CPU path instead of failing: this is a
-        placement decision, not a correctness one, and CI has no iGPU.
-        """
-        if (backend or self.backend) != "hetero":
-            return None
+    def _has_gpu(self):
+        """Whether torch sees an iGPU. Checked once; prints a note if not."""
         if not hasattr(self, "_gpu_ok"):
             self._gpu_ok = torch.cuda.is_available()
             if not self._gpu_ok:
                 print(
                     "[hetero] no ROCm device visible to torch; the operators "
-                    "without an NPU kernel stay on the CPU",
+                    "placed on the iGPU run as under --backend npu",
                     flush=True,
                 )
-        return "cuda" if self._gpu_ok else None
+        return self._gpu_ok
 
     # ---- operators ----
     # Each is torch by default and Triton on the NPU when enabled. The torch
@@ -349,7 +375,7 @@ class LlamaPrefill:
     def _rms_norm(self, x, weight, eps, backend=None):
         """x: [N, D] -> normalized by RMS over D, scaled by `weight` [D]."""
         with self.timer.track("rms_norm"):
-            if self._on_npu("rms_norm", backend):
+            if self._device("rms_norm", backend) == "npu":
                 import kernels
 
                 return kernels.triton_rms_norm(x, weight, eps)
@@ -372,7 +398,7 @@ class LlamaPrefill:
         them: they select a device schedule, and it has none.
         """
         with self.timer.track("matmul"):
-            if self._on_npu("matmul", backend):
+            if self._device("matmul", backend) == "npu":
                 import kernels
 
                 return kernels.triton_matmul(x, w, **mm)
@@ -393,14 +419,14 @@ class LlamaPrefill:
     def _swiglu(self, gate, up, backend=None):
         """SiLU(gate) * up, elementwise."""
         with self.timer.track("swiglu"):
-            if self._on_npu("swiglu", backend):
+            if self._device("swiglu", backend) == "npu":
                 import kernels
 
                 return kernels.triton_swiglu(gate, up)
             return torch.nn.functional.silu(gate) * up
 
     def _rope(self, x, lut, n_heads, backend=None):
-        """Half-split RoPE (HuggingFace Llama convention). CPU only, see NPU_OPS.
+        """Half-split RoPE (HuggingFace Llama convention). Host or iGPU.
 
         x:   [N, n_heads*DH]
         lut: [N, DH] = [cos_0..cos_{DH/2-1}, sin_0..sin_{DH/2-1}]
@@ -415,20 +441,19 @@ class LlamaPrefill:
         """
         with self.timer.track("rope"):
             N = x.shape[0]
-            # Under `hetero` this runs on the iGPU: it has no NPU kernel, so
-            # the choice is host or GPU, not NPU or GPU. The result comes back
-            # to the CPU because the next operator is an NPU GEMM, which reads
+            # Under `hetero` this runs on the iGPU. The result comes back to
+            # the CPU because the next operator is an NPU GEMM, which reads
             # host memory -- the same round trip examples/qwen2_5 makes around
             # its GPU attention.
-            dev = self._gpu_device(backend)
-            if dev is not None:
+            if self._device("rope", backend) == "gpu":
+                dev = "cuda"
                 # A Triton kernel, not torch on a GPU tensor: torch is this
                 # repository's CPU reference (README), and `examples/gpt2` and
                 # `examples/qwen2_5` have run their GPU half as `*_kernel_gpu`
                 # since they grew one.
                 import gpu_kernels
 
-                with gpu_kernels.gpu_driver():
+                with driver_scope("gpu"):
                     out = gpu_kernels.rope_batch(
                         x.to(dev), lut.to(dev), n_heads, lut.shape[-1]
                     )
@@ -458,24 +483,23 @@ class LlamaPrefill:
         the head dim, so it is passed rather than derived. Wrong here is quiet:
         the softmax still normalizes, it just runs at the wrong temperature.
 
-        CPU only, see NPU_OPS.
+        Host or iGPU, see PLACEMENT.
         """
         with self.timer.track("attention"):
             N = q.shape[0]
             rep = n_q // n_kv
             scale = dh**-0.5 if scale is None else scale
-            # The other op with no NPU kernel, and the one that pays for the
-            # transfer: the scores are [n_q, N, N], so this is where a long
-            # prompt spends its prefill. See `_gpu_device`.
-            dev = self._gpu_device(backend)
-            if dev is not None:
+            # The scores are [n_q, N, N], which is where a long prompt spends
+            # its prefill.
+            if self._device("attention", backend) == "gpu":
+                dev = "cuda"
                 # Flash-style, so the [n_q, N, N] score matrix the torch body
                 # below materializes never exists -- that matrix is what makes
                 # a long prompt expensive here. See `_rope` for why it is a
                 # kernel rather than torch on a GPU tensor.
                 import gpu_kernels
 
-                with gpu_kernels.gpu_driver():
+                with driver_scope("gpu"):
                     out = gpu_kernels.attn_prefill(
                         q.to(dev), k.to(dev), v.to(dev), n_q, n_kv, dh, window, scale
                     )
