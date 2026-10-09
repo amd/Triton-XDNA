@@ -55,6 +55,7 @@ _COMMON_ENV = {
     "DECODE_GOLDEN": "golden",
     "DECODE_UNI_DEC": "decode_waves",
     "PROJ_RC_CACHE": "proj_rc_cache",
+    "DECODE_DYNSEQ": "dynseq",
 }
 
 #: The four knobs that moved. In the shared engine, mlir-air `deffe6f1` made
@@ -275,6 +276,9 @@ class DecodeConfig:
             builder and the kernel read it separately and must agree, so a model
             that moves it off the default has to say so here. ``None`` leaves the
             builder's default (1), which is what every model currently takes.
+        dynseq: ``DECODE_DYNSEQ`` -- take the context length at dispatch, as
+            scratchpad parameters of a full ELF, instead of building it into
+            the design. ``None`` leaves the builder's default (off).
     """
 
     def __init__(
@@ -294,6 +298,7 @@ class DecodeConfig:
         engine=DEFAULT_ENGINE,
         decode_waves=None,
         kv_src=None,
+        dynseq=None,
     ):
         if engine not in ENGINES:
             raise DecodeConfigError(
@@ -340,6 +345,7 @@ class DecodeConfig:
         #: needs no per-field formatting and `fingerprint()` separates two
         #: templates that differ only in their map.
         self.kv_src = kv_src
+        self.dynseq = None if dynseq is None else int(bool(dynseq))
 
     #: The context length the built artifact actually serves, which is rounded
     #: up to a multiple of 16. Two requests that round to the same value produce

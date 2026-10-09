@@ -40,6 +40,8 @@ def test_rejects_mlir_airs_own_elf_dispatch():
             airsrc.select_decode_artifact(env)
         except airsrc.DecodeArtifactError as e:
             assert "mlir-air's own full-ELF dispatch" in str(e)
+            # The refusal names the switch that does choose the HSA decode.
+            assert "AMD_TRITON_NPU_HSA_DECODE" in str(e)
         else:
             raise AssertionError(f"DECODE_ELF={asked!r} should have been refused")
 

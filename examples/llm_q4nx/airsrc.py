@@ -180,6 +180,9 @@ def select_decode_artifact(env=None):
     argument -- and an explicit request for it is refused with the reason,
     which beats aborting later inside mlir-air.
 
+    This does not decide whether the HSA decode runs a full ELF of its own;
+    ``hsa_decode.use_scratchpad`` does.
+
     Returns the value written, so a caller (and a test) can check it.
     """
     env = os.environ if env is None else env
@@ -190,7 +193,8 @@ def select_decode_artifact(env=None):
             "dispatch, which these examples never use: they run the xclbin "
             "templates built by decode_build.py, and on HSA they dispatch the "
             "decode themselves. mlir-air's route also aborts in-process on a "
-            "duplicate LLVM option registration. Unset DECODE_ELF."
+            "duplicate LLVM option registration. Unset DECODE_ELF; to choose "
+            "the HSA decode's shape use AMD_TRITON_NPU_HSA_DECODE=elf|insts."
         )
     env["DECODE_ELF"] = "0"
     return env["DECODE_ELF"]

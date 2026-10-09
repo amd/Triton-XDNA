@@ -107,7 +107,7 @@ class ModelSpec:
     #: The op owns that split; see `tl.extra.npu.DecodeEngine`.
     engine: str = "fused_decode"
 
-    def decode_config(self, context_length):
+    def decode_config(self, context_length, dynseq=None):
         """This spec as a `tl.extra.npu.DecodeConfig`.
 
         The mapping lives here, once, rather than at each call site: every knob
@@ -121,6 +121,9 @@ class ModelSpec:
         here too, leaving the builder its own default -- which is deliberate for
         `UNIFIED`, `DECODE_WGROUP`, `DECODE_STACK`, `DECODE_UNI_DEC` and
         `PROJ_RC_CACHE`, each documented above where it is or is not set.
+
+        `dynseq` is not a property of the model but of the artifact: set for
+        the full ELF that takes its context length at dispatch.
         """
         from triton.language.extra.npu import DecodeConfig
 
@@ -145,6 +148,7 @@ class ModelSpec:
             decode_waves=e.get("DECODE_UNI_DEC"),
             kv_src=self.kv_source_map(),
             engine=self.engine,
+            dynseq=dynseq,
         )
 
     def kv_source_map(self):

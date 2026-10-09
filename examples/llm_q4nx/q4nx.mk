@@ -18,10 +18,15 @@ shared  := $(realpath $(srcdir)/../llm_q4nx)
 root    := $(realpath $(srcdir)/../..)
 
 # Dispatch runtime: xrt, or hsa for models with `supports_hsa` in
-# registry.py. Under hsa the decode is built as PDI.
+# registry.py. Under hsa the decode is a full ELF if the loaded ROCR can run it
+# (hsa_decode.use_scratchpad), and the PDI template pair otherwise. Deferred, so
+# only a decode build pays for asking.
 RUNTIME  ?= xrt
 export AMD_TRITON_NPU_RUNTIME = $(RUNTIME)
-DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),pdi,xclbin)
+HSA_DECODE_FORMAT = $(shell cd $(shared) && $(PYTHON) -c "import hsa_decode, registry; \
+  print('elf' if hsa_decode.use_scratchpad(registry.spec('$(MODEL_NAME)').engine) else 'pdi')" \
+  2>/dev/null || echo pdi)
+DECODE_FORMAT = $(if $(filter hsa,$(RUNTIME)),$(HSA_DECODE_FORMAT),xclbin)
 
 # Prefill engine. triton: this repository's prefill, placed by BACKEND and
 # OPS. auto: mlir-air's fused prefill where the model has one (BACKEND and OPS

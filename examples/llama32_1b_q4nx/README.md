@@ -192,7 +192,7 @@ python prefill.py --backend cpu --kv-out /tmp/kv.npz
 ### Running on the HSA runtime
 
 ```bash
-make compile-decode RUNTIME=hsa   # the decode as PDI, not xclbin
+make compile-decode RUNTIME=hsa   # the decode for HSA (ELF or PDI, see below)
 make chat RUNTIME=hsa
 ```
 
@@ -211,12 +211,26 @@ not the per-dispatch cache flush -- that is what resident regions removed, and
 without them the gap is roughly three times larger. What remains has not been
 attributed, so treat the HSA path as correct and close, not as a replacement.
 
-The interesting part is how the context length gets to the device. HSA has no
-scratchpad parameters, so the full-ELF mechanism is unavailable; but the AIE
-dispatch packet carries the instruction stream's address per enqueue, so
-`../llm_q4nx/hsa_decode.py` patches the 248 L-dependent words per token — the same words
-mlir-air's xclbin path rewrites. One PDI serves every context length; the
-L=2048 and L=2047 builds are byte-identical.
+The interesting part is how the context length gets to the device. There are
+two ways, and the loaded ROCR decides which one runs:
+
+**Scratchpad parameters** — two scalars in device memory that the design reads
+in its dispatch preamble, so one full ELF serves every context length and
+nothing rewrites the instruction stream per token. The control code reaches the
+scratchpad through an address the host patches in, so this needs a ROCR whose
+`hsa_amd_pointer_info` reports an AIE allocation's device address.
+
+**A patched instruction stream** — the fallback. Two builds at adjacent L differ
+only in the words encoding it, so a diff gives base and slope, and 248 words are
+patched per token. One PDI serves every context length.
+
+`../llm_q4nx/hsa_decode.py`'s `use_scratchpad()` asks the question, and
+`make compile-decode RUNTIME=hsa` builds whichever artifact the answer calls
+for. `AMD_TRITON_NPU_HSA_DECODE=elf|insts` forces one.
+
+On Strix the ELF measured about 1.5% slower than the patched stream (ten
+alternated pairs at 60 and 120 tokens). Its control code is larger — aiecc
+inlines each `load_pdi` — so there is more of it to fetch per token.
 
 `--ops` takes `all` or a comma list of `matmul,rms_norm,swiglu`, so a
 numerical regression can be bisected to a single kernel against the same CPU
