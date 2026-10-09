@@ -142,15 +142,16 @@ Install one from [TheRock](https://github.com/ROCm/TheRock)'s nightly ROCm wheel
 the backend picks it up automatically, with no environment variables to set:
 
 ```bash
-pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ rocm-sdk-core
+pip install --index-url https://nightly.repo.amd.com/rocm/whl-next/ rocm-sdk-core
 ```
 
 `rocm-sdk-core` is the only package needed — it carries both the headers and
 `libhsa-runtime64`. AIE dispatch requires a build from **2026-07-16 or later**;
-earlier ones lack the memory-handle resolution fix and abort at dispatch. Note
-that the older per-GPU-family indexes (`https://rocm.nightlies.amd.com/v2/<target>/`)
-are deprecated and frozen — they still resolve under pip, so pointing at one
-silently installs a runtime too old to work.
+earlier ones lack the memory-handle resolution fix and abort at dispatch. The
+older indexes no longer receive builds but still resolve under pip:
+`https://rocm.nightlies.amd.com/whl-multi-arch/` stopped at 2026-08-22, and the
+per-GPU-family indexes (`https://rocm.nightlies.amd.com/v2/<target>/`) install a
+runtime too old to work.
 
 The backend searches, in order: `AMD_NPU_ROCR_PATH`, `ROCM_PATH`, a pip-installed ROCm (TheRock's `rocm-sdk` wheels), then `/opt/rocm`. A candidate is accepted only if it provides *all* the headers the runtime includes — including `hsa/hsa_ext_amd_aie.h` — plus `libhsa-runtime64`, so an installation without AIE support is reported at startup rather than failing later in the compile. If nothing qualifies, the error lists every candidate and what each was missing. Set `AMD_NPU_ROCR_PATH` to override the search with a specific prefix — a locally built rocr-runtime, for instance.
 
