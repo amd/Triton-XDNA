@@ -94,6 +94,8 @@ This will automatically install all required dependencies:
 
 The mlir-air version is pinned in `utils/mlir-air-hash.txt`. The matching mlir-aie commit is pinned by the mlir-air wheel's `[aie]` extra, so it's resolved transitively. llvm-aie is pinned in `utils/peano-requirements.txt`, to the nightly that the pinned mlir-aie was itself built against -- the `[aie]` extra requires it without a version, so otherwise an install would take whatever nightly happened to be newest that day.
 
+The HSA launch runtime's ROCm is optional and pinned separately, in `utils/rocm-requirements.txt`. It is the `hsa` extra rather than a requirement, so the default XRT install does not pull it in; see [Launch runtime](#launch-runtime-xrt-default-or-hsa).
+
 #### Option 3: Build from Source (Using Cmake)
 
 ```bash
@@ -138,16 +140,21 @@ Under HSA the output format is `pdi`. The HSA runtime is Linux-only and requires
 an **AIE-capable ROCR** — one that provides the AIE dispatch extension header
 (`include/hsa/hsa_ext_amd_aie.h`) and `libhsa-runtime64`.
 
-Install one from [TheRock](https://github.com/ROCm/TheRock)'s nightly ROCm wheels;
-the backend picks it up automatically, with no environment variables to set:
+Install the pinned one from [TheRock](https://github.com/ROCm/TheRock)'s nightly
+ROCm wheels; the backend picks it up automatically, with no environment
+variables to set:
 
 ```bash
-pip install --index-url https://nightly.repo.amd.com/rocm/whl-next/ rocm-sdk-core
+pip install -r utils/rocm-requirements.txt          # from a checkout
+pip install "triton-xdna[hsa]" \
+  --extra-index-url https://nightly.repo.amd.com/rocm/whl-next/   # with the wheel
 ```
 
 `rocm-sdk-core` is the only package needed — it carries both the headers and
-`libhsa-runtime64`. AIE dispatch requires a build from **2026-07-16 or later**;
-earlier ones lack the memory-handle resolution fix and abort at dispatch. The
+`libhsa-runtime64`. The pin in `utils/rocm-requirements.txt` is a nightly with
+everything the HSA path uses, including the device-address reporting the
+full-ELF decode needs; an older one falls back to the patched-stream decode,
+and one from before 2026-07-16 aborts at dispatch. The
 older indexes no longer receive builds but still resolve under pip:
 `https://rocm.nightlies.amd.com/whl-multi-arch/` stopped at 2026-08-22, and the
 per-GPU-family indexes (`https://rocm.nightlies.amd.com/v2/<target>/`) install a
