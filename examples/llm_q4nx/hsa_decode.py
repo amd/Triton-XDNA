@@ -5,8 +5,8 @@
 mlir-air's decoder dispatches through pyxrt. This runs the same design on
 HsaRuntime instead, which is what makes a fully-HSA chatbot possible.
 
-The whole problem is the context length. It changes every token, and the
-design can take it two ways:
+The context length changes every token, and the design can take it two
+ways:
 
 * as scratchpad parameters of a full ELF: two scalars in device memory that the
   design reads in its dispatch preamble. One ELF serves every L and nothing
@@ -294,7 +294,7 @@ def parse_params(path):
     The parameter names depend on the model: AIR names the KV append offset
     after the sequence argument it is affine in and puts the coefficients in
     the suffix, e.g. `..._x256_m256` for L*256 - 256. So parameters are found
-    by their kind column -- `addr` for the append offset, `core` for the mask --
+    by their kind column (`addr` for the append offset, `core` for the mask),
     and the arithmetic is read from the name.
     """
     with open(path) as f:

@@ -62,8 +62,7 @@ ENGINE_OBJECTS = {
 
 DEFAULT_L = 2048
 
-#: The full ELF's artifacts, beside the templates. mlir-air's own ELF loader
-#: reads the same names.
+#: The full ELF's artifacts, written beside the templates.
 ELF_NAME = "decode_scratchpad.elf"
 ELF_PARAMS = "decode_scratchpad.params.txt"
 ELF_MAXL = "decode_scratchpad.maxl"

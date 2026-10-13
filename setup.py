@@ -246,8 +246,8 @@ def _make_version_spec(pkg_name, version, timestamp, short_commit, suffix=""):
 def parse_pin(path: Path, package: str) -> str:
     """The pinned `package==version` requirement from a requirements file.
 
-    The same files are fed to `pip install -r`, so each is the one place its
-    version lives.
+    CI and env_setup install the same files with `pip install -r`, so the
+    version is kept in one place.
     """
     for line in path.read_text().splitlines():
         line = line.strip()

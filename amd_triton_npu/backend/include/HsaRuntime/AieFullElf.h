@@ -4,33 +4,26 @@
 // Reader for the full-ELF kernel binaries aiecc emits (`aiecc --get-full-elf`).
 //
 // A full ELF carries the PDIs and the control code in one file, along with the
-// relocations that say where addresses have to be written into the control
-// code. ROCR deliberately knows nothing about any of that: the application
-// extracts the pieces, allocates them from the agent's device memory pool,
-// patches its own addresses in, and names the buffers in an ordinary dispatch
-// packet. The one address it cannot know is the PDI's device address, so it
-// passes the offset of that patch site in
-// hsa_amd_aie_kernel_dispatch_packet_t::pdi_patch_offset and ROCR fills it in;
-// that non-zero offset is also what selects the full-ELF dispatch shape.
+// relocations that say where addresses go in the control code. ROCR does not
+// read it: the application extracts the pieces, allocates them from the
+// agent's device memory pool, patches its own addresses in, and names the
+// buffers in an ordinary dispatch packet. The PDI address ROCR writes itself,
+// at the offset passed in
+// hsa_amd_aie_kernel_dispatch_packet_t::pdi_patch_offset; a non-zero offset is
+// also what selects the full-ELF dispatch shape.
 //
-// Derived from the reference reader in ROCm/rocm-systems#11668
-// (rocrtst/suites/aie/aie_full_elf.h), which supports only what its
-// vector_scalar_add design needs. Three things here go beyond it, because the
-// designs this backend lowers need them:
+// Besides arguments and PDIs this handles:
 //
-//   * the scratchpad. `scratch-pad-ctrl` is an ordinary relocation symbol whose
-//     st_size is the buffer's size; the reference refuses it outright. It is
-//     the whole point of reading these ELFs here -- it is how a runtime value
-//     (a decode's context length) reaches the device without rewriting the
-//     instruction stream per token.
-//   * every PDI, not just the patched one. A design that switches
-//     configuration with `load_pdi` carries several (the fused decode carries
-//     four) and the reference allocates only the one with a patch site.
-//   * more than one kernel per file, selected by name.
+//   * the scratchpad: `scratch-pad-ctrl` is a relocation symbol whose st_size
+//     is the buffer size. It is how a runtime value reaches the device without
+//     rewriting the control code per dispatch.
+//   * every PDI in the file. A design that switches configuration with
+//     `load_pdi` carries several.
+//   * several kernels per file, selected by name.
 //
 // Reads ELF32 little-endian on a little-endian host, so the on-disk layout is
-// the host layout. Bounds-checked throughout: a truncated or hostile file is a
-// clean exception, never a read off the end.
+// the host layout. Bounds-checked throughout: a truncated or malformed file
+// raises an exception rather than reading past the end.
 #pragma once
 
 #include <algorithm>
@@ -50,8 +43,8 @@ namespace aie_full_elf {
 // ELF OS/ABI identifying an aie2p AIE ELF.
 inline constexpr std::uint8_t kElfAmdAie2p = 69;
 
-// The relocation symbol naming the control scratchpad. Same name XRT looks for
-// (xrt_module.cpp's Control_ScratchPad_Symbol); its st_size is the buffer size.
+// The relocation symbol naming the control scratchpad, as XRT names it. Its
+// st_size is the buffer size.
 inline constexpr char kScratchpadSymbol[] = "scratch-pad-ctrl";
 
 // Relocation types, matching the patch schemes the NPU firmware and XRT use.
@@ -90,15 +83,11 @@ struct Kernel {
   std::string name; // "<kernel>:<instance>", e.g. "main:q4nx_decode"
   std::vector<std::uint8_t> ctrl_code;
 
-  // Every place the control code takes a PDI's device address.
-  //
-  // A design that switches configuration mid-stream has more than one: the
-  // fused decode's q4nx_decode takes .pdi.2 at 0x28 and then .pdi.1 at
-  // 0x569c4. The dispatch packet carries a single pdi_addr, so ROCR can fill
-  // in exactly one of them -- pdi_patches.front(), reported as
-  // pdi_patch_offset. The rest are written by write_control_code, which is no
-  // different in kind from what the ABI already requires for arguments: they
-  // are addresses of buffers this process allocated.
+  // Every place the control code takes a PDI's device address. A design that
+  // switches configuration mid-stream has more than one. The dispatch packet
+  // carries a single pdi_addr, so ROCR fills in only pdi_patches.front(),
+  // reported as pdi_patch_offset; write_control_code writes the rest, as it
+  // does the argument addresses.
   std::vector<PdiPatch> pdi_patches;
 
   bool has_pdi_patch() const { return !pdi_patches.empty(); }
@@ -125,12 +114,9 @@ struct Kernel {
   }
 };
 
-// Everything in one full ELF: its kernels, and the PDIs they share.
-//
-// The PDIs are held here rather than per kernel because a file's kernels
-// declare the same set (byte for byte -- the fused decode's two kernels both
-// declare empty_1/empty_0/seg/main), and the largest is ~175 KiB. Holding them
-// once means loading them once.
+// Everything in one full ELF: its kernels, and the PDIs they share. The PDIs
+// are held here rather than per kernel because a file's kernels declare the
+// same set, so holding them once means loading them once.
 struct Image {
   std::vector<Pdi> pdis;
   std::map<std::string, Kernel> kernels;
@@ -177,8 +163,7 @@ inline const char *string_at(const View &v, const Elf32_Shdr &strtab,
 }
 
 // "_Z4mainPcPcPc" -> "main". Only the simple `_Z<len><name>` form aiecc emits
-// is handled; anything else is returned unchanged, which at worst makes the
-// kernel name uglier, never wrong.
+// is handled; anything else is returned unchanged.
 inline std::string kernel_name_from_symbol(const std::string &symbol) {
   if (symbol.rfind("_Z", 0) != 0)
     return symbol;
@@ -284,11 +269,9 @@ inline Image parse(const std::uint8_t *image_data, std::size_t image_size) {
   // ---- PDIs ---------------------------------------------------------------
   // Collected by section name prefix rather than through the groups, because
   // the groups hold only the control code. A file with several kernels repeats
-  // each PDI once per kernel under the same name and with identical bytes
-  // (verified on the fused decode: .pdi.1..4 appear twice, byte for byte), so
-  // deduplicate by name -- otherwise the decode's 175 KiB seg.pdi is loaded
-  // twice for no reason. A name that recurs with *different* bytes would make
-  // the relocation's symbol name ambiguous, so refuse it rather than pick one.
+  // each PDI per kernel under the same name and with identical bytes, so
+  // deduplicate by name. A name that recurs with different bytes would make the
+  // relocation's symbol ambiguous, so refuse it.
   std::map<std::string, std::size_t> pdi_by_name;
   for (std::uint32_t i = 0; i < ehdr->e_shnum; ++i) {
     const char *name = section_name(i);
@@ -471,9 +454,9 @@ inline Image parse(const std::uint8_t *image_data, std::size_t image_size) {
     if (it != sites.end()) {
       KernelSites &ks = it->second;
 
-      // Lowest offset first, so pdi_patches.front() -- the one ROCR fills in --
-      // is the configuration the stream loads before it runs anything, not
-      // whichever relocation happened to come first in .rela.dyn.
+      // Lowest offset first, so pdi_patches.front(), the one ROCR fills in, is
+      // the configuration the stream loads first rather than whichever
+      // relocation came first in .rela.dyn.
       k.pdi_patches = std::move(ks.pdi_patches);
       std::sort(k.pdi_patches.begin(), k.pdi_patches.end(),
                 [](const PdiPatch &a, const PdiPatch &b) {
@@ -541,9 +524,8 @@ inline Image parse_file(const std::string &path) {
 }
 
 // Fold a buffer address into a shim DMA buffer descriptor, the scheme the NPU
-// firmware defines. This *adds* to the descriptor already in place, so it must
-// only ever be applied to a pristine copy of the control code -- see
-// write_control_code.
+// firmware defines. This adds to the descriptor already in place, so apply it
+// only to a pristine copy of the control code (see write_control_code).
 inline void patch_shim_dma48(std::uint32_t *site, std::uint64_t addr) {
   constexpr std::uint64_t kDdrAieAddrOffset = 0x80000000;
   std::uint64_t base = ((static_cast<std::uint64_t>(site[2]) & 0xFFFF) << 32) |
@@ -567,11 +549,8 @@ inline void patch_address64(std::uint32_t *site, std::uint64_t addr) {
 // control code first: the shim DMA scheme is additive, so patching over a
 // previous result would accumulate.
 //
-// `pdi_addrs` is indexed by Image::pdis position. The *first* PDI patch site is
-// deliberately skipped -- ROCR writes that one at pdi_patch_offset() when the
-// packet is submitted, from the packet's pdi_addr. Writing it here too would be
-// harmless but redundant; leaving it to ROCR is what makes the dispatch
-// full-ELF in the first place.
+// `pdi_addrs` is indexed by Image::pdis position. The first PDI patch site is
+// skipped: ROCR writes it at pdi_patch_offset() from the packet's pdi_addr.
 inline void write_control_code(const Kernel &kernel, void *dst,
                                std::size_t dst_size,
                                const std::vector<std::uint64_t> &arg_addrs,
