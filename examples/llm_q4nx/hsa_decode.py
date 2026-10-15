@@ -29,6 +29,7 @@ before any compute.
 import ctypes
 import os
 import re
+import threading
 import weakref
 
 import numpy as np
@@ -129,8 +130,26 @@ def mark_resident(lib, arr):
         raise HsaDecodeError(buf.value.decode())
 
 
+_PROGRAM_LOCKS = {}
+_PROGRAM_LOCKS_MTX = threading.Lock()
+
+
+def _program_lock(handle):
+    """The lock for one prepared program, shared by every holder of it.
+
+    The runtime caches programs by path, so two decoders can share a
+    scratchpad or an instruction stream. Whatever the host writes there has
+    to stay put until the dispatch that reads it completes.
+    """
+    with _PROGRAM_LOCKS_MTX:
+        return _PROGRAM_LOCKS.setdefault(handle, threading.Lock())
+
+
 class HsaProgram:
-    """A prepared PDI + instruction stream, with the stream patchable per token."""
+    """A prepared PDI + instruction stream, with the stream patchable per token.
+
+    Hold `lock` from patching the stream through the dispatch that runs it.
+    """
 
     def __init__(self, pdi_path, insts_path):
         from triton.backends.amd_triton_npu.driver import load_hsa_runtime
@@ -143,6 +162,7 @@ class HsaProgram:
         )
         if not self.handle:
             raise HsaDecodeError(buf.value.decode())
+        self.lock = _program_lock(self.handle)
         self.insts_words = os.path.getsize(insts_path) // 4
 
     def patch_insts(self, word_offset, words):
@@ -230,7 +250,10 @@ def use_scratchpad(engine="fused_decode"):
 
 
 class HsaElfProgram(HsaProgram):
-    """A full-ELF kernel and the scratchpad the host writes before each dispatch."""
+    """A full-ELF kernel and the scratchpad the host writes before each dispatch.
+
+    Hold `lock` from writing the scratchpad through the dispatch that reads it.
+    """
 
     def __init__(self, elf_path, kernel_name):
         from triton.backends.amd_triton_npu.driver import load_hsa_runtime
@@ -243,6 +266,7 @@ class HsaElfProgram(HsaProgram):
         )
         if not self.handle:
             raise HsaDecodeError(buf.value.decode())
+        self.lock = _program_lock(self.handle)
 
         addr = ctypes.c_void_p()
         size = ctypes.c_uint64()
@@ -317,19 +341,48 @@ def parse_params(path):
     return Params(slot[addr[0]], scale, addend, slot[core[0]])
 
 
-def _elf_program(artifact_dir, attn_maxl, region_w):
+def _elf_file(artifact_dir, name):
+    path = os.path.join(artifact_dir, name)
+    if not os.path.exists(path):
+        raise HsaDecodeError(
+            f"{path} is missing; build the decode with\n"
+            "    make compile-decode RUNTIME=hsa"
+        )
+    return path
+
+
+def elf_window(artifact_dir, max_L=None):
+    """The ATTN_MAXL the scratchpad ELF was built for.
+
+    The base decoder picks its window from whichever xclbin pairs are in the
+    directory, so the ELF route hands it this one rather than letting it
+    choose a pair the ELF was not built with.
+    """
+    with open(_elf_file(artifact_dir, "decode_scratchpad.maxl")) as f:
+        maxl = int(f.read().split()[0])
+    if max_L is not None and int(max_L) > maxl:
+        raise HsaDecodeError(
+            f"max_L={max_L} exceeds the ELF's ATTN_MAXL={maxl}; rebuild with "
+            "make compile-decode RUNTIME=hsa DECODE_L=<L>"
+        )
+    return maxl
+
+
+def _elf_program(artifact_dir, attn_maxl, region_w, model=None):
     """The scratchpad ELF and its parameter layout, checked against the decoder."""
-    elf = os.path.join(artifact_dir, "decode_scratchpad.elf")
-    params_txt = os.path.join(artifact_dir, "decode_scratchpad.params.txt")
-    maxl_txt = os.path.join(artifact_dir, "decode_scratchpad.maxl")
-    for f in (elf, params_txt, maxl_txt):
-        if not os.path.exists(f):
+    elf = _elf_file(artifact_dir, "decode_scratchpad.elf")
+    params_txt = _elf_file(artifact_dir, "decode_scratchpad.params.txt")
+    # The ELF keeps its own stamp: a later template build for another model
+    # rewrites the shared one and leaves this ELF in place.
+    if model is not None:
+        with open(_elf_file(artifact_dir, "decode_scratchpad.model")) as f:
+            built_for = f.read().strip()
+        if built_for != model:
             raise HsaDecodeError(
-                f"{f} is missing; build the decode with\n"
-                "    make compile-decode RUNTIME=hsa"
+                f"decode_scratchpad.elf was built for {built_for!r}, not "
+                f"{model!r}; rebuild with make compile-decode RUNTIME=hsa"
             )
-    with open(maxl_txt) as f:
-        built_maxl = int(f.read().split()[0])
+    built_maxl = elf_window(artifact_dir)
     if built_maxl != attn_maxl:
         raise HsaDecodeError(
             f"the ELF was built for ATTN_MAXL={built_maxl} but the decoder uses "
@@ -384,7 +437,7 @@ def require_xclbin_pair(artifact_dir):
 
 
 def make_hsa_decoder_class(
-    air, artifact_dir, decoder_class="FusedDecoder", engine="fused_decode"
+    air, artifact_dir, decoder_class="FusedDecoder", engine="fused_decode", model=None
 ):
     """mlir-air's fused decoder with the dispatch moved onto HSA.
 
@@ -418,10 +471,13 @@ def make_hsa_decoder_class(
 
         def __init__(self, *a, **kw):
             require_xclbin_pair(artifact_dir)
+            elf = use_scratchpad(engine)
+            if elf:
+                kw["max_L"] = elf_window(artifact_dir, kw.get("max_L"))
             super().__init__(*a, **kw)
-            if use_scratchpad(engine):
+            if elf:
                 self._params, self._prog = _elf_program(
-                    artifact_dir, self.ATTN_MAXL, self._g("REGION_W")
+                    artifact_dir, self.ATTN_MAXL, self._g("REGION_W"), model
                 )
                 self._gen = None
             else:
@@ -569,16 +625,18 @@ def make_hsa_decoder_class(
 
         def dispatch(self, tok, p):
             L = p + 1
-            if self._gen is None:
-                self._params.write(self._prog.params, L)
-            else:
-                self._prog.patch_insts(self._gen.lo, self._gen.slice_for(L))
             self._x[:] = np.asarray(self.embed[tok], self._bf16)
             self._write_rms_rope(p)
-            # 8B split-weight tail follows the fixed five (base's w_bos[1:] order).
-            self._prog.dispatch(
-                [self._x, self._w, self._r, self._y, self._kv, *self._w_tail]
-            )
+            with self._prog.lock:
+                if self._gen is None:
+                    self._params.write(self._prog.params, L)
+                else:
+                    self._prog.patch_insts(self._gen.lo, self._gen.slice_for(L))
+                # 8B split-weight tail follows the fixed five (base's w_bos[1:]
+                # order).
+                self._prog.dispatch(
+                    [self._x, self._w, self._r, self._y, self._kv, *self._w_tail]
+                )
             voc = self._y[self.decode_y : self.decode_y + self._g("UNI_LM") * self.VP]
             return voc[: self.VOCAB_SIZE].astype(np.float32)
 
@@ -663,7 +721,6 @@ def _make_hsa_ple_decoder_class(base, artifact_dir):
             L = p + 1
             if not (1 <= L <= self.maxL):
                 raise ValueError(f"position {p} is outside [0,{self.maxL - 1}]")
-            self._prog.patch_insts(self._gen.lo, self._gen.slice_for(L))
             x0 = np.asarray(
                 self.qm.embed_rows("model.embed_tokens.weight", [tok])[0], self.bf16
             )
@@ -676,9 +733,11 @@ def _make_hsa_ple_decoder_class(base, artifact_dir):
             mark_dirty(self._prog.lib, self._pw)
             rope = self._rope_slab(p)
             self._r[self._rope_base : self._rope_base + rope.size] = rope
-            self._prog.dispatch(
-                [self._x, self._w, self._r, self._y, self._kv, self._pw, self._px]
-            )
+            with self._prog.lock:
+                self._prog.patch_insts(self._gen.lo, self._gen.slice_for(L))
+                self._prog.dispatch(
+                    [self._x, self._w, self._r, self._y, self._kv, self._pw, self._px]
+                )
             n = self.UNI_LM * self.VP
             yv = self._y[self.decode_y : self.decode_y + n].astype(np.float32)
             yv = yv[: self.VOCAB_SIZE]

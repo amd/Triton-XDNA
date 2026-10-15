@@ -68,6 +68,9 @@ DEFAULT_L = 2048
 ELF_NAME = "decode_scratchpad.elf"
 ELF_PARAMS = "decode_scratchpad.params.txt"
 ELF_MAXL = "decode_scratchpad.maxl"
+#: The model the ELF was built for. Separate from STAMP, which every template
+#: build rewrites while leaving the ELF in place.
+ELF_MODEL = "decode_scratchpad.model"
 
 
 #: Written beside the artifacts, naming the model that built them.
@@ -186,6 +189,8 @@ def _copy_elf(art, out_dir, model):
     # KV cache and the mask threshold.
     with open(os.path.join(out_dir, ELF_MAXL), "w") as f:
         f.write(f"{art['attn_maxl']}\n")
+    with open(os.path.join(out_dir, ELF_MODEL), "w") as f:
+        f.write(model.name + "\n")
     with open(os.path.join(out_dir, STAMP), "w") as f:
         f.write(model.name + "\n")
     print(f"[decode-build] -> {dst_e} + {ELF_PARAMS}", flush=True)

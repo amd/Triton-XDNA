@@ -927,7 +927,11 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             air,
             dc,
             make_hsa_decoder_class(
-                air, airsrc.fused_decode_dir(spec.engine), dc, engine=spec.engine
+                air,
+                airsrc.fused_decode_dir(spec.engine),
+                dc,
+                engine=spec.engine,
+                model=spec.name,
             ),
         )
 

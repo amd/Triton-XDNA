@@ -23,6 +23,7 @@
 
 #include "HsaRuntime/HsaRuntime.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -407,6 +408,10 @@ struct triton_npu_hsa_program {
   // pdi_index indexes both.
   std::vector<PoolBuffer> pdi_bufs;
   std::vector<std::uint64_t> pdi_addrs;
+  // The PDIs the control code switches to by address, other than the one in
+  // the packet's pdi_addr. Each is listed as a trailing kernarg, like the
+  // scratchpad, so ROCR keeps it resident and flushes it.
+  std::vector<std::size_t> switched_pdis;
 
   // The control code. `ctrl` owns an over-allocation; `ctrl_va` is the 16
   // KiB-aligned address inside it that the packet names, which the ABI
@@ -549,13 +554,26 @@ public:
     // for data that never arrives and the dispatch hangs.
 
     // Every PDI, not just the patched one: the control code switches to the
-    // others by address, and an unmapped one faults the array.
+    // others by address, and an unmapped one faults the array. Only those need
+    // a device address; ROCR writes the first patch site itself, so a
+    // single-PDI design does not depend on the pointer-info query.
     prog->pdi_bufs.reserve(prog->image->pdis.size());
-    prog->pdi_addrs.reserve(prog->image->pdis.size());
+    prog->pdi_addrs.assign(prog->image->pdis.size(), 0);
     for (const aie_full_elf::Pdi &pdi : prog->image->pdis) {
       prog->pdi_bufs.push_back(alloc_dev(pdi.data.size()));
       std::memcpy(prog->pdi_bufs.back().va(), pdi.data.data(), pdi.data.size());
-      prog->pdi_addrs.push_back(device_address(prog->pdi_bufs.back().va()));
+    }
+    for (std::size_t i = 1; i < k.pdi_patches.size(); ++i) {
+      const std::size_t idx = k.pdi_patches[i].pdi_index;
+      if (idx >= prog->pdi_bufs.size())
+        throw std::runtime_error("kernel '" + std::string(kernel_name) +
+                                 "' switches to a PDI the ELF does not carry");
+      if (prog->pdi_addrs[idx] == 0)
+        prog->pdi_addrs[idx] = device_address(prog->pdi_bufs[idx].va());
+      if (idx != k.rocr_pdi_index() &&
+          std::find(prog->switched_pdis.begin(), prog->switched_pdis.end(),
+                    idx) == prog->switched_pdis.end())
+        prog->switched_pdis.push_back(idx);
     }
 
     prog->ctrl =
@@ -753,14 +771,23 @@ public:
       // It is declared at its full size, not the token span a resident region
       // uses, because the declared size is also what ROCR flushes from the CPU
       // cache, and the host has just written these bytes.
-      const std::uint32_t extra_kernargs =
-          (program->full_elf && program->scratchpad.va() != nullptr) ? 1u : 0u;
+      //
+      // The PDIs the control code switches to are reached the same way, so
+      // they are listed after it for the same reason.
+      std::vector<const PoolBuffer *> extra;
+      if (program->full_elf) {
+        if (program->scratchpad.va() != nullptr)
+          extra.push_back(&program->scratchpad);
+        for (std::size_t idx : program->switched_pdis)
+          extra.push_back(&program->pdi_bufs[idx]);
+      }
+      const auto extra_kernargs = static_cast<std::uint32_t>(extra.size());
       const std::uint32_t total_kernargs = num_tensors + extra_kernargs;
       if (total_kernargs > TRITON_NPU_HSA_MAX_KERNARGS)
         throw std::runtime_error(
             "dispatch needs " + std::to_string(total_kernargs) +
-            " kernarg slots (including the scratchpad) but the runtime "
-            "supports at most " +
+            " kernarg slots (including the scratchpad and switched PDIs) but "
+            "the runtime supports at most " +
             std::to_string(TRITON_NPU_HSA_MAX_KERNARGS) +
             "; raise TRITON_NPU_HSA_MAX_KERNARGS in HsaRuntime.h and rebuild");
 
@@ -770,10 +797,10 @@ public:
         kernargs[i] = reinterpret_cast<std::uint64_t>(dev_addr[i]);
         kernargs[total_kernargs + i] = declared_sizes[i];
       }
-      if (extra_kernargs) {
-        kernargs[num_tensors] =
-            reinterpret_cast<std::uint64_t>(program->scratchpad.va());
-        kernargs[total_kernargs + num_tensors] = program->scratchpad.size();
+      for (std::uint32_t j = 0; j < extra_kernargs; ++j) {
+        kernargs[num_tensors + j] =
+            reinterpret_cast<std::uint64_t>(extra[j]->va());
+        kernargs[total_kernargs + num_tensors + j] = extra[j]->size();
       }
 
       // Build the AIE dispatch packet.
@@ -1885,15 +1912,20 @@ extern "C" int triton_npu_hsa_full_elf_supported(void) {
   // no queue and dispatches nothing.
   //
   // Whether ROCR reports a device address for AIE memory is not visible in any
-  // symbol or version, so the probe asks about a real allocation.
+  // symbol or version, so the probe asks about a real allocation. Full-ELF
+  // dispatch is aie2p-only, so another generation answers 0 without asking.
   if (hsa_init() != HSA_STATUS_SUCCESS)
     return 0;
 
   int supported = 0;
   std::vector<hsa_agent_t> aies;
   AgentSearch as_aie{HSA_DEVICE_TYPE_AIE, &aies};
+  char name[64] = {};
   if (hsa_iterate_agents(collect_agents, &as_aie) == HSA_STATUS_SUCCESS &&
-      !aies.empty()) {
+      !aies.empty() &&
+      hsa_agent_get_info(aies.front(), HSA_AGENT_INFO_NAME, name) ==
+          HSA_STATUS_SUCCESS &&
+      std::strncmp(name, "aie2p", sizeof(name)) == 0) {
     PoolSearch s{
         HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED, false, {}, false};
     const hsa_status_t st =

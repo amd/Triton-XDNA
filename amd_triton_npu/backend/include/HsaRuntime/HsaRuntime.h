@@ -89,8 +89,8 @@ int triton_npu_hsa_scratchpad(triton_npu_hsa_program_t program, void **addr,
 
 // Whether this ROCR can dispatch a full ELF whose design needs an address
 // resolved for it: a control scratchpad, or a further configuration it
-// switches to. Returns 1 if it can, 0 if it cannot. Never fails, and creates
-// no queue.
+// switches to. Returns 1 if it can, 0 if it cannot, including on an AIE agent
+// other than aie2p. Never fails, and creates no queue.
 //
 // The control code reaches those buffers through device addresses patched into
 // it, so this asks whether hsa_amd_pointer_info reports a device address for an

@@ -102,6 +102,63 @@ def test_hsa_decoder_names_the_missing_xclbin_pair():
         hsa_decode.require_xclbin_pair(d)
 
 
+def _elf_dir(d, model, maxl=2048):
+    """An artifact directory as `decode_build.py --format elf` leaves it."""
+    import types
+
+    import decode_build
+
+    src = os.path.join(d, "build")
+    os.makedirs(src)
+    for n in ("decode.elf", "params.txt"):
+        open(os.path.join(src, n), "w").close()
+    art = {"elf_path": os.path.join(src, "decode.elf"), "attn_maxl": maxl}
+    decode_build._copy_elf(art, d, types.SimpleNamespace(name=model))
+
+
+def test_elf_window_is_the_one_the_elf_was_built_for():
+    import tempfile
+
+    import hsa_decode
+
+    with tempfile.TemporaryDirectory() as d:
+        _elf_dir(d, "llama-3.2-1b", maxl=2048)
+        assert hsa_decode.elf_window(d) == 2048
+        assert hsa_decode.elf_window(d, max_L=1024) == 2048
+        try:
+            hsa_decode.elf_window(d, max_L=4096)
+        except hsa_decode.HsaDecodeError:
+            pass
+        else:
+            raise AssertionError("a max_L beyond the ELF's window accepted")
+
+
+def test_elf_keeps_its_own_model_stamp():
+    import tempfile
+
+    import decode_build
+    import hsa_decode
+
+    with tempfile.TemporaryDirectory() as d:
+        _elf_dir(d, "llama-3.2-1b")
+        # A template build for another model rewrites the shared stamp only.
+        with open(os.path.join(d, decode_build.STAMP), "w") as f:
+            f.write("llama-3.2-3b\n")
+        try:
+            hsa_decode._elf_program(d, 2048, 256, model="llama-3.2-3b")
+        except hsa_decode.HsaDecodeError as e:
+            assert "'llama-3.2-1b'" in str(e)
+        else:
+            raise AssertionError("another model's ELF accepted")
+
+
+def test_programs_sharing_a_handle_share_a_lock():
+    import hsa_decode
+
+    assert hsa_decode._program_lock(0x1000) is hsa_decode._program_lock(0x1000)
+    assert hsa_decode._program_lock(0x1000) is not hsa_decode._program_lock(0x2000)
+
+
 def main():
     failures = 0
     for name, fn in sorted(globals().items()):
