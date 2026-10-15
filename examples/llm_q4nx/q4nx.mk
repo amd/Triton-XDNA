@@ -19,8 +19,8 @@ root    := $(realpath $(srcdir)/../..)
 
 # Dispatch runtime: xrt, or hsa for models with `supports_hsa` in
 # registry.py. Under hsa the decode is a full ELF if the loaded ROCR can run it
-# (hsa_decode.use_scratchpad), and the PDI template pair otherwise. Deferred, so
-# only a decode build pays for asking.
+# (hsa_decode.use_scratchpad), and the PDI template pair otherwise; both also
+# get the xclbin pair. Deferred, so only a decode build pays for asking.
 RUNTIME  ?= xrt
 export AMD_TRITON_NPU_RUNTIME = $(RUNTIME)
 HSA_DECODE_FORMAT = $(shell cd $(shared) && $(PYTHON) -c "import hsa_decode, registry; \

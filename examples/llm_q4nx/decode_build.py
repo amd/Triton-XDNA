@@ -19,7 +19,9 @@ slope reference.
 
 The full ELF is what the HSA decode runs on a ROCR that can resolve the device
 address of a host allocation: the context length reaches it as scratchpad
-parameters, so one artifact serves every L and there is no template pair.
+parameters, so one artifact serves every L and there is no template pair to
+dispatch. `--format elf` and `--format pdi` also build the xclbin pair, which
+mlir-air's decoder loads at construction.
 
 Both templates are built in one process. `build_module()` reads its geometry
 from the environment at import time, which is why this used to fork per context
@@ -217,7 +219,7 @@ def main(argv=None):
         choices=("xclbin", "pdi", "elf"),
         help="elf: one full ELF for every context length, for the HSA decode on "
         "a ROCR that resolves device addresses; pdi: the HSA template pair; "
-        "xclbin: XRT's",
+        "xclbin: XRT's. elf and pdi also build the xclbin pair",
     )
     args = ap.parse_args(argv)
     model = registry.spec(args.model)
@@ -229,20 +231,25 @@ def main(argv=None):
     # The ELF takes L at dispatch, so one build serves every context length.
     if args.format == "elf":
         lower_template(args.max_context_length, args.out_dir, "elf", model)
-        return 0
+    else:
+        _lower_pair(args.max_context_length, args.out_dir, args.format, model)
 
-    # The loader wants the L template and an L-1 slope reference. Both in this
-    # process: the builder's geometry used to be import-time state that a
-    # second build in the same process would have inherited, which is why this
-    # forked. `tl.extra.npu.fused_decode` takes the configuration as arguments
-    # and scopes the environment to one build, so it no longer can.
-    for L in (args.max_context_length, args.max_context_length - 1):
-        lower_template(L, args.out_dir, args.format, model)
+    # The HSA decoders subclass mlir-air's, which loads the xclbin pair to set
+    # up weights and geometry even though HSA dispatches the ELF or PDIs.
+    if args.format != "xclbin":
+        _lower_pair(args.max_context_length, args.out_dir, "xclbin", model)
+    return 0
+
+
+def _lower_pair(L, out_dir, output_format, model):
+    """The template at L and the L-1 build the loader takes the slope from."""
+    for l in (L, L - 1):
+        lower_template(l, out_dir, output_format, model)
     print(
-        "[decode-build] both templates lowered through tl.extra.npu.fused_decode.",
+        f"[decode-build] both {output_format} templates lowered through "
+        "tl.extra.npu.fused_decode.",
         flush=True,
     )
-    return 0
 
 
 if __name__ == "__main__":

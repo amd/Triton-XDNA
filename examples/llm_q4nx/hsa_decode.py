@@ -362,6 +362,27 @@ def _programs(artifact_dir, attn_maxl):
     return InstsForL(lo, hi, attn_maxl - 1, attn_maxl), HsaProgram(pdi, hi)
 
 
+def require_xclbin_pair(artifact_dir):
+    """Fail early if the xclbin pair mlir-air's decoder loads is missing.
+
+    The HSA decoders subclass mlir-air's, and its `__init__` needs the pair
+    even when HSA dispatches the ELF or PDIs. Its own error does not say so.
+    """
+    names = os.listdir(artifact_dir) if os.path.isdir(artifact_dir) else ()
+    built = {
+        int(m.group(1))
+        for m in (re.fullmatch(r"decode_L(\d+)\.xclbin", n) for n in names)
+        if m and f"decode_L{m.group(1)}.insts.bin" in names
+    }
+    if not any(L - 1 in built for L in built):
+        raise HsaDecodeError(
+            f"{artifact_dir} has no decode_L<N>.xclbin + decode_L<N-1>.xclbin "
+            "pair, which mlir-air's decoder loads even under HSA. Build it "
+            "with\n"
+            "    make compile-decode RUNTIME=hsa"
+        )
+
+
 def make_hsa_decoder_class(
     air, artifact_dir, decoder_class="FusedDecoder", engine="fused_decode"
 ):
@@ -396,6 +417,7 @@ def make_hsa_decoder_class(
             raise AttributeError(name)
 
         def __init__(self, *a, **kw):
+            require_xclbin_pair(artifact_dir)
             super().__init__(*a, **kw)
             if use_scratchpad(engine):
                 self._params, self._prog = _elf_program(
@@ -575,6 +597,7 @@ def _make_hsa_ple_decoder_class(base, artifact_dir):
 
     class HsaPleDecoder(base):
         def __init__(self, *a, **kw):
+            require_xclbin_pair(artifact_dir)
             super().__init__(*a, **kw)
             self._gen, self._prog = _programs(artifact_dir, self.ATTN_MAXL)
             lib = self._prog.lib

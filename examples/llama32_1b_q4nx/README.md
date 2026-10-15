@@ -226,7 +226,9 @@ patched per token. One PDI serves every context length.
 
 `../llm_q4nx/hsa_decode.py`'s `use_scratchpad()` asks the question, and
 `make compile-decode RUNTIME=hsa` builds whichever artifact the answer calls
-for. `AMD_TRITON_NPU_HSA_DECODE=elf|insts` forces one.
+for, plus the xclbin template pair that mlir-air's decoder loads at
+construction. `AMD_TRITON_NPU_HSA_DECODE=elf|insts` forces one; forcing
+`insts` after an ELF build also needs `decode_build.py --format pdi`.
 
 On Strix the ELF measured about 1.5% slower than the patched stream (ten
 alternated pairs at 60 and 120 tokens). Its control code is larger — aiecc
