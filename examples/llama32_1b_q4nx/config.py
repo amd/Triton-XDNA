@@ -34,6 +34,9 @@ INTER = 8192  # mlp intermediate
 N_LAYERS = 16
 VOCAB = 128256
 
+#: Whether the LM head is the embedding (`llama_prefill.LlamaGpuDecode.HEADS`).
+TIED_LM_HEAD = True
+
 # The deployed fused decode's epsilon (fused_decode/models/all_models.h:54).
 # HF's config says 1e-5; matching the decode matters more than matching HF,
 # and at D=2048 the two differ far below bf16 resolution.
@@ -53,7 +56,12 @@ BOS = 128000  # <|begin_of_text|>, for the session warmup
 #: (the builder environment, -DMODEL_TYPE, GLU_SLICE, the core stack, which
 #: driver API is used) is invisible to it. Regenerate with `--prefill-engine
 #: triton --max-tokens 8 --greedy` if the decode legitimately changes.
-EXPECT_IDS = [12366, 13, 578, 6864, 315, 10057, 374, 20437, 13]
+EXPECT_IDS = [12366, 13, 578, 6864, 315, 279, 3723, 4273, 374]
+
+#: The same from the iGPU decode (`--decode gpu`), whichever engine prefilled.
+#: It is also what the host prefill predicts token by token
+#: (`llm_q4nx/test_dense_decode_vs_prefill.py`).
+EXPECT_IDS_IGPU = [12366, 13, 578, 6864, 315, 279, 3723, 4273, 374]
 
 #: The same after mlir-air's fused prefill, the default engine. Its numerics
 #: move a later greedy token on this model; these are what mlir-air's own
@@ -126,3 +134,17 @@ def rope_lut(seq_len, dtype=None):
 
         dtype = bfloat16
     return generate_rope_lut(LlamaConfig(n_layers=N_LAYERS), seq_len, dtype)
+
+
+def load_q4nx_packed(model=None, n_layers=None):
+    """The bundle's projections still packed, for the iGPU forward
+    (`llama_prefill.LlamaGpuDecode`). See `llama_prefill.packed_bundle`."""
+    _add_air_paths()
+    from llama32_1b_q4nx_weights import Q4nxModel
+
+    sys.path.insert(0, _SHARED)
+    from llama_prefill import packed_bundle
+
+    return packed_bundle(
+        Q4nxModel(model or MODEL_DEFAULT), sys.modules[__name__], n_layers
+    )

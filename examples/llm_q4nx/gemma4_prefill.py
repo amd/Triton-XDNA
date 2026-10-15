@@ -1447,6 +1447,33 @@ class Gemma4GpuDecode:
         return out
 
 
+class Gemma4IgpuPrefill(Gemma4Prefill):
+    """`--prefill-engine igpu`: the prompt through `Gemma4GpuDecode.prefill`.
+
+    A `Gemma4Prefill` on the host backend, so the NPU decode and
+    `generate_on_gpu` find everything they read on it -- the slab, the
+    context length, the first token -- with the prefill itself on the iGPU.
+    The iGPU decoder it builds is the one `generate_on_gpu` then reuses, so
+    the weights are moved to the iGPU once.
+    """
+
+    ENGINE = "igpu"
+
+    def __init__(self, *a, **kw):
+        kw["backend"] = "cpu"
+        super().__init__(*a, **kw)
+
+    def gpu_decoder(self):
+        dec = getattr(self, "_gpu_decoder", None)
+        if dec is None:
+            dec = Gemma4GpuDecode(self, max_L=self.max_seq)
+            self._gpu_decoder = dec
+        return dec
+
+    def prefill(self, ids):
+        return self.gpu_decoder().prefill(ids)
+
+
 # ---------------------------------------------------------------------------
 # NPU decode
 # ---------------------------------------------------------------------------

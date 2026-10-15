@@ -262,6 +262,14 @@ runs:
           # One-op NPUChain re-dispatch (the LLM projection and attention chains).
           python3 scripts/test_npu_chain_single_op.py
 
+          # An NPUChain's own bf16_emulation setting, independent of the global one.
+          python3 scripts/test_npu_chain_bf16_emulation.py
+
+          # Gemma4's FFN chain against torch, at row counts the gates below
+          # never reach: their prompts are short, and the gate/up epilogue
+          # path only runs on wide chains. No weights, no mlir-air sources.
+          ( cd examples/llm_q4nx && python3 test_fused_mlp.py )
+
           # The weight loader lives in mlir-air's sources, which the wheel does
           # not ship, so fetch them at the pinned commit first. Sparse and
           # blobless: ~1.7 MB of two directories. Without this the example
@@ -442,6 +450,22 @@ runs:
               q_fail=$((q_fail + 1))
             fi
 
+            # The same for the other models' layout (`dense_kv_layout`),
+            # against each model's own `seed_kv`.
+            rc=0
+            echo "📁 Example: llm_q4nx/test_dense_kv_layout.py"
+            ( cd examples/llm_q4nx && python3 test_dense_kv_layout.py ) || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "   ✅ PASS: test_dense_kv_layout.py"
+              q_pass=$((q_pass + 1))
+            elif [ "$rc" -eq 77 ]; then
+              echo "   ⏭️  SKIP: test_dense_kv_layout.py -- declined (exit 77)"
+              q_skip=$((q_skip + 1))
+            else
+              echo "   ❌ FAIL: test_dense_kv_layout.py (exit code $rc)"
+              q_fail=$((q_fail + 1))
+            fi
+
             echo ""
             echo "--------------------------------------------------"
             echo "Q4NX Gate Results:"
@@ -481,10 +505,10 @@ runs:
             fi
           done
 
-          # Gemma4-E2B, the one Q4NX model with a GPU decode. STEP 9b runs
-          # every Q4NX gate with the iGPU hidden, so `hetero` and `--decode
-          # gpu` have no coverage there at all -- which is what this step is
-          # for. Two runs, because they fail differently:
+          # Gemma4-E2B on the iGPU. STEP 9b runs every Q4NX gate with the iGPU
+          # hidden, so `hetero`, `--decode gpu` and `--prefill-engine igpu`
+          # have no coverage there at all -- which is what this step is for.
+          # Three runs, because they fail differently:
           #
           #   --prefill-engine triton --backend hetero
           #       the prefill's RoPE and attention on the iGPU, the rest on
@@ -493,15 +517,15 @@ runs:
           #       the Triton NPU prefill plus the Triton iGPU decode, gating
           #       the recorded continuation. The decode under test is ours,
           #       not mlir-air's template, so it needs no `make compile-decode`.
-          #
-          # So the two runs cover the two halves separately: the first is the
-          # only gate on the iGPU prefill operators, the second the only gate
-          # on the GPU decode.
+          #   --prefill-engine igpu --decode gpu
+          #       the whole run on the iGPU: `Gemma4GpuDecode.prefill`, then
+          #       the decode from the slab it wrote.
           #
           # Skipped rather than failed when the weights or mlir-air's sources
           # are unreachable; the example exits 77 for both.
           for args in "--prefill-engine triton --backend hetero --prefill-only" \
-                      "--prefill-engine triton --backend npu --decode gpu --prompt 2,818,5279,529,7001,563 --max-tokens 3 --greedy"; do
+                      "--prefill-engine triton --backend npu --decode gpu --prompt 2,818,5279,529,7001,563 --max-tokens 3 --greedy" \
+                      "--prefill-engine igpu --decode gpu --prompt 2,818,5279,529,7001,563 --max-tokens 3 --greedy"; do
             echo "--- hetero: gemma4_e2b_q4nx $args ---"
             rc=0
             ( cd examples/gemma4_e2b_q4nx \
@@ -555,6 +579,63 @@ runs:
           else
             echo "FAIL: llama32_1b_q4nx decode gated green but zero-copy neither"
             echo "      engaged nor reported it was unavailable."
+            hetero_rc=1
+          fi
+
+          # The Llama-family iGPU forward (`LlamaGpuDecode`), on the smallest
+          # model: iGPU prefill then iGPU decode, and the Triton NPU prefill
+          # writing the iGPU decoder's shared cache. Both gate the recorded
+          # iGPU continuation.
+          for args in "--prefill-engine igpu --decode gpu --max-tokens 9 --greedy" \
+                      "--prefill-engine triton --backend npu --decode gpu --max-tokens 9 --greedy"; do
+            echo "--- igpu: llama32_1b_q4nx $args ---"
+            rc=0
+            ( cd examples/llama32_1b_q4nx \
+              && python llama32_1b_q4nx_inference.py $args ) || rc=$?
+            if [ "$rc" -eq 77 ]; then
+              echo "SKIP: llama32_1b_q4nx $args (exit 77)"
+            elif [ "$rc" -ne 0 ]; then
+              echo "FAIL: llama32_1b_q4nx $args (exit $rc)"
+              hetero_rc=1
+            fi
+          done
+
+          # The iGPU prefill writing the NPU decoder's cache, through the
+          # zero-copy path. No continuation is recorded for this pair yet, so
+          # the exit status covers the first token only; the handoff itself is
+          # checked by its marker, as for the zero-copy row above.
+          echo "--- igpu prefill, npu decode: llama32_1b_q4nx ---"
+          rc=0
+          zc_out=$( cd examples/llama32_1b_q4nx \
+            && python llama32_1b_q4nx_inference.py --prefill-engine igpu \
+                 --max-tokens 8 --greedy 2>&1 ) || rc=$?
+          echo "$zc_out"
+          if [ "$rc" -eq 77 ]; then
+            echo "SKIP: llama32_1b_q4nx igpu prefill, npu decode (exit 77)"
+          elif [ "$rc" -ne 0 ]; then
+            echo "FAIL: llama32_1b_q4nx igpu prefill, npu decode (exit $rc)"
+            hetero_rc=1
+          elif echo "$zc_out" | grep -q "KV handed over in place" \
+               && ! echo "$zc_out" | grep -q "copied once"; then
+            echo "PASS: llama32_1b_q4nx igpu prefill handed its KV to the NPU decode in place"
+          elif echo "$zc_out" | grep -q "XRT zero-copy unavailable"; then
+            echo "SKIP: llama32_1b_q4nx igpu prefill, npu decode -- no shared pages here"
+          else
+            echo "FAIL: llama32_1b_q4nx igpu prefill gated green but the KV handoff"
+            echo "      neither engaged nor reported it was unavailable."
+            hetero_rc=1
+          fi
+
+          # Each iGPU decode step against a prefill re-run over the growing
+          # prefix, after both the host and the iGPU prefill.
+          echo "--- llama32_1b_q4nx: test_dense_decode_vs_prefill.py ---"
+          rc=0
+          ( cd examples/llm_q4nx \
+            && python test_dense_decode_vs_prefill.py --example llama32_1b_q4nx ) || rc=$?
+          if [ "$rc" -eq 77 ]; then
+            echo "SKIP: test_dense_decode_vs_prefill.py (exit 77)"
+          elif [ "$rc" -ne 0 ]; then
+            echo "FAIL: test_dense_decode_vs_prefill.py (exit $rc)"
             hetero_rc=1
           fi
 

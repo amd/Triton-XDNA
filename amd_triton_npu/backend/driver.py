@@ -1337,6 +1337,40 @@ def _extract_elf_kernel_name(config_json_path):
     return f"{last_kernel['name']}:{instance_id}"
 
 
+_FOLD_ADD_SCRIPT = """
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    transform.include @fold_add_into_matmul_init failures(propagate) (%arg1)
+      : (!transform.any_op) -> ()
+    transform.yield
+  }
+}
+"""
+
+
+@functools.lru_cache(maxsize=64)
+def _fold_accumulator_adds(asm_src_text):
+    """`asm_src_text` with each contraction's accumulator add folded into its
+    `outs`, as the generated schedule's first phase does.
+
+    Returned unchanged when there is no generic to fold, or when the fold
+    does not apply; detection then declines the module as before. Cached,
+    because detection runs on every launch.
+    """
+    if "linalg.generic" not in asm_src_text or "linalg.matmul" not in asm_src_text:
+        return asm_src_text
+    try:
+        context = air.ir.Context()
+        module = Module.parse(asm_src_text, context=context)
+        script = Module.parse(
+            _inject_transform_library(_FOLD_ADD_SCRIPT), context=context
+        )
+        run_transform(script, module)
+    except Exception:
+        return asm_src_text
+    return str(module)
+
+
 def _detect_matmul(asm_src_text):
     """Detect a single plain matmul in the TritonShared IR.
 
@@ -1345,13 +1379,14 @@ def _detect_matmul(asm_src_text):
     ``fill`` (fused epilogues are out of scope). Returns None otherwise, in
     which case the caller keeps the built-in default tiling.
 
-    A ``tt.dot`` carrying a live accumulator is declined: it lowers to a
-    contraction plus a ``linalg.generic`` add, which fails the subset test
-    above. ``@fold_add_into_matmul_init`` removes that generic, but schedules
-    are selected after this runs, so such a kernel needs an explicit
-    ``transform_script``.
+    A ``tt.dot`` carrying a live accumulator, as in a K loop, lowers to a
+    contraction plus a ``linalg.generic`` add. Detection looks at the module
+    with that add folded into the contraction, which is what the generated
+    schedule does first, so only other fused epilogues are declined.
     """
     import re
+
+    asm_src_text = _fold_accumulator_adds(asm_src_text)
 
     # Bail if any linalg op other than matmul / fill is present (fusion).
     linalg_ops = set(re.findall(r"linalg\.(\w+)", asm_src_text))
@@ -1373,7 +1408,17 @@ def _detect_matmul(asm_src_text):
     # Defensive shape consistency: A[MxK] * B[KxN] = C[MxN].
     if k != k2 or m != m2 or n != n2 or in_elem != in_elem2:
         return None
-    return {"m": m, "k": k, "n": n, "in_elem": in_elem, "out_elem": out_elem}
+    # A kernel K loop carries the accumulator tensor through an scf.for; the
+    # shapes above are then one K step.
+    k_loop = bool(re.search(r"scf\.for\b[^\n]*iter_args\([^\n]*tensor<", asm_src_text))
+    return {
+        "m": m,
+        "k": k,
+        "n": n,
+        "in_elem": in_elem,
+        "out_elem": out_elem,
+        "k_loop": k_loop,
+    }
 
 
 def _matmul_transform_params(info, npu_version):
@@ -1444,14 +1489,22 @@ def _matmul_transform_params(info, npu_version):
             l2_k = v
             break
 
+    # In a kernel K loop each step is one L2 tile, and the tile above is the
+    # per-core one inside it.
+    l1_k = None
+    if info.get("k_loop", False):
+        l1_k, l2_k = l2_k, k
+
     return {
         "l1_m": l1_m,
         "l1_n": l1_n,
         "l2_k": l2_k,
+        "l1_k": l1_k,
         "pack_sizes": (pack_m, pack_n, pack_k),
         "accum_type": accum_type,
         "contract_input_type": contract_input_type,
         "bf16_emulation": bf16_emulation,
+        "k_loop": info.get("k_loop", False),
     }
 
 

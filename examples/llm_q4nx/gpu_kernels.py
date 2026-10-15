@@ -36,6 +36,10 @@ import triton.language as tl
 _GELU_2C = 1.5957691216057308
 _GELU_K = 0.044715
 
+#: `(C2, KC)` per GLU activation. The kernels compute `x * sigmoid(C2 * (x +
+#: KC * x^3))`: gelu_tanh at the constants above, SiLU at `(1, 0)`.
+_ACT = {"gelu_tanh": (_GELU_2C, _GELU_K), "silu": (1.0, 0.0)}
+
 
 def _pow2(n):
     return 1 << (max(int(n), 1) - 1).bit_length()
@@ -443,7 +447,7 @@ def _q4nx_split(nbj):
     return split
 
 
-def gemv_q4nx(x, w, glu_in=False):
+def gemv_q4nx(x, w, glu_in=False, act="gelu_tanh"):
     """x: [1, K] -> [1, N] against a `Q4NXWeight`. f32 out, as `gemv` returns.
 
     The decode's weight-bound half at 5 bits a weight rather than 16: every
@@ -451,7 +455,8 @@ def gemv_q4nx(x, w, glu_in=False):
     the cost, and reading the bundle's own encoding cuts them 3.2x.
 
     `glu_in`: `x` is a gate|up row, `[1, 2K]`, and the product is taken
-    against `gelu_tanh(gate) * up` -- the FFN's GeGLU, fused into the load.
+    against `act(gate) * up` -- the FFN's GLU, fused into the load. `act` is
+    a key of `_ACT`.
     """
     # bf16-rounded in the kernel, as `gemv` does, and for the same reasons.
     x = x.reshape(-1).contiguous()
@@ -467,8 +472,7 @@ def gemv_q4nx(x, w, glu_in=False):
         out,
         nbj,
         nbj // split,
-        _GELU_2C,
-        _GELU_K,
+        *_ACT[act],
         SPLIT=split,
         GLU_IN=glu_in,
         CODEC_K=w.codec == "k",
@@ -731,10 +735,10 @@ def gemm_w4a8(x, w):
     return out
 
 
-def gemm_w4a8_glu_q8(x, w):
-    """`quant_q8(gelu_tanh(gate) * up)` for x: [M, K] against a stacked
-    gate|up `Q4NXWeight` `[2 * inter, K]`, as `(xq, dx, xs)` ready for the
-    down GEMM. The f32 gate|up is never written to memory."""
+def gemm_w4a8_glu_q8(x, w, act="gelu_tanh"):
+    """`quant_q8(act(gate) * up)` for x: [M, K] against a stacked gate|up
+    `Q4NXWeight` `[2 * inter, K]`, as `(xq, dx, xs)` ready for the down GEMM.
+    The f32 gate|up is never written to memory. `act` is a key of `_ACT`."""
     xq, dx, xs = quant_q8(x)
     if xq.shape[1] != w.K:
         raise ValueError(f"activation is {tuple(xq.shape)}, weight K is {w.K}")
@@ -758,8 +762,7 @@ def gemm_w4a8_glu_q8(x, w):
         M,
         w.K // Q4NX_COLS,
         inter // 32,
-        _GELU_2C,
-        _GELU_K,
+        *_ACT[act],
         BM=BM,
         RB=RB,
         CODEC_K=w.codec == "k",
@@ -1618,10 +1621,12 @@ ATTN_WARPS, ATTN_STAGES = 2, 1
 
 
 @triton.jit
-def _fa_qk_slice(q_row, K, j, mask_t, mask_j, c0, dc, DH: tl.constexpr, s):
-    """`s += q[:, c0:c0+DC] @ k[:, c0:c0+DC]^T`, both slices read from memory."""
+def _fa_qk_slice(q_row, K, j, mask_t, mask_j, c0, dc, KS: tl.constexpr, s):
+    """`s += q[:, c0:c0+DC] @ k[:, c0:c0+DC]^T`, both slices read from memory.
+
+    `K` points at this head's lanes; `KS` is the K row stride."""
     q = tl.load(q_row + c0 + dc[None, :], mask=mask_t[:, None], other=0.0)
-    k = tl.load(K + j[:, None] * DH + c0 + dc[None, :], mask=mask_j[:, None], other=0.0)
+    k = tl.load(K + j[:, None] * KS + c0 + dc[None, :], mask=mask_j[:, None], other=0.0)
     return tl.dot(q, tl.trans(k), acc=s)
 
 
@@ -1641,6 +1646,7 @@ def _attn_prefill_fa_kernel(
     BN: tl.constexpr,
     DC: tl.constexpr,
     HAS_WINDOW: tl.constexpr,
+    NKV: tl.constexpr = 1,
 ):
     """Causal, optionally windowed attention for one head and `BM` query rows.
 
@@ -1659,10 +1665,16 @@ def _attn_prefill_fa_kernel(
       L2 per key block, in a loop that must stay rolled: unrolled, the
       compiler hoists every slice's loads and spills again.
 
-    Q, K and V are fp16; the output is f32.
+    Q, K and V are fp16; the output is f32. K and V are `[N, NKV * DH]`; query
+    head `h` reads KV head `h // (NQ // NKV)`, as `flash_attn.comp`'s
+    `gqa_ratio` does.
     """
     pid_m = tl.program_id(0)
     h = tl.program_id(1)
+    KS: tl.constexpr = NKV * DH
+    kvh = h // (NQ // NKV)
+    K += kvh * DH
+    V += kvh * DH
     t = pid_m * BM + tl.arange(0, BM)
     mask_t = t < N
     d = tl.arange(0, DH)
@@ -1681,7 +1693,7 @@ def _attn_prefill_fa_kernel(
         mask_j = j < N
         s = tl.zeros((BM, BN), tl.float32)
         for c0 in tl.range(0, DH, DC, loop_unroll_factor=1):
-            s = _fa_qk_slice(q_row, K, j, mask_t, mask_j, c0, dc, DH, s)
+            s = _fa_qk_slice(q_row, K, j, mask_t, mask_j, c0, dc, KS, s)
         s = s * scale
         keep = mask_j[None, :] & (j[None, :] <= t[:, None])
         if HAS_WINDOW:
@@ -1694,7 +1706,7 @@ def _attn_prefill_fa_kernel(
         alpha = tl.exp(m_i - m_exp)
         p = tl.exp(s - m_exp[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        v = tl.load(V + j[:, None] * DH + d[None, :], mask=mask_j[:, None], other=0.0)
+        v = tl.load(V + j[:, None] * KS + d[None, :], mask=mask_j[:, None], other=0.0)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
         m_i = m_new
     tl.store(
@@ -1709,13 +1721,15 @@ def _attn_prefill_fa_kernel(
 _FA_TILE = {256: (32, 64), 512: (32, 32)}
 
 
-def attn_prefill_fa(q, k, v, n_q, dh, window=None, scale=None):
-    """q: [N, n_q*dh], k/v: [N, dh] (one KV head) -> [N, n_q*dh], f32.
+def attn_prefill_fa(q, k, v, n_q, dh, window=None, scale=None, n_kv=1):
+    """q: [N, n_q*dh], k/v: [N, n_kv*dh] -> [N, n_q*dh], f32.
 
     Causal, windowed where `window` is given. Inputs should be fp16; others
     are converted here at the cost of extra launches.
     """
     N = q.shape[0]
+    if n_q % n_kv or k.shape[-1] != n_kv * dh:
+        raise ValueError(f"k is {tuple(k.shape)} for {n_kv} heads of {dh}")
     scale = dh**-0.5 if scale is None else scale
     q, k, v = (x.to(torch.float16).contiguous() for x in (q, k, v))
     out = torch.empty((N, n_q * dh), dtype=torch.float32, device=q.device)
@@ -1734,6 +1748,7 @@ def attn_prefill_fa(q, k, v, n_q, dh, window=None, scale=None):
         BN=32,
         DC=DC,
         HAS_WINDOW=window is not None,
+        NKV=n_kv,
         num_warps=4,
         num_stages=1,
     )
@@ -1794,3 +1809,388 @@ def attn_prefill(
         num_stages=ATTN_STAGES,
     )
     return out
+
+
+# ===========================================================================
+# GQA models (`llama_prefill.LlamaGpuDecode`)
+# ===========================================================================
+# `qkv_post` and `attn_decode` for models with several KV heads, and the
+# pre-norm form of `rmsnorm_residual`. The cache is `dense_kv_layout`'s, read
+# and written in place.
+
+
+@triton.jit
+def _add_rmsnorm_kernel(X, Y, W, OUT, H, N, eps, BLOCK_N: tl.constexpr):
+    """`out = x + y` and `h = rmsnorm(out) * w`, one program per row."""
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < N
+    row = tl.program_id(0).to(tl.int64) * N
+    x = tl.load(X + row + offs, mask=mask, other=0.0).to(tl.float32)
+    x += tl.load(Y + row + offs, mask=mask, other=0.0).to(tl.float32)
+    tl.store(OUT + row + offs, x, mask=mask)
+    inv = 1.0 / tl.sqrt(tl.sum(x * x) / N + eps)
+    w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
+    tl.store(H + row + offs, x * inv * w, mask=mask)
+
+
+def add_rmsnorm(x, y, weight, eps):
+    """A pre-norm block's sublayer tail: `(x + y, rmsnorm(x + y) * weight)`.
+
+    The residual add and the next sublayer's norm in one launch, per row of
+    `[rows, N]`, f32. The pre-norm counterpart of `rmsnorm_residual`.
+    """
+    N = weight.numel()
+    x = x.reshape(-1, N).contiguous()
+    rows = x.shape[0]
+    out = torch.empty((rows, N), dtype=torch.float32, device=x.device)
+    h = torch.empty_like(out)
+    _add_rmsnorm_kernel[(rows,)](
+        x,
+        y.reshape(rows, N).contiguous(),
+        weight.contiguous(),
+        out,
+        h,
+        N,
+        eps,
+        BLOCK_N=_pow2(N),
+    )
+    return out, h
+
+
+@triton.jit(do_not_specialize=["pos"])
+def _qkv_post_gqa_kernel(
+    QKV,
+    BIAS,
+    QN,
+    KN,
+    ROW,
+    QOUT,
+    SLAB,
+    KOUT,
+    VOUT,
+    pos,
+    eps,
+    region_stride,
+    stride_qkv,
+    stride_row,
+    NQ: tl.constexpr,
+    NKV: tl.constexpr,
+    DH: tl.constexpr,
+    RH: tl.constexpr,
+    HPG: tl.constexpr,
+    NGRP: tl.constexpr,
+    REGION_W: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_QK_NORM: tl.constexpr,
+    HAS_KV: tl.constexpr,
+    DENSE_KV: tl.constexpr,
+):
+    """Everything between the QKV projection and attention, for one head of
+    one token: bias, per-head RMSNorm, RoPE, and the KV-cache append.
+
+    Program `h < NQ` is query head `h`; program `NQ + j` is KV head `j`, which
+    does K and V together. The order is the models': bias on the raw
+    projection, then the head norm (Qwen3, Gemma3), then the rotation.
+
+    RoPE is the half-split form over the first `2 * RH` lanes of the head,
+    lane `i` paired with `i + RH`; the rest are copied through. `RH = DH / 2`
+    rotates the whole head.
+
+    K (roped) and V (raw) are rounded to bf16 into row `pos + t` of
+    `dense_kv_layout`'s regions: KV head `j` is in group `j // HPG`, at lane
+    `(j % HPG) * DH`. `SLAB` is the layer's base. With `DENSE_KV` they are also
+    stored as `[T, NKV * DH]` for the prefill's attention.
+    """
+    h = tl.program_id(0)
+    t = tl.program_id(1)
+    QKV += t * stride_qkv
+    ROW += t * stride_row
+    d = tl.arange(0, DH)
+    rot = d < 2 * RH
+    lo = d < RH
+    i = tl.where(rot, d % RH, 0)
+    partner = tl.where(rot, tl.where(lo, d + RH, d - RH), d)
+    cos = tl.load(ROW + i, mask=rot, other=1.0).to(tl.float32)
+    sin = tl.load(ROW + RH + i, mask=rot, other=0.0).to(tl.float32)
+    sin = tl.where(lo, -sin, sin)
+    if h < NQ:
+        base = h * DH
+        nw = QN
+    else:
+        base = NQ * DH + (h - NQ) * DH
+        nw = KN
+    x = tl.load(QKV + base + d).to(tl.float32)
+    xp = tl.load(QKV + base + partner).to(tl.float32)
+    if HAS_BIAS:
+        x += tl.load(BIAS + base + d)
+        xp += tl.load(BIAS + base + partner)
+    if HAS_QK_NORM:
+        inv = 1.0 / tl.sqrt(tl.sum(x * x) / DH + eps)
+        x = x * inv * tl.load(nw + d).to(tl.float32)
+        xp = xp * inv * tl.load(nw + partner).to(tl.float32)
+    y = tl.where(rot, x * cos + xp * sin, x)
+    if h < NQ:
+        tl.store(QOUT + t * (NQ * DH) + base + d, y)
+    else:
+        j = h - NQ
+        vb = (NQ + NKV) * DH + j * DH
+        v = tl.load(QKV + vb + d).to(tl.float32)
+        if HAS_BIAS:
+            v += tl.load(BIAS + vb + d)
+        if DENSE_KV:
+            tl.store(KOUT + t * (NKV * DH) + j * DH + d, y)
+            tl.store(VOUT + t * (NKV * DH) + j * DH + d, v)
+        if HAS_KV:
+            g = j // HPG
+            off = (pos + t).to(tl.int64) * REGION_W + (j % HPG) * DH + d
+            tl.store(SLAB + g * region_stride + off, y.to(tl.bfloat16))
+            tl.store(SLAB + (NGRP + g) * region_stride + off, v.to(tl.bfloat16))
+
+
+def qkv_post_gqa(
+    qkv,
+    lut_rows,
+    n_q,
+    n_kv,
+    dh,
+    eps=1e-6,
+    q_norm=None,
+    k_norm=None,
+    bias=None,
+    kv=None,
+    dense_kv=False,
+    out_dtype=torch.float32,
+):
+    """Bias, head norms, RoPE and the KV-cache append, in one launch.
+
+    `qkv` is the fused projection's `[T, (n_q + 2 n_kv) * dh]`, one row for a
+    decode step and the prompt for a prefill; `lut_rows` the RoPE table's
+    `[T, 2 * rh]` rows (`[cos | sin]`, `rh = dh / 2` unless the model rotates
+    part of the head). `bias` is the `[(n_q + 2 n_kv) * dh]` projection bias,
+    and `q_norm`/`k_norm` the per-head norm weights, both where the model has
+    them.
+
+    `kv`, to append to the cache, is `(layer_slab, pos, geom)`: one layer's
+    row of the `[n_layers, lreg]` slab, the first position, and its
+    `DenseKVGeometry`. Returns the rotated q `[T, n_q * dh]`, and with
+    `dense_kv` also K and V as `[T, n_kv * dh]`, all in `out_dtype`.
+    """
+    T = qkv.shape[0] if qkv.dim() == 2 else 1
+    qkv = qkv.reshape(T, -1)
+    if qkv.shape[1] != (n_q + 2 * n_kv) * dh:
+        raise ValueError(f"qkv is {tuple(qkv.shape)} for {n_q}+2x{n_kv} heads of {dh}")
+    lut_rows = lut_rows.reshape(T, -1)
+    if qkv.stride(1) != 1 or lut_rows.stride(1) != 1:
+        qkv, lut_rows = qkv.contiguous(), lut_rows.contiguous()
+    rh = lut_rows.shape[1] // 2
+    if (q_norm is None) != (k_norm is None):
+        raise ValueError("q_norm and k_norm come together")
+    dev = qkv.device
+    q = torch.empty((T, n_q * dh), dtype=out_dtype, device=dev)
+    kd = torch.empty((T, n_kv * dh), dtype=out_dtype, device=dev) if dense_kv else q
+    vd = torch.empty_like(kd) if dense_kv else q
+    if kv is not None:
+        slab, pos, geom = kv
+        if geom.kv_width != n_kv * dh or slab.numel() != geom.lreg:
+            raise ValueError("the slab's geometry is not this model's")
+        if not (0 <= pos and pos + T <= geom.attn_maxl):
+            raise ValueError(
+                f"KV rows {pos}..{pos + T - 1} are outside the slab's "
+                f"{geom.attn_maxl} rows"
+            )
+        if not slab.is_contiguous():
+            raise ValueError("the layer's slab row must be contiguous")
+        hpg, ngrp, rw, rs = (
+            geom.region_w // dh,
+            geom.ngrp,
+            geom.region_w,
+            geom.region_stride,
+        )
+    else:
+        slab, pos, hpg, ngrp, rw, rs = q, 0, 1, 1, dh, 0
+    _qkv_post_gqa_kernel[(n_q + n_kv, T)](
+        qkv,
+        bias if bias is not None else qkv,
+        q_norm if q_norm is not None else qkv,
+        k_norm if k_norm is not None else qkv,
+        lut_rows,
+        q,
+        slab,
+        kd,
+        vd,
+        pos,
+        eps,
+        rs,
+        qkv.stride(0),
+        lut_rows.stride(0),
+        NQ=n_q,
+        NKV=n_kv,
+        DH=dh,
+        RH=rh,
+        HPG=hpg,
+        NGRP=ngrp,
+        REGION_W=rw,
+        HAS_BIAS=bias is not None,
+        HAS_QK_NORM=q_norm is not None,
+        HAS_KV=kv is not None,
+        DENSE_KV=dense_kv,
+    )
+    return (q, kd, vd) if dense_kv else q
+
+
+@triton.jit(do_not_specialize=["lo", "S", "chunk"])
+def _attn_decode_gqa_kernel(
+    Q,
+    KR,
+    VR,
+    OUT,
+    ML,
+    lo,
+    S,
+    chunk,
+    scale,
+    NQ: tl.constexpr,
+    NKV: tl.constexpr,
+    DH: tl.constexpr,
+    GP: tl.constexpr,
+    HPG: tl.constexpr,
+    REGION_STRIDE_K: tl.constexpr,
+    REGION_W: tl.constexpr,
+    BS: tl.constexpr,
+    DIRECT: tl.constexpr,
+):
+    """One token's attention for one KV head over one chunk of the context.
+
+    llama.cpp's `flash_attn.comp` at N = 1: the KV head's `G = NQ / NKV`
+    query heads are the rows of one tile, padded to `GP` >= 16 for the
+    matrix cores, so K and V are read once per KV head rather than once per
+    query head. The context is split across programs (`split_k`), each
+    writing its unnormalized partial and `(max, sum)`; `_attn_decode_reduce_kernel`
+    combines them. `DIRECT` is the one-split case, which normalizes and
+    stores the output itself.
+
+    K and V are read where `dense_kv_layout` keeps them: `KR`/`VR` are the
+    layer's K and V regions, KV head `j` at group `j // HPG`, lane
+    `(j % HPG) * DH`, rows `REGION_W` apart. fp16 operands, f32 accumulation.
+    """
+    j = tl.program_id(0)
+    sp = tl.program_id(1)
+    G: tl.constexpr = NQ // NKV
+    r = tl.arange(0, GP)
+    d = tl.arange(0, DH)
+    mask_r = r < G
+    q = tl.load(
+        Q + (j * G + r[:, None]) * DH + d[None, :], mask=mask_r[:, None], other=0.0
+    )
+    q = (q.to(tl.float32) * scale).to(tl.float16)
+    lane = (j // HPG) * REGION_STRIDE_K + (j % HPG) * DH
+    KR += lane
+    VR += lane
+    m_i = tl.full((GP,), float("-inf"), tl.float32)
+    l_i = tl.zeros((GP,), tl.float32)
+    acc = tl.zeros((GP, DH), tl.float32)
+    s0 = lo + sp * chunk
+    s1 = tl.minimum(S, s0 + chunk)
+    for j0 in range(s0, s1, BS):
+        rows = j0 + tl.arange(0, BS)
+        mask_s = rows < s1
+        off = rows.to(tl.int64)[:, None] * REGION_W + d[None, :]
+        k = tl.load(KR + off, mask=mask_s[:, None], other=0.0).to(tl.float16)
+        s = tl.dot(q, tl.trans(k))
+        s = tl.where(mask_s[None, :], s, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        v = tl.load(VR + off, mask=mask_s[:, None], other=0.0).to(tl.float16)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
+        m_i = m_new
+    h = j * G + r
+    if DIRECT:
+        tl.store(
+            OUT + h[:, None] * DH + d[None, :], acc / l_i[:, None], mask=mask_r[:, None]
+        )
+    else:
+        nsp = tl.num_programs(1)
+        tl.store(
+            OUT + (h[:, None] * nsp + sp) * DH + d[None, :], acc, mask=mask_r[:, None]
+        )
+        tl.store(ML + (h * nsp + sp) * 2, m_i, mask=mask_r)
+        tl.store(ML + (h * nsp + sp) * 2 + 1, l_i, mask=mask_r)
+
+
+@triton.jit
+def _attn_decode_reduce_kernel(P, ML, OUT, NSP, DH: tl.constexpr, BSP: tl.constexpr):
+    """Combine one query head's `NSP` split partials (`flash_attn_split_k_reduce`)."""
+    h = tl.program_id(0)
+    s = tl.arange(0, BSP)
+    ms = s < NSP
+    m = tl.load(ML + (h * NSP + s) * 2, mask=ms, other=float("-inf"))
+    l = tl.load(ML + (h * NSP + s) * 2 + 1, mask=ms, other=0.0)
+    mx = tl.max(m, axis=0)
+    w = tl.where(ms, tl.exp(m - mx), 0.0)
+    d = tl.arange(0, DH)
+    p = tl.load(
+        P + (h * NSP + s[:, None]) * DH + d[None, :], mask=ms[:, None], other=0.0
+    )
+    o = tl.sum(p * w[:, None], axis=0) / tl.sum(l * w, axis=0)
+    tl.store(OUT + h * DH + d, o)
+
+
+#: Keys per split of the GQA decode attention: one program reads at most this
+#: many rows of K and V for one KV head.
+DECODE_ATTN_CHUNK = 256
+
+
+def attn_decode_gqa(q, layer_slab, geom, n_q, n_kv, dh, S, scale=None, lo=0):
+    """q: [1, n_q * dh] against cache rows `[lo, S)` of one layer -> [1, n_q * dh].
+
+    `layer_slab` is that layer's row of the `dense_kv_layout` slab, read in
+    place. `lo` is a sliding window's first row. f32 out.
+    """
+    scale = dh**-0.5 if scale is None else scale
+    if n_q % n_kv or geom.kv_width != n_kv * dh:
+        raise ValueError("the slab's geometry is not this model's")
+    q = q.reshape(-1).contiguous()
+    span = S - lo
+    nsp = max(1, triton.cdiv(span, DECODE_ATTN_CHUNK))
+    chunk = triton.cdiv(span, nsp)
+    G = n_q // n_kv
+    out = torch.empty(n_q * dh, dtype=torch.float32, device=q.device)
+    direct = nsp == 1
+    part = (
+        out
+        if direct
+        else torch.empty(n_q * nsp * dh, dtype=torch.float32, device=q.device)
+    )
+    ml = (
+        out
+        if direct
+        else torch.empty(n_q * nsp * 2, dtype=torch.float32, device=q.device)
+    )
+    kr = layer_slab[geom.region_offset(0, 0) :]
+    vr = layer_slab[geom.region_offset(1, 0) :]
+    _attn_decode_gqa_kernel[(n_kv, nsp)](
+        q,
+        kr,
+        vr,
+        part,
+        ml,
+        lo,
+        S,
+        chunk,
+        float(scale),
+        NQ=n_q,
+        NKV=n_kv,
+        DH=dh,
+        GP=max(16, _pow2(G)),
+        HPG=geom.region_w // dh,
+        REGION_STRIDE_K=geom.region_stride,
+        REGION_W=geom.region_w,
+        BS=32,
+        DIRECT=direct,
+        num_warps=4,
+    )
+    if not direct:
+        _attn_decode_reduce_kernel[(n_q,)](part, ml, out, nsp, DH=dh, BSP=_pow2(nsp))
+    return out.reshape(1, n_q * dh)

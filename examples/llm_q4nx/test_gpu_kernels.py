@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check `gpu_kernels` against torch, at the shapes Gemma4-E2B decode uses.
+"""Check `gpu_kernels` against torch, at the shapes Gemma4-E2B decode uses,
+and the GQA kernels at every dense model's attention geometry (`DENSE`).
 
 torch is the oracle here, which is the role `README.md` gives it. Every case is
 a real shape from the model -- both head dims, both FFN widths, the sliding
@@ -348,6 +349,165 @@ def _gemm_w4a8(G, dev):
     return ok
 
 
+#: (name, n_q, n_kv, dh, KV groups, RoPE lanes, head norm, bias): each dense
+#: model's attention, with the KV groups `dense_kv_layout.for_model` gives it.
+DENSE = [
+    ("llama-3.2-1b", 32, 8, 64, 2, 64, False, False),
+    ("llama-3.2-3b", 24, 8, 128, 2, 128, False, False),
+    ("qwen2.5-3b", 16, 2, 128, 1, 128, False, True),
+    ("qwen2.5-7b", 28, 4, 128, 2, 128, False, True),
+    ("qwen3-4b", 32, 8, 128, 2, 128, True, False),
+    ("phi4-mini", 24, 8, 128, 2, 96, False, False),
+    ("gemma3-4b", 8, 4, 256, 2, 256, True, False),
+]
+
+
+def _ref_rope(x, lut, n_heads, dh):
+    """Half-split RoPE over the first `lut.shape[1]` lanes of each head."""
+    R = lut.shape[1]
+    h = R // 2
+    v = x.reshape(x.shape[0], n_heads, dh)
+    cos, sin = lut[:, None, :h], lut[:, None, h:]
+    x1, x2, tail = v[..., :h], v[..., h:R], v[..., R:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos, tail], -1).reshape(
+        x.shape[0], -1
+    )
+
+
+def _ref_head_norm(x, w, n_heads, dh):
+    v = x.reshape(x.shape[0], n_heads, dh)
+    v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + RMS_EPS) * w
+    return v.reshape(x.shape[0], -1)
+
+
+def _dense_qkv_post(G, dev):
+    """`qkv_post_gqa` against torch, and its cache rows against the host
+    writer `dense_kv_layout.scatter`, which `test_dense_kv_layout.py` holds to
+    mlir-air's own `seed_kv`."""
+    from dense_kv_layout import K_REGION, V_REGION, DenseKVGeometry, scatter
+
+    print("\nqkv_post_gqa  bias + head norms + rope + KV append (dense models)")
+    ok = True
+    g = torch.Generator().manual_seed(0)
+    for name, nq, nkv, dh, ngrp, R, qkn, bias in DENSE:
+        T, pos, L = 37, 5, 1
+        geom = DenseKVGeometry(3, 64, ngrp, nkv * dh // ngrp)
+        W = (nq + 2 * nkv) * dh
+        qkv = torch.randn(T, W, generator=g)
+        ang = torch.rand(T, R // 2, generator=g) * 6
+        lut = torch.cat([ang.cos(), ang.sin()], 1)
+        b = torch.randn(W, generator=g) if bias else None
+        qn = torch.rand(dh, generator=g) + 0.5 if qkn else None
+        kn = torch.rand(dh, generator=g) + 0.5 if qkn else None
+
+        x = qkv + b if bias else qkv
+        q, k, v = x.split([nq * dh, nkv * dh, nkv * dh], 1)
+        if qkn:
+            q, k = _ref_head_norm(q, qn, nq, dh), _ref_head_norm(k, kn, nkv, dh)
+        q, k = _ref_rope(q, lut, nq, dh), _ref_rope(k, lut, nkv, dh)
+
+        slab = torch.zeros(geom.slab_shape(), dtype=torch.bfloat16, device=dev)
+        gq, gk, gv = G.qkv_post_gqa(
+            qkv.to(dev),
+            lut.to(dev),
+            nq,
+            nkv,
+            dh,
+            RMS_EPS,
+            q_norm=qn.to(dev) if qkn else None,
+            k_norm=kn.to(dev) if qkn else None,
+            bias=b.to(dev) if bias else None,
+            kv=(slab[L], pos, geom),
+            dense_kv=True,
+        )
+        ok &= check(f"{name} q", gq.cpu(), q, 1e-5)
+        ok &= check(f"{name} k", gk.cpu(), k, 1e-5)
+        ok &= check(f"{name} v", gv.cpu(), v, 1e-5)
+        # The cache bytes: the host writer, fed this kernel's own K and V so
+        # that bf16 rounding cannot differ.
+        want = torch.zeros(geom.slab_shape(), dtype=torch.bfloat16)
+        scatter(want, L, K_REGION, gk.cpu().to(torch.bfloat16), geom, pos)
+        scatter(want, L, V_REGION, gv.cpu().to(torch.bfloat16), geom, pos)
+        same = torch.equal(slab.cpu().view(torch.int16), want.view(torch.int16))
+        print(f"  {name + ' cache rows':<34} {'identical' if same else 'FAIL'}")
+        ok &= same
+    return ok
+
+
+def _dense_attn_decode(G, dev):
+    """`attn_decode_gqa`, reading the cache in place, against torch."""
+    from dense_kv_layout import K_REGION, V_REGION, DenseKVGeometry, gather
+
+    print("\nattn_decode_gqa  (dense models, split-K over the context)")
+    ok = True
+    g = torch.Generator().manual_seed(1)
+    for name, nq, nkv, dh, ngrp, *_ in DENSE:
+        geom = DenseKVGeometry(2, 2048, ngrp, nkv * dh // ngrp)
+        slab = (torch.randn(geom.slab_shape(), generator=g) * 0.5).to(torch.bfloat16)
+        slab_d = slab.to(dev)
+        # One row; one split; several, ragged; and a window's lower bound.
+        for S, lo in ((1, 0), (37, 0), (300, 0), (1500, 0), (1500, 700)):
+            q = torch.randn(1, nq * dh, generator=g)
+            K = gather(slab, 1, K_REGION, geom, S)[lo:].float()
+            V = gather(slab, 1, V_REGION, geom, S)[lo:].float()
+            G_ = nq // nkv
+            kh = K.view(-1, nkv, dh).repeat_interleave(G_, 1).transpose(0, 1)
+            vh = V.view(-1, nkv, dh).repeat_interleave(G_, 1).transpose(0, 1)
+            qh = q.view(nq, dh, 1)
+            p = torch.softmax((kh @ qh)[..., 0] * dh**-0.5, -1)
+            want = (p[:, None, :] @ vh)[:, 0].reshape(1, -1)
+            got = G.attn_decode_gqa(q.to(dev), slab_d[1], geom, nq, nkv, dh, S, lo=lo)
+            ok &= check(f"{name} S={S} lo={lo}", got.cpu(), want, 1e-2)
+    return ok
+
+
+def _dense_attn_prefill(G, dev):
+    """`attn_prefill_fa` with GQA against the f32 `attn_prefill`."""
+    print("\nattn_prefill_fa  (dense models, GQA)")
+    ok = True
+    g = torch.Generator().manual_seed(2)
+    for name, nq, nkv, dh, *_ in DENSE:
+        for N in (37, 300):
+            q = torch.randn(N, nq * dh, generator=g).to(dev)
+            k = torch.randn(N, nkv * dh, generator=g).to(dev)
+            v = torch.randn(N, nkv * dh, generator=g).to(dev)
+            want = G.attn_prefill(q, k, v, nq, nkv, dh)
+            got = G.attn_prefill_fa(q.half(), k.half(), v.half(), nq, dh, n_kv=nkv)
+            ok &= check(f"{name} N={N}", got, want, 1e-2)
+    return ok
+
+
+def _dense_glu_and_norm(G, dev):
+    """SwiGLU through the fused GLU paths, and the pre-norm tail."""
+    print("\nSwiGLU (act='silu') and add_rmsnorm")
+    ok = True
+    D_, I = 512, 1024
+    gu = _random_q4nx(G, 2 * I, D_, dev)
+    down = _random_q4nx(G, D_, I, dev)
+    Wgu, Wd = G.dequant_q4nx(gu).float(), G.dequant_q4nx(down).float()
+
+    h = torch.randn(1, D_, device=dev)
+    gate, up = (h.to(torch.bfloat16).float() @ Wgu).split(I, 1)
+    act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16).float()
+    got = G.gemv_q4nx(G.gemv_q4nx(h, gu), down, glu_in=True, act="silu")
+    ok &= check("gemv_q4nx glu_in act=silu", got, act @ Wd)
+
+    hm = torch.randn(64, D_, device=dev)
+    gate, up = (hm @ Wgu).split(I, 1)
+    want = (torch.nn.functional.silu(gate) * up) @ Wd
+    got = G.gemm_w4a8(G.gemm_w4a8_glu_q8(hm, gu, act="silu"), down)
+    ok &= check("gemm_w4a8_glu_q8 act=silu", got, want, 3e-2)
+
+    x = torch.randn(5, D_, device=dev)
+    y = torch.randn(5, D_, device=dev)
+    w = torch.rand(D_, device=dev)
+    s, hn = G.add_rmsnorm(x, y, w, RMS_EPS)
+    ok &= check("add_rmsnorm sum", s, x + y, 1e-6)
+    ref = (x + y) * torch.rsqrt((x + y).pow(2).mean(-1, keepdim=True) + RMS_EPS) * w
+    ok &= check("add_rmsnorm norm", hn, ref, 1e-5)
+    return ok
+
+
 def main():
     if not torch.cuda.is_available():
         print("SKIP: no ROCm device visible to torch")
@@ -604,6 +764,11 @@ def main():
                 ok = False
                 continue
             ok &= check(f"{name} N={N} dh={dh} win={win}", got, ref)
+
+    ok &= _dense_glu_and_norm(G, dev)
+    ok &= _dense_qkv_post(G, dev)
+    ok &= _dense_attn_decode(G, dev)
+    ok &= _dense_attn_prefill(G, dev)
 
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

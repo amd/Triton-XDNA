@@ -27,10 +27,9 @@ practical way to debug a 28-layer model whose end-to-end signal is one token
 id. `--ops` narrows which operators go to the NPU; `--compare-cpu` builds a
 second model with backend="cpu" and diffs the KV cache layer by layer.
 
-This forward is much shorter than gpt2's for two reasons, both structural:
-there is no decode here (it is mlir-air's fused superkernel, reached through
-the npz `save_kv_npz` describes), and there is no iGPU path, so no per-op
-device placement.
+The NPU decode is mlir-air's fused superkernel, reached through the handoff
+`save_kv_npz` describes or the shared cache `bind_kv_sink` takes. The iGPU
+prefill and decode are `LlamaGpuDecode` at the end of this file.
 """
 
 import os
@@ -41,6 +40,8 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 from triton.backends.amd_triton_npu.driver_scope import driver_scope
+
+from dense_kv_layout import K_REGION, V_REGION, DenseKVGeometry, gather
 
 from config import (
     D,
@@ -263,26 +264,17 @@ class LlamaPrefill:
         self.kv_v[L][:keep] = v[:keep].to(torch.float32).cpu().numpy()
 
     def _kv_store_direct(self, L, k, v, keep):
-        """Scatter K/V into the sink's region-major layout, ngrp K then ngrp V."""
+        """Write the layer's K/V into the sink, in `dense_kv_layout`'s layout."""
+        from dense_kv_layout import K_REGION, V_REGION, DenseKVGeometry, scatter
+
         s = self._kv_sink
-        rw, ng, rs, lreg = s["region_w"], s["ngrp"], s["region_stride"], s["lreg"]
-        # A region holds rs/rw rows; a longer prompt would scatter past it into
-        # the next region (which the later per-step budget cannot catch).
-        if keep * rw > rs:
-            raise ValueError(
-                f"prompt of {keep} exceeds the decode window {rs // rw}; "
-                "rebuild the decode at a larger ATTN_MAXL or shorten the prompt"
-            )
+        geom = DenseKVGeometry.from_sink(s)
         # uint16 view: a bit copy, since torch and ml_dtypes bf16 would else convert.
         buf = s["buf"].view(np.uint16)
-        kb = k[:keep].to(torch.bfloat16).view(torch.uint16).cpu().numpy()
-        vb = v[:keep].to(torch.bfloat16).view(torch.uint16).cpu().numpy()
-        base = L * lreg
-        for g in range(ng):
-            ko = base + g * rs
-            buf[ko : ko + keep * rw].reshape(keep, rw)[:] = kb[:, g * rw : (g + 1) * rw]
-            vo = base + (ng + g) * rs
-            buf[vo : vo + keep * rw].reshape(keep, rw)[:] = vb[:, g * rw : (g + 1) * rw]
+        slab = buf[: geom.n_layers * geom.lreg].reshape(geom.slab_shape())
+        for region, x in ((K_REGION, k), (V_REGION, v)):
+            rows = x[:keep].to(torch.bfloat16).view(torch.uint16).cpu().numpy()
+            scatter(slab, L, region, rows, geom)
 
     #: What `--ops` selects when nothing is asked for. `None` means every
     #: operator with an NPU kernel, which is right wherever the NPU is faster
@@ -790,3 +782,511 @@ class LlamaPrefill:
         K, V = self.kv_stack()
         np.savez(path, k=K, v=V, first=first, prompt=np.array(prompt))
         return K, V
+
+
+# ---------------------------------------------------------------------------
+# iGPU prefill and decode
+# ---------------------------------------------------------------------------
+def _q4_0_as_codec_b(data):
+    """Signed Q4_0 chunks as Codec B, exactly.
+
+    Same chunk layout, but the nibbles are two's-complement and the mins zero,
+    so `w = s * n`. With `u = n ^ 8 = n + 8` that is `w = s * u - 8s`: Codec B
+    with `min = -8 * scale`, which bf16 holds exactly.
+    """
+    import gpu_kernels as gk
+
+    c = data.reshape(-1, gk.Q4NX_CHUNK_BYTES).copy()
+    if c[:, 512:1024].any():
+        raise RuntimeError("Q4_0 chunks with nonzero mins")
+    sc = torch.from_numpy(c[:, :512].view(np.uint16).copy()).view(torch.bfloat16)
+    c[:, 512:1024] = (sc * -8).view(torch.uint16).numpy().view(np.uint8)
+    c[:, 1024:] ^= 0x88
+    return c.reshape(-1)
+
+
+def _quantize_pack(w):
+    """A float `[N, K]` matrix as Codec B chunks, through mlir-air's own
+    quantizer and block packer (what its decode is built from)."""
+    from proj_qmm_pack import GROUP, pack_q4k_blocks
+    from qwen25_7b_q4nx_requant import _requant_q4k
+
+    q, sc, mn = _requant_q4k(np.asarray(w, np.float32), GROUP)
+    return pack_q4k_blocks(q, sc, mn).view(np.uint8).reshape(-1)
+
+
+def packed_bundle(qm, cfg, n_layers=None, inter=None, q4_0=False):
+    """The projections in Codec B, still packed, and the host tensors the iGPU
+    forward needs. `qm` is mlir-air's weight reader for the model.
+
+    From a `model.q4nx` bundle the chunks are read as stored (`q4_0` converts
+    the signed variant). From a reader with no bundle behind it, one that
+    quantizes an HF checkpoint, they are quantized here.
+
+    `inter` is the GLU width as stored, where the bundle pads it with zeros.
+
+    Returns a dict with
+        layers: per layer, `qkv`, `o`, `gate_up`, `down` as
+            `(uint8 chunks, N, K)` for y = W x, q|k|v and gate|up stacked
+            along N (the chunks are block-major over (N/32, K/256), so
+            stacking is concatenation); the norms as `attn_norm`, `ffn_norm`
+            and, for Gemma's sandwich, `post_attn_norm`, `post_ffn_norm`;
+            `q_norm`, `k_norm` and `qkv_bias` where the model has them
+        embed: bfloat16 `[VOCAB, D]` torch tensor
+        final_norm: float32
+        lm_head: `(uint8 chunks, VOCAB, D)`, or None without a packed head
+
+    Only the I8 header (`w = s * q + min`) is read. The older "Q4NX" header
+    subtracts its zero point and is refused rather than misread.
+    """
+    D, DQ, DK, V = cfg.D, cfg.DQ, cfg.DK, cfg.VOCAB
+    I = inter or cfg.INTER
+    bundle = hasattr(qm, "_hdr")
+
+    def raw(name, N, K):
+        if not bundle:
+            return _quantize_pack(qm.bf16(name))
+        e = qm._hdr[name]
+        if e.get("dtype") != "I8":
+            raise RuntimeError(f"{name}: {e.get('dtype')} header; expected I8")
+        if e["shape"][0] != (N // 32) * (K // 256):
+            raise RuntimeError(f"{name}: {e['shape'][0]} chunks is not {N}x{K}")
+        data = qm._raw_i16(name).view(np.uint8)
+        return _q4_0_as_codec_b(data) if q4_0 else data
+
+    layers = []
+    for k in range(n_layers or cfg.N_LAYERS):
+        p = f"model.layers.{k}."
+        a, m = p + "self_attn.", p + "mlp."
+        qkv = [
+            raw(a + "q_proj.weight", DQ, D),
+            raw(a + "k_proj.weight", DK, D),
+            raw(a + "v_proj.weight", DK, D),
+        ]
+        gate_up = [raw(m + "gate_proj.weight", I, D), raw(m + "up_proj.weight", I, D)]
+        L = dict(
+            qkv=(np.concatenate(qkv), DQ + 2 * DK, D),
+            o=(raw(a + "o_proj.weight", D, DQ), D, DQ),
+            gate_up=(np.concatenate(gate_up), 2 * I, D),
+            down=(raw(m + "down_proj.weight", D, I), D, I),
+        )
+        norms = [np.asarray(n, np.float32) for n in qm.layer_rms(k)]
+        if len(norms) == 2:
+            L["attn_norm"], L["ffn_norm"] = norms
+        else:
+            L["attn_norm"], L["post_attn_norm"], L["ffn_norm"], L["post_ffn_norm"] = (
+                norms
+            )
+        if hasattr(qm, "layer_qk_norm"):
+            L["q_norm"], L["k_norm"] = (
+                np.asarray(n, np.float32) for n in qm.layer_qk_norm(k)
+            )
+        if hasattr(qm, "layer_qkv_bias"):
+            L["qkv_bias"] = np.concatenate(qm.layer_qkv_bias(k)).astype(np.float32)
+        layers.append(L)
+
+    if bundle:
+        embed = torch.from_numpy(qm._raw_i16("model.embed_tokens.weight"))
+        embed = embed.view(torch.bfloat16).view(V, D)
+        has_head = qm._hdr.get("lm_head.weight", {}).get("dtype") == "I8"
+    else:
+        embed = torch.from_numpy(qm.bf16("model.embed_tokens.weight")).bfloat16()
+        has_head = qm.has("lm_head.weight")
+    return dict(
+        layers=layers,
+        embed=embed,
+        final_norm=np.asarray(qm.bf16("model.norm.weight"), np.float32),
+        lm_head=(raw("lm_head.weight", V, D), V, D) if has_head else None,
+    )
+
+
+class LlamaGpuDecode:
+    """Prefill and greedy decode of a Llama-family model, in Triton, on the iGPU.
+
+    `Gemma4GpuDecode` for the models mlir-air's shared decode engine builds.
+    Built from a prefiller (`pf`): it reads the model and layer count from it,
+    and leaves `current_context_length` and `last_first_token` on it after its
+    own prefill, as the host prefill does.
+
+    The weights come packed from the bundle (`config.load_q4nx_packed`), not
+    from `pf`: the projections are read in place by the W4A16 GEMV (decode)
+    and the W4A8 GEMM (prefill), and nothing is dequantized on the host.
+
+    The KV cache is a `[n_layers, lreg]` slab in `dense_kv_layout`'s layout,
+    which is the one mlir-air's NPU decode reads. It is allocated in pages the
+    NPU and the iGPU share where the interop exists, or adopted from an NPU
+    decoder (`bind_kv_sink`). Either way a prefill on one device and a decode
+    on the other meet in the same rows:
+
+    * iGPU prefill, iGPU decode: `prefill`, then `generate`;
+    * host/NPU prefill, iGPU decode: the prefiller bound to `kv_sink()`;
+    * iGPU prefill, NPU decode: this object bound to the decoder's sink.
+
+    The forward covers the Llama family by what each layer carries, not by
+    model name: `q_norm`/`k_norm` (per-head RMSNorm before RoPE),
+    `qkv_bias`, `post_attn_norm`/`post_ffn_norm` (Gemma's sandwich), a RoPE
+    table narrower than the head (partial rotary), and from `config`,
+    `is_global_layer` with `SLIDING_WINDOW` (local layers attend a window and
+    use the local table), `GLU_ACT` and `TIED_LM_HEAD`.
+    """
+
+    #: What the projections are read as. `q4k` re-encodes each matrix to
+    #: `gpu_kernels`' Codec K on the host at load, as `Gemma4GpuDecode` does;
+    #: `q4nx` streams the bundle's chunks. `Q4NX_GPU_WEIGHTS` overrides.
+    WEIGHTS = ("q4k", "q4nx")
+    #: The LM head: `packed` is the bundle's `lm_head`; `tied` is the bf16
+    #: embedding, the default for a model that ties them (`TIED_LM_HEAD`),
+    #: where the packed copy is a lossier rendering of the same matrix.
+    #: `Q4NX_GPU_HEAD` overrides.
+    HEADS = ("packed", "tied")
+
+    def __init__(self, pf, max_L, device="cuda", weights=None, head=None):
+        import config as cfg
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "no ROCm device visible to torch; use the NPU decode instead, "
+                "or install a ROCm build of torch"
+            )
+        weights = weights or os.environ.get("Q4NX_GPU_WEIGHTS", "q4k")
+        if weights not in self.WEIGHTS:
+            raise ValueError(f"weights={weights!r}; expected one of {self.WEIGHTS}")
+        tied = getattr(cfg, "TIED_LM_HEAD", False)
+        head = head or os.environ.get("Q4NX_GPU_HEAD") or ("tied" if tied else "packed")
+        if head not in self.HEADS:
+            raise ValueError(f"head={head!r}; expected one of {self.HEADS}")
+        if head == "tied" and not tied:
+            raise ValueError(f"{cfg.MODEL_NAME} does not tie its LM head")
+        self.cfg, self.pf, self.dev = cfg, pf, device
+        self.weights, self.head = weights, head
+        self.timer = pf.timer
+        self.n_layers = pf.n_layers
+        self.nq, self.nkv, self.dh = cfg.N_Q_HEADS, cfg.N_KV_HEADS, cfg.DH
+        self.eps = cfg.RMS_EPS
+        self.act = getattr(cfg, "GLU_ACT", "silu")
+        self.max_L = max_L
+        self.geom = DenseKVGeometry.for_model(
+            cfg.MODEL_NAME, self.nkv, self.dh, self.n_layers, max_L
+        )
+        self._slab = None  # the shared buffer, where there is one
+        self._slab_t = None  # its `[n_layers, lreg]` iGPU view
+        self._load(pf.model)
+
+    def _load(self, model):
+        import gpu_kernels as gk
+
+        packed = self.cfg.load_q4nx_packed(model, n_layers=self.n_layers)
+        dev = self.dev
+
+        def proj(entry):
+            data, N, K = entry
+            w = gk.Q4NXWeight(torch.from_numpy(data), N, K)
+            if self.weights == "q4k":
+                try:
+                    w = w.to_codec_k()
+                except ValueError:
+                    pass  # a positive min, which Codec K cannot hold
+            return w.to(dev)
+
+        projs = ("qkv", "o", "gate_up", "down")
+        self.w = [
+            {k: proj(v) if k in projs else _t(v).to(dev) for k, v in L.items()}
+            for L in packed.pop("layers")
+        ]
+        self.embed = packed["embed"]
+        self.final_norm = _t(packed["final_norm"]).to(dev)
+        if self.head == "tied":
+            # `[D, VOCAB]` as a transposed view; see `gpu_kernels.gemv`.
+            self.lm_head = self.embed.to(dev).T
+        elif packed["lm_head"] is None:
+            raise RuntimeError("the bundle has no packed lm_head")
+        else:
+            self.lm_head = proj(packed["lm_head"])
+        self.lut = _t(self.cfg.rope_lut(self.max_L)).to(dev)
+        self.lut_global = None
+        if hasattr(self.cfg, "is_global_layer"):
+            self.lut_global = _t(self.cfg.rope_lut(self.max_L, global_layer=True)).to(
+                dev
+            )
+
+    # ---- the cache ----
+    def bind_kv_sink(self, sink):
+        """Use a decoder's resident KV buffer as the cache.
+
+        `sink` is what `harness._xrt_kv_sink` builds, with `torch`, the
+        buffer's iGPU view. Its geometry must be this model's, or every row
+        would land at the wrong offset without an error.
+        """
+        geom = DenseKVGeometry.from_sink(sink, self.n_layers)
+        if (geom.ngrp, geom.region_w) != (self.geom.ngrp, self.geom.region_w):
+            raise ValueError(
+                f"sink has {geom.ngrp} groups of {geom.region_w}, the model "
+                f"{self.geom.ngrp} of {self.geom.region_w}"
+            )
+        t = sink.get("torch")
+        if t is None or not t.is_cuda:
+            raise ValueError("the sink has no iGPU view")
+        self.geom = geom
+        self._slab = sink.get("shared")
+        n = geom.n_layers * geom.lreg
+        self._slab_t = t.reshape(-1)[:n].view(*geom.slab_shape())
+
+    def kv_sink(self):
+        """The cache as a sink a host or NPU prefiller can bind
+        (`LlamaPrefill.bind_kv_sink`), for this object to decode from."""
+        self._ensure_kv()
+        if self._slab is None:
+            raise RuntimeError("the KV cache is not in shared pages here")
+        return dict(self.geom.sink(self._slab.numpy()), torch=self._slab_t)
+
+    def _ensure_kv(self):
+        """Allocate the slab, in XRT/HIP-shared pages if the interop works.
+
+        Without it the slab is plain iGPU memory, and only the iGPU-only split
+        is available.
+        """
+        if self._slab_t is not None:
+            return
+        shape = self.geom.slab_shape()
+        try:
+            import kernels
+            from triton.backends.amd_triton_npu import shared
+
+            self._slab = shared.zeros(
+                *shape, dtype=torch.bfloat16, device="xrt:0", share=kernels.igpu_share()
+            )
+            self._slab_t = self._slab.torch()
+            if not self._slab_t.is_cuda:
+                raise RuntimeError("no iGPU view of the shared buffer")
+        except Exception as e:  # noqa: BLE001 -- see the docstring
+            if os.environ.get("AMD_TRITON_NPU_DEBUG"):
+                print(f"[gpu] KV not in shared pages: {e}", flush=True)
+            self._slab = None
+            self._slab_t = torch.zeros(shape, dtype=torch.bfloat16, device=self.dev)
+
+    @property
+    def kv_slab(self):
+        """The shared buffer holding the cache, or None."""
+        return self._slab
+
+    def kv_stack(self, P):
+        """Rows `[0, P)` as `(k, v)` float32 `[n_layers, P, DK]`. A copy."""
+        return tuple(
+            torch.stack(
+                [gather(self._slab_t, L, r, self.geom, P) for L in range(self.n_layers)]
+            )
+            .float()
+            .cpu()
+            .numpy()
+            for r in (K_REGION, V_REGION)
+        )
+
+    # ---- forward ----
+    def _window(self, L):
+        g = getattr(self.cfg, "is_global_layer", None)
+        return None if g is None or g(L) else self.cfg.SLIDING_WINDOW
+
+    def _lut(self, L):
+        g = getattr(self.cfg, "is_global_layer", None)
+        return self.lut_global if g is not None and g(L) else self.lut
+
+    def _qkv_post(self, qkv, L, rows, pos, **kw):
+        import gpu_kernels as gk
+
+        w = self.w[L]
+        return gk.qkv_post_gqa(
+            qkv,
+            rows,
+            self.nq,
+            self.nkv,
+            self.dh,
+            self.eps,
+            q_norm=w.get("q_norm"),
+            k_norm=w.get("k_norm"),
+            bias=w.get("qkv_bias"),
+            kv=(self._slab_t[L], pos, self.geom),
+            **kw,
+        )
+
+    def _tail(self, x, y, L, post, nxt):
+        """End a sublayer: `(x', rmsnorm(x') * nxt)`. Pre-norm adds `y` to
+        `x`; Gemma's sandwich norms `y` with `post` first."""
+        import gpu_kernels as gk
+
+        w = self.w[L]
+        if post in w:
+            return gk.rmsnorm_residual(y, w[post], self.eps, x, next_norm=nxt)
+        return gk.add_rmsnorm(x, y, nxt, self.eps)
+
+    def _next_norm(self, L):
+        return self.w[L + 1]["attn_norm"] if L + 1 < self.n_layers else self.final_norm
+
+    def _head(self, h):
+        import gpu_kernels as gk
+
+        if isinstance(self.lm_head, gk.Q4NXWeight):
+            return gk.gemv_q4nx(h, self.lm_head)[0]
+        return gk.gemv(h, self.lm_head)[0]
+
+    def prefill(self, ids):
+        """The prompt into cache rows `[0, N)`. Returns its last logits.
+
+        The projections quantize activations to int8 (`gpu_kernels.gemm_w4a8`)
+        and attention takes fp16 operands, so the logits are close to the host
+        prefill's, not equal.
+        """
+        ids = [int(t) for t in np.asarray(ids).reshape(-1)]
+        N = len(ids)
+        if N > min(self.max_L, self.geom.attn_maxl):
+            raise ValueError(
+                f"a {N}-token prompt exceeds the cache's "
+                f"{min(self.max_L, self.geom.attn_maxl)} rows"
+            )
+        self._ensure_kv()
+        with driver_scope("gpu"):
+            logits = self._prefill(ids).cpu()
+        self.pf._ids = ids
+        self.pf.current_context_length = N
+        self.pf.last_first_token = int(torch.argmax(logits))
+        return logits
+
+    def _prefill(self, ids):
+        import gpu_kernels as gk
+
+        N = len(ids)
+        nq, nkv, dh, eps = self.nq, self.nkv, self.dh, self.eps
+        x = self.embed[torch.tensor(ids)].float().to(self.dev)
+        h = gk.rmsnorm(x, self.w[0]["attn_norm"], eps)
+        for L in range(self.n_layers):
+            w = self.w[L]
+            q, kd, vd = self._qkv_post(
+                gk.gemm_w4a8(h, w["qkv"]),
+                L,
+                self._lut(L)[:N],
+                0,
+                dense_kv=True,
+                out_dtype=torch.float16,
+            )
+            a = gk.attn_prefill_fa(q, kd, vd, nq, dh, window=self._window(L), n_kv=nkv)
+            o = gk.gemm_w4a8(a, w["o"])
+            x, h = self._tail(x, o, L, "post_attn_norm", w["ffn_norm"])
+            gq = gk.gemm_w4a8_glu_q8(h, w["gate_up"], act=self.act)
+            d = gk.gemm_w4a8(gq, w["down"])
+            x, h = self._tail(x, d, L, "post_ffn_norm", self._next_norm(L))
+        return self._head(h[N - 1 : N])
+
+    def step(self, token, pos):
+        """One token at position `pos`: appends its K/V at row `pos` and
+        attends `[0, pos]`. Returns its logits, on the iGPU."""
+        if not 0 <= pos < min(self.max_L, self.geom.attn_maxl):
+            raise ValueError(f"position {pos} is outside the cache")
+        with driver_scope("gpu"):
+            return self._step(token, pos)
+
+    def _step(self, token, pos):
+        import gpu_kernels as gk
+
+        nq, nkv, dh, eps = self.nq, self.nkv, self.dh, self.eps
+        x = self.embed[token : token + 1].float().to(self.dev)
+        h = gk.rmsnorm(x, self.w[0]["attn_norm"], eps)
+        for L in range(self.n_layers):
+            w = self.w[L]
+            q = self._qkv_post(gk.gemv_q4nx(h, w["qkv"]), L, self._lut(L)[pos], pos)
+            win = self._window(L)
+            lo = 0 if win is None else max(0, pos - win + 1)
+            a = gk.attn_decode_gqa(
+                q, self._slab_t[L], self.geom, nq, nkv, dh, pos + 1, lo=lo
+            )
+            o = gk.gemv_q4nx(a, w["o"])
+            x, h = self._tail(x, o, L, "post_attn_norm", w["ffn_norm"])
+            gu = gk.gemv_q4nx(h, w["gate_up"])
+            d = gk.gemv_q4nx(gu, w["down"], glu_in=True, act=self.act)
+            x, h = self._tail(x, d, L, "post_ffn_norm", self._next_norm(L))
+        return self._head(h)
+
+    def generate(self, first=None, n_tokens=1, eos=()):
+        """Greedy continuation, `first` included. Returns the ids.
+
+        Continues from the prefiller's `current_context_length` rows, read at
+        the call: whichever prefill wrote them, the decode reads them in place.
+        """
+        self._ensure_kv()
+        if first is None:
+            first = self.pf.last_first_token
+        out = [int(first)]
+        pos = self.pf.current_context_length
+        limit = min(self.max_L, self.geom.attn_maxl)
+        with driver_scope("gpu"):
+            for _ in range(max(0, n_tokens - 1)):
+                if pos >= limit:
+                    print(f"[gpu-decode] hit the cache's {limit} rows", flush=True)
+                    break
+                with self.timer.track("gpu_decode_step"):
+                    nxt = int(torch.argmax(self._step(out[-1], pos)))
+                pos += 1
+                out.append(nxt)
+                if nxt in eos:
+                    break
+        return out
+
+
+class _IgpuPrefill:
+    """Mixed in ahead of a `LlamaPrefill` class; see `igpu_prefill_class`."""
+
+    ENGINE = "igpu"
+
+    def __init__(self, *a, **kw):
+        kw["backend"] = "cpu"
+        super().__init__(*a, **kw)
+
+    def _alloc_base_kv(self, n_layers, max_seq):
+        """No host cache: the decoder's slab is the cache."""
+
+    def load_weights(self, model=None):
+        """The decoder's packed weights only; no host copy."""
+        if model is not None:
+            self.model = model
+        self.gpu_decoder()
+
+    def make_npu_resident(self):
+        """Nothing to convert: no host weights are loaded."""
+
+    def gpu_decoder(self):
+        dec = getattr(self, "_gpu_decoder", None)
+        if dec is None:
+            dec = LlamaGpuDecode(self, max_L=self.max_seq)
+            self._gpu_decoder = dec
+        return dec
+
+    def bind_kv_sink(self, sink):
+        super().bind_kv_sink(sink)
+        self.gpu_decoder().bind_kv_sink(sink)
+
+    def prefill(self, ids):
+        return self.gpu_decoder().prefill(ids)
+
+    def clear_context(self):
+        self.current_context_length = 0
+
+    def kv_view(self, layer_idx):
+        dec = self.gpu_decoder()
+        return tuple(
+            gather(dec._slab_t, layer_idx, r, dec.geom, self.current_context_length)
+            .float()
+            .cpu()
+            .numpy()
+            for r in (K_REGION, V_REGION)
+        )
+
+    def kv_stack(self):
+        return self.gpu_decoder().kv_stack(self.current_context_length)
+
+
+def igpu_prefill_class(base):
+    """`base` (a `LlamaPrefill` class) with its prefill on the iGPU
+    (`LlamaGpuDecode.prefill`): `--prefill-engine igpu`."""
+    return type(
+        f"Igpu{base.__name__}",
+        (_IgpuPrefill, base),
+        {"__doc__": _IgpuPrefill.__doc__},
+    )

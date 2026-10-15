@@ -81,6 +81,9 @@ class ModelSpec:
     #: prefill must store K/V through `_kv_store`; set only where the decode has
     #: been verified on hardware.
     supports_xrt_zero_copy: bool = False
+    #: Whether the model has an iGPU forward: `--prefill-engine igpu` and
+    #: `--decode gpu` (`Gemma4GpuDecode`, or `llama_prefill.LlamaGpuDecode`).
+    supports_igpu: bool = False
     #: Host memory the prefill needs to hold this model's dequantized bf16
     #: weights, in GiB. Checked before anything is allocated: an undersized
     #: host is SIGKILLed partway through the load, and a process cannot catch
@@ -199,6 +202,7 @@ class ModelSpec:
 #: not carry this one's over.
 LLAMA_3_2_1B = ModelSpec(
     name="llama-3.2-1b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="llama-3.2-1b",
         VOCAB_CHUNK_I2="18",
@@ -239,6 +243,7 @@ LLAMA_3_2_1B = ModelSpec(
 #:   and ours would silently stop matching.
 LLAMA_3_2_3B = ModelSpec(
     name="llama-3.2-3b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="llama-3.2-3b",
         VOCAB_CHUNK_I2="9",
@@ -276,6 +281,7 @@ LLAMA_3_2_3B = ModelSpec(
 #: `W_DUAL_CHAN=1` again arrives by a bare `export`, not in `DECODE_ENV`.
 LLAMA_3_1_8B = ModelSpec(
     name="llama-3.1-8b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="llama-3.1-8b",
         VOCAB_CHUNK_I2="16",
@@ -322,6 +328,7 @@ LLAMA_3_1_8B = ModelSpec(
 #: host, which is a second reason not to pin a value we do not need.
 QWEN3_4B = ModelSpec(
     name="qwen3-4b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="qwen3-4b",
         VOCAB_CHUNK_I2="30",
@@ -367,6 +374,7 @@ QWEN3_4B = ModelSpec(
 #: from the builder rather than repeating a number.
 GEMMA3_4B = ModelSpec(
     name="gemma3-4b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="gemma3-4b",
         VOCAB_CHUNK_I2="5",
@@ -412,6 +420,7 @@ GEMMA3_4B = ModelSpec(
 #: read from the environment rather than from `_MODELS` -- see `engine`.
 GEMMA4_E2B = ModelSpec(
     name="gemma4-e2b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="gemma4-e2b",
         VOCAB_CHUNK_I2="27",
@@ -467,6 +476,7 @@ GEMMA4_E2B = ModelSpec(
 #:   mlir-air's driver does from its own `DECODE_WGROUP = 9`.
 QWEN3_8B = ModelSpec(
     name="qwen3-8b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="qwen3-8b",
         VOCAB_CHUNK_I2="8",
@@ -528,6 +538,7 @@ QWEN3_8B = ModelSpec(
 #:   the 4 GiB a shim BD's uint32 byte offset can address in one BO.
 QWEN2_5_7B = ModelSpec(
     name="qwen2.5-7b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="qwen2.5-7b",
         VOCAB_CHUNK_I2="7",
@@ -584,6 +595,7 @@ QWEN2_5_7B = ModelSpec(
 #: deadlock this model's vocab wave.
 PHI4_MINI = ModelSpec(
     name="phi4-mini",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="phi4-mini",
         VOCAB_CHUNK_I2="18",
@@ -643,6 +655,7 @@ PHI4_MINI = ModelSpec(
 #: divisibility rule and still deadlock the vocab wave on device.
 QWEN2_5_3B = ModelSpec(
     name="qwen2.5-3b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="qwen2.5-3b",
         VOCAB_CHUNK_I2="12",

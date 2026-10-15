@@ -458,6 +458,67 @@ def test_prefill_fingerprint_follows_sources():
         raise AssertionError("a missing kernel directory was hashed as empty")
 
 
+_FAKE_DENSE_BUILDER = """
+import json, sys
+from pathlib import Path
+out = Path(sys.argv[3])
+(out / "argv.json").write_text(json.dumps(sys.argv[1:]))
+(out / "manifest.json").write_text(json.dumps(dict(gemm=["g"], attn={}, lm=None)))
+for ext in (".xclbin", ".insts.bin"):
+    (out / ("g" + ext)).write_bytes(b"")
+(out / "libhostops.so").write_bytes(b"")
+"""
+
+
+def test_prefill_max_len():
+    """max_len is a dense model's build option: refused for Gemma4 and when
+    not positive, left out of the digest when unset, and passed to the
+    builder as --max-len, each value its own build."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    import triton.backends.amd_triton_npu.driver as drv
+
+    m = importlib.import_module("triton.language.extra.npu.fused_prefill")
+    for model, n in (("gemma4-e2b", 4096), ("llama-3.2-1b", 0)):
+        try:
+            m.PrefillConfig(model, max_len=n)
+        except m.PrefillConfigError:
+            continue
+        raise AssertionError(f"PrefillConfig({model!r}, max_len={n}) was accepted")
+    saved = drv.find_peano_root, m._mlir_aie_root
+    drv.find_peano_root = lambda: "/peano"
+    m._mlir_aie_root = lambda: "/aie"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ex = _fake_air_tree(tmp, builder=_FAKE_DENSE_BUILDER)
+            d = _shared(ex)
+            fp = lambda c: m.fingerprint(c, d, "/peano", "/aie")  # noqa: E731
+            default = m.PrefillConfig("llama-3.2-1b")
+            long = m.PrefillConfig("llama-3.2-1b", max_len=32768)
+            assert fp(default) == fp(m.PrefillConfig("llama-3.2-1b", max_len=None))
+            assert (
+                len(
+                    {
+                        fp(default),
+                        fp(long),
+                        fp(m.PrefillConfig("llama-3.2-1b", max_len=65536)),
+                    }
+                )
+                == 3
+            )
+            cache = Path(tmp) / "cache"
+            r = m.fused_prefill(long, d, cache_root=cache)
+            argv = json.loads((Path(r["build_dir"]) / "argv.json").read_text())
+            assert argv[-2:] == ["--max-len", "32768"], argv
+            r = m.fused_prefill(default, d, cache_root=cache)
+            argv = json.loads((Path(r["build_dir"]) / "argv.json").read_text())
+            assert "--max-len" not in argv, argv
+    finally:
+        drv.find_peano_root, m._mlir_aie_root = saved
+
+
 def test_prefill_reuses_a_complete_build():
     """A complete build under the current fingerprint is returned as is (the
     fake builder in `_fake_air_tree` fails if it runs), and a build missing the
@@ -607,6 +668,7 @@ def main():
             "a fused prefill rebuild publishes a new generation",
             test_prefill_rebuild_publishes_a_new_generation,
         ),
+        ("max_len is a dense build option", test_prefill_max_len),
     ]
     print("tl.extra.npu:")
     failed = sum(not check(n, f) for n, f in tests)

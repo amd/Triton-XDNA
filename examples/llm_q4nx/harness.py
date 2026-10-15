@@ -262,6 +262,7 @@ def run_prefill(
     kv_path,
     profile=False,
     npu_resident=True,
+    gpu_decode=False,
 ):
     """Our prefill -> the handoff npz.
 
@@ -270,6 +271,8 @@ def run_prefill(
     1B reads the npz, while the 3B is handed this object and calls
     `kv_view()` on it. See `ModelSpec.driver_api`. `kv_path=None` skips the
     npz, which is what the object-handoff models and `--prefill-only` want.
+    `gpu_decode` attaches the iGPU decoder before the prefill, so the prefill
+    writes its cache (`attach_gpu_decoder`).
     """
     import torch
 
@@ -277,6 +280,8 @@ def run_prefill(
     m = make_prefiller(
         prefill_cls, cfg, backend, ops, max_seq, model, npu_resident=npu_resident
     )
+    if gpu_decode:
+        attach_gpu_decoder(cfg, m)
     t_load = time.time() - t0
     m.timer.enabled = profile
     if profile:  # one warm pass so timings exclude compilation
@@ -435,6 +440,9 @@ def _xrt_kv_sink(dec, spec):
         # The decoder's own seed_kv stride; the module REGION_STRIDE can differ.
         "region_stride": dec.ATTN_MAXL * geom.REGION_W,
         "lreg": dec.LREG,
+        # The iGPU's view of the same pages, for an iGPU prefill.
+        "torch": slab.torch(),
+        "shared": slab,
     }
     return sink, publish
 
@@ -627,22 +635,84 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     return list(out)
 
 
-#: Models with a `--decode gpu` implementation. One entry, deliberately: a
-#: registry with a single member is still clearer than the same string tested
-#: in two places that can drift apart.
-GPU_DECODE_MODELS = frozenset({"gemma4-e2b"})
+def igpu_prefill_cls(cfg, prefill_cls):
+    """`--prefill-engine igpu`'s prefiller for this model."""
+    if cfg.MODEL_NAME == "gemma4-e2b":
+        from gemma4_prefill import Gemma4IgpuPrefill
+
+        return Gemma4IgpuPrefill
+    from llama_prefill import igpu_prefill_class
+
+    return igpu_prefill_class(prefill_cls)
 
 
-def fused_prefill_config(cfg):
+#: The NPU's XRT device, held open once taken; see `hold_npu`.
+_npu = None
+
+
+def hold_npu():
+    """Open the NPU through XRT before torch starts ROCm, and keep it open.
+
+    ROCm's runtime opens the NPU too, as an AIE agent, and holds it; some
+    amdxdna drivers then refuse XRT's open as busy. Whichever opens second
+    must be ROCm, which carries on without its AIE agent. A no-op where there
+    is no pyxrt or no NPU.
+    """
+    global _npu
+    if _npu is None:
+        try:
+            import pyxrt
+
+            _npu = pyxrt.device(0)
+        except Exception:  # noqa: BLE001 -- no NPU here; nothing to order
+            pass
+
+
+def attach_gpu_decoder(cfg, prefiller):
+    """Give a host/NPU prefiller its iGPU decoder before it runs.
+
+    A Llama-family prefiller is bound to the decoder's cache (`kv_sink`), so
+    its K/V land where the decode reads them. Where the cache is not in shared
+    pages, `generate_on_gpu` copies them across instead. Gemma4's prefiller
+    already writes a shared slab, and its decoder is built from it afterwards.
+    """
+    if cfg.MODEL_NAME == "gemma4-e2b" or hasattr(prefiller, "gpu_decoder"):
+        return
+    # The decoder starts ROCm, and the prefill has not opened the NPU yet.
+    hold_npu()
+    from llama_prefill import LlamaGpuDecode
+
+    dec = LlamaGpuDecode(prefiller, max_L=prefiller.max_seq)
+    try:
+        prefiller.bind_kv_sink(dec.kv_sink())
+    except RuntimeError:
+        pass
+    prefiller._gpu_decoder = dec
+
+
+def fused_prefill_config(cfg, max_seq=None):
     """The `PrefillConfig` of this model's mlir-air fused NPU prefill
-    (`--prefill-engine air-fused`), or None if mlir-air has none."""
+    (`--prefill-engine air-fused`), or None if mlir-air has none.
+
+    A dense model's build holds prompts up to mlir-air's default length for
+    it; a longer `max_seq` asks for a build that holds that many, rounded up
+    to the model's KV block.
+    """
     import triton.language as tl
 
     npu = tl.extra.npu
     try:
-        return npu.PrefillConfig(cfg.MODEL_NAME)
+        config = npu.PrefillConfig(cfg.MODEL_NAME)
     except npu.PrefillConfigError:
         return None
+    if config.dense and max_seq:
+        from dense_fused_prefill import _dense
+
+        desc = _dense()[1].MODELS[config.dense]
+        if max_seq > desc.max_len:
+            n = -(-max_seq // desc.lkp) * desc.lkp
+            config = npu.PrefillConfig(cfg.MODEL_NAME, config.jobs, max_len=n)
+    return config
 
 
 def fused_prefill_cls(cfg, prefill_cls, config):
@@ -686,16 +756,24 @@ def generate_on_gpu(cfg, args, prefiller, first, ids):
     generation without a built decode template, and giving the fused kernel a
     reference to be scored against.
 
-    Model-specific, and deliberately not dressed up as general: only Gemma4
-    has a `Gemma4GpuDecode` today, and a base-class hook with one implementation
-    would claim more than it delivers.
+    Gemma4's decoder is `Gemma4GpuDecode`, built here from the prefiller; the
+    other models' is `LlamaGpuDecode`, attached to the prefiller before it ran
+    (`attach_gpu_decoder`, or the iGPU prefill's own).
     """
-    if cfg.MODEL_NAME not in GPU_DECODE_MODELS:
-        raise ExampleUnavailable(
-            f"--decode gpu is implemented for "
-            f"{', '.join(sorted(GPU_DECODE_MODELS))} only; {cfg.MODEL_NAME} "
-            f"has no GPU decode. Use --decode npu."
-        )
+    eos = tuple(getattr(cfg, "EOS_IDS", ()) or ())
+    if cfg.MODEL_NAME != "gemma4-e2b":
+        dec = prefiller._gpu_decoder
+        if not hasattr(prefiller, "gpu_decoder") and prefiller._kv_sink is None:
+            # The cache is not shared: bring the host prefill's K/V across.
+            import torch
+            from dense_kv_layout import K_REGION, V_REGION, scatter
+
+            dec._ensure_kv()
+            for L, kv in enumerate(zip(*prefiller.kv_stack())):
+                for region, rows in zip((K_REGION, V_REGION), kv):
+                    rows = torch.from_numpy(rows).to(torch.bfloat16).to(dec.dev)
+                    scatter(dec._slab_t, L, region, rows, dec.geom)
+        return dec.generate(first, args.max_tokens, eos=eos)
     from gemma4_prefill import Gemma4GpuDecode
 
     # Built once and cached on the prefiller. The weights it moves to the iGPU
@@ -713,7 +791,6 @@ def generate_on_gpu(cfg, args, prefiller, first, ids):
     if dec is None:
         dec = Gemma4GpuDecode(prefiller, max_L=prefiller.max_seq)
         prefiller._gpu_decoder = dec
-    eos = tuple(getattr(cfg, "EOS_IDS", ()) or ())
     return dec.generate(first, args.max_tokens, eos=eos)
 
 
@@ -726,18 +803,20 @@ def build_parser(doc, backends=("cpu", "npu", "hetero")):
         choices=("npu", "gpu"),
         default="npu",
         help="npu: mlir-air's fused decode, all layers in one dispatch. gpu: "
-        "Triton on the iGPU, token by token -- the hybrid half of a run whose "
-        "prefill is still on the NPU. Only Gemma4-E2B implements it.",
+        "Triton on the iGPU, token by token, reading the KV cache in place "
+        "whichever engine prefilled it.",
     )
     ap.add_argument(
         "--prefill-engine",
-        choices=("auto", "triton", "air-fused"),
+        choices=("auto", "triton", "air-fused", "igpu"),
         default="auto",
         help="what runs the prefill. triton: this repository's prefill, its "
         "operators placed by --backend and --ops. air-fused: mlir-air's "
         "one-device chunked NPU prefill (tl.extra.npu.fused_prefill), handing "
         "its KV to the decode the way the Triton prefill does; --backend, "
-        "--ops and --profile do not apply to it and are refused. auto "
+        "--ops and --profile do not apply to it and are refused. igpu: the "
+        "whole prefill in Triton on the iGPU, writing the KV cache in the "
+        "layout both decodes read. auto "
         "(default): air-fused where mlir-air has one for the model, except "
         "with --interactive, which only hosts the Triton prefill; triton "
         "otherwise.",
@@ -803,26 +882,34 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     """
     args = build_parser(doc, tuple(prefill_cls.PLACEMENT)).parse_args(argv)
 
-    # `--decode gpu` is implemented per model, and only Gemma4-E2B has one.
-    # Checked here rather than in `generate_on_gpu`, which runs after the
-    # weights have loaded -- minutes to say a flag combination was never going
-    # to work.
-    if args.decode == "gpu" and cfg.MODEL_NAME not in GPU_DECODE_MODELS:
+    # Checked before the weights load, which takes minutes.
+    igpu = args.prefill_engine == "igpu"
+    if (args.decode == "gpu" or igpu) and not spec.supports_igpu:
         raise SystemExit(
-            f"--decode gpu is implemented for "
-            f"{', '.join(sorted(GPU_DECODE_MODELS))} only; {cfg.MODEL_NAME} has "
-            f"none. Use --decode npu."
+            f"{cfg.MODEL_NAME} has no iGPU forward (registry.ModelSpec."
+            f"supports_igpu); use --decode npu and an NPU prefill engine."
+        )
+    if igpu and (args.backend is not None or args.ops is not None):
+        raise SystemExit(
+            "--backend and --ops place the Triton prefill's operators; the igpu "
+            "engine runs the whole prefill on the iGPU."
+        )
+    if igpu and getattr(args, "interactive", False):
+        raise SystemExit(
+            "--prefill-engine igpu cannot be combined with --interactive: the "
+            "interactive session is mlir-air's and hosts the Triton prefill only."
         )
 
     # The HSA runtime needs an AIE-capable ROCR in the process, and torch's HIP
     # runs on the ROCR it ships with. One process holds one ROCR, so under HSA
     # nothing may use the iGPU.
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa" and (
-        args.decode == "gpu" or args.backend == "hetero"
+        args.decode == "gpu" or args.backend == "hetero" or igpu
     ):
         raise SystemExit(
             "AMD_TRITON_NPU_RUNTIME=hsa cannot be combined with the iGPU "
-            "(--decode gpu, --backend hetero): the HSA runtime's ROCR and "
+            "(--decode gpu, --prefill-engine igpu, --backend hetero): the HSA "
+            "runtime's ROCR and "
             "torch's HIP cannot run in one process."
         )
 
@@ -870,7 +957,12 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
                 "--prefill-engine air-fused cannot be combined with --interactive "
                 "yet: the interactive session constructs its own prefiller."
             )
+        # Sized here, not above: sizing loads mlir-air's fused runtime, which
+        # the other prefill engines must not need.
+        fused = fused_prefill_config(cfg, args.max_seq)
         prefill_cls = fused_prefill_cls(cfg, prefill_cls, fused)
+    if igpu:
+        prefill_cls = igpu_prefill_cls(cfg, prefill_cls)
 
     # The interactive session comes from mlir-air and always drives its own
     # fused NPU decoder; it never consults `--decode`. Accepting the pair would
@@ -903,12 +995,19 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             f"Use --max-tokens for a single turn."
         )
 
-    # Sized for the Triton prefill's bf16 weights. A dense fused prefill keeps
-    # them packed and loads no host copy; Gemma4's still does.
-    if not (args.prefill_engine == "air-fused" and fused.dense):
+    # Sized for the Triton prefill's bf16 weights. The dense fused and iGPU
+    # prefills keep them packed and load no host copy; Gemma4's still do.
+    dense = cfg.MODEL_NAME != "gemma4-e2b"
+    if not ((args.prefill_engine == "air-fused" and fused.dense) or (igpu and dense)):
         check_host_memory(spec)
 
-    air = None if args.prefill_only else air_inference_module(spec)
+    # mlir-air's driver and its built decode are the NPU decode's; an iGPU
+    # decode needs neither.
+    air = (
+        None
+        if args.prefill_only or args.decode == "gpu"
+        else air_inference_module(spec)
+    )
 
     if air is not None:
         # One model's artifacts under another's name decode to fluent nonsense
@@ -1027,6 +1126,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             profile=args.profile,
             # A GPU decode reads the torch weights this would have released.
             npu_resident=args.decode != "gpu",
+            gpu_decode=args.decode == "gpu",
         )
         ttft = time.time() - t_pf
         # Stop rather than decode from a prefill already known to be wrong.
@@ -1083,6 +1183,21 @@ def _decode_gate(air, spec, cfg, args, ids, out):
     golden = getattr(cfg, "EXPECT_IDS", None)
     if getattr(args, "prefill_engine", None) == "air-fused":
         golden = getattr(cfg, "EXPECT_IDS_AIR_FUSED", golden)
+    # The iGPU's numerics are its own, so what follows an iGPU prefill or comes
+    # out of the iGPU decode is recorded separately.
+    record = None
+    if getattr(args, "decode", None) == "gpu":
+        record = "EXPECT_IDS_IGPU"
+    elif getattr(args, "prefill_engine", None) == "igpu":
+        record = "EXPECT_IDS_IGPU_PREFILL"
+    if record is not None:
+        golden = getattr(cfg, record, None)
+        if golden is None:
+            print(
+                f"[e2e] no config.{record} for {cfg.MODEL_NAME}; decode ids not "
+                f"gated",
+                flush=True,
+            )
     if golden and args.greedy and ids == list(cfg.PROMPT):
         got = list(out)[: len(golden)]
         if got != list(golden):

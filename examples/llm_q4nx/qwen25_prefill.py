@@ -125,8 +125,7 @@ class Qwen25Prefill(LlamaPrefill):
 
         # The decode's handoff: roped K, raw V, head-major within a position.
         # Both carry their bias -- it was added before the split.
-        self.kv_k[L][:keep] = k[:keep].to(torch.float32).numpy()
-        self.kv_v[L][:keep] = v[:keep].to(torch.float32).numpy()
+        self._kv_store(L, k, v, keep)
 
         a = self._attention(q, k, v, N_Q_HEADS, N_KV_HEADS, DH)  # [N, DQ]
         x = x + self._matmul(a, w["o"], **self._wide)

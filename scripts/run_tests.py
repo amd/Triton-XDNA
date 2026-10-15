@@ -57,6 +57,7 @@ SCRIPTLESS_UNSUPPORTED = {
         # default transform is used instead; it fails to legalize
         # airrt.dma_memcpy_nd / airrt.segment_load on npu1.
         "gelu": "non-matmul; built-in default transform fails to legalize on npu1",
+        "erf": "npu2-only example",
         "rms_norm": "non-matmul; built-in default transform fails to legalize on npu1",
         # Auto-generation produces a legal schedule, but the resulting L2->L1
         # copy needs a buffer descriptor of 32768 32-bit words against a

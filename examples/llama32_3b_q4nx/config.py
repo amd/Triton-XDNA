@@ -43,6 +43,10 @@ VOCAB = 128256
 # does not override it, so this matches the 1B.
 RMS_EPS = 1e-6
 
+#: Whether the LM head is the embedding (`llama_prefill.LlamaGpuDecode.HEADS`).
+TIED_LM_HEAD = True
+
+
 # The Paris gate, from llama32_3b_q4nx_prefill.py -- the same prompt and the
 # same expected token as the 1B, which makes a wrong-weights mixup invisible to
 # the gate alone. The fingerprint check in load_q4nx is what catches that.
@@ -144,3 +148,17 @@ def rope_lut(seq_len, dtype=None):
 
         dtype = bfloat16
     return generate_rope_lut(LlamaConfig(n_layers=N_LAYERS), seq_len, dtype)
+
+
+def load_q4nx_packed(model=None, n_layers=None):
+    """The projections in Codec B, still packed, for the iGPU forward
+    (`llama_prefill.LlamaGpuDecode`). See `llama_prefill.packed_bundle`."""
+    _add_air_paths()
+    from llama32_1b_q4nx_weights import Q4nxModel
+
+    qm = Q4nxModel(model or MODEL_DEFAULT)
+
+    sys.path.insert(0, _SHARED)
+    from llama_prefill import packed_bundle
+
+    return packed_bundle(qm, sys.modules[__name__], n_layers)
