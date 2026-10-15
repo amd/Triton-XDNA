@@ -26,7 +26,9 @@ export AMD_TRITON_NPU_RUNTIME = $(RUNTIME)
 HSA_DECODE_FORMAT = $(shell cd $(shared) && $(PYTHON) -c "import hsa_decode, registry; \
   print('elf' if hsa_decode.use_scratchpad(registry.spec('$(MODEL_NAME)').engine) else 'pdi')" \
   2>/dev/null || echo pdi)
-DECODE_FORMAT = $(if $(filter hsa,$(RUNTIME)),$(HSA_DECODE_FORMAT),xclbin)
+# Under xrt, DECODE_ELF=1 builds and runs mlir-air's full-ELF decode instead
+# of the xclbin templates.
+DECODE_FORMAT = $(if $(filter hsa,$(RUNTIME)),$(HSA_DECODE_FORMAT),$(if $(filter 1,$(DECODE_ELF)),elf,xclbin))
 
 # Prefill engine. triton: this repository's prefill, placed by BACKEND and
 # OPS. auto: mlir-air's fused prefill where the model has one (BACKEND and OPS
@@ -85,6 +87,7 @@ help:
 	@echo "  make preflight        Check the environment is set up"
 	@echo ""
 	@echo "  RUNTIME=xrt|hsa       Dispatch runtime (default: xrt)"
+	@echo "  DECODE_ELF=1          (xrt) mlir-air's full-ELF decode instead of the xclbin"
 	@echo "  ENGINE=triton|auto    Prefill engine (default: triton; auto = fused where available)"
 	@echo "  BACKEND=npu|hetero|cpu Where the Triton prefill's operators run (default: npu)"
 	@echo "  OPS=all|matmul,...    Which operators go to the NPU (default: the model's)"

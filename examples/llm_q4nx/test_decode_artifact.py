@@ -30,20 +30,73 @@ def test_leaves_an_explicit_zero_alone():
     assert airsrc.select_decode_artifact(env) == "0"
 
 
-def test_rejects_mlir_airs_own_elf_dispatch():
-    # mlir-air's default. Has to fail here, with a reason, rather than inside
-    # mlir-air on a missing decode_scratchpad.maxl -- or, worse, in an abort
-    # from a duplicate LLVM option registration.
-    for asked in ("1", "yes", "true"):
-        env = {"DECODE_ELF": asked}
+def test_takes_mlir_airs_full_elf_on_xrt():
+    for env in (
+        {"DECODE_ELF": "1"},
+        {"DECODE_ELF": "1", "AMD_TRITON_NPU_RUNTIME": "xrt"},
+    ):
+        assert airsrc.select_decode_artifact(env) == "1"
+
+
+def test_refuses_mlir_airs_full_elf_on_hsa():
+    # The HSA decoder picks its own artifact; mlir-air's would dispatch via pyxrt.
+    env = {"DECODE_ELF": "1", "AMD_TRITON_NPU_RUNTIME": "hsa"}
+    try:
+        airsrc.select_decode_artifact(env)
+    except airsrc.DecodeArtifactError as e:
+        assert "AMD_TRITON_NPU_HSA_DECODE" in str(e)
+    else:
+        raise AssertionError("DECODE_ELF=1 under HSA should have been refused")
+
+
+def test_refuses_an_unknown_decode_elf():
+    for asked in ("yes", "true", "2"):
         try:
-            airsrc.select_decode_artifact(env)
-        except airsrc.DecodeArtifactError as e:
-            assert "mlir-air's own full-ELF dispatch" in str(e)
-            # The refusal names the switch that does choose the HSA decode.
-            assert "AMD_TRITON_NPU_HSA_DECODE" in str(e)
+            airsrc.select_decode_artifact({"DECODE_ELF": asked})
+        except airsrc.DecodeArtifactError:
+            pass
         else:
             raise AssertionError(f"DECODE_ELF={asked!r} should have been refused")
+
+
+def test_xrt_scratchpad_encodes_like_mlir_aie():
+    import tempfile
+    import types
+
+    import numpy as np
+
+    import xrt_elf
+
+    words = np.zeros(2, np.uint32)
+    synced = []
+    bo = types.SimpleNamespace(map=lambda: memoryview(words), sync=synced.append)
+    run = types.SimpleNamespace(get_ctrl_scratchpad_bo=lambda: bo)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "params.txt")
+        with open(path, "w") as f:
+            f.write(
+                "2\n"
+                "__air_param_argoff_5_x256_m256 0 i32 addr -2147483648 2147483647\n"
+                "__air_param_attn_blk_0 1 i32 core - -\n"
+                "0\n"
+            )
+        fake = types.SimpleNamespace(
+            xclBOSyncDirection=types.SimpleNamespace(XCL_BO_SYNC_BO_TO_DEVICE=0)
+        )
+        real = sys.modules.get("pyxrt")
+        sys.modules["pyxrt"] = fake  # no XRT needed to check the encoding
+        try:
+            sp = xrt_elf.Scratchpad(run, path)
+        finally:
+            if real is None:
+                del sys.modules["pyxrt"]
+            else:
+                sys.modules["pyxrt"] = real
+        sp.write("__air_param_argoff_5_x256_m256", np.int32(7 * 256 - 256))
+        sp.write("__air_param_attn_blk_0", np.int32(7))
+        sp.sync()
+    assert words.tolist() == [7 * 256 - 256, 7 << 2]  # addr raw, core << 2
+    assert len(synced) == 1
 
 
 def _built_by(fmt):

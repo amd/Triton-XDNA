@@ -161,40 +161,29 @@ class DecodeArtifactError(RuntimeError):
 
 
 def select_decode_artifact(env=None):
-    """Keep mlir-air's decoder off *its own* full-ELF dispatch.
+    """Which decode artifact mlir-air's decoder loads, through ``DECODE_ELF``.
 
-    ``DECODE_ELF`` (``fused_decode/decode_elf.py``) does not select a decode
-    shape so much as select *who dispatches it*: set, ``FusedDecoder`` loads a
-    full ELF and runs it through pyxrt itself. These examples never want that.
-    They build the xclbin templates (``decode_build.py``) and run the decode
-    from those, and on HSA they drive the dispatch themselves.
+    mlir-air reads ``DECODE_ELF`` at import and defaults it to ``1``, its
+    full-ELF decode. These examples default it to ``0``, the xclbin templates
+    ``decode_build.py`` builds; on XRT that is the faster of the two.
 
-    It would not get that far in any case: mlir-air's ELF path brings up a
-    second LLVM and re-registers an option Triton has already registered
-    ("Option 'print-inst-addrs' registered more than once!"), which aborts the
-    process rather than raising. That is a bug to fix, not a shape rejected on
-    taste.
-
-    So the variable is written here rather than left to its default -- it is
-    the only channel ``FusedDecoder`` offers, its ``__init__`` taking no such
-    argument -- and an explicit request for it is refused with the reason,
-    which beats aborting later inside mlir-air.
-
-    This does not decide whether the HSA decode runs a full ELF of its own;
-    ``hsa_decode.use_scratchpad`` does.
+    ``DECODE_ELF=1`` selects mlir-air's full ELF on XRT (build it with
+    ``make compile-decode DECODE_ELF=1``; ``xrt_elf.install`` makes it
+    importable next to Triton). Under HSA it is refused: there the HSA decoder
+    dispatches and picks its own artifact, through
+    ``AMD_TRITON_NPU_HSA_DECODE``.
 
     Returns the value written, so a caller (and a test) can check it.
     """
     env = os.environ if env is None else env
-    asked = env.get("DECODE_ELF")
-    if asked is not None and asked != "0":
+    asked = env.get("DECODE_ELF", "0")
+    if asked not in ("0", "1"):
+        raise DecodeArtifactError(f"DECODE_ELF={asked!r}; expected 0 or 1")
+    if asked == "1" and env.get("AMD_TRITON_NPU_RUNTIME", "xrt") == "hsa":
         raise DecodeArtifactError(
-            f"DECODE_ELF={asked!r} hands the decode to mlir-air's own full-ELF "
-            "dispatch, which these examples never use: they run the xclbin "
-            "templates built by decode_build.py, and on HSA they dispatch the "
-            "decode themselves. mlir-air's route also aborts in-process on a "
-            "duplicate LLVM option registration. Unset DECODE_ELF; to choose "
-            "the HSA decode's shape use AMD_TRITON_NPU_HSA_DECODE=elf|insts."
+            "DECODE_ELF=1 selects mlir-air's XRT full-ELF decode, but the "
+            "runtime is HSA, whose decoder chooses its own artifact. Unset "
+            "DECODE_ELF; use AMD_TRITON_NPU_HSA_DECODE=elf|insts instead."
         )
-    env["DECODE_ELF"] = "0"
-    return env["DECODE_ELF"]
+    env["DECODE_ELF"] = asked
+    return asked

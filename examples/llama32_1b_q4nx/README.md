@@ -189,6 +189,17 @@ python prefill.py --backend npu --ops matmul --compare-cpu
 python prefill.py --backend cpu --kv-out /tmp/kv.npz
 ```
 
+### Full-ELF decode on XRT
+
+```bash
+make compile-decode DECODE_ELF=1
+DECODE_ELF=1 make run
+```
+
+The context length reaches the device through scratchpad parameters, so one
+ELF serves every L. The xclbin decode measured faster on Strix, so the ELF
+stays opt-in. It is the same artifact the HSA decode runs.
+
 ### Running on the HSA runtime
 
 ```bash
