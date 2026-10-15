@@ -105,6 +105,26 @@ def check_stamp(model, out_dir=None):
         )
 
 
+def check_elf_stamp(model, out_dir=None):
+    """Refuse to run the full ELF built for another model.
+
+    The ELF keeps its own stamp because a template build rewrites `STAMP` and
+    leaves the ELF in place, so `check_stamp` passing says nothing about it.
+    """
+    out_dir = out_dir or airsrc.fused_decode_dir(model.engine)
+    try:
+        with open(os.path.join(out_dir, ELF_MODEL)) as f:
+            built = f.read().strip()
+    except OSError:
+        built = None
+    if built != model.name:
+        what = f"was built for {built!r}" if built else "has no model stamp"
+        raise SystemExit(
+            f"the full ELF in {out_dir} {what}, not {model.name!r}; rebuild it:\n"
+            f"  make compile-decode MODEL={model.name} DECODE_ELF=1"
+        )
+
+
 def lower_template(L, out_dir=None, output_format="xclbin", model=None):
     """Lower one decode template -- the binary + insts pair for context length L.
 

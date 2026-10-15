@@ -205,6 +205,36 @@ def test_elf_keeps_its_own_model_stamp():
             raise AssertionError("another model's ELF accepted")
 
 
+def test_xrt_elf_checks_its_own_model_stamp():
+    import tempfile
+    import types
+
+    import decode_build
+
+    with tempfile.TemporaryDirectory() as d:
+        _elf_dir(d, "llama-3.2-1b")
+        # A template build for another model rewrites the shared stamp only.
+        with open(os.path.join(d, decode_build.STAMP), "w") as f:
+            f.write("qwen3-4b\n")
+        qwen = types.SimpleNamespace(name="qwen3-4b", engine="fused_decode")
+        decode_build.check_stamp(qwen, d)
+        try:
+            decode_build.check_elf_stamp(qwen, d)
+        except SystemExit as e:
+            assert "'llama-3.2-1b'" in str(e)
+        else:
+            raise AssertionError("another model's ELF accepted")
+        llama = types.SimpleNamespace(name="llama-3.2-1b", engine="fused_decode")
+        decode_build.check_elf_stamp(llama, d)
+        os.remove(os.path.join(d, decode_build.ELF_MODEL))
+        try:
+            decode_build.check_elf_stamp(llama, d)
+        except SystemExit as e:
+            assert "no model stamp" in str(e)
+        else:
+            raise AssertionError("an unstamped ELF accepted")
+
+
 def test_programs_sharing_a_handle_share_a_lock():
     import hsa_decode
 

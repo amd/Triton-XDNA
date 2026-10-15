@@ -1022,6 +1022,8 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         # One model's artifacts under another's name decode to fluent nonsense
         # rather than failing, so check before the decoder loads them.
         decode_build.check_stamp(spec)
+        if os.environ.get("DECODE_ELF") == "1":
+            decode_build.check_elf_stamp(spec)
 
     # On HSA the decode is ours too: mlir-air's decoder dispatches through
     # pyxrt, and HSA needs the instruction stream patched per token instead.
