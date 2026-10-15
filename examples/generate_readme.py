@@ -88,6 +88,12 @@ EXAMPLES = [
     },
     {
         "category": "Element-wise",
+        "name": "Erf / exact GELU",
+        "path": "erf",
+        "datatypes": "bf16",
+    },
+    {
+        "category": "Element-wise",
         "name": "Leaky ReLU",
         "path": "leaky_relu",
         "datatypes": "bf16",
