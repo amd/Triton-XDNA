@@ -304,6 +304,7 @@ LLAMA_3_1_8B = ModelSpec(
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",
     decoder_class="FusedDecode8B",
+    supports_hsa=True,
     supports_xrt_zero_copy=True,
 )
 
@@ -506,7 +507,7 @@ QWEN3_8B = ModelSpec(
     # `LlamaConfig` lives there), but naming it here keeps the path set the
     # same whichever module gets imported first.
     extra_packages=("qwen3_4b",),
-    supports_hsa=False,
+    supports_hsa=True,
 )
 
 
@@ -626,7 +627,7 @@ PHI4_MINI = ModelSpec(
     # allocation serves both.
     min_host_gib=14.0,
     extra_packages=("llama32_1b_q4nx", "llama32_3b"),
-    supports_hsa=False,
+    supports_hsa=True,
     supports_xrt_zero_copy=True,
 )
 
@@ -677,7 +678,7 @@ QWEN2_5_3B = ModelSpec(
     # inside CI's runner -- unlike its 7B sibling, which declines there.
     min_host_gib=12.0,
     extra_packages=("qwen25_3b",),
-    supports_hsa=False,
+    supports_hsa=True,
 )
 
 

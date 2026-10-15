@@ -538,6 +538,11 @@ def make_hsa_decoder_class(
                 return int(fd.UNI_DEC)
             return 16  # 1B hardcodes 16, defines no UNI_DEC
 
+        def _rope_w(self):
+            # The rope LUT covers the rotated head dims: ROPE_W where the
+            # decoder rotates only part of the head, otherwise all of DH.
+            return int(getattr(self, "ROPE_W", None) or self.DH)
+
         #: Base carries per-layer rope slabs (Qwen3/Gemma3), not the 1B's LUT.
         def _per_layer_rope(self):
             return hasattr(self, "_rope_base") and hasattr(self, "_rope_slab")
@@ -579,7 +584,7 @@ def make_hsa_decoder_class(
             if self._per_layer_rope():
                 gap = self._n_layers() * self.ROPE_W_LEN
             else:
-                gap = self.DH
+                gap = self._rope_w()
                 self._rms_lut_off = int(self.rms_slabs.size)
             _rms = np.concatenate(
                 [self.rms_slabs, np.zeros(gap, self._bf16), self.final_norm]
@@ -594,10 +599,11 @@ def make_hsa_decoder_class(
                 off = self._rope_base
                 self._r[off : off + rope.size] = rope
             else:
-                half = self.DH // 2
+                w = self._rope_w()
+                half = w // 2
                 off = self._rms_lut_off
                 self._r[off : off + half] = self.rope_cos[p][:half].astype(self._bf16)
-                self._r[off + half : off + self.DH] = self.rope_sin[p][:half].astype(
+                self._r[off + half : off + w] = self.rope_sin[p][:half].astype(
                     self._bf16
                 )
 
