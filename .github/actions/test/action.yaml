@@ -432,6 +432,9 @@ runs:
               gate "$ex" --prefill-engine triton --prefill-only
             done
 
+            # Gemma4's fused prefill device with its GEMMs from Triton.
+            gate gemma4_e2b_q4nx --prefill-engine triton-fused --prefill-only
+
             # The KV layout our prefills hand the NPU decode in place, against
             # mlir-air's own `seed_kv` run on the same K/V. The decode gate
             # above sees a wrong layout only as wrong tokens; this names the

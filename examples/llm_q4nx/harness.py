@@ -724,7 +724,7 @@ def fused_prefill_config(cfg, max_seq=None):
     return config
 
 
-def fused_prefill_cls(cfg, prefill_cls, config):
+def fused_prefill_cls(cfg, prefill_cls, config, triton=False):
     """A `prefill_cls` that runs mlir-air's fused NPU prefill.
 
     Builds it through `tl.extra.npu.fused_prefill` (a cache hit after the first
@@ -746,6 +746,18 @@ def fused_prefill_cls(cfg, prefill_cls, config):
         from dense_fused_prefill import fused_prefill_class
 
         cls = fused_prefill_class(prefill_cls, config.dense)
+    elif triton:
+        # mlir-air's build supplies everything but the device, which is
+        # rebuilt with the GEMMs from Triton.
+        from gemma4_fused_prefill import Gemma4TritonFusedPrefill as cls
+        from gemma4_triton_fused import triton_fused_prefill
+
+        built = triton_fused_prefill(built["build_dir"])
+        print(
+            f"[triton-fused-prefill] {built['build_dir']} "
+            f"({'cached' if built['cached'] else 'built'})",
+            flush=True,
+        )
     else:
         from gemma4_fused_prefill import Gemma4FusedPrefill as cls
 
@@ -817,13 +829,15 @@ def build_parser(doc, backends=("cpu", "npu", "hetero")):
     )
     ap.add_argument(
         "--prefill-engine",
-        choices=("auto", "triton", "air-fused", "igpu"),
+        choices=("auto", "triton", "air-fused", "triton-fused", "igpu"),
         default="auto",
         help="what runs the prefill. triton: this repository's prefill, its "
         "operators placed by --backend and --ops. air-fused: mlir-air's "
         "one-device chunked NPU prefill (tl.extra.npu.fused_prefill), handing "
         "its KV to the decode the way the Triton prefill does; --backend, "
-        "--ops and --profile do not apply to it and are refused. igpu: the "
+        "--ops and --profile do not apply to it and are refused. "
+        "triton-fused (Gemma4-E2B): the same device with its GEMMs compiled "
+        "from Triton (gemma4_triton_fused). igpu: the "
         "whole prefill in Triton on the iGPU, writing the KV cache in the "
         "layout both decodes read. auto "
         "(default): air-fused where mlir-air has one for the model, except "
@@ -932,7 +946,8 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             if fused is not None and not getattr(args, "interactive", False)
             else "triton"
         )
-    if args.prefill_engine == "air-fused":
+    one_device = args.prefill_engine in ("air-fused", "triton-fused")
+    if one_device:
         # These only apply to the Triton prefill. Reject them instead of
         # ignoring them, so a run cannot report on a configuration it did not
         # use.
@@ -951,25 +966,33 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
                 f"{', '.join(triton_only)} "
                 f"{'configures' if len(triton_only) == 1 else 'configure'} the "
                 f"Triton prefill, but "
-                f"the prefill engine is air-fused ({why}). Add --prefill-engine "
+                f"the prefill engine is {args.prefill_engine} ({why}). Add "
+                f"--prefill-engine "
                 f"triton to run the Triton prefill."
             )
     args.backend = args.backend or "npu"
-    if args.prefill_engine == "air-fused":
+    if one_device:
         if fused is None:
             raise SystemExit(
-                f"--prefill-engine air-fused: mlir-air has no fused prefill "
-                f"for {cfg.MODEL_NAME}."
+                f"--prefill-engine {args.prefill_engine}: mlir-air has no fused "
+                f"prefill for {cfg.MODEL_NAME}."
+            )
+        if args.prefill_engine == "triton-fused" and fused.dense:
+            raise SystemExit(
+                "--prefill-engine triton-fused is built for gemma4-e2b only."
             )
         if getattr(args, "interactive", False):
             raise SystemExit(
-                "--prefill-engine air-fused cannot be combined with --interactive "
-                "yet: the interactive session constructs its own prefiller."
+                f"--prefill-engine {args.prefill_engine} cannot be combined with "
+                f"--interactive yet: the interactive session constructs its own "
+                f"prefiller."
             )
         # Sized here, not above: sizing loads mlir-air's fused runtime, which
         # the other prefill engines must not need.
         fused = fused_prefill_config(cfg, args.max_seq)
-        prefill_cls = fused_prefill_cls(cfg, prefill_cls, fused)
+        prefill_cls = fused_prefill_cls(
+            cfg, prefill_cls, fused, triton=args.prefill_engine == "triton-fused"
+        )
     if igpu:
         prefill_cls = igpu_prefill_cls(cfg, prefill_cls)
 
@@ -1007,7 +1030,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     # Sized for the Triton prefill's bf16 weights. The dense fused and iGPU
     # prefills keep them packed and load no host copy; Gemma4's still do.
     dense = cfg.MODEL_NAME != "gemma4-e2b"
-    if not ((args.prefill_engine == "air-fused" and fused.dense) or (igpu and dense)):
+    if not ((one_device and fused.dense) or (igpu and dense)):
         check_host_memory(spec)
 
     # mlir-air's driver and its built decode are the NPU decode's; an iGPU
@@ -1192,7 +1215,7 @@ def _decode_gate(air, spec, cfg, args, ids, out):
     build; the rest gate on `EXPECT_IDS`.
     """
     golden = getattr(cfg, "EXPECT_IDS", None)
-    if getattr(args, "prefill_engine", None) == "air-fused":
+    if getattr(args, "prefill_engine", None) in ("air-fused", "triton-fused"):
         golden = getattr(cfg, "EXPECT_IDS_AIR_FUSED", golden)
     # The iGPU's numerics are its own, so what follows an iGPU prefill or comes
     # out of the iGPU decode is recorded separately.
