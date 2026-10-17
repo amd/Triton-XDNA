@@ -390,9 +390,8 @@ import json, sys
 from pathlib import Path
 out = Path(sys.argv[1])
 (out / "manifest.json").write_text(json.dumps(dict(gemm=["g"], attn={}, lm="lm")))
-for n in ("g", "lm"):
-    for ext in (".xclbin", ".insts.bin"):
-        (out / (n + ext)).write_bytes(b"")
+for f in ("fused_prefill.xclbin", "fused_prefill.txn.h", "lm.xclbin", "lm.insts.bin"):
+    (out / f).write_bytes(b"")
 (out / "libhostops.so").write_bytes(b"")
 """
 
@@ -464,8 +463,8 @@ from pathlib import Path
 out = Path(sys.argv[3])
 (out / "argv.json").write_text(json.dumps(sys.argv[1:]))
 (out / "manifest.json").write_text(json.dumps(dict(gemm=["g"], attn={}, lm=None)))
-for ext in (".xclbin", ".insts.bin"):
-    (out / ("g" + ext)).write_bytes(b"")
+for f in ("fused_prefill.xclbin", "fused_prefill.txn.h"):
+    (out / f).write_bytes(b"")
 (out / "libhostops.so").write_bytes(b"")
 """
 
@@ -540,11 +539,12 @@ def test_prefill_reuses_a_complete_build():
             cache = Path(tmp) / "cache"
             out = cache / f"gemma4-e2b_{m.fingerprint(cfg, d, '/peano', '/aie')}"
             out.mkdir(parents=True)
-            man = dict(gemm=["g"], attn={"a": {"base": "b"}}, lm="lm")
+            man = dict(gemm=["g"], attn={"a": "a_8"}, lm="lm")
             (out / "manifest.json").write_text(json.dumps(man))
-            for n in ("g", "b", "lm"):
-                for ext in (".xclbin", ".insts.bin"):
-                    (out / f"{n}{ext}").write_bytes(b"")
+            for f in ("fused_prefill.xclbin", "fused_prefill.txn.h"):
+                (out / f).write_bytes(b"")
+            for ext in (".xclbin", ".insts.bin"):
+                (out / f"lm{ext}").write_bytes(b"")
             (out / "libhostops.so").write_bytes(b"")
             r = m.fused_prefill(cfg, d, cache_root=cache)
             assert r["cached"] and r["build_dir"] == str(out.resolve()), r
@@ -575,11 +575,10 @@ def test_prefill_reuses_a_dense_build():
             cache = Path(tmp) / "cache"
             out = cache / f"llama-3.2-1b_{m.fingerprint(cfg, d, '/peano', '/aie')}"
             out.mkdir(parents=True)
-            man = dict(gemm=["g"], attn={"a": {"base": "b"}}, lm=None)
+            man = dict(gemm=["g"], attn={"a": "a_8"}, lm=None)
             (out / "manifest.json").write_text(json.dumps(man))
-            for n in ("g", "b"):
-                for ext in (".xclbin", ".insts.bin"):
-                    (out / f"{n}{ext}").write_bytes(b"")
+            for f in ("fused_prefill.xclbin", "fused_prefill.txn.h"):
+                (out / f).write_bytes(b"")
             (out / "libhostops.so").write_bytes(b"")
             r = m.fused_prefill(cfg, d, cache_root=cache)
             assert r["cached"] and r["build_dir"] == str(out.resolve()), r
