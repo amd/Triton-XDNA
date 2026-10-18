@@ -118,12 +118,14 @@ def _builder_const(spec, name, env):
 
     engine = ENGINES[spec.engine]
     eng_dir = airsrc.fused_decode_dir(spec.engine)
+    # As a build sees it: the variables the engine reads are only those given.
+    base = {k: v for k, v in os.environ.items() if k not in engine.env}
     r = subprocess.run(
         [sys.executable, os.path.join(eng_dir, engine.module)],
         capture_output=True,
         text=True,
         cwd=eng_dir,
-        env=dict(os.environ, **env, FUSED_DECODE_PRINT_CONST=name),
+        env=dict(base, **env, FUSED_DECODE_PRINT_CONST=name),
     )
     out = r.stdout.strip().splitlines()
     if r.returncode != 0 or not out or not out[-1].strip().isdigit():

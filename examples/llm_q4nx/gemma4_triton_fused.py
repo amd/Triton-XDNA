@@ -38,12 +38,18 @@ _SOURCES = (HERE / "gemma4_gemm.py", HERE / "fused_device.py", SCHEDULE, Path(__
 
 
 def fingerprint(air_build_dir):
-    """Digest of mlir-air's build this one extends and of the files here that
-    make the device."""
+    """Digest of mlir-air's build this one extends, of the files here that
+    make the device, and of the Triton and NPU backend that compile it."""
+    import triton
+    import triton.backends.amd_triton_npu as backend
+
     h = hashlib.sha256()
     h.update(Path(air_build_dir).resolve().name.encode())
     h.update(json.dumps(AIRCC_ARGS).encode() + str(STACK_SIZE).encode())
-    for p in _SOURCES:
+    h.update(triton.__version__.encode())
+    backend_dir = Path(backend.__file__).parent
+    sources = sorted(p for p in backend_dir.rglob("*") if p.suffix in (".py", ".mlir"))
+    for p in [*_SOURCES, *sources]:
         h.update(p.read_bytes())
     return h.hexdigest()[:16]
 
