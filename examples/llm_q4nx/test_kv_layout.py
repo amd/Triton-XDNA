@@ -95,10 +95,12 @@ def main():
     # case for the reshape rather than for the scatter.
     for attn_maxl, P in ((128, 6), (256, 163)):
         fd = air._load_builder(n_layers, attn_maxl, kv_src)
-        if (fd.DH_A, fd.REGION_W) != (KVL.DH_A, KVL.REGION_W):
+        theirs = (fd.DH_A, fd.REGION_W, fd.KV_LAYER)
+        ours = (KVL.DH_A, KVL.REGION_W, KVL.layer_elems(attn_maxl))
+        if theirs != ours:
             print(
-                f"  builder geometry DH_A={fd.DH_A} REGION_W={fd.REGION_W}, "
-                f"kv_layout has {KVL.DH_A} {KVL.REGION_W}  FAIL"
+                f"  builder geometry DH_A, REGION_W, KV_LAYER = {theirs}, "
+                f"kv_layout has {ours}  FAIL"
             )
             ok = False
             continue
@@ -143,7 +145,7 @@ def main():
             a = np.zeros((1, KVL.REGION_W), np.float32)
             KVL.scatter_rows(a, row, dh, reg)
             b = np.zeros((1, KVL.REGION_W), np.float32)
-            b[0, KVL.lane_index(dh, reg)] = np.tile(row, (1, KVL.N_ATTN_CU))
+            b[0, KVL.lane_index(dh, reg)] = row
             if not np.array_equal(a, b):
                 print(f"  lane_index disagrees with scatter_rows at dh={dh}  FAIL")
                 ok = False
