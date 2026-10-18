@@ -122,11 +122,3 @@ class Gemma4TritonFusedPrefill(Gemma4FusedPrefill):
     (`gemma4_triton_fused`)."""
 
     ENGINE = "triton-fused"
-
-    def __init__(self, build_dir, *a, **kw):
-        super().__init__(build_dir, *a, **kw)
-        f = self._fused
-        # The Triton GEMM's sequence takes more buffer arguments than mlir-air's
-        # GEMM; the slots past the runtime's own get placeholders as well.
-        n = int(f.fp.xb.get_kernels()[0].get_num_args()) - 3
-        f.dummy += [f.fp.bo(4096, i) for i in range(len(f.dummy), n)]

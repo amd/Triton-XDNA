@@ -30,15 +30,16 @@ class FusedDevice:
     `add_air` (AIR built elsewhere), then compiled together by `compile`."""
 
     def __init__(self, name, air_project_path):
-        self.name, self.proj = name, air_project_path
+        self.name, self.proj = name, os.path.abspath(air_project_path)
         self.ops = []  # (op name, kernel key, air text)
         self.cols = {}  # kernel key -> first column
         self.width = {}  # kernel key -> columns
-        self.next_col = 0
 
     def add(self, name, kernel, grid, args, constexprs=None, transform_script=None):
         g = tuple(grid) + (1,) * (3 - len(grid))
-        prev = triton.runtime.driver.active
+        # Not `driver.active`: with no driver set it makes the default one,
+        # which fails where no backend reports itself active.
+        prev = triton.runtime.driver._active
         triton.runtime.driver.set_active(NPUDriver())
         try:
             with config_context(compile_only=True):
@@ -106,7 +107,6 @@ class FusedDevice:
                 x += 1
             self.cols[key], self.width[key] = x, width
             self._used |= set(range(x, x + width))
-            self.next_col = max(self.next_col, x + width)
         at, x = {}, self.cols[key]
         for n, w in widths.items():
             at[n], x = x, x + w
@@ -158,8 +158,10 @@ class FusedDevice:
         stack_size=2048,
     ):
         npu = detect_npu_version()
-        if self.next_col > NUM_COLS.get(npu, 8):
-            raise ValueError(f"kernels need {self.next_col} columns, {npu} has fewer")
+        text = self.module_text()
+        width = max(self._used, default=-1) + 1
+        if width > NUM_COLS.get(npu, 8):
+            raise ValueError(f"the herds need {width} columns, {npu} has fewer")
         os.makedirs(os.path.join(self.proj, "air_project"), exist_ok=True)
         for o in objects:  # link_with objects, found next to the cores' code
             for d in (self.proj, os.path.join(self.proj, "air_project")):
@@ -168,7 +170,7 @@ class FusedDevice:
                     os.symlink(o, dst)
         path = os.path.join(self.proj, f"{self.name}.air.mlir")
         with open(path, "w") as f:
-            f.write(self.module_text())
+            f.write(text)
         cwd = os.getcwd()
         os.chdir(self.proj)
         try:

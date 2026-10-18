@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -45,6 +46,26 @@ def fingerprint(air_build_dir):
     for p in _SOURCES:
         h.update(p.read_bytes())
     return h.hexdigest()[:16]
+
+
+def _kernel_args(xclbin):
+    """The number of arguments the xclbin's kernel takes."""
+    from triton.backends.amd_triton_npu.hsa_xrt import _xclbinutil
+
+    with tempfile.TemporaryDirectory() as tmp:
+        md = os.path.join(tmp, "md.xml")
+        subprocess.run(
+            [
+                _xclbinutil(),
+                "-i",
+                str(xclbin),
+                "--dump-section",
+                f"EMBEDDED_METADATA:RAW:{md}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return Path(md).read_text().count("<arg ")
 
 
 def build(air_build_dir, out):
@@ -90,6 +111,11 @@ def build(air_build_dir, out):
         extra_args=AIRCC_ARGS,
         stack_size=STACK_SIZE,
     )
+    # mlir-air's runtime binds its own buffers to the kernel's arguments.
+    if _kernel_args(xclbin) != _kernel_args(ref / "fused_prefill.xclbin"):
+        raise RuntimeError(
+            f"{xclbin} takes other kernel arguments than mlir-air's device"
+        )
     for p in ref.iterdir():
         if p.suffix in (".o", ".so") or p.name.startswith("lm."):
             shutil.copy(p, out / p.name)
