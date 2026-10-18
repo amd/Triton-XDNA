@@ -12,14 +12,13 @@ prebuilt modules' herds already use.
 import os
 import re
 
-import triton
 from triton.backends.amd_triton_npu.config import config_context
 from triton.backends.amd_triton_npu.driver import (
-    NPUDriver,
     _aircc_compile,
     _ttshared_to_air,
     detect_npu_version,
 )
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 SEG = "seg"
 NUM_COLS = {"npu1": 4, "npu2": 8}
@@ -37,15 +36,8 @@ class FusedDevice:
 
     def add(self, name, kernel, grid, args, constexprs=None, transform_script=None):
         g = tuple(grid) + (1,) * (3 - len(grid))
-        # Not `driver.active`: with no driver set it makes the default one,
-        # which fails where no backend reports itself active.
-        prev = triton.runtime.driver._active
-        triton.runtime.driver.set_active(NPUDriver())
-        try:
-            with config_context(compile_only=True):
-                c = kernel.warmup(*args, grid=g, **(constexprs or {}))
-        finally:
-            triton.runtime.driver.set_active(prev)
+        with driver_scope("npu"), config_context(compile_only=True):
+            c = kernel.warmup(*args, grid=g, **(constexprs or {}))
         with config_context(transform_tiling_script=transform_script):
             m = _ttshared_to_air(c.asm["ttsharedir"], *g)
         # The op's run-time ints, bound in the launch: the herds take them as
@@ -128,6 +120,7 @@ class FusedDevice:
 
         texts = []
         self._used = self._taken()
+        self.cols, self.width = {}, {}
         with Context(), Location.unknown():
             i64 = IntegerType.get_signless(64)
             for name, key, air in self.ops:
@@ -163,7 +156,8 @@ class FusedDevice:
         if width > NUM_COLS.get(npu, 8):
             raise ValueError(f"the herds need {width} columns, {npu} has fewer")
         os.makedirs(os.path.join(self.proj, "air_project"), exist_ok=True)
-        for o in objects:  # link_with objects, found next to the cores' code
+        for o in map(os.path.abspath, objects):
+            # link_with objects, found next to the cores' code
             for d in (self.proj, os.path.join(self.proj, "air_project")):
                 dst = os.path.join(d, os.path.basename(o))
                 if not os.path.exists(dst):
