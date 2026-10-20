@@ -1,15 +1,15 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Gemma4-E2B's fused one-device NPU prefill with the GEMMs in Triton.
+"""Gemma4-E2B's fused one-device NPU prefill, every op from Triton.
 
 mlir-air's fused prefill (`--prefill-engine air-fused`) runs every op of a
-128-token chunk on one device. This builds the same device with every GEMM
-compiled from `gemma4_gemm.mm_g` instead of mlir-air's GEMM herd, and the
-attention ops from mlir-air's own builder, linked into one module by
-`fused_device.FusedDevice`. The rest of the build (the LM head, the host
-library, the kernel objects) is mlir-air's, taken from its build, so its
-runtime drives the device unchanged.
+128-token chunk on one device. This builds the same device from Triton: every
+GEMM from `gemma4_gemm.mm_g` and the attention ops from
+`gemma4_attention.attn`, linked into one module by `fused_device.FusedDevice`,
+with the kernel arguments and run-time arguments of mlir-air's ops. The rest
+of the build (the LM head, the host library) is mlir-air's, taken from its
+build, so its runtime drives the device unchanged.
 """
 
 import hashlib
@@ -34,7 +34,14 @@ AIRCC_ARGS = (
 )
 STACK_SIZE = 4096
 #: This module's own inputs, beyond mlir-air's build it extends.
-_SOURCES = (HERE / "gemma4_gemm.py", HERE / "fused_device.py", SCHEDULE, Path(__file__))
+_SOURCES = (
+    HERE / "gemma4_gemm.py",
+    HERE / "gemma4_attention.py",
+    HERE / "fused_device.py",
+    SCHEDULE,
+    HERE / "transform_gemma4_attention_aie2p.mlir.in",
+    Path(__file__),
+)
 
 
 def fingerprint(air_build_dir):
@@ -81,6 +88,7 @@ def build(air_build_dir, out):
     from triton.backends.amd_triton_npu.config import config_context
 
     import airsrc
+    import gemma4_attention as A
     import gemma4_gemm as G
     from fused_device import FusedDevice
 
@@ -93,11 +101,29 @@ def build(air_build_dir, out):
     out.mkdir(parents=True, exist_ok=True)
     heads = spec.ATTN_POINTS["base"][0]
     dev = FusedDevice("fused_prefill", str(out / "proj"))
-    for op in D.attn_ops(spec.CFG):
-        name = seq_name(op, (heads,))
-        lch = D.build(spec.CFG, op, heads, 1, 0, 0, name=name, own=True)
-        dev.add_air(name, str(lch.build(target="npu2")))
     with config_context(bf16_emulation=True):
+        # Same interface as mlir-air's device: the GEMM's buffers, then each
+        # attention group's q, KV and o in config order; an attention op
+        # takes (nkv, q0, k0) at run time.
+        for op, groups in D.attn_ops(spec.CFG).items():
+            if len(groups) != 1:
+                raise NotImplementedError(f"attention op {op} drives {groups}")
+            (grp,) = groups
+            g = spec.CFG.attn[grp]
+            rounds = heads * (D.M // (A.NQT.value * g.lkp))
+            q = torch.zeros(rounds * A.NQT.value * g.lkp, g.dh, dtype=torch.bfloat16)
+            kv = torch.zeros(2 * g.lkp * g.dh, dtype=torch.bfloat16)
+            dev.add(
+                seq_name(op, (heads,)),
+                A.attn,
+                (1,),
+                A.args(g, rounds, 1, 0, 0, q, kv, torch.zeros_like(q)),
+                transform_script=str(A.schedule(g.lkp, g.dh, dev.proj)),
+                slot=3 + 3 * list(spec.CFG.attn).index(grp),
+                runtime=("nk", "q0", "k0"),
+                key=f"attn_{grp}",
+                pin_l2=True,
+            )
         for k, n, act, wq in spec.gemm_shapes():
             a = torch.zeros(128, k, dtype=torch.bfloat16)
             c = torch.zeros(128, n, dtype=torch.bfloat16)
@@ -109,9 +135,7 @@ def build(air_build_dir, out):
                 G.args(a, w, c, n, k, act, wq),
                 transform_script=str(SCHEDULE),
             )
-    objects = sorted(str(p) for p in ref.glob("*.o"))
     xclbin, header = dev.compile(
-        objects=objects,
         runtime_loop_tiling_sizes=(),
         bf16_emulation=True,
         extra_args=AIRCC_ARGS,
