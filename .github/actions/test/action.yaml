@@ -419,21 +419,23 @@ runs:
             if [ "$build_rc" -ne 0 ]; then
               echo "   ❌ FAIL: make compile-decode (exit code $build_rc)"
               q_fail=$((q_fail + 1))
-              gate gemma4_e2b_q4nx --prefill-only
+              gate gemma4_e2b_q4nx --prefill-engine triton-fused --prefill-only
             else
               echo "   ✅ PASS: make compile-decode"
               q_pass=$((q_pass + 1))
-              gate gemma4_e2b_q4nx --decode npu --max-tokens 8 --greedy
+              # The prefill is the fused device with its GEMMs from Triton;
+              # mlir-air's own fused prefill is gated by test_decode_vs_prefill.
+              gate gemma4_e2b_q4nx --prefill-engine triton-fused --decode npu \
+                --max-tokens 8 --greedy
             fi
 
             # The Triton prefill of the models whose default is the fused one.
+            # Gemma4's runs in its decode gate above; its layer-by-layer Triton
+            # prefill is gated by the hetero runs.
             for ex in llama32_3b_q4nx llama31_8b_q4nx qwen3_4b_q4nx \
-                      qwen3_8b_q4nx phi4_mini_q4nx gemma3_4b_q4nx gemma4_e2b_q4nx; do
+                      qwen3_8b_q4nx phi4_mini_q4nx gemma3_4b_q4nx; do
               gate "$ex" --prefill-engine triton --prefill-only
             done
-
-            # Gemma4's fused prefill device with its GEMMs from Triton.
-            gate gemma4_e2b_q4nx --prefill-engine triton-fused --prefill-only
 
             # The KV layout our prefills hand the NPU decode in place, against
             # mlir-air's own `seed_kv` run on the same K/V. The decode gate
