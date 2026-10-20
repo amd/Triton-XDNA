@@ -295,8 +295,19 @@ EXAMPLES = [
         "description": (
             "Gemma3's block plus per-layer embeddings, layers that differ in "
             "shape from each other, and twenty that carry no KV cache of "
-            "their own. The only model here whose decode runs on mlir-air's "
-            "per-layer-embedding engine rather than the shared one."
+            "their own. Its decode runs on mlir-air's per-layer-embedding "
+            "engine rather than the shared one."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Gemma4-E4B (Q4NX)",
+        "path": "gemma4_e4b_q4nx",
+        "datatypes": "bf16 prefill, q4nx decode",
+        "description": (
+            "Gemma4-E2B's architecture at D 2560 and 42 layers, with two KV "
+            "heads. mlir-air's fused NPU prefill and per-layer-embedding "
+            "decode."
         ),
     },
 ]

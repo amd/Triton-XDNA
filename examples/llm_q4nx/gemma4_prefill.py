@@ -221,8 +221,8 @@ class Gemma4Prefill(LlamaPrefill):
         self._kv_host = _host_view(self._kv_slab)
         self._kv_src = {
             src: (
-                np.zeros((self.max_seq, head_dim(src)), np.float32),
-                np.zeros((self.max_seq, head_dim(src)), np.float32),
+                np.zeros((self.max_seq, N_KV_HEADS * head_dim(src)), np.float32),
+                np.zeros((self.max_seq, N_KV_HEADS * head_dim(src)), np.float32),
             )
             for src, users in self._kv_fanout.items()
             if users != [src]
