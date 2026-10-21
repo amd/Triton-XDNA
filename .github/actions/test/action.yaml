@@ -13,6 +13,13 @@ inputs:
       Leave empty to detect it from the NPU the runner actually has.
     required: false
     default: ""
+  llm_scope:
+    description: >
+      Which LLM gates to run: "pr" runs the representative models that
+      together cover every prefill/decode placement, "nightly" runs every
+      model.
+    required: false
+    default: "pr"
 
 
 runs:
@@ -26,6 +33,7 @@ runs:
         # capped at 21000 characters, and this one is longer.
         TEST_ENV_NAME: ${{ inputs.env_name }}
         TEST_DEVICE: ${{ inputs.device }}
+        TEST_LLM_SCOPE: ${{ inputs.llm_scope }}
       shell: "bash"
       run: |
         set -x  # Enable command tracing
@@ -201,14 +209,21 @@ runs:
         echo "=========================================="
         # gpt2/qwen are the end-to-end iGPU-free gate. They default to --backend npu
         # if the HuggingFace hub is unreachable the examples exit 77 = SKIP.
+        # On PRs gpt2 stands in for both; nightly runs qwen too.
+        LLM_SCOPE="${TEST_LLM_SCOPE:-pr}"
+        echo "LLM scope: $LLM_SCOPE"
+        hf_examples="gpt2"
+        if [ "$LLM_SCOPE" = "nightly" ]; then
+          hf_examples="gpt2 qwen2_5"
+        fi
         pip install --no-cache-dir transformers numpy ml_dtypes
         CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
           python scripts/run_tests.py --device "$DEVICE" --verbose --timeout 1200 \
-            -t gpt2 -t qwen2_5
+            $(printf -- '-t %s ' $hf_examples)
 
         echo ""
         echo "=========================================="
-        echo "STEP 9b: Q4NX prefill gates"
+        echo "STEP 9b: Q4NX gates"
         echo "=========================================="
         # Invoked directly rather than through run_tests.py, which would run the
         # entry point with no arguments and so try to generate -- and generation
@@ -341,63 +356,67 @@ runs:
               gate llama32_1b_q4nx --prefill-engine triton --max-tokens 8 --greedy
             fi
 
-            gate llama32_3b_q4nx --prefill-only
+            # The other models' prefill gates run nightly. On PRs the 1B and
+            # Gemma4-E2B stand in for them.
+            if [ "$LLM_SCOPE" = "nightly" ]; then
+              gate llama32_3b_q4nx --prefill-only
 
-            # The 8B is prefill-only for the 3B's reason and skips itself for
-            # one of its own: its dequantized bf16 weights do not fit every
-            # runner, and an undersized host does not raise -- it SIGKILLs the
-            # load, which no `except` can turn into a skip. `min_host_gib` is
-            # checked before anything is allocated, so this reports SKIP rather
-            # than dying at exit 137.
-            gate llama31_8b_q4nx --prefill-only
+              # The 8B is prefill-only for the 3B's reason and skips itself for
+              # one of its own: its dequantized bf16 weights do not fit every
+              # runner, and an undersized host does not raise -- it SIGKILLs the
+              # load, which no `except` can turn into a skip. `min_host_gib` is
+              # checked before anything is allocated, so this reports SKIP rather
+              # than dying at exit 137.
+              gate llama31_8b_q4nx --prefill-only
 
-            # Qwen3-4B is prefill-only for the 3B's reason -- its decode needs
-            # a requantized weight cache a fresh runner does not have -- and
-            # carries a min_host_gib of its own. Its prefill gate is still the
-            # first coverage of a non-Llama forward: the per-head qk-norm and
-            # the decoupled q dim are both in it.
-            gate qwen3_4b_q4nx --prefill-only
+              # Qwen3-4B is prefill-only for the 3B's reason -- its decode needs
+              # a requantized weight cache a fresh runner does not have -- and
+              # carries a min_host_gib of its own. Its prefill gate is still the
+              # first coverage of a non-Llama forward: the per-head qk-norm and
+              # the decoupled q dim are both in it.
+              gate qwen3_4b_q4nx --prefill-only
 
-            # Qwen3-8B runs the same forward as the 4B, so its gate is not
-            # there to cover the block a second time -- it covers the two
-            # things the 4B's cannot: an untied LM head (the failure mode is
-            # fluent text off a plausible logit vector, which cost a gate
-            # failure to find on Llama-3.1-8B) and, in the decode it does not
-            # reach here, a core stack and a weight split that are this
-            # model's alone. Like the 8B it may decline on min_host_gib; a
-            # SKIP is not a PASS.
-            gate qwen3_8b_q4nx --prefill-only
+              # Qwen3-8B runs the same forward as the 4B, so its gate is not
+              # there to cover the block a second time -- it covers the two
+              # things the 4B's cannot: an untied LM head (the failure mode is
+              # fluent text off a plausible logit vector, which cost a gate
+              # failure to find on Llama-3.1-8B) and, in the decode it does not
+              # reach here, a core stack and a weight split that are this
+              # model's alone. Like the 8B it may decline on min_host_gib; a
+              # SKIP is not a PASS.
+              gate qwen3_8b_q4nx --prefill-only
 
-            # Qwen2.5-7B, prefill-only, and the one gate here that is not
-            # reading a prepared weight bundle: there is no FastFlowLM
-            # Qwen2.5-7B NPU2 bundle, so it quantizes an upstream checkpoint on
-            # load. That makes it the slowest of these and gives it a
-            # min_host_gib of its own, but it is also the only coverage of a
-            # biased projection -- every other forward here is y = x @ W.
-            gate qwen25_7b_q4nx --prefill-only
+              # Qwen2.5-7B, prefill-only, and the one gate here that is not
+              # reading a prepared weight bundle: there is no FastFlowLM
+              # Qwen2.5-7B NPU2 bundle, so it quantizes an upstream checkpoint on
+              # load. That makes it the slowest of these and gives it a
+              # min_host_gib of its own, but it is also the only coverage of a
+              # biased projection -- every other forward here is y = x @ W.
+              gate qwen25_7b_q4nx --prefill-only
 
-            # Qwen2.5-3B, prefill-only. Same forward as the 7B, so its value
-            # here is not the block: it is the only model whose decode env sets
-            # W_DUAL_CHAN=0, and unlike the 7B it fits the runner, so it is the
-            # one Qwen2.5 gate that actually executes rather than declining.
-            gate qwen25_3b_q4nx --prefill-only
+              # Qwen2.5-3B, prefill-only. Same forward as the 7B, so its value
+              # here is not the block: it is the only model whose decode env sets
+              # W_DUAL_CHAN=0, and unlike the 7B it fits the runner, so it is the
+              # one Qwen2.5 gate that actually executes rather than declining.
+              gate qwen25_3b_q4nx --prefill-only
 
-            # Phi-4-mini, prefill-only. Its gate is the only coverage of a
-            # partial rotation: 96 of 128 lanes rotated and the rest copied
-            # through, on LongRoPE frequencies. Getting either wrong leaves the
-            # head boundary intact and the text fluent, so nothing but the
-            # first-token comparison catches it.
-            gate phi4_mini_q4nx --prefill-only
+              # Phi-4-mini, prefill-only. Its gate is the only coverage of a
+              # partial rotation: 96 of 128 lanes rotated and the rest copied
+              # through, on LongRoPE frequencies. Getting either wrong leaves the
+              # head boundary intact and the text fluent, so nothing but the
+              # first-token comparison catches it.
+              gate phi4_mini_q4nx --prefill-only
 
-            # Gemma3-4B, prefill-only for the same two reasons. Its gate is
-            # worth more than the others' despite being the same shape: four
-            # bundle conventions, a norm sandwich, dual-theta RoPE and a GELU
-            # GLU all have to be right for the first token to come out, and
-            # each of them fails into fluent wrong text rather than an error.
-            # What it does NOT cover is the 1024-token sliding window -- the
-            # canonical prompt is six tokens, so the window never binds. Only
-            # the decode comparison against mlir-air's own generation does.
-            gate gemma3_4b_q4nx --prefill-only
+              # Gemma3-4B, prefill-only for the same two reasons. Its gate is
+              # worth more than the others' despite being the same shape: four
+              # bundle conventions, a norm sandwich, dual-theta RoPE and a GELU
+              # GLU all have to be right for the first token to come out, and
+              # each of them fails into fluent wrong text rather than an error.
+              # What it does NOT cover is the 1024-token sliding window -- the
+              # canonical prompt is six tokens, so the window never binds. Only
+              # the decode comparison against mlir-air's own generation does.
+              gate gemma3_4b_q4nx --prefill-only
+            fi
 
             # Gemma4-E2B. The widest gate here per token of prompt: the first
             # token cannot come out unless the per-layer embeddings, the
@@ -427,8 +446,13 @@ runs:
             fi
 
             # The Triton prefill of the models whose default is the fused one.
-            for ex in llama32_3b_q4nx llama31_8b_q4nx qwen3_4b_q4nx \
-                      qwen3_8b_q4nx phi4_mini_q4nx gemma3_4b_q4nx gemma4_e2b_q4nx; do
+            # The 1B's Triton prefill is gated above along with its decode.
+            triton_prefill="gemma4_e2b_q4nx"
+            if [ "$LLM_SCOPE" = "nightly" ]; then
+              triton_prefill="llama32_3b_q4nx llama31_8b_q4nx qwen3_4b_q4nx \
+                qwen3_8b_q4nx phi4_mini_q4nx gemma3_4b_q4nx gemma4_e2b_q4nx"
+            fi
+            for ex in $triton_prefill; do
               gate "$ex" --prefill-engine triton --prefill-only
             done
 
@@ -518,7 +542,7 @@ runs:
         if [ "$DEVICE" = "aie2p" ]; then
           export HSA_OVERRIDE_GFX_VERSION=11.5.1
           hetero_rc=0
-          for ex in gpt2 qwen2_5; do
+          for ex in $hf_examples; do
             echo "--- hetero: $ex ---"
             entry=$(ls examples/$ex/*_inference.py | head -1)
             rc=0
