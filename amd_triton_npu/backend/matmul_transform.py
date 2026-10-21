@@ -45,6 +45,7 @@ def generate_matmul_transform(
     contract_input_type: str = None,
     bf16_emulation: bool = False,
     k_loop: bool = False,
+    epilogue: bool = False,
 ) -> str:
     """Generate a matmul transform dialect MLIR script.
 
@@ -88,6 +89,13 @@ def generate_matmul_transform(
             variable, and the L2 staging buffers are allocated once outside
             it. Each step of the loop is one L2 tile, so the kernel's K step
             must equal ``l2_k``.
+        epilogue: The kernel has an elementwise tail after the matmul, such
+            as ``tl.dot(a, b) * s``, an activation or ``.to(tl.bfloat16)``.
+            The tail runs on the epilogue herd, on the packed accumulator in
+            L1, before the unpack writes the tile back to L2. It may only read
+            the accumulator, scalars and constants. A tail that reads another
+            tensor (a bias, a residual) is not supported, since that tensor
+            would need its own path from DDR into the core tiles.
 
     Returns:
         Complete MLIR module string with transform.with_named_sequence.
@@ -226,6 +234,77 @@ def generate_matmul_transform(
 """
     )
 
+    # The elementwise tail after the matmul, run on the epilogue herd.
+    ep_prefuse = ep_dlp = ep_fuse = ep_vector_tiling = ep_herd_cast = ""
+    if epilogue:
+        # Rows per vector op, for 16-lane vectors: the bf16 casts below and
+        # the f32 reciprocal both need 16 or 32 lanes.
+        ep_rows = 16 // pack_n
+        assert 1 <= ep_rows <= pack_m and 16 % pack_n == 0, (pack_m, pack_n)
+        # triton-shared emits one generic per op, and broadcasts each scalar
+        # through a 2-D fill. Fusing them leaves the accumulator's init as the
+        # only linalg.fill, which the fill matching below relies on.
+        ep_prefuse = """
+        %ep_func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %ep_func_fused = transform.air.fuse_elementwise_linalg %ep_func : (!transform.any_op) -> !transform.any_op
+        %ep_op0 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        transform.annotate %ep_op0 "epilogue_op" : !transform.any_op
+"""
+        # Move C's unpack after the tail. The tail then works on the packed
+        # accumulator and is the unpack's producer, so it can be fused into
+        # the epilogue forall (fuse_into_containing_op only fuses producers).
+        ep_dlp = """
+        %dlp_func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        transform.apply_patterns to %dlp_func {
+            transform.apply_patterns.linalg.data_layout_propagation
+        } : !transform.any_op
+        transform.apply_cse to %dlp_func : !transform.any_op
+"""
+        # The unpack now writes the tail's result, which has no L2 buffer yet.
+        # It is matched again afterwards since bufferize_to_allocation
+        # replaces the op.
+        unpack_l2_home = """        %unpack_op0 = transform.structured.match ops{["linalg.unpack"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %unpack_l2_buf, %unpack_l2 = transform.structured.bufferize_to_allocation %unpack_op0
+            <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+"""
+        unpack_match = unpack_l2_home + unpack_match
+        # Process the core tile pack_m rows at a time, so the tail's L1 output
+        # is a strip rather than a full tile; a full f32 tile does not fit in
+        # L1 next to the accumulator and the A/B buffers. The tail is fused
+        # twice because each fusion moves it down one loop level. The row
+        # loop steps by pack_m, which puts `iv floordiv pack_m` into the
+        # accumulator index, and AIR's L1 partitioning cannot split the
+        # accumulator per core through a floordiv. Normalizing the loop to
+        # unit step turns the index back into `iv`.
+        ep_fuse = f"""        %ep_rows_unpack, %ep_rows_loop =
+          transform.structured.tile_using_for %epilogue_tiled_unpack tile_sizes [{pack_m}, 0]
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+        %ep_op = transform.structured.match ops{{["linalg.generic"]}} attributes{{epilogue_op}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %ep_fused0, %ep_loop0 = transform.structured.fuse_into_containing_op %ep_op into %epilogue_forall : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+        %ep_fused, %ep_loop = transform.structured.fuse_into_containing_op %ep_fused0 into %ep_rows_loop : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+        %ep_rows_unit = transform.air.normalize_loop_to_unit_step %ep_loop : (!transform.any_op) -> !transform.any_op
+        %ep_norm_func = transform.structured.match ops{{["func.func"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        transform.apply_patterns to %ep_norm_func {{
+            transform.apply_patterns.canonicalization
+        }} : !transform.any_op
+        %ep_l1_buf, %ep_l1 = transform.structured.bufferize_to_allocation %ep_fused
+            <{{memory_space = 2, bufferize_destination_only, emit_dealloc}}> : !transform.any_op
+"""
+        ep_vector_tiling = f"""\
+        %ep_v = transform.structured.match ops{{["linalg.generic"]}} attributes{{epilogue_op}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %ep_v_tiled, %ep_v_loops:3 =
+          transform.structured.tile_using_for %ep_v tile_sizes [1, 1, {ep_rows}, 0]
+          : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+"""
+        # The vectorized tail is rank 4 (1 x 1 x ep_rows x pack_n), which
+        # aievec cannot lower; linearize it to rank 1. Then apply the same
+        # bf16 casts as the standalone elementwise schedules. Both are scoped
+        # to the epilogue herd so the compute herd is left alone.
+        ep_herd_cast = """        %ep_herd = transform.structured.match ops{["air.herd"]} attributes{epilogue_herd} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %ep_herd_lin = transform.air.linearize_vectors %ep_herd : (!transform.any_op) -> !transform.any_op
+        transform.include @cast_bf16_only_ops failures(propagate) (%ep_herd_lin) : (!transform.any_op) -> ()
+"""
+
     # Phase 10 takes every herd; there is no herd to leave alone.
     herd_vectorize_filter = ""
     phase_11_12 = f"""\
@@ -256,7 +335,7 @@ def generate_matmul_transform(
     return f"""\
 // Auto-generated by matmul_transform.py — do not edit manually.
 // Parameters: l1_m={l1_m}, l1_n={l1_n}, l2_k={l2_k}, {l1_k_param}\
-pack=[{pack_m},{pack_n},{pack_k}], accum={accum_type}, contract_in={contract_input_type}{", k_loop" if k_loop else ""}
+pack=[{pack_m},{pack_n},{pack_k}], accum={accum_type}, contract_in={contract_input_type}{", k_loop" if k_loop else ""}{", epilogue" if epilogue else ""}
 //
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
@@ -273,7 +352,7 @@ module attributes {{transform.with_named_sequence}} {{
 
         transform.include @fold_add_into_matmul_init failures(propagate) (%arg1)
           : (!transform.any_op) -> ()
-
+{ep_prefuse}
     //==========================================================================
     // PHASE 1: TILE L3->L2 MEMORY COPIES
     // Tile memref copies for streaming data from DDR (L3) to MemTile (L2).
@@ -341,7 +420,7 @@ module attributes {{transform.with_named_sequence}} {{
 
         // Annotate for robust matching after K-tiling
         transform.annotate %packed_c "packed_matmul" : !transform.any_op
-
+{ep_dlp}
     //==========================================================================
     // PHASE 4: TILE K REDUCTION AND FUSE PACK OPERATIONS
     // Tile packed K dim by {packed_k_tile} (= {l2_k} raw K elements).
@@ -405,7 +484,7 @@ module attributes {{transform.with_named_sequence}} {{
           transform.structured.tile_using_forall {unpack_target} tile_sizes [{l1_m}, {l1_n}]
             : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         transform.annotate %epilogue_forall "epilogue_forall" : !transform.any_op
-
+{ep_fuse}
         %func_3 = transform.structured.match ops{{["func.func"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
         transform.apply_patterns to %func_3 {{
             transform.apply_patterns.linalg.tiling_canonicalization
@@ -439,7 +518,7 @@ module attributes {{transform.with_named_sequence}} {{
     //==========================================================================
 
         %generic1 = transform.structured.match ops{{["linalg.generic"]}} attributes{{init_fill}} in %arg1 : (!transform.any_op) -> !transform.any_op
-{matmul_vector_tiling}        %inner_most_fills, %vec_fill_loops:2 =
+{matmul_vector_tiling}{ep_vector_tiling}        %inner_most_fills, %vec_fill_loops:2 =
           transform.structured.tile_using_for %generic1 tile_sizes [1, 1, 0, 0]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
 
@@ -462,7 +541,7 @@ module attributes {{transform.with_named_sequence}} {{
 
         %herds = transform.structured.match ops{{["air.herd"]}}{herd_vectorize_filter} in %arg1 : (!transform.any_op) -> !transform.any_op
         %vectorized_herds = transform.air.herd_vectorize %herds : (!transform.any_op) -> !transform.any_op
-
+{ep_herd_cast}
         %func7 = transform.structured.match ops{{["func.func"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
         transform.apply_patterns to %func7 {{
             transform.apply_patterns.linalg.tiling_canonicalization
@@ -542,6 +621,12 @@ if __name__ == "__main__":
         help="The matmul sits in the kernel's own K loop, one l2_k per step",
     )
     parser.add_argument(
+        "--epilogue",
+        action="store_true",
+        help="The kernel carries an elementwise tail past its matmul "
+        "(scale, activation, cast) reading only the accumulator and scalars",
+    )
+    parser.add_argument(
         "-o", "--output", type=str, default=None, help="Output file (default: stdout)"
     )
 
@@ -556,6 +641,7 @@ if __name__ == "__main__":
         contract_input_type=args.contract_input_type,
         bf16_emulation=args.bf16_emulation,
         k_loop=args.k_loop,
+        epilogue=args.epilogue,
     )
     if args.output:
         with open(args.output, "w") as f:

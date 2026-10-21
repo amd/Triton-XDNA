@@ -58,6 +58,12 @@ EXAMPLES = [
     },
     {
         "category": "Matrix",
+        "name": "Matrix Multiplication (BF16, Elementwise Epilogue)",
+        "path": "matmul_bf16_epilogue",
+        "datatypes": "bf16",
+    },
+    {
+        "category": "Matrix",
         "name": "Matrix Multiplication (Autotune)",
         "path": "autotune-matmul",
         "datatypes": "bf16",

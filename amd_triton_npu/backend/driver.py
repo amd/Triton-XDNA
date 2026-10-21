@@ -1374,24 +1374,35 @@ def _fold_accumulator_adds(asm_src_text):
 def _detect_matmul(asm_src_text):
     """Detect a single plain matmul in the TritonShared IR.
 
-    Returns a dict {m, k, n, in_elem, out_elem} when the module contains
-    exactly one ``linalg.matmul`` and no linalg compute ops other than
-    ``fill`` (fused epilogues are out of scope). Returns None otherwise, in
+    Returns a dict {m, k, n, in_elem, out_elem, k_loop, epilogue} when the
+    module contains exactly one ``linalg.matmul`` and no linalg compute ops
+    other than ``fill`` and an elementwise tail. Returns None otherwise, in
     which case the caller keeps the built-in default tiling.
 
     A ``tt.dot`` carrying a live accumulator, as in a K loop, lowers to a
     contraction plus a ``linalg.generic`` add. Detection looks at the module
     with that add folded into the contraction, which is what the generated
-    schedule does first, so only other fused epilogues are declined.
+    schedule does first. Any generic left after that is an elementwise tail
+    (a scale, an activation, a cast) and sets ``epilogue``. Tails that read
+    another tensor from DDR, such as a bias, are declined.
     """
     import re
 
     asm_src_text = _fold_accumulator_adds(asm_src_text)
 
-    # Bail if any linalg op other than matmul / fill is present (fusion).
+    # Bail if any linalg op other than matmul / fill / generic is present
+    # (`yield` is the generic's own terminator).
     linalg_ops = set(re.findall(r"linalg\.(\w+)", asm_src_text))
-    if not linalg_ops.issubset({"matmul", "fill"}):
+    if not linalg_ops.issubset({"matmul", "fill", "generic", "yield"}):
         return None
+    epilogue = "generic" in linalg_ops
+    if epilogue:
+        iterators = re.findall(r"iterator_types = \[([^\]]*)\]", asm_src_text)
+        if any("reduction" in it for it in iterators):
+            return None
+        # A and B are the only tensors read in from DDR.
+        if asm_src_text.count("bufferization.to_tensor") != 2:
+            return None
 
     matmuls = re.findall(
         r"linalg\.matmul\b.*?"
@@ -1418,6 +1429,7 @@ def _detect_matmul(asm_src_text):
         "in_elem": in_elem,
         "out_elem": out_elem,
         "k_loop": k_loop,
+        "epilogue": epilogue,
     }
 
 
@@ -1505,6 +1517,7 @@ def _matmul_transform_params(info, npu_version):
         "contract_input_type": contract_input_type,
         "bf16_emulation": bf16_emulation,
         "k_loop": info.get("k_loop", False),
+        "epilogue": info.get("epilogue", False),
     }
 
 
