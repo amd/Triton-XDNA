@@ -63,6 +63,9 @@ SCRIPTLESS_UNSUPPORTED = {
         # copy needs a buffer descriptor of 32768 32-bit words against a
         # 16383-word maximum for the tile type.
         "matmul_i8_m128_n64_k64": "aie.dma_bd length exceeds the npu1 tile maximum",
+        # Scriptless detection declines a matmul with an epilogue, and the
+        # example has no transform_aie2.mlir.
+        "matmul_bf16_epilogue": "no npu1 schedule for the matmul epilogue",
         # LLM examples targeting npu2. They drive their own per-kernel
         # transform scripts, all of which are *_aie2p.mlir, so the single
         # transform_<device>.mlir convention does not apply to them either.

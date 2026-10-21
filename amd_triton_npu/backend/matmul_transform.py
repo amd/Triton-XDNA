@@ -234,39 +234,25 @@ def generate_matmul_transform(
 """
     )
 
-    # The elementwise tail after the matmul, run on the epilogue herd.
+    # The elementwise tail after the matmul, run on the epilogue herd. The
+    # steps that take no parameters are in transform_library/epilogue.mlir.
     ep_prefuse = ep_dlp = ep_fuse = ep_vector_tiling = ep_herd_cast = ""
     if epilogue:
         # Rows per vector op, so each op in the tail is 16 lanes wide.
         ep_rows = 16 // pack_n
         assert 1 <= ep_rows <= pack_m and 16 % pack_n == 0, (pack_m, pack_n)
-        # Fuse the tail into one generic. Scalar operands then sit in its body
-        # rather than in broadcast fills, so the accumulator init is the only
-        # linalg.fill, as the fill matching below expects.
         ep_prefuse = """
-        %ep_func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %ep_func_fused = transform.air.fuse_elementwise_linalg %ep_func : (!transform.any_op) -> !transform.any_op
-        %ep_op0 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        transform.annotate %ep_op0 "epilogue_op" : !transform.any_op
+        transform.include @epilogue_fuse_tail failures(propagate) (%arg1)
+          : (!transform.any_op) -> ()
 """
-        # Move C's unpack after the tail, so the tail works on the packed
-        # accumulator and can be fused into the epilogue forall as the
-        # unpack's producer.
         ep_dlp = """
-        %dlp_func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %dlp_func {
-            transform.apply_patterns.linalg.data_layout_propagation
-        } : !transform.any_op
-        transform.apply_cse to %dlp_func : !transform.any_op
+        transform.include @epilogue_unpack_after_tail failures(propagate) (%arg1)
+          : (!transform.any_op) -> ()
 """
-        # The unpack now writes the tail's result, which has no L2 buffer yet.
-        # It is matched again afterwards since bufferize_to_allocation
-        # replaces the op.
-        unpack_l2_home = """        %unpack_op0 = transform.structured.match ops{["linalg.unpack"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %unpack_l2_buf, %unpack_l2 = transform.structured.bufferize_to_allocation %unpack_op0
-            <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+        unpack_to_l2 = """        transform.include @epilogue_unpack_to_l2 failures(propagate) (%arg1)
+          : (!transform.any_op) -> ()
 """
-        unpack_match = unpack_l2_home + unpack_match
+        unpack_match = unpack_to_l2 + unpack_match
         # Run the tail pack_m rows at a time so its L1 output is a strip, not
         # a second core tile. It is fused once per loop level. The row loop is
         # normalized to unit step to keep `floordiv` out of the accumulator
@@ -291,12 +277,8 @@ def generate_matmul_transform(
           transform.structured.tile_using_for %ep_v tile_sizes [1, 1, {ep_rows}, 0]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
 """
-        # Flatten the tail's rank-4 vectors to rank 1, then apply the same
-        # bf16 casts as the standalone elementwise schedules. Both are limited
-        # to the epilogue herd.
-        ep_herd_cast = """        %ep_herd = transform.structured.match ops{["air.herd"]} attributes{epilogue_herd} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %ep_herd_lin = transform.air.linearize_vectors %ep_herd : (!transform.any_op) -> !transform.any_op
-        transform.include @cast_bf16_only_ops failures(propagate) (%ep_herd_lin) : (!transform.any_op) -> ()
+        ep_herd_cast = """        transform.include @epilogue_vectorize failures(propagate) (%arg1)
+          : (!transform.any_op) -> ()
 """
 
     # Phase 10 takes every herd; there is no herd to leave alone.

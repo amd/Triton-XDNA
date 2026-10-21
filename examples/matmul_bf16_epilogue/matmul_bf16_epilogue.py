@@ -5,13 +5,12 @@
 # 1/sqrt(head_dim) scale applied to attention scores, a SiLU, and a scale with
 # a bf16 store.
 #
-# There is no transform script. The driver detects the matmul and its
-# epilogue and generates the schedule.
+# The schedule (transform_aie2p.mlir) is generated with --epilogue. One
+# schedule serves all three epilogues.
 
 import torch
 import triton
 import triton.language as tl
-from triton.backends.amd_triton_npu.driver import detect_npu_version
 import sys, os
 
 sys.path.append(os.path.abspath(".."))
@@ -100,10 +99,5 @@ def test_matmul(M, N, K, epilogue):
 if __name__ == "__main__":
     benchmark.select_npu_backend()
     torch.manual_seed(0)
-    epilogues = ["scale", "silu", "scale_bf16"]
-    # SiLU needs a vector exp, which the generated schedule supports on AIE2P
-    # only.
-    if detect_npu_version() == "npu1":
-        epilogues.remove("silu")
-    for epilogue in epilogues:
+    for epilogue in ("scale", "silu", "scale_bf16"):
         test_matmul(1024, 1024, HEAD_DIM, epilogue)

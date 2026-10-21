@@ -1371,83 +1371,27 @@ def _fold_accumulator_adds(asm_src_text):
     return str(module)
 
 
-@functools.lru_cache(maxsize=64)
-def _generics_follow_matmul(asm_src_text):
-    """Whether every ``linalg.generic`` in the module is computed from the
-    result of its single ``linalg.matmul``, i.e. is part of an output tail
-    rather than preprocessing of A or B."""
-    try:
-        context = air.ir.Context()
-        module = Module.parse(asm_src_text, context=context)
-    except Exception:
-        return False
-
-    generics, matmuls = [], []
-
-    def collect(op):
-        for region in op.regions:
-            for block in region.blocks:
-                for child in block.operations:
-                    if child.operation.name == "linalg.generic":
-                        generics.append(child.operation)
-                    elif child.operation.name == "linalg.matmul":
-                        matmuls.append(child.operation)
-                    collect(child.operation)
-
-    collect(module.operation)
-    if len(matmuls) != 1:
-        return False
-
-    reached = []
-    pending = list(matmuls[0].results)
-    while pending:
-        for use in pending.pop().uses:
-            user = use.owner.operation
-            # A matmul in a K loop reaches the tail through the loop's result.
-            if user.name == "scf.yield":
-                user = user.parent
-            if any(user == r for r in reached):
-                continue
-            reached.append(user)
-            pending.extend(user.results)
-    return all(any(g == r for r in reached) for g in generics)
-
-
 def _detect_matmul(asm_src_text):
     """Detect a single plain matmul in the TritonShared IR.
 
-    Returns a dict {m, k, n, in_elem, out_elem, k_loop, epilogue} when the
-    module contains exactly one ``linalg.matmul`` and no linalg compute ops
-    other than ``fill`` and an elementwise tail. Returns None otherwise, in
+    Returns a dict {m, k, n, in_elem, out_elem} when the module contains
+    exactly one ``linalg.matmul`` and no linalg compute ops other than
+    ``fill`` (fused epilogues are out of scope). Returns None otherwise, in
     which case the caller keeps the built-in default tiling.
 
     A ``tt.dot`` carrying a live accumulator, as in a K loop, lowers to a
     contraction plus a ``linalg.generic`` add. Detection looks at the module
     with that add folded into the contraction, which is what the generated
-    schedule does first. Generics left after that set ``epilogue`` when all
-    of them are computed from the matmul's result, as an elementwise tail
-    (a scale, an activation, a cast) is. Generics on the inputs, and tails
-    that read another tensor from DDR such as a bias, are declined.
+    schedule does first, so only other fused epilogues are declined.
     """
     import re
 
     asm_src_text = _fold_accumulator_adds(asm_src_text)
 
-    # Bail if any linalg op other than matmul / fill / generic is present
-    # (`yield` is the generic's own terminator).
+    # Bail if any linalg op other than matmul / fill is present (fusion).
     linalg_ops = set(re.findall(r"linalg\.(\w+)", asm_src_text))
-    if not linalg_ops.issubset({"matmul", "fill", "generic", "yield"}):
+    if not linalg_ops.issubset({"matmul", "fill"}):
         return None
-    epilogue = "generic" in linalg_ops
-    if epilogue:
-        iterators = re.findall(r"iterator_types = \[([^\]]*)\]", asm_src_text)
-        if any("reduction" in it for it in iterators):
-            return None
-        # A and B are the only tensors read in from DDR.
-        if asm_src_text.count("bufferization.to_tensor") != 2:
-            return None
-        if not _generics_follow_matmul(asm_src_text):
-            return None
 
     matmuls = re.findall(
         r"linalg\.matmul\b.*?"
@@ -1474,7 +1418,6 @@ def _detect_matmul(asm_src_text):
         "in_elem": in_elem,
         "out_elem": out_elem,
         "k_loop": k_loop,
-        "epilogue": epilogue,
     }
 
 
@@ -1562,7 +1505,6 @@ def _matmul_transform_params(info, npu_version):
         "contract_input_type": contract_input_type,
         "bf16_emulation": bf16_emulation,
         "k_loop": info.get("k_loop", False),
-        "epilogue": info.get("epilogue", False),
     }
 
 
