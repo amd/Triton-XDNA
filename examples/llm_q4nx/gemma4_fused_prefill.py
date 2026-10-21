@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Gemma4-E2B prefill on mlir-air's fused one-device NPU prefill.
+"""Gemma4 prefill on mlir-air's fused one-device NPU prefill.
 
 mlir-air's `fused_prefill` runs every op of a 128-token chunk on one configured
 device, with the int4 weights dequantized on the cores. This class drives it
@@ -18,19 +18,34 @@ its HIP alias. The fused prefill's host copy of K/V, kept only for `kv_stack()`,
 is dropped.
 """
 
+import importlib
+import json
+from pathlib import Path
+
 import numpy as np
 import torch
 
 import airsrc
 import kv_layout
-from config import head_dim
+from config import AIR_PACKAGES, head_dim
 from dense_fused_prefill import engine_on_launch_runtime, run_fused
 from gemma4_prefill import Gemma4Prefill, _bf16_np
 
+#: The model's mlir-air package. E4B's runs E2B's code at its own dims, so
+#: everything is reached through it rather than through E2B's directly.
+PACKAGE = AIR_PACKAGES[0]
+
+
+def _weights():
+    airsrc.add_air_paths(PACKAGE)
+    return importlib.import_module(f"{PACKAGE}_weights")
+
 
 def _fused_prefill_class():
-    airsrc.add_air_paths("gemma4_e2b_q4nx")
-    from air_examples.llms.gemma4_e2b_q4nx.fused_prefill import runtime
+    _weights()
+    runtime = importlib.import_module(
+        f"air_examples.llms.{PACKAGE}.fused_prefill.runtime"
+    )
 
     engine_on_launch_runtime()
     return runtime.FusedPrefill
@@ -56,18 +71,19 @@ class Gemma4FusedPrefill(Gemma4Prefill):
             def _kv_append(self, L, r0, k, v):
                 super()._kv_append(L, r0, k, v)
                 self.kv.pop(L, None)
-                # k, v are [T, 1, dh]: this model has one KV head.
+                # k, v are [T, n_kv, dh].
                 t = k.shape[0]
                 owner._store_kv_rows(L, r0, k.reshape(t, -1), v.reshape(t, -1))
 
-        self._fused = _Fused(build_dir, max_len=min(self.kv_attn_maxl, self.max_seq))
+        # A build with more than one KV head is made for a fixed prompt length,
+        # recorded in its manifest; one without takes any.
+        man = json.loads((Path(build_dir) / "manifest.json").read_text())
+        self._rows = min(self.kv_attn_maxl, self.max_seq, man.get("max_len") or 1 << 30)
+        self._fused = _Fused(build_dir, max_len=self._rows)
 
     def load_weights(self, model=None):
         super().load_weights(model)
-        airsrc.add_air_paths("gemma4_e2b_q4nx")
-        import gemma4_e2b_q4nx_weights as gw
-
-        self._fused.load_weights(gw.Q4nxModel(model or self.model))
+        self._fused.load_weights(_weights().Q4nxModel(model or self.model))
 
     def make_npu_resident(self):
         """Nothing to convert: the projections run in the fused prefill.
@@ -97,12 +113,12 @@ class Gemma4FusedPrefill(Gemma4Prefill):
     def prefill(self, ids):
         ids = [int(t) for t in np.asarray(ids).reshape(-1)]
         N = len(ids)
-        # Both bound the rows written below; checked before the slab is touched.
-        limit = min(self.kv_attn_maxl, self.max_seq)
-        if N > limit:
+        # These bound the rows written below; checked before the slab is touched.
+        if N > self._rows:
             raise ValueError(
-                f"a {N}-token prompt exceeds the {limit} rows this prefiller "
-                f"holds (ATTN_MAXL={self.kv_attn_maxl}, max_seq={self.max_seq})"
+                f"a {N}-token prompt exceeds the {self._rows} rows this prefiller "
+                f"holds (ATTN_MAXL={self.kv_attn_maxl}, max_seq={self.max_seq}, "
+                f"and the fused prefill build's own limit)"
             )
         self._zero_slab()
         out = run_fused(self._fused, ids)

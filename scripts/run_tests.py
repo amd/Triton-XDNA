@@ -40,6 +40,7 @@ DEFAULT_SKIPPED_EXAMPLES = {
     "phi4_mini_q4nx",
     "gemma3_4b_q4nx",
     "gemma4_e2b_q4nx",
+    "gemma4_e4b_q4nx",
     # Not an example: the harness the *_q4nx examples share. Its files are
     # libraries, and the two with a __main__ are build steps -- running
     # decode_build.py as a "test" lowers the whole decode.
@@ -78,6 +79,7 @@ SCRIPTLESS_UNSUPPORTED = {
         "phi4_mini_q4nx": "npu2-only example",
         "gemma3_4b_q4nx": "npu2-only example",
         "gemma4_e2b_q4nx": "npu2-only example",
+        "gemma4_e4b_q4nx": "npu2-only example",
     },
     "aie2p": {},
 }

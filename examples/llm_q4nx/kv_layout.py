@@ -1,6 +1,6 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
-"""The one definition of Gemma4-E2B's KV cache layout.
+"""The one definition of the Gemma4 KV cache layout (E2B and E4B).
 
 Three things read this cache -- the Triton prefill, mlir-air's fused NPU decode
 and the Triton iGPU decode -- and they used to hold two layouts between them,
@@ -18,12 +18,13 @@ The layout, as the decode template is built:
 
     slab[L]  =  [ K region: ATTN_MAXL x REGION_W ][ V region: same ][ copies ]
 
-    REGION_W = DH_A(512)
+    REGION_W = N_KV x DH_A(512)
 
-One device row holds the model's single MQA head once; the decode reads it
-back once and fans it to both attention compute units. The decode's append
-also writes each row a second time, past the K and V regions, where nothing
-reads it back; a prefill leaves that part zero. Every layer is built at
+A device row holds the model's KV heads side by side, DH_A each. E2B has one
+(MQA) head, held once: the decode reads it back once and fans it to both
+attention compute units, and its append also writes each row a second time,
+past the K and V regions, where nothing reads it back; a prefill leaves that
+part zero. E4B has two heads, one per attention compute unit, and no copy. Every layer is built at
 the widest layer's geometry, so a sliding layer's 256-wide head does not fill
 its 512-wide slot. Where it sits depends on the region:
 
@@ -37,21 +38,24 @@ contiguous alternative as measured-wrong for K. V is not roped, and the decode
 streams a sliding layer's o-proj weights for the front half of the slot only,
 so its V is contiguous there. `FusedDecoder.seed_kv` is the reference for both.
 
-All 35 layer slabs are live, including the 20 that read a lower layer's cache:
+Every layer's slab is live, including those of the layers that read a lower
+layer's cache:
 `DECODE_KV_SRC` only reaches the builder when a Makefile sets `KV_SRC`, and
 neither this repo's `decode_build.py` nor mlir-air's own `compile-decode` does,
 so the template on disk is identity-mapped -- layer L reads and appends to slab
-L. Filling only the 15 owning slabs decodes to garbage; that was measured.
+L. Filling only the owning slabs decodes to garbage; that was measured.
 """
 
+from config import N_KV_HEADS as N_KV
+
 #: Copies of the K and V regions in one layer's slab (the builder's
-#: `KV_COPIES`).
-KV_COPIES = 2
+#: `KV_COPIES`): a single head is replicated for the two attention CUs.
+KV_COPIES = 2 if N_KV == 1 else 1
 #: The build's head dim -- the full-attention layers' width. Sliding layers are
 #: half this and are padded up to it, as the module docstring describes.
 DH_A = 512
-#: One device row.
-REGION_W = DH_A
+#: One device row: every KV head, DH_A apart.
+REGION_W = N_KV * DH_A
 #: Regions per layer: K then V.
 N_REGIONS = 2
 
@@ -120,7 +124,8 @@ def _runs(dh, region):
 
 
 def scatter_rows(dst, src, dh, region):
-    """Write `src` `[n, dh]` into `dst` `[n, REGION_W]`, padded.
+    """Write `src` `[n, N_KV * dh]` into `dst` `[n, REGION_W]`, each head padded
+    into its own DH_A slot.
 
     `dst` is a `region_view` slice; `src` is the prefill's dense head. numpy and
     torch both take this unchanged, and both convert on assignment -- but pass
@@ -131,8 +136,10 @@ def scatter_rows(dst, src, dh, region):
     is zeroed before a prefill writes into it, and nothing ever writes them.
     Zeroing them per row would be half again the write volume for no effect.
     """
-    for d0, s0, w in _runs(dh, region):
-        dst[:, d0 : d0 + w] = src[:, s0 : s0 + w]
+    for h in range(N_KV):
+        for d0, s0, w in _runs(dh, region):
+            d0, s0 = d0 + h * DH_A, s0 + h * dh
+            dst[:, d0 : d0 + w] = src[:, s0 : s0 + w]
 
 
 def lane_index(dh, region):
@@ -154,7 +161,7 @@ def lane_index(dh, region):
 
 
 def gather_rows(src, dh, region, out=None):
-    """The inverse of `scatter_rows`: `[n, REGION_W]` -> `[n, dh]`.
+    """The inverse of `scatter_rows`: `[n, REGION_W]` -> `[n, N_KV * dh]`.
 
     For `kv_stack()` and `--compare-cpu`, which want the dense head back.
     """
@@ -162,7 +169,9 @@ def gather_rows(src, dh, region, out=None):
 
     n = src.shape[0]
     if out is None:
-        out = np.empty((n, dh), dtype=np.float32)
-    for d0, s0, w in _runs(dh, region):
-        out[:, s0 : s0 + w] = src[:, d0 : d0 + w]
+        out = np.empty((n, N_KV * dh), dtype=np.float32)
+    for h in range(N_KV):
+        for d0, s0, w in _runs(dh, region):
+            d0, s0 = d0 + h * DH_A, s0 + h * dh
+            out[:, s0 : s0 + w] = src[:, d0 : d0 + w]
     return out
