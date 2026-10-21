@@ -294,19 +294,8 @@ runs:
           if [ "$air_rc" -ne 0 ]; then
             echo "SKIP: Q4NX examples (mlir-air sources unavailable)"
           else
-            # Every prefill/decode placement and runtime of each model; see the
-            # script for which models and cases each scope runs.
-            #
-            # The HSA cases need an AIE-capable ROCR. Its pip package shares its
-            # name with the ROCm torch's, so it goes to a directory of its own and
-            # the script preloads it (README, "Sharing a process with PyTorch").
-            rocr_dir="${RUNNER_TEMP:-/tmp}/rocr"
-            if pip install --no-cache-dir --no-deps --target "$rocr_dir" \
-                 -r utils/rocm-requirements.txt; then
-              export AMD_NPU_ROCR_PATH="$rocr_dir/_rocm_sdk_core"
-            else
-              echo "WARNING: AIE-capable ROCR install failed; HSA cases will skip"
-            fi
+            # Every prefill/decode placement of each model; see the script for
+            # which models and cases each scope runs.
             q_fail=0
             python3 scripts/run_llm_gates.py --scope "$LLM_SCOPE" || q_fail=1
 

@@ -3,10 +3,10 @@
 # SPDX-License-Identifier: MIT
 """Run the Q4NX LLM gates on the NPU.
 
-Each model runs every prefill/decode placement and runtime that
+Each model runs every prefill/decode placement that
 examples/llm_q4nx/registry.py says it supports. `--scope nightly` runs that for
 every model; `--scope pr` runs a subset on two models that together still
-reach every placement and runtime once.
+reach every placement once.
 
 A model's cases run back to back after its own decode build: the decode
 artifacts live in one directory per decode engine, stamped with the model they
@@ -59,10 +59,7 @@ MODELS = {
 }
 
 # On PRs: Llama-3.2-1B takes the KV handoffs, Gemma4-E2B the other model family
-# and the hetero prefill. The full-ELF decode and HSA are left to nightly while
-# they fail on the runner: the ELF decode build does not write the
-# decode_scratchpad.args mlir-air now reads, and HSA hits issue #151. Case names
-# are those in `plan`.
+# and the hetero prefill. Case names are those in `plan`.
 PR_CASES = {
     "llama32_1b_q4nx": {
         "default",
@@ -102,8 +99,8 @@ class Case:
     cmd: list
     cwd: Path
     env: dict = field(default_factory=dict)
-    # Decode build this case needs: "xclbin", "elf", "hsa" or None.
-    decode: str = None
+    # Needs the model's NPU decode built.
+    npu_decode: bool = False
     # Check that the KV cache reached the NPU decode in place.
     zero_copy: bool = False
 
@@ -118,23 +115,6 @@ def has_fused_prefill(model):
     return True
 
 
-def rocr_env():
-    """HSA settings for a process that also imports ROCm torch, or None if no
-    AIE-capable ROCR is installed. See README, "Sharing a process with
-    PyTorch"."""
-    root = os.environ.get("AMD_NPU_ROCR_PATH")
-    if not root:
-        return None
-    lib = Path(root) / "lib" / "libhsa-runtime64.so.1"
-    if not lib.is_file():
-        return None
-    preload = os.environ.get("LD_PRELOAD")
-    return {
-        "AMD_TRITON_NPU_RUNTIME": "hsa",
-        "LD_PRELOAD": f"{lib}:{preload}" if preload else str(lib),
-    }
-
-
 def plan(ex, spec, fused):
     """Every case `spec` supports, for example directory `ex`."""
     d = EXAMPLES / ex
@@ -143,7 +123,7 @@ def plan(ex, spec, fused):
     cases = [
         # The default prefill engine (mlir-air's fused one where the model has
         # it) and mlir-air's NPU decode, gated on the recorded continuation.
-        Case("default", entry + gen, d, HIDE_IGPU, decode="xclbin"),
+        Case("default", entry + gen, d, HIDE_IGPU, npu_decode=True),
     ]
     if fused:
         cases.append(
@@ -152,7 +132,7 @@ def plan(ex, spec, fused):
                 entry + ["--prefill-engine", "triton"] + gen,
                 d,
                 HIDE_IGPU,
-                decode="xclbin",
+                npu_decode=True,
             )
         )
     if spec.supports_igpu:
@@ -163,7 +143,7 @@ def plan(ex, spec, fused):
                 entry + ["--prefill-engine", "triton", "--backend", "hetero"] + gen,
                 d,
                 SHOW_IGPU,
-                decode="xclbin",
+                npu_decode=True,
             ),
             Case(
                 "triton-gpu",
@@ -182,7 +162,7 @@ def plan(ex, spec, fused):
                 entry + ["--prefill-engine", "igpu"] + gen,
                 d,
                 SHOW_IGPU,
-                decode="xclbin",
+                npu_decode=True,
                 zero_copy=spec.supports_xrt_zero_copy,
             ),
         ]
@@ -191,7 +171,7 @@ def plan(ex, spec, fused):
         # the decode's KV cache into pages XRT and HIP share.
         cases.append(
             Case(
-                "zero-copy", entry + gen, d, SHOW_IGPU, decode="xclbin", zero_copy=True
+                "zero-copy", entry + gen, d, SHOW_IGPU, npu_decode=True, zero_copy=True
             )
         )
     if ex == "llama32_1b_q4nx":
@@ -221,19 +201,9 @@ def plan(ex, spec, fused):
                 ],
                 SHARED,
                 SHOW_IGPU,
-                decode="xclbin",
+                npu_decode=True,
             )
         )
-    if spec.engine == "fused_decode":
-        # mlir-air's full-ELF decode under XRT, which only the shared decode
-        # engine builds.
-        cases.append(
-            Case("elf", entry + gen, d, {**HIDE_IGPU, "DECODE_ELF": "1"}, decode="elf")
-        )
-    if spec.supports_hsa:
-        # The HSA runtime cannot share a process with torch's HIP, so it only
-        # pairs with an NPU prefill and the NPU decode.
-        cases.append(Case("hsa", entry + gen, d, HIDE_IGPU, decode="hsa"))
     return cases
 
 
@@ -275,20 +245,11 @@ def run(cmd, cwd, env, capture=False):
     return p.returncode, p.stdout if capture else ""
 
 
-def build_decode(ex, fmt, first, rocr, report):
-    """Build the decode in one format. The model's first build compiles its AIE
-    kernels too; later ones only relower the templates. Returns whether the
-    build succeeded."""
-    what = f"{ex}: decode build ({fmt})"
-    env = dict(HIDE_IGPU)
-    target = "compile-decode" if first else "recompile-decode"
-    if fmt == "elf":
-        env["DECODE_ELF"] = "1"
-    elif fmt == "hsa":
-        env.update(rocr)
-        env["RUNTIME"] = "hsa"
+def build_decode(ex, report):
+    """`make compile-decode` for one model. Returns whether it succeeded."""
+    what = f"{ex}: decode build"
     print(f"📁 {what}", flush=True)
-    rc, _ = run(["make", target], EXAMPLES / ex, env)
+    rc, _ = run(["make", "compile-decode"], EXAMPLES / ex, HIDE_IGPU)
     if rc == 0:
         report.ok(what)
         return True
@@ -337,11 +298,8 @@ def main():
     sys.path.insert(0, str(SHARED))
     import registry
 
-    rocr = rocr_env()
     report = Report()
     models = args.model or (list(MODELS) if args.scope == "nightly" else list(PR_CASES))
-    if args.list:
-        print(f"AIE-capable ROCR: {'yes' if rocr else 'no (HSA cases skip)'}")
     for ex in models:
         name = MODELS[ex]
         spec = registry.spec(name)
@@ -351,24 +309,17 @@ def main():
         print(f"\n========== {ex} ({len(cases)} cases) ==========", flush=True)
         if args.list:
             for c in cases:
-                print(f"  {c.name:24} decode={c.decode or '-':7} {' '.join(c.cmd[1:])}")
+                decode = "npu-decode" if c.npu_decode else ""
+                print(f"  {c.name:24} {decode:11} {' '.join(c.cmd[1:])}")
             continue
 
-        built = {}
+        built = None
         for case in cases:
-            fmt = case.decode
-            if fmt == "hsa" and rocr is None:
-                report.skip(
-                    f"{ex}: {case.name}", "no AIE-capable ROCR (AMD_NPU_ROCR_PATH)"
-                )
+            if case.npu_decode and built is None:
+                built = build_decode(ex, report)
+            if case.npu_decode and not built:
+                report.skip(f"{ex}: {case.name}", "its decode build failed")
                 continue
-            if fmt and fmt not in built:
-                built[fmt] = build_decode(ex, fmt, not built, rocr, report)
-            if fmt and not built[fmt]:
-                report.skip(f"{ex}: {case.name}", f"its {fmt} decode build failed")
-                continue
-            if fmt == "hsa":
-                case.env = {**case.env, **rocr}
             run_case(ex, case, report)
 
     if args.list:
