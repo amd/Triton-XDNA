@@ -55,6 +55,20 @@ triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *hsaco_path,
                                                 char *errbuf,
                                                 size_t errbuf_len);
 
+// Like triton_npu_hsa_prepare, but pack-loads an hsaco already in memory
+// instead of reading one from a file. The bytes are copied before this call
+// returns, so hsaco_data need not outlive it.
+//
+// Unlike triton_npu_hsa_prepare, not cached by path -- there is no path to key
+// on. Meant for an hsaco that is good for only one load (e.g. one baked with a
+// single scratchpad's device address, which no other hsaco shares); preparing
+// the same bytes twice loads two independent programs rather than reusing one.
+triton_npu_hsa_program_t triton_npu_hsa_prepare_bytes(const void *hsaco_data,
+                                                      uint64_t hsaco_size,
+                                                      const char *kernel_name,
+                                                      char *errbuf,
+                                                      size_t errbuf_len);
+
 // Initialize the runtime (idempotent) and allocate a zeroed control scratchpad
 // of `size` bytes for a full-ELF design that declares parameters. Returns its
 // host address and writes the address the NPU reaches it by to *dev_addr, or

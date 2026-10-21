@@ -528,6 +528,21 @@ public:
     return raw;
   }
 
+  // Load + resolve an hsaco already in memory, as prepare() does for one on
+  // disk. Not cached: bytes_programs_ only owns the result so its lifetime
+  // outlives this call, the same guarantee prepare()'s cache gives by
+  // accident. Thread-safe.
+  triton_npu_hsa_program *prepare_bytes(std::vector<char> hsaco_bytes,
+                                        const char *kernel_name) {
+    auto prog = std::make_unique<triton_npu_hsa_program>();
+    prog->exe =
+        LoadedExecutable::load(aie_agent_, std::move(hsaco_bytes), kernel_name);
+    triton_npu_hsa_program *raw = prog.get();
+    std::lock_guard<std::mutex> lock(programs_mtx_);
+    bytes_programs_.push_back(std::move(prog));
+    return raw;
+  }
+
   // Allocate a zeroed control scratchpad and return its host address, with the
   // address the NPU reaches it by in *dev_addr. Kept until teardown: that
   // address is baked into a program's control code, and programs are never
@@ -930,6 +945,11 @@ private:
   // destructor freeing them all. Unlike regions_ below, which cannot be.
   std::unordered_map<std::string, std::unique_ptr<triton_npu_hsa_program>>
       programs_;
+  // Programs from prepare_bytes(), which has no key to look one up by (each
+  // is loaded from an hsaco meant for a single use). Owns them so they
+  // outlive the call, same as programs_ for the path-keyed ones; the one
+  // iteration is the destructor freeing them all, like programs_.
+  std::vector<std::unique_ptr<triton_npu_hsa_program>> bytes_programs_;
   // Control scratchpads by host address (see scratchpad_alloc). Guarded by
   // programs_mtx_, since each one belongs to a program.
   std::unordered_map<void *, PoolBuffer> scratchpads_;
@@ -1080,6 +1100,7 @@ private:
         vmem_free(b);
     vmem_pool_.clear();
     programs_.clear();
+    bytes_programs_.clear();
     scratchpads_.clear();
     kernarg_buffer_ = PoolBuffer{};
     if (signal_.handle) {
@@ -1615,6 +1636,26 @@ triton_npu_hsa_prepare(const char *hsaco_path, const char *kernel_name,
     return nullptr;
   } catch (...) {
     write_err(errbuf, errbuf_len, "HSA prepare failed", "unknown error");
+    return nullptr;
+  }
+}
+
+extern "C" triton_npu_hsa_program_t
+triton_npu_hsa_prepare_bytes(const void *hsaco_data, uint64_t hsaco_size,
+                             const char *kernel_name, char *errbuf,
+                             size_t errbuf_len) {
+  try {
+    if (!hsaco_data || !kernel_name)
+      throw std::runtime_error("null hsaco_data or kernel_name");
+    const auto *bytes = static_cast<const char *>(hsaco_data);
+    return runtime().prepare_bytes(std::vector<char>(bytes, bytes + hsaco_size),
+                                   kernel_name);
+  } catch (const std::exception &e) {
+    write_err(errbuf, errbuf_len, "HSA prepare (bytes) failed", e.what());
+    return nullptr;
+  } catch (...) {
+    write_err(errbuf, errbuf_len, "HSA prepare (bytes) failed",
+              "unknown error");
     return nullptr;
   }
 }

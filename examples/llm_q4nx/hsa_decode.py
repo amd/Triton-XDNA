@@ -25,7 +25,6 @@ before any compute.
 import ctypes
 import os
 import re
-import tempfile
 import threading
 import weakref
 
@@ -178,21 +177,18 @@ class HsaElfProgram:
             ctypes.cast(va, ctypes.POINTER(ctypes.c_uint32)), (size // 4,)
         )
 
-        # Full ELF is aie2p only. The runtime caches programs by path, and this
-        # hsaco is good only for this scratchpad, so the path names it: the
-        # runtime never frees a scratchpad, so no other one has its address.
+        # Full ELF is aie2p only. This hsaco is good only for this scratchpad
+        # (it is baked with this one's device address), so prepare_bytes loads
+        # it straight from memory rather than caching it by a path nothing else
+        # would ever share.
         hsaco = _pack_hsaco(
             "elf", {"elf_path": str(elf_path)}, "aie2p", kernel_name, dev_addr.value
         )
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, f"decode_{dev_addr.value:x}.hsaco")
-            with open(path, "wb") as f:
-                f.write(hsaco)
-            buf, n = _errbuf()
-            self.lib.triton_npu_hsa_prepare.restype = ctypes.c_void_p
-            self.handle = self.lib.triton_npu_hsa_prepare(
-                path.encode(), kernel_name.encode(), buf, n
-            )
+        buf, n = _errbuf()
+        self.lib.triton_npu_hsa_prepare_bytes.restype = ctypes.c_void_p
+        self.handle = self.lib.triton_npu_hsa_prepare_bytes(
+            hsaco, ctypes.c_uint64(len(hsaco)), kernel_name.encode(), buf, n
+        )
         if not self.handle:
             raise HsaDecodeError(buf.value.decode())
         self.lock = threading.Lock()

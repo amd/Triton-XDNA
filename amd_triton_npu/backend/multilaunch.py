@@ -33,8 +33,8 @@ from .driver import (
     _get_output_format,
     _get_cached_aircc_artifacts,
     _put_aircc_artifacts,
-    _pack_hsaco,
-    _NPU_VERSION_TO_ARCH,
+    _cached_hsaco,
+    _pack_and_cache_hsaco,
     detect_npu_version,
     npu_wait_module,
     release_external_contexts,
@@ -295,12 +295,11 @@ module {{
                 with open(cached["elf_kernel_name_path"]) as f:
                     elf_kernel_name = f.read()
             if link_profile == "hsa":
-                hsaco_path = cache.get_file("kernel.hsaco")
-                if hsaco_path is not None:
-                    hsaco_kernel_name = (
-                        elf_kernel_name if output_format == "elf" else self.name
-                    )
-                    return hsaco_path, hsaco_kernel_name
+                cached_hsaco = _cached_hsaco(
+                    cache, output_format, elf_kernel_name, self.name
+                )
+                if cached_hsaco is not None:
+                    return cached_hsaco
                 cached = None  # hsaco missing: force a rebuild below
             elif output_format == "elf":
                 return cached["elf_path"], elf_kernel_name
@@ -323,13 +322,14 @@ module {{
         # Cache the format-specific artifacts and return the cached paths.
         cached = _put_aircc_artifacts(cache, artifacts, output_format)
         if link_profile == "hsa":
-            arch = _NPU_VERSION_TO_ARCH[npu_version]
-            hsaco_kernel_name = (
-                artifacts["elf_kernel_name"] if output_format == "elf" else self.name
+            return _pack_and_cache_hsaco(
+                cache,
+                output_format,
+                artifacts,
+                npu_version,
+                artifacts.get("elf_kernel_name"),
+                self.name,
             )
-            hsaco_bytes = _pack_hsaco(output_format, artifacts, arch, hsaco_kernel_name)
-            hsaco_path = cache.put(hsaco_bytes, "kernel.hsaco", binary=True)
-            return hsaco_path, hsaco_kernel_name
         if output_format == "elf":
             return cached["elf_path"], artifacts["elf_kernel_name"]
         return cached["bin_path"], cached["insts_path"]

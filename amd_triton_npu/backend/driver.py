@@ -2558,6 +2558,12 @@ def _scratchpad_relocs(blob):
             raise ValueError(f"scratchpad relocation with patch scheme {scheme}")
         size = st_size
         relocs.append((off, f.sections[st_shndx].offset + r_offset, addend))
+    # hsa_decode.py views the scratchpad as whole uint32 words
+    # (size // 4); a size that isn't a multiple of 4 would silently truncate
+    # the last partial word instead of failing where the build is actually
+    # broken.
+    if size % 4 != 0:
+        raise ValueError(f"scratchpad size {size} is not a multiple of 4")
     return size, relocs
 
 
@@ -2634,6 +2640,50 @@ def _pack_hsaco(output_format, artifacts, arch, kernel_name, scratchpad_addr=Non
             + ["--arch", arch, *kernel]
         )
         return Path(path).read_bytes()
+
+
+def _hsaco_kernel_name(output_format, elf_kernel_name, pdi_kernel_name):
+    """The name ``_pack_hsaco`` looks the kernel up by: the full ELF's own
+    instance-qualified name for ``output_format == "elf"``, or the caller's own
+    (arbitrary) kernel name for a PDI + instruction sequence -- packing and the
+    later ``hsa_executable_get_symbol_by_name`` only have to agree with each
+    other.
+    """
+    return elf_kernel_name if output_format == "elf" else pdi_kernel_name
+
+
+def _cached_hsaco(cache, output_format, elf_kernel_name, pdi_kernel_name):
+    """The cached hsaco's ``(path, kernel_name)``, or ``None`` if it is missing.
+
+    Callers that already resolved the format-specific aircc artifacts
+    (xclbin/insts or elf/elf_kernel_name) from the cache ask this before
+    deciding to rebuild. ``None`` means those format-specific artifacts are
+    cached but the hsaco itself is not (e.g. a cache dir from before this
+    hsaco path existed), so the caller should treat that as a cache miss for
+    the hsaco alone, not for the format-specific artifacts it already has.
+    """
+    hsaco_path = cache.get_file("kernel.hsaco")
+    if hsaco_path is None:
+        return None
+    return hsaco_path, _hsaco_kernel_name(
+        output_format, elf_kernel_name, pdi_kernel_name
+    )
+
+
+def _pack_and_cache_hsaco(
+    cache, output_format, artifacts, npu_version, elf_kernel_name, pdi_kernel_name
+):
+    """Pack aircc's artifacts into an hsaco, cache it, and return ``(hsaco_path,
+    hsaco_kernel_name)``. ``elf_kernel_name``/``pdi_kernel_name`` are as for
+    ``_hsaco_kernel_name``.
+    """
+    arch = _NPU_VERSION_TO_ARCH[npu_version]
+    hsaco_kernel_name = _hsaco_kernel_name(
+        output_format, elf_kernel_name, pdi_kernel_name
+    )
+    hsaco_bytes = _pack_hsaco(output_format, artifacts, arch, hsaco_kernel_name)
+    hsaco_path = cache.put(hsaco_bytes, "kernel.hsaco", binary=True)
+    return hsaco_path, hsaco_kernel_name
 
 
 def compile_module(
@@ -2800,6 +2850,15 @@ def compile_module(
         filename = f"{name}.pyd" if IS_WINDOWS else f"{name}.so"
         cache_path = cache.get_file(filename)
         cached_artifacts = _get_cached_aircc_artifacts(cache, output_format)
+        if cached_artifacts is None:
+            # A compiled __npu_dispatch.so with no aircc artifacts behind it is
+            # unusable: cache_elf_path/cache_bin_path (and, under HSA,
+            # cache_hsaco_path/hsaco_kernel_name) are only set inside the
+            # `cached_artifacts is not None` block below, so leaving cache_path
+            # as a cache hit here would reach the final dispatch with those
+            # names never assigned -- an UnboundLocalError instead of a clean
+            # rebuild. Treat a partially-evicted cache dir as a full miss.
+            cache_path = None
         if cached_artifacts is not None:
             if output_format == "elf":
                 cache_elf_path = cached_artifacts["elf_path"]
@@ -2808,8 +2867,14 @@ def compile_module(
                 cache_bin_path = cached_artifacts["bin_path"]
                 cache_insts_path = cached_artifacts["insts_path"]
             if link_profile == "hsa":
-                cache_hsaco_path = cache.get_file("kernel.hsaco")
-                if cache_hsaco_path is None:
+                elf_kernel_name = None
+                if output_format == "elf":
+                    with open(cache_elf_kernel_path) as f:
+                        elf_kernel_name = f.read().strip()
+                cached_hsaco = _cached_hsaco(
+                    cache, output_format, elf_kernel_name, kernel_name
+                )
+                if cached_hsaco is None:
                     # Force a real rebuild: cache_path gates that branch below,
                     # not cached_artifacts, so both have to be cleared or a
                     # cache dir with a compiled .so but no kernel.hsaco (e.g.
@@ -2818,11 +2883,8 @@ def compile_module(
                     # dispatch with no cache_hsaco_path/hsaco_kernel_name set.
                     cached_artifacts = None
                     cache_path = None
-                elif output_format == "elf":
-                    with open(cache_elf_kernel_path) as f:
-                        hsaco_kernel_name = f.read().strip()
                 else:
-                    hsaco_kernel_name = kernel_name
+                    cache_hsaco_path, hsaco_kernel_name = cached_hsaco
 
         if cache_path is None:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -2921,17 +2983,13 @@ def compile_module(
                     cache_bin_path = cached_artifacts["bin_path"]
                     cache_insts_path = cached_artifacts["insts_path"]
                 if link_profile == "hsa":
-                    arch = _NPU_VERSION_TO_ARCH[npu_version]
-                    hsaco_kernel_name = (
-                        artifacts["elf_kernel_name"]
-                        if output_format == "elf"
-                        else kernel_name
-                    )
-                    hsaco_bytes = _pack_hsaco(
-                        output_format, artifacts, arch, hsaco_kernel_name
-                    )
-                    cache_hsaco_path = cache.put(
-                        hsaco_bytes, "kernel.hsaco", binary=True
+                    cache_hsaco_path, hsaco_kernel_name = _pack_and_cache_hsaco(
+                        cache,
+                        output_format,
+                        artifacts,
+                        npu_version,
+                        artifacts.get("elf_kernel_name"),
+                        kernel_name,
                     )
                 with open(so_path, "rb") as f:
                     cache_path = cache.put(f.read(), filename, binary=True)
