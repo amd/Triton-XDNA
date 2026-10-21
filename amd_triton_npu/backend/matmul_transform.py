@@ -237,22 +237,21 @@ def generate_matmul_transform(
     # The elementwise tail after the matmul, run on the epilogue herd.
     ep_prefuse = ep_dlp = ep_fuse = ep_vector_tiling = ep_herd_cast = ""
     if epilogue:
-        # Rows per vector op, for 16-lane vectors: the bf16 casts below and
-        # the f32 reciprocal both need 16 or 32 lanes.
+        # Rows per vector op, so each op in the tail is 16 lanes wide.
         ep_rows = 16 // pack_n
         assert 1 <= ep_rows <= pack_m and 16 % pack_n == 0, (pack_m, pack_n)
-        # triton-shared emits one generic per op, and broadcasts each scalar
-        # through a 2-D fill. Fusing them leaves the accumulator's init as the
-        # only linalg.fill, which the fill matching below relies on.
+        # Fuse the tail into one generic. Scalar operands then sit in its body
+        # rather than in broadcast fills, so the accumulator init is the only
+        # linalg.fill, as the fill matching below expects.
         ep_prefuse = """
         %ep_func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
         %ep_func_fused = transform.air.fuse_elementwise_linalg %ep_func : (!transform.any_op) -> !transform.any_op
         %ep_op0 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
         transform.annotate %ep_op0 "epilogue_op" : !transform.any_op
 """
-        # Move C's unpack after the tail. The tail then works on the packed
-        # accumulator and is the unpack's producer, so it can be fused into
-        # the epilogue forall (fuse_into_containing_op only fuses producers).
+        # Move C's unpack after the tail, so the tail works on the packed
+        # accumulator and can be fused into the epilogue forall as the
+        # unpack's producer.
         ep_dlp = """
         %dlp_func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
         transform.apply_patterns to %dlp_func {
@@ -268,14 +267,10 @@ def generate_matmul_transform(
             <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
 """
         unpack_match = unpack_l2_home + unpack_match
-        # Process the core tile pack_m rows at a time, so the tail's L1 output
-        # is a strip rather than a full tile; a full f32 tile does not fit in
-        # L1 next to the accumulator and the A/B buffers. The tail is fused
-        # twice because each fusion moves it down one loop level. The row
-        # loop steps by pack_m, which puts `iv floordiv pack_m` into the
-        # accumulator index, and AIR's L1 partitioning cannot split the
-        # accumulator per core through a floordiv. Normalizing the loop to
-        # unit step turns the index back into `iv`.
+        # Run the tail pack_m rows at a time so its L1 output is a strip, not
+        # a second core tile. It is fused once per loop level. The row loop is
+        # normalized to unit step to keep `floordiv` out of the accumulator
+        # index, which AIR's per-core L1 partitioning needs.
         ep_fuse = f"""        %ep_rows_unpack, %ep_rows_loop =
           transform.structured.tile_using_for %epilogue_tiled_unpack tile_sizes [{pack_m}, 0]
             : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
@@ -296,10 +291,9 @@ def generate_matmul_transform(
           transform.structured.tile_using_for %ep_v tile_sizes [1, 1, {ep_rows}, 0]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
 """
-        # The vectorized tail is rank 4 (1 x 1 x ep_rows x pack_n), which
-        # aievec cannot lower; linearize it to rank 1. Then apply the same
-        # bf16 casts as the standalone elementwise schedules. Both are scoped
-        # to the epilogue herd so the compute herd is left alone.
+        # Flatten the tail's rank-4 vectors to rank 1, then apply the same
+        # bf16 casts as the standalone elementwise schedules. Both are limited
+        # to the epilogue herd.
         ep_herd_cast = """        %ep_herd = transform.structured.match ops{["air.herd"]} attributes{epilogue_herd} in %arg1 : (!transform.any_op) -> !transform.any_op
         %ep_herd_lin = transform.air.linearize_vectors %ep_herd : (!transform.any_op) -> !transform.any_op
         transform.include @cast_bf16_only_ops failures(propagate) (%ep_herd_lin) : (!transform.any_op) -> ()

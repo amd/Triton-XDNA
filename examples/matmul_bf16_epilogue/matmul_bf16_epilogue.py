@@ -86,8 +86,7 @@ def test_matmul(M, N, K, epilogue):
         BLOCK_SIZE_N=BLOCK_SIZE_N,
     )
     ref = a.float() @ b.float()
-    # The tolerance is the plain GEMM's, carried through the tail: the scale
-    # shrinks the error with the values, SiLU's slope is at most ~1.1.
+    # The plain GEMM's tolerance, scaled along with the output.
     atol = 1e-1 * K**0.5
     if epilogue == "silu":
         ref = torch.nn.functional.silu(ref)
@@ -102,8 +101,8 @@ if __name__ == "__main__":
     benchmark.select_npu_backend()
     torch.manual_seed(0)
     epilogues = ["scale", "silu", "scale_bf16"]
-    # AIE2 has no vector exp; it comes from an external kernel object the
-    # generated schedule does not link, so SiLU is AIE2P-only here.
+    # SiLU needs a vector exp, which the generated schedule supports on AIE2P
+    # only.
     if detect_npu_version() == "npu1":
         epilogues.remove("silu")
     for epilogue in epilogues:
