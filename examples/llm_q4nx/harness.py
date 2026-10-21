@@ -727,39 +727,34 @@ def fused_prefill_config(cfg, max_seq=None):
 def fused_prefill_cls(cfg, prefill_cls, config, triton=False):
     """A `prefill_cls` that runs mlir-air's fused NPU prefill.
 
-    Builds it through `tl.extra.npu.fused_prefill` (a cache hit after the first
-    build) and returns a factory with `run_prefill`'s calling convention. The
-    prefiller's own host path runs on the CPU backend, so no Triton NPU chain
-    is built. Gemma4-E2B's keeps the embedding, norms and head its decoders
-    read; a dense model's (`dense_fused_prefill`) keeps nothing but the KV.
+    Builds it through `tl.extra.npu.fused_prefill`, or through
+    `gemma4_triton_fused` if `triton` (a cache hit after the first build), and
+    returns a factory with `run_prefill`'s calling convention. The prefiller's
+    own host path runs on the CPU backend, so no Triton NPU chain is built.
+    Gemma4-E2B's keeps the embedding, norms and head its decoders read; a dense
+    model's (`dense_fused_prefill`) keeps nothing but the KV.
     """
     import triton.language as tl
 
-    built = tl.extra.npu.fused_prefill(config, airsrc.fused_prefill_dir(config.package))
-    print(
-        f"[fused-prefill] {built['build_dir']} "
-        f"({'cached' if built['cached'] else 'built'})",
-        flush=True,
-    )
-
-    if config.dense:
-        from dense_fused_prefill import fused_prefill_class
-
-        cls = fused_prefill_class(prefill_cls, config.dense)
-    elif triton:
-        # mlir-air's build supplies everything but the device, which is
-        # rebuilt with the GEMMs from Triton.
+    if triton:
+        # The same device with its GEMMs compiled from Triton.
         from gemma4_fused_prefill import Gemma4TritonFusedPrefill as cls
         from gemma4_triton_fused import triton_fused_prefill
 
-        built = triton_fused_prefill(built["build_dir"])
-        print(
-            f"[triton-fused-prefill] {built['build_dir']} "
-            f"({'cached' if built['cached'] else 'built'})",
-            flush=True,
-        )
+        built, tag = triton_fused_prefill(), "triton-fused-prefill"
     else:
-        from gemma4_fused_prefill import Gemma4FusedPrefill as cls
+        fp_dir = airsrc.fused_prefill_dir(config.package)
+        built, tag = tl.extra.npu.fused_prefill(config, fp_dir), "fused-prefill"
+        if config.dense:
+            from dense_fused_prefill import fused_prefill_class
+
+            cls = fused_prefill_class(prefill_cls, config.dense)
+        else:
+            from gemma4_fused_prefill import Gemma4FusedPrefill as cls
+    print(
+        f"[{tag}] {built['build_dir']} ({'cached' if built['cached'] else 'built'})",
+        flush=True,
+    )
 
     def make(backend=None, **kw):
         return cls(built["build_dir"], backend="cpu", **kw)

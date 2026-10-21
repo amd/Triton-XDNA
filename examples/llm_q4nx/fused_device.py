@@ -10,7 +10,6 @@ prebuilt modules' herds already use.
 """
 
 import os
-import re
 
 from triton.backends.amd_triton_npu.config import config_context
 from triton.backends.amd_triton_npu.driver import (
@@ -21,7 +20,6 @@ from triton.backends.amd_triton_npu.driver import (
 from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 SEG = "seg"
-NUM_COLS = {"npu1": 4, "npu2": 8}
 
 
 class FusedDevice:
@@ -43,6 +41,7 @@ class FusedDevice:
         # The op's run-time ints, bound in the launch: the herds take them as
         # RTPs, so every shape of a kernel has the same segment body.
         _bind_ints(m, kernel, args)
+        _drop_unused_scalars(_entry(m))
         self.ops.append((name, kernel.fn.__name__, str(m)))
 
     def add_air(self, name, air_text):
@@ -139,8 +138,8 @@ class FusedDevice:
                     s.attributes["sym_name"] = StringAttr.get(SEG)
                     s.attributes["x_loc"] = IntegerAttr.get(i64, 0)
                     s.attributes["y_loc"] = IntegerAttr.get(i64, 2)
-                texts.append(_drop_unused_scalars(str(m), name))
-            return _link(texts)
+                texts.append(str(m))
+        return _link(texts)
 
     def compile(
         self,
@@ -152,9 +151,6 @@ class FusedDevice:
     ):
         npu = detect_npu_version()
         text = self.module_text()
-        width = max(self._used, default=-1) + 1
-        if width > NUM_COLS.get(npu, 8):
-            raise ValueError(f"the herds need {width} columns, {npu} has fewer")
         os.makedirs(os.path.join(self.proj, "air_project"), exist_ok=True)
         for o in map(os.path.abspath, objects):
             # link_with objects, found next to the cores' code
@@ -192,22 +188,39 @@ def _herd_width(h):
     raise ValueError(f"herd {h.attributes['sym_name']}: size is not a constant")
 
 
-def _drop_unused_scalars(text, name):
-    """The op's sequence takes only the scalars it still reads."""
-    head = f"func.func @{name}("
-    i = text.index(head) + len(head)
-    depth, j = 1, i
-    while depth:
-        depth += {"(": 1, ")": -1}.get(text[j], 0)
-        j += 1
-    sig, body = text[i : j - 1], text[j:]
-    keep = []
-    for a in re.split(r",\s*(?=%)", sig):
-        argname = a.split(":")[0].strip()
-        used = re.search(re.escape(argname) + r"(?![\w])", body)
-        if "memref" in a or used:
-            keep.append(a)
-    return text[:i] + ", ".join(keep) + text[j - 1 :]
+def _entry(m):
+    """The module's public func with a body: the kernel."""
+    return next(
+        op
+        for op in m.body.operations
+        if op.operation.name == "func.func"
+        and len(op.regions[0].blocks)
+        and "sym_visibility" not in op.attributes
+    )
+
+
+def _drop_unused_scalars(fn):
+    """Erase the func's scalar arguments nothing reads, so its runtime
+    sequence takes only buffers and the scalars it still uses."""
+    from air.ir import ArrayAttr, FunctionType, MemRefType, TypeAttr
+
+    block = fn.regions[0].blocks[0]
+    keep = [
+        isinstance(a.type, MemRefType) or bool(list(a.uses)) for a in block.arguments
+    ]
+    for i in reversed(range(len(keep))):
+        if not keep[i]:
+            block.erase_argument(i)
+    old = FunctionType(TypeAttr(fn.attributes["function_type"]).value)
+    with fn.context:
+        fn.attributes["function_type"] = TypeAttr.get(
+            FunctionType.get([a.type for a in block.arguments], old.results)
+        )
+        if "arg_attrs" in fn.attributes:
+            attrs = ArrayAttr(fn.attributes["arg_attrs"])
+            fn.attributes["arg_attrs"] = ArrayAttr.get(
+                [a for a, k in zip(attrs, keep) if k]
+            )
 
 
 def _bind_ints(m, kernel, args):
@@ -215,14 +228,7 @@ def _bind_ints(m, kernel, args):
     from air.dialects import arith
     from air.ir import FloatAttr, InsertionPoint, IntegerAttr, IntegerType, Location
 
-    fn = next(
-        op
-        for op in m.body.operations
-        if op.operation.name == "func.func"
-        and len(op.regions[0].blocks)
-        and "sym_visibility" not in op.attributes
-    )
-    block = fn.regions[0].blocks[0]
+    block = _entry(m).regions[0].blocks[0]
     with m.context, Location.unknown(m.context):
         ip = InsertionPoint.at_block_begin(block)
         i32 = IntegerType.get_signless(32)
@@ -252,25 +258,9 @@ def _ops_named(op, name):
 
 
 def _link(texts):
-    from air.ir import Context, Location, Module
+    import airsrc
 
-    with Context(), Location.unknown():
-        mods = [Module.parse(t) for t in texts]
-        base, seen = mods[0], {}
+    airsrc.register_air_examples()
+    from air_examples.llms.shared.fused_prefill.build import _link
 
-        def key(op):
-            if "sym_name" in op.attributes:
-                return str(op.attributes["sym_name"])
-
-        for op in base.body.operations:
-            seen[key(op)] = op.get_asm(print_generic_op_form=True)
-        for m in mods[1:]:
-            for op in list(m.body.operations):
-                k, text = key(op), op.get_asm(print_generic_op_form=True)
-                if k in seen:
-                    if seen[k] != text:
-                        raise ValueError(f"ops declare {k} differently")
-                    continue
-                seen[k] = text
-                base.body.append(op)
-        return str(base)
+    return _link(texts)
