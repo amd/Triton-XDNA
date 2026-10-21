@@ -68,6 +68,9 @@ DEFAULT_L = 2048
 ELF_NAME = "decode_scratchpad.elf"
 ELF_PARAMS = "decode_scratchpad.params.txt"
 ELF_MAXL = "decode_scratchpad.maxl"
+#: Which sequence argument each runtime scalar is, which mlir-air's ElfDecode
+#: computes the scratchpad parameters from.
+ELF_ARGS = "decode_scratchpad.args"
 #: The model the ELF was built for. Separate from STAMP, which every template
 #: build rewrites while leaving the ELF in place.
 ELF_MODEL = "decode_scratchpad.model"
@@ -197,7 +200,8 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
 
 
 def _copy_elf(art, out_dir, model):
-    """Copy the full ELF, its parameter list and its ATTN_MAXL into `out_dir`."""
+    """Copy the full ELF, its parameter list, its scalar arguments and its
+    ATTN_MAXL into `out_dir`."""
     # aiecc writes params.txt beside the ELF. Without it the host cannot find
     # the parameters in the scratchpad, so a build that emitted none is an error.
     params = os.path.join(os.path.dirname(art["elf_path"]), "params.txt")
@@ -207,9 +211,22 @@ def _copy_elf(art, out_dir, model):
             "so the context length has no way to reach the device. It needs an "
             "mlir-air whose fused_decode honours DECODE_DYNSEQ."
         )
+    scalars = art.get("seq_scalar_args") or {}
+    if "L" not in scalars:
+        raise SystemExit(
+            "the build reported no sequence argument for the context length, so "
+            f"{ELF_ARGS} cannot be written. It needs an mlir-air whose "
+            "fused_decode records SEQ_SCALAR_ARGS."
+        )
     dst_e = os.path.join(out_dir, ELF_NAME)
     shutil.copyfile(art["elf_path"], dst_e)
     shutil.copyfile(params, os.path.join(out_dir, ELF_PARAMS))
+    # The format mlir-air's own ELF build writes: the readback takes whole
+    # blocks, one part, and no window skip.
+    with open(os.path.join(out_dir, ELF_ARGS), "w") as f:
+        for name, n in scalars.items():
+            f.write(f"arg {n} {name}\n")
+        f.write("align 1\nparts 1\n")
     # Recorded, not defaulted: a driver assuming another ATTN_MAXL mis-sizes the
     # KV cache and the mask threshold.
     with open(os.path.join(out_dir, ELF_MAXL), "w") as f:

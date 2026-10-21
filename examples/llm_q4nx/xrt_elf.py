@@ -84,35 +84,17 @@ def install(air):
     class ElfDecode(elf.ElfDecode):
         _pyxrt_scratchpad = True
 
+        # Only the writer changes. `dispatch` computes the parameter values
+        # and calls `write` and `sync`, which `Scratchpad` provides.
         def bind(self, bos):
             self.run = self.xrt.run(self.kern)
             for i, b in enumerate(bos):
                 self.run.set_arg(i, b)
             self.params = Scratchpad(self.run, self.params_path)
-            # Older builds declare the context length as a trailing scalar
-            # argument, which XRT requires set; newer ones read it only from
-            # the scratchpad and declare no such argument.
-            try:
-                self.run.set_arg(self.scalar_arg, 0)
-                self._l_arg = True
-            except IndexError:
-                self._l_arg = False
             print(
                 f"[xrt-elf] ONE full ELF: {self.elf_path.name}, L in "
                 f"{len(self.params._params)} scratchpad words",
                 flush=True,
             )
-
-        def dispatch(self, L, np):
-            self.params.write(
-                self.append_param, np.int32(L * self.append_scale + self.append_addend)
-            )
-            self.params.write(self.mask_param, np.int32(L))
-            self.params.sync()
-            if self._l_arg:
-                self.run.set_arg(self.scalar_arg, L)
-            self.run.start()
-            self.run.wait(elf.DISPATCH_TIMEOUT_MS)
-            return self.run.state()
 
     elf.ElfDecode = ElfDecode
