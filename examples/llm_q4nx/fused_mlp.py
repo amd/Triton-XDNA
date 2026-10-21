@@ -55,15 +55,12 @@ reading both column halves at a row stride; every spelling of that failed --
 script hangs the device, and a 1D linear-index form (`row = offs // INTER`)
 fails in aircc.
 
-The contraction: exact K, restated in MLIR
-------------------------------------------
-`_mm_kernel` contracts the whole of K in one tile, which asks two things of K
-at once: `tl.arange` wants a power of two, and `rows * K` has to stay under
-Triton's tensor cap. Those are the FRONTEND's rules, not `linalg.matmul`'s, so
-every GEMM here is captured at a K the frontend accepts and then restated to
-contract the real one (`_exact_k_ttshared`): `gate`/`up` contract D=1536, not
-2048, and `down` contracts the FFN width in one op, captured at
-`_DOWN_CAPTURE_K` and widened to 6144 or 12288. Nothing is padded in K and
+The contraction: exact K
+------------------------
+`_mm_kernel` is Triton's usual GEMM: a loop over K, one `BLOCK_SIZE_K` slice
+per step, accumulating `tl.dot` in f32. The slice is the schedule's `l2_k`, so
+any multiple of it is a legal K: `gate`/`up` contract D=1536, not 2048, and
+`down` contracts the whole FFN width in one op. Nothing is padded in K and
 nothing is split, so no partial sums and no adds to fold them back.
 
 This replaced two earlier arrangements -- padding K to a power of two, and
@@ -89,7 +86,7 @@ import triton
 import triton.language as tl
 from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
-# The tile width, the row tiers and Triton's tensor cap come from `kernels`.
+# The tile width and the row tiers come from `kernels`.
 # The chain runs the same GEMM kernel on the same schedule as every standalone
 # projection, so a second opinion here would be a second opinion about the
 # hardware.
@@ -97,7 +94,6 @@ from kernels import (
     DEEP_L2_K,
     L2_K,
     MAX_BLOCK_NUMEL,
-    MAX_TILE_NUMEL,
     _GELU_2C,
     _GELU_K,
     col_tier,
@@ -106,7 +102,6 @@ from kernels import (
     igpu_share,
     matmul_script,
     npu_device,
-    narrow_k,
     row_tier,
     script,
     unaliased_stride,
@@ -114,6 +109,18 @@ from kernels import (
 
 #: Qwen's, unmodified. See the module docstring.
 MERGE_SCRIPT = "qwen2_5/transform_swiglu_f32in_aie2p.mlir"
+#: The 64x128 matmul schedule with an epilogue herd, for gate and up writing
+#: bf16 (the gate through gelu_tanh), and the K step it is written for.
+EPI_SCRIPT = "llm_q4nx/transform_matmul_epilogue_aie2p.mlir"
+EPI_L2_K = 32
+#: The bf16 multiply that joins gate and up.
+MUL_SCRIPT = "qwen2_5/transform_add_aie2p.mlir"
+#: From this many rows per chain, gate (gelu_tanh in its epilogue) and up write
+#: bf16 and a multiply joins them. Narrower chains keep the f32 planes and the
+#: merge, which are faster there. Q4NX_FFN_GATE_EPILOGUE=0 keeps them at every
+#: width.
+GATE_EPILOGUE_MIN_ROWS = 512
+_GATE_EPILOGUE = os.environ.get("Q4NX_FFN_GATE_EPILOGUE", "1") == "1"
 #: The f32 variant: these operands are produced on-device by the GEMMs before
 #: it and never touch the host, so they are still f32 rather than bf16.
 #: It splits the range over four of npu2's eight columns. Widening it to eight
@@ -124,12 +131,6 @@ ADD_SCRIPT = "gpt2/transform_add_f32_aie2p.mlir"
 
 class SharedBufferUnavailable(RuntimeError):
     """Raised inside `_io_pages` to take its fallback path."""
-
-
-#: The K a `down` capture is taken at. Any legal one will do -- the extent is
-#: restated afterwards -- and this is small enough that `block_m * K` clears
-#: Triton's tensor cap at every row tier.
-_DOWN_CAPTURE_K = 1024
 
 
 def _host(w):
@@ -149,12 +150,8 @@ def _pow2(n):
 def _plan_down(inter):
     """`(HID, chunk)` -- the width the merge writes, and one `down` K tile.
 
-    Both are now the FFN width itself. `down` contracts that width, and the
-    two rules that used to forbid saying so -- `tl.arange` wants a power of
-    two, `rows * K` must clear Triton's tensor cap -- are the FRONTEND's, and
-    `down` no longer goes through it: its op is given to the chain as MLIR.
-    So no padding, no split into power-of-two pieces, and none of the adds
-    that folded them back.
+    Both are the FFN width itself: `down` contracts all of it in one op, so
+    there is no padding, no split into pieces, and no adds to fold them back.
 
     Kept as a function because the split is what the buffer layout and
     `_down_slots` are written against, and one width per model is still worth
@@ -163,50 +160,47 @@ def _plan_down(inter):
     return inter, inter
 
 
-def _exact_k_ttshared(
-    chain, rows, k, n, block_m, block_n, a_stride, script, k_capture=None
+def _mm_op(
+    rows,
+    k,
+    n,
+    block_m,
+    block_n,
+    a_stride,
+    l2_k=L2_K,
+    out_dtype=torch.float32,
+    constexprs=None,
 ):
-    """`_mm_kernel`'s ttsharedir, restated to contract exactly `k`.
+    """`chain.add` arguments for `_mm_kernel` over a `rows x k @ k x n` GEMM.
 
-    Two frontend rules stop a kernel from asking for the reduction a model
-    actually has: `tl.arange` wants a power of two, and `block_m * K` has to
-    stay under Triton's tensor cap. `linalg.matmul` has neither, and the
-    schedules tile K by `l2_k`, so the capture only has to be LEGAL -- its K
-    need not be the one wanted, above or below. `k_capture` names a legal one
-    where the real K is too wide to ask for (`down` contracts 12288, and
-    512x16384 is twice the cap).
-
-    Both row strides are kernel constexprs, so a capture taken at the real
-    stride has every offset right and the K extent is the only edit.
-
-    Measured on the wide gate at M=1024, N=12288: 8.76 -> 6.54 ms, TFLOP/s
-    unchanged at 5.9 -- the same efficiency over 25% fewer bytes.
+    Shape-representative placeholders; only shapes and dtypes drive the
+    lowering. `l2_k` is the schedule's, and `k` must be a multiple of it.
+    `out_dtype` and `constexprs` are for `_mm_bf16_kernel`.
     """
-    kp = k_capture if k_capture is not None else _pow2(k)
+    if k % l2_k:
+        raise ValueError(f"K={k} is not a multiple of the schedule's l2_k={l2_k}")
     tA = torch.zeros((rows, a_stride), dtype=torch.bfloat16)
-    tB = torch.zeros((kp, n), dtype=torch.bfloat16)
-    tC = torch.zeros((rows, n), dtype=torch.float32)
-    grid = (rows // block_m, n // block_n)
-    src = chain._capture_ttshared(
-        _mm_kernel,
-        grid,
-        (tA, tB, tC, rows, n, kp, a_stride, 1, n, 1, n, 1),
-        {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": kp},
-    )
-    if isinstance(src, bytes):
-        src = src.decode()
-    return narrow_k(src, k, kp, block_m, block_n)
+    tB = torch.zeros((k, n), dtype=torch.bfloat16)
+    tC = torch.zeros((rows, n), dtype=out_dtype)
+    return {
+        "args": (tA, tB, tC, rows, n, k, a_stride, 1, n, 1, n, 1),
+        "constexprs": {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_n,
+            "BLOCK_SIZE_K": l2_k,
+            **(constexprs or {}),
+        },
+    }
 
 
-def _row_tile(rows, k, block_n):
-    """Rows one `_mm_kernel` program may take when it contracts `k` in one tile.
+def _row_tile(rows, block_n):
+    """Rows one `_mm_kernel` program may take.
 
-    The chain's own `rows` where Triton's tensor cap and the array allow it,
-    halved until they do. The op then covers all of `rows` in
-    `rows // _row_tile(...)` grid steps, so every op still spans the same rows
-    -- only its herd gets smaller.
+    The chain's own `rows` where the array allows it, halved until it does.
+    The op then covers all of `rows` in `rows // _row_tile(...)` grid steps,
+    so every op still spans the same rows -- only its herd gets smaller.
     """
-    cap = min(MAX_TILE_NUMEL // k, MAX_BLOCK_NUMEL // block_n)
+    cap = MAX_BLOCK_NUMEL // block_n
     return min(rows, 1 << cap.bit_length() - 1)
 
 
@@ -241,29 +235,28 @@ def _mm_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    aoff: tl.constexpr = 0,
-    boff: tl.constexpr = 0,
 ):
-    """bf16 x bf16 -> f32, one tile per program. Qwen's `_mm_kernel`.
+    """bf16 x bf16 -> f32, one output tile per program, K in a loop.
 
     Spelled with explicit strides rather than reusing `kernels._matmul_kernel`
     because a chain op's operands are whole padded buffers, so the row stride
-    and the logical width come apart.
-
-    `aoff`/`boff` start the contraction part-way into both operands, which is
-    what lets several of these share one pair of buffers and each take a slice
-    of K. A chain's `arg_map` names a whole buffer and nothing else, so the
-    slice has to be the kernel's business; constexpr, so each slice is its own
-    compiled program with no address arithmetic at run time.
+    and the logical width come apart. `K` must be a multiple of
+    `BLOCK_SIZE_K`.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a = tl.load(A + aoff + offs_m[:, None] * sam + offs_k[None, :] * sak)
-    b = tl.load(B + boff + offs_k[:, None] * sbk + offs_n[None, :] * sbn)
-    tl.store(C + offs_m[:, None] * scm + offs_n[None, :] * scn, tl.dot(a, b))
+    a_ptrs = A + offs_m[:, None] * sam + offs_k[None, :] * sak
+    b_ptrs = B + offs_k[:, None] * sbk + offs_n[None, :] * sbn
+    tl.static_assert(K % BLOCK_SIZE_K == 0)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in range(0, K // BLOCK_SIZE_K):
+        acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc)
+        a_ptrs += BLOCK_SIZE_K * sak
+        b_ptrs += BLOCK_SIZE_K * sbk
+    tl.store(C + offs_m[:, None] * scm + offs_n[None, :] * scn, acc)
 
 
 @triton.jit
@@ -272,6 +265,55 @@ def _add_f32(A, B, C, n_elements: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     tl.store(C + offsets[:], tl.load(A + offsets[:]) + tl.load(B + offsets[:]))
+
+
+@triton.jit
+def _mm_bf16_kernel(
+    A,
+    B,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    sam: tl.constexpr,
+    sak: tl.constexpr,
+    sbk: tl.constexpr,
+    sbn: tl.constexpr,
+    scm: tl.constexpr,
+    scn: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GELU: tl.constexpr,
+    C2: tl.constexpr,
+    KG: tl.constexpr,
+):
+    """`_mm_kernel` writing bf16, with gelu_tanh applied first when `GELU`."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + offs_m[:, None] * sam + offs_k[None, :] * sak
+    b_ptrs = B + offs_k[:, None] * sbk + offs_n[None, :] * sbn
+    tl.static_assert(K % BLOCK_SIZE_K == 0)
+    c = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in range(0, K // BLOCK_SIZE_K):
+        c = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), c)
+        a_ptrs += BLOCK_SIZE_K * sak
+        b_ptrs += BLOCK_SIZE_K * sbk
+    if GELU:
+        y = (C2 * 0.5) * (c + KG * c * c * c)
+        c = 0.5 * c * (1.0 + tl.extra.cuda.libdevice.tanh(y))
+    tl.store(C + offs_m[:, None] * scm + offs_n[None, :] * scn, c.to(tl.bfloat16))
+
+
+@triton.jit
+def _mul_bf16(A, B, C, n_elements: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    """C = A * B over three bf16 buffers."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    tl.store(C + offsets[:], tl.load(A + offsets[:]) * tl.load(B + offsets[:]))
 
 
 @triton.jit
@@ -334,6 +376,9 @@ class FusedMLP:
         6 Bd   bf16 (HID, D_pad)      static
         7 OUT   f32 (rows, D_pad)     output
 
+    `Cg` and `Cu` are bf16 in a chain of at least `GATE_EPILOGUE_MIN_ROWS`
+    rows, where they hold gelu_tanh(gate) and up and `H` is their product.
+
     `K_exact` is D; `K_stride` is A's row stride, at least D and held off a
     power of two (`kernels.unaliased_stride`).
 
@@ -351,9 +396,6 @@ class FusedMLP:
         self.D = d_model
         self.H = inter
         # `gate` and `up` contract D itself, not the power of two above it.
-        # The frontend cannot spell that (`tl.arange`), so their op arrives as
-        # MLIR -- see `_exact_k_ttshared`. `K_pad` stays as the fallback for a
-        # D that IS a power of two, where the two are the same number anyway.
         self.K_pad = _pow2(d_model)
         self.K_exact = d_model
         # The activation's row stride, held off a power of two so A's rows do
@@ -548,7 +590,7 @@ class FusedMLP:
         n_down = HID // chunk
         partials, sums = self._down_slots()
         gu_n, dn_n = self.gu_n, self.dn_n
-        gu_m, dn_m = _row_tile(M, K_exact, gu_n), _row_tile(M, _DOWN_CAPTURE_K, dn_n)
+        gu_m, dn_m = _row_tile(M, gu_n), _row_tile(M, dn_n)
         # Per op, not per chain: the two can land on different blocks -- `down`
         # contracts a wider K and writes a narrower N -- and a schedule only
         # places on the block it was generated for.
@@ -556,9 +598,8 @@ class FusedMLP:
         # `down` reduces over the whole FFN width, so it is the one GEMM here
         # long enough in K for the deep L2 tile to pay -- and narrow enough in
         # N (D_pad) for its DMA stride to fit. See `kernels.DEEP_L2_K`.
-        dn_script = matmul_script(
-            dn_m, dn_n, l2_k=DEEP_L2_K if HID % DEEP_L2_K == 0 else L2_K
-        )
+        dn_l2_k = DEEP_L2_K if HID % DEEP_L2_K == 0 else L2_K
+        dn_script = matmul_script(dn_m, dn_n, l2_k=dn_l2_k)
 
         # Shape-representative placeholders; only shapes and dtypes drive the
         # warmup lowering, never the values.
@@ -572,21 +613,27 @@ class FusedMLP:
         tOut = torch.zeros((M, D_pad), dtype=torch.float32)
         tOutf = torch.zeros(M * D_pad, dtype=torch.float32)
 
-        chain = NPUChain(f"q4nx_mlp_{self.H}_m{M}")
-        gemms = ((self.BG_I, self.CG_I), (self.BU_I, self.CU_I))
-        gu_src = _exact_k_ttshared(
-            chain, M, self.K_exact, HID, gu_m, gu_n, self.K_stride, gu_script
+        # The gate epilogue's GELU is f32 math, which runs on the bf16 datapath.
+        epilogue = self._gate_epilogue(M)
+        chain = NPUChain(
+            f"q4nx_mlp{'e' if epilogue else ''}_{self.H}_m{M}",
+            bf16_emulation=True if epilogue else None,
         )
+        if epilogue:
+            self._add_gate_up_epilogue(chain, M, gu_m, gu_n)
+            self._chains[M] = self._add_down(chain, M, dn_m, dn_n, dn_script, dn_l2_k)
+            return self._chains[M]
+        gemms = ((self.BG_I, self.CG_I), (self.BU_I, self.CU_I))
+        gu_op = _mm_op(M, K_exact, HID, gu_m, gu_n, self.K_stride)
         for src, dst in gemms:
             # gate, then up -- the same GEMM against the same activation, so
-            # they differ only in which weight they read and where they land,
-            # and one module serves both.
+            # they differ only in which weight they read and where they land.
             chain.add(
-                gu_src,
+                _mm_kernel,
                 grid=(M // gu_m, HID // gu_n),
                 arg_map={0: self.A_I, 1: src, 2: dst},
-                args=(),
                 transform_script=gu_script,
+                **gu_op,
             )
         # merge: H = gelu_tanh(Cg) * Cu, or just the multiply where the gate
         # GEMM's drain already did the activation.
@@ -601,31 +648,60 @@ class FusedMLP:
             constexprs={"BLOCK_SIZE": merge_block},
             transform_script=script(MERGE_SCRIPT),
         )
-        # down, contracting the FFN width in ONE op. It used to go in
-        # `n_down` power-of-two pieces with adds folding them back, because a
-        # kernel cannot ask for a K of 12288 -- not a power of two, and
-        # `dn_m * 16384` is twice Triton's tensor cap. Stating it in the
-        # module costs neither: the pieces were 3 launches and 2 full-width
-        # f32 adds against this one, 54 MiB of output traffic against 6.
-        dn_src = _exact_k_ttshared(
-            chain,
-            M,
-            HID,
-            D_pad,
-            dn_m,
-            dn_n,
-            HID,
-            dn_script,
-            k_capture=_DOWN_CAPTURE_K,
-        )
+        self._chains[M] = self._add_down(chain, M, dn_m, dn_n, dn_script, dn_l2_k)
+        return chain
+
+    @staticmethod
+    def _gate_epilogue(M):
+        """Whether the chain for `M` rows runs gate and up with epilogues."""
+        return _GATE_EPILOGUE and M >= GATE_EPILOGUE_MIN_ROWS
+
+    def _add_gate_up_epilogue(self, chain, M, gu_m, gu_n):
+        """gate (gelu_tanh in its epilogue) and up writing bf16, then their product."""
+        HID = self.HID
+        epi = script(EPI_SCRIPT)
+        for src, dst, gelu in (
+            (self.BG_I, self.CG_I, True),
+            (self.BU_I, self.CU_I, False),
+        ):
+            chain.add(
+                _mm_bf16_kernel,
+                grid=(M // gu_m, HID // gu_n),
+                arg_map={0: self.A_I, 1: src, 2: dst},
+                transform_script=epi,
+                **_mm_op(
+                    M,
+                    self.K_exact,
+                    HID,
+                    gu_m,
+                    gu_n,
+                    self.K_stride,
+                    l2_k=EPI_L2_K,
+                    out_dtype=torch.bfloat16,
+                    constexprs={"GELU": gelu, "C2": _GELU_2C, "KG": _GELU_K},
+                ),
+            )
+        t = torch.zeros(M * HID, dtype=torch.bfloat16)
+        block = elem_block(M * HID, 2 + 2 + 2)
         chain.add(
-            dn_src,
+            _mul_bf16,
+            grid=((M * HID) // block,),
+            arg_map={0: self.CG_I, 1: self.CU_I, 2: self.H_I},
+            args=(t, t, t, M * HID),
+            constexprs={"BLOCK_SIZE": block},
+            transform_script=script(MUL_SCRIPT),
+        )
+
+    def _add_down(self, chain, M, dn_m, dn_n, dn_script, dn_l2_k):
+        """`down` into OUT, contracting the whole FFN width in one op."""
+        HID, D_pad = self.HID, self.D_pad
+        chain.add(
+            _mm_kernel,
             grid=(M // dn_m, D_pad // dn_n),
             arg_map={0: self.H_I, 1: self.BD_I, 2: self.OUT_I},
-            args=(),
             transform_script=dn_script,
+            **_mm_op(M, HID, D_pad, dn_m, dn_n, HID, l2_k=dn_l2_k),
         )
-        self._chains[M] = chain
         return chain
 
     # ---- dispatch ----
@@ -686,8 +762,9 @@ class FusedMLP:
                 args[self.BD_I] = _host(Bd)
                 # The gate's output is bf16 where its drain herd applied the
                 # activation, and f32 where the merge still has to.
-                args[self.CG_I] = np.empty((M, HID), dtype=np.float32)
-                args[self.CU_I] = np.empty((M, HID), dtype=np.float32)
+                plane = bfloat16 if self._gate_epilogue(M) else np.float32
+                args[self.CG_I] = np.empty((M, HID), dtype=plane)
+                args[self.CU_I] = np.empty((M, HID), dtype=plane)
                 args[self.H_I] = np.empty(M * HID, dtype=bfloat16)
                 for i in (self.OUT_I, *partials, *sums):
                     args[i] = np.empty((M, D_pad), dtype=np.float32)

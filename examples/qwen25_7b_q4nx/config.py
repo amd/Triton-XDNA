@@ -46,6 +46,10 @@ VOCAB = 152064
 # what mlir-air's Qwen2.5 reference forward uses.
 RMS_EPS = 1e-6
 
+#: Whether the LM head is the embedding (`llama_prefill.LlamaGpuDecode.HEADS`).
+TIED_LM_HEAD = False
+
+
 #: RoPE base. Single theta, no llama3 frequency scaling and no second theta.
 #: `rope_lut` gets this from mlir-air rather than from here; the value is
 #: restated for the reader.
@@ -241,3 +245,21 @@ def rope_lut(seq_len, dtype=None):
         dtype = bfloat16
     lut = np.stack([generate_rope_lut(p) for p in range(seq_len)])
     return lut.astype(dtype)
+
+
+def load_q4nx_packed(model=None, n_layers=None):
+    """The projections in Codec B, still packed, for the iGPU forward
+    (`llama_prefill.LlamaGpuDecode`). See `llama_prefill.packed_bundle`.
+
+    There is no bundle: the HF checkpoint is quantized onto Codec B here, by
+    mlir-air's own quantizer and packer, which makes these the bytes its NPU
+    decode is built from. Slow -- every projection is quantized at load."""
+    _add_air_paths()
+    import qwen25_7b_q4nx_weights as gw
+
+    qm = gw.open_weight_source(model or MODEL_DEFAULT)
+
+    sys.path.insert(0, _SHARED)
+    from llama_prefill import packed_bundle
+
+    return packed_bundle(qm, sys.modules[__name__], n_layers)

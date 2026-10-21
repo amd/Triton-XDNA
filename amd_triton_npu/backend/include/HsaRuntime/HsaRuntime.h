@@ -55,6 +55,45 @@ triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *hsaco_path,
                                                 char *errbuf,
                                                 size_t errbuf_len);
 
+// Initialize the runtime (idempotent) and allocate a zeroed control scratchpad
+// of `size` bytes for a full-ELF design that declares parameters. Returns its
+// host address and writes the address the NPU reaches it by to *dev_addr, or
+// returns NULL on error (with a message written to errbuf). It lives as long
+// as the runtime does, like the programs it is baked into.
+//
+// ROCR's hsaco loader patches only PDI and argument addresses into a full ELF's
+// control code, and refuses one that relocates anything else. So the caller
+// writes *dev_addr into the control code at the scratchpad's relocation sites
+// itself, drops those relocations, and packs the result (see driver.py's
+// _pack_hsaco). The scratchpad is device-visible memory the host writes and
+// the device reads in its dispatch preamble; which uint32 a parameter takes and
+// how it is encoded come from the build's params.txt, which this runtime does
+// not read.
+//
+// Needs a ROCR whose hsa_amd_pointer_info reports an AIE allocation's device
+// address; see triton_npu_hsa_scratchpad_supported.
+void *triton_npu_hsa_scratchpad_alloc(uint64_t size, uint64_t *dev_addr,
+                                      char *errbuf, size_t errbuf_len);
+
+// Flush host writes to a scratchpad from the CPU cache, so that the next
+// dispatch reads them. Returns 0 on success, or a negative value on error (with
+// a message written to errbuf); `va` must be an address
+// triton_npu_hsa_scratchpad_alloc returned.
+//
+// Nothing else does it: the packet lists only the kernel's arguments, which a
+// full ELF has to match exactly, so the scratchpad cannot ride along as an
+// extra argument for ROCR to flush.
+int triton_npu_hsa_scratchpad_flush(void *va, char *errbuf, size_t errbuf_len);
+
+// Whether this ROCR can resolve a scratchpad's device address: 1 if it can, 0
+// if it cannot, including on an AIE agent other than aie2p. Never fails, and
+// creates no queue. It allocates a page to ask, and so calls hsa_init (which is
+// refcounted).
+//
+// Meant to be asked before choosing which artifact to build or load. A full
+// ELF with no scratchpad dispatches without it.
+int triton_npu_hsa_scratchpad_supported(void);
+
 // Dispatch a prepared program: acquire vmem I/O buffers, copy inputs in, fill
 // kernargs, enqueue the AIE packet, wait for completion, copy outputs back, and
 // return the buffers to the pool. host_ptrs[i]/sizes[i] describe tensor i (i in

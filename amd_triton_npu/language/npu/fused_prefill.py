@@ -71,9 +71,14 @@ class PrefillConfigError(ValueError):
 
 
 class PrefillConfig:
-    """What a fused prefill build depends on besides its sources."""
+    """What a fused prefill build depends on besides its sources.
 
-    def __init__(self, model, jobs=8):
+    `max_len` is the longest prompt a dense model's build takes; None keeps
+    mlir-air's default for the model. mlir-air checks that it is a multiple of
+    the model's KV block.
+    """
+
+    def __init__(self, model, jobs=8, max_len=None):
         if model not in MODELS:
             raise PrefillConfigError(
                 f"no fused prefill for {model!r}; mlir-air has one for "
@@ -81,8 +86,18 @@ class PrefillConfig:
             )
         if int(jobs) < 1:
             raise PrefillConfigError(f"jobs must be >= 1, got {jobs}")
+        if max_len is not None:
+            if MODELS[model] is None:
+                raise PrefillConfigError(
+                    f"max_len applies to a dense model's build; {model} sets its "
+                    f"length when it loads"
+                )
+            if int(max_len) < 1:
+                raise PrefillConfigError(f"max_len must be >= 1, got {max_len}")
+            max_len = int(max_len)
         self.model = model
         self.jobs = int(jobs)
+        self.max_len = max_len
         #: The model's key in mlir-air's dense model table, or None.
         self.dense = MODELS[model]
 
@@ -93,7 +108,10 @@ class PrefillConfig:
         return "shared" if self.dense else "gemma4_e2b_q4nx"
 
     def __repr__(self):
-        return f"PrefillConfig(model={self.model!r}, jobs={self.jobs})"
+        return (
+            f"PrefillConfig(model={self.model!r}, jobs={self.jobs}, "
+            f"max_len={self.max_len})"
+        )
 
 
 def _toolchain_versions():
@@ -120,6 +138,9 @@ def fingerprint(config, fused_prefill_dir, peano_root, aie_root):
     shared = examples / "llms" / "shared" / "fused_prefill"
     h = hashlib.sha256()
     h.update(config.model.encode())
+    if config.max_len is not None:
+        # Left out when unset, so a default build keeps its digest.
+        h.update(f"max_len={config.max_len}".encode())
     # The shared builder and device, which every model's build runs on; for a
     # dense model `d` is that directory, and its model table is in it.
     if not shared.is_dir():
@@ -226,6 +247,8 @@ def fused_prefill(config, fused_prefill_dir, cache_root=None, rebuild=False):
             cmd = [sys.executable, str(d / builder)]
             cmd += ["build", config.dense] if config.dense else []
             cmd += [str(gen), "-j", str(config.jobs)]
+            if config.max_len is not None:
+                cmd += ["--max-len", str(config.max_len)]
             r = subprocess.run(cmd, env=env, cwd=gen, capture_output=True, text=True)
             if r.returncode != 0 or not _complete(gen):
                 shutil.rmtree(gen, ignore_errors=True)

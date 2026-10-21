@@ -44,6 +44,12 @@ assert DQ != D, "Gemma3-4B has a decoupled q dim; o_proj contracts DQ -> D"
 # uses. The norm weights are fed as-is at this eps -- see `load_q4nx`.
 RMS_EPS = 1e-6
 
+#: Whether the LM head is the embedding (`llama_prefill.LlamaGpuDecode.HEADS`).
+TIED_LM_HEAD = False
+#: The GLU's activation, for the iGPU forward's fused GLU kernels.
+GLU_ACT = "gelu_tanh"
+
+
 #: Gemma3's dual-theta RoPE. Five layers in six are "local" (theta 1e4, no
 #: position scaling, attention limited to a 1024-token sliding window); every
 #: sixth is "global" (theta 1e6 with positions divided by 8, unbounded
@@ -76,6 +82,10 @@ BOS = 2
 #: mlir-air's own PARIS_GREEDY for this model. The only assertion that covers
 #: the decode at all; the first-token gate above is pure prefill.
 EXPECT_IDS = [9079, 236761, 108, 50429, 563, 496, 4185, 3988, 573, 1610]
+
+#: The same after mlir-air's fused prefill, the default engine. Its numerics
+#: move a later greedy token on this model.
+EXPECT_IDS_AIR_FUSED = [9079, 236761, 108, 50429, 563, 3224, 618, 506, 623, 17698]
 
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Gemma3-4B-NPU2")
 
@@ -215,3 +225,17 @@ def rope_lut(seq_len, dtype=None, global_layer=False):
     lf = ROPE_GLOBAL_LINEAR_FACTOR if global_layer else 1.0
     lut = np.stack([generate_rope_lut(p, theta, lf) for p in range(seq_len)])
     return lut.astype(dtype)
+
+
+def load_q4nx_packed(model=None, n_layers=None):
+    """The projections in Codec B, still packed, for the iGPU forward
+    (`llama_prefill.LlamaGpuDecode`). See `llama_prefill.packed_bundle`."""
+    _add_air_paths()
+    import gemma3_4b_q4nx_weights as gw
+
+    qm = gw.Q4nxModel(model or MODEL_DEFAULT)
+
+    sys.path.insert(0, _SHARED)
+    from llama_prefill import packed_bundle
+
+    return packed_bundle(qm, sys.modules[__name__], n_layers)

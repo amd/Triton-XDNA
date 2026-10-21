@@ -15,8 +15,10 @@ them to `_kv_store`, so the host cache, `kv_view`, `kv_stack`, the npz and a
 bound decoder sink all see them exactly as they see the Triton prefill's.
 """
 
+import json
 import os
 import weakref
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -106,6 +108,11 @@ class _FusedPrefill:
         super().__init__(*a, **kw)
         dense, models = _dense()
         self._desc = models.MODELS[self.AIR_MODEL]
+        # The longest prompt is the build's, which can differ from the model
+        # table's default (PrefillConfig.max_len).
+        man = json.loads((Path(build_dir) / "manifest.json").read_text())
+        if man.get("max_len"):
+            self._desc = self._desc._replace(max_len=man["max_len"])
         if self._desc.layers != self.n_layers:
             raise ValueError(
                 f"the fused prefill runs all {self._desc.layers} layers of "

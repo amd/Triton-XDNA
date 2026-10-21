@@ -68,24 +68,21 @@ class _Chain:
         self.n = len(shapes)
         self.chain = NPUChain(name)
         self.a, self.b, self.c = [], [], []
-        srcs = {}
+        ops = {}
         for i, (M, K, N) in enumerate(shapes):
             stride = kn.unaliased_stride(K)
-            if (M, K, N) not in srcs:
+            if (M, K, N) not in ops:
                 bn = 512 if N % 512 == 0 else 256
-                bm = fused_mlp._row_tile(M, K, bn)
-                sc = kn.matmul_script(bm, bn)
-                src = fused_mlp._exact_k_ttshared(
-                    self.chain, M, K, N, bm, bn, stride, sc
-                )
-                srcs[(M, K, N)] = (src, sc, (M // bm, N // bn))
-            src, sc, grid = srcs[(M, K, N)]
+                bm = fused_mlp._row_tile(M, bn)
+                op = fused_mlp._mm_op(M, K, N, bm, bn, stride)
+                ops[(M, K, N)] = (op, kn.matmul_script(bm, bn), (M // bm, N // bn))
+            op, sc, grid = ops[(M, K, N)]
             self.chain.add(
-                src,
+                fused_mlp._mm_kernel,
                 grid=grid,
                 arg_map={0: i, 1: self.n + i, 2: 2 * self.n + i},
-                args=(),
                 transform_script=sc,
+                **op,
             )
             self.a.append(_page((M, stride), torch.bfloat16))
             self.b.append(_page((K, N), torch.bfloat16))

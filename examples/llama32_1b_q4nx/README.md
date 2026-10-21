@@ -189,45 +189,56 @@ python prefill.py --backend npu --ops matmul --compare-cpu
 python prefill.py --backend cpu --kv-out /tmp/kv.npz
 ```
 
-### Running on the HSA runtime
-
-**Currently unsupported** (`AMD_TRITON_NPU_RUNTIME=hsa make chat` fails fast
-with a clear error; `registry.py`'s `supports_hsa=False` for this model
-reflects it). ROCr's AIE hsaco/kernel-object dispatch removed
-`triton_npu_hsa_patch_insts`, and the decode below depended on it. See
-`../llm_q4nx/hsa_decode.py`'s `_check_hsa_decode_supported` and `HsaProgram`
-docstrings for why, and what porting it would need (a per-context-length
-packed-executable cache, unmeasured). The rest of this section is kept as a
-record of what worked under the old (PDI + instruction-stream address) HSA
-dispatch ABI.
+### Full-ELF decode on XRT
 
 ```bash
-make compile-decode RUNTIME=hsa   # the decode as PDI, not xclbin
+make compile-decode DECODE_ELF=1
+DECODE_ELF=1 make run
+```
+
+The context length reaches the device through scratchpad parameters, so one
+ELF serves every L. The xclbin decode measured faster on Strix, so the ELF
+stays opt-in. It is the same artifact the HSA decode runs.
+
+### Running on the HSA runtime
+
+```bash
+make compile-decode RUNTIME=hsa   # the decode's full ELF, see below
 make chat RUNTIME=hsa
 ```
 
-Both halves used to dispatch through `HsaRuntime` rather than XRT, and the
-decode's logits were bit-identical to the XRT path.
+Both halves then dispatch through `HsaRuntime` rather than XRT, and the
+decode's logits are bit-identical to the XRT path.
 
-It was not as fast. Measured on Strix, 60 tokens, runtimes alternated:
+It is not as fast. Measured on Strix, 60 tokens, runtimes alternated, before
+the move to hsaco dispatch (ROCR before `7a71bfb`):
 
 | | tok/s |
 |---|---|
 | XRT | 54.5 – 54.8 |
 | HSA | 49.1 – 51.5 |
 
-a stable gap of about 9%, reproducible across runs rather than noise. It was
+a stable gap of about 9%, reproducible across runs rather than noise. It is
 not the per-dispatch cache flush -- that is what resident regions removed, and
-without them the gap was roughly three times larger. What remained was never
-attributed.
+without them the gap is roughly three times larger. What remains has not been
+attributed, so treat the HSA path as correct and close, not as a replacement.
 
-The interesting part was how the context length got to the device. HSA has no
-scratchpad parameters, so the full-ELF mechanism was unavailable; but the old
-AIE dispatch packet carried the instruction stream's address per enqueue, so
-`../llm_q4nx/hsa_decode.py` patched the 248 L-dependent words per token — the
-same words mlir-air's xclbin path rewrites. One PDI served every context
-length; the L=2048 and L=2047 builds are byte-identical. That observation
-still holds; only the per-token patch mechanism it relied on is gone.
+The interesting part is how the context length gets to the device: as
+scratchpad parameters, two scalars in device memory that the design reads in
+its dispatch preamble, so one full ELF serves every context length and nothing
+rewrites the instruction stream per token.
+
+ROCR loads the ELF from an hsaco and patches only PDI and argument addresses
+into its control code; it refuses one that relocates anything else. So
+`../llm_q4nx/hsa_decode.py` allocates the scratchpad first, asks ROCR for its
+device address (`hsa_amd_pointer_info`, which needs a ROCR that reports one for
+an AIE allocation), writes that into the control code, and packs the result.
+The host then writes L before each dispatch and flushes it from the CPU cache.
+
+`make compile-decode RUNTIME=hsa` builds the ELF plus the xclbin template pair
+that mlir-air's decoder loads at construction. The patched-instruction-stream
+alternative from before hsaco dispatch is gone: the stream now belongs to a
+loaded ROCR executable, with no buffer left to patch per token.
 
 `--ops` takes `all` or a comma list of `matmul,rms_norm,swiglu`, so a
 numerical regression can be bisected to a single kernel against the same CPU

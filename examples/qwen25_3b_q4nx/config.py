@@ -50,6 +50,10 @@ INTER_DEVICE_PAD = 11264
 # what mlir-air's Qwen2.5 reference forward uses.
 RMS_EPS = 1e-6
 
+#: Whether the LM head is the embedding (`llama_prefill.LlamaGpuDecode.HEADS`).
+TIED_LM_HEAD = False
+
+
 #: RoPE base. Single theta, no llama3 frequency scaling and no second theta.
 ROPE_THETA = 1000000.0
 
@@ -251,3 +255,28 @@ def rope_lut(seq_len, dtype=None):
         dtype = bfloat16
     lut = np.stack([generate_rope_lut(p) for p in range(seq_len)])
     return lut.astype(dtype)
+
+
+def load_q4nx_packed(model=None, n_layers=None):
+    """The projections in Codec B, still packed, for the iGPU forward
+    (`llama_prefill.LlamaGpuDecode`). See `llama_prefill.packed_bundle`.
+
+    The bundle's signed Q4_0 is converted to Codec B exactly, and its GLU
+    axis is read at the padded 11264 it ships; an HF checkpoint is quantized
+    on load instead."""
+    _add_air_paths()
+    import qwen25_3b_q4_weights as gw
+
+    qm = gw.open_weight_source(model or MODEL_DEFAULT)
+
+    sys.path.insert(0, _SHARED)
+    from llama_prefill import packed_bundle
+
+    bundle = isinstance(qm, gw.Q4nxModel)
+    return packed_bundle(
+        qm,
+        sys.modules[__name__],
+        n_layers,
+        inter=INTER_DEVICE_PAD if bundle else INTER,
+        q4_0=bundle,
+    )

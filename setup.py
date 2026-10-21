@@ -243,17 +243,22 @@ def _make_version_spec(pkg_name, version, timestamp, short_commit, suffix=""):
     return f"{pkg_name}=={full}"
 
 
-def parse_peano_pin(path: Path) -> str:
-    """The pinned llvm-aie requirement from utils/peano-requirements.txt.
+def parse_pin(path: Path, package: str) -> str:
+    """The pinned `package==version` requirement from a requirements file.
 
-    The file is also fed to `pip install -r` by CI and env_setup, so it is the
-    one place the version lives.
+    CI and env_setup install the same files with `pip install -r`, so the
+    version is kept in one place.
     """
     for line in path.read_text().splitlines():
         line = line.strip()
-        if line.startswith("llvm-aie=="):
+        if line.startswith(f"{package}=="):
             return line
-    raise RuntimeError(f"no pinned llvm-aie requirement in {path}")
+    raise RuntimeError(f"no pinned {package} requirement in {path}")
+
+
+def parse_peano_pin(path: Path) -> str:
+    """The pinned llvm-aie requirement from utils/peano-requirements.txt."""
+    return parse_pin(path, "llvm-aie")
 
 
 def get_install_requires():
@@ -279,6 +284,19 @@ def get_install_requires():
         f"mlir-air[aie]=={mlir_air_full_version}",
         parse_peano_pin(BASE_DIR / "utils" / "peano-requirements.txt"),
     ]
+
+
+def get_extras_require():
+    """Optional dependencies, by extra.
+
+    `hsa`: the ROCm runtime for AMD_TRITON_NPU_RUNTIME=hsa, pinned in
+    utils/rocm-requirements.txt. The default XRT runtime does not need it.
+    """
+    return {
+        "hsa": [
+            parse_pin(BASE_DIR / "utils" / "rocm-requirements.txt", "rocm-sdk-core")
+        ],
+    }
 
 
 def run_command(args: list[str | Path], cwd: Path, env: dict[str, str] | None = None):
@@ -651,8 +669,13 @@ class TritonXdnaBdistWheel(bdist_wheel):
         with open(metadata_path, "r") as f:
             content = f.read()
 
-        # Get our dependencies
+        # Get our dependencies. Extras are written here too: the wheel is
+        # repacked from Triton's build, so setup()'s extras_require never
+        # reaches its METADATA.
         our_deps = get_install_requires()
+        for extra, reqs in get_extras_require().items():
+            our_deps += [f'{req}; extra == "{extra}"' for req in reqs]
+        extra_lines = [f"Provides-Extra: {extra}" for extra in get_extras_require()]
 
         # METADATA format: headers, then blank line, then body
         # We need to insert Requires-Dist lines in the header section
@@ -667,6 +690,9 @@ class TritonXdnaBdistWheel(bdist_wheel):
             if not header_ended and line.strip() == "":
                 # Insert our dependencies before the blank line
                 if not deps_inserted:
+                    for line_ in extra_lines:
+                        if line_ not in content:
+                            new_lines.append(line_)
                     for dep in our_deps:
                         dep_line = f"Requires-Dist: {dep}"
                         # Only add if not already present
@@ -681,6 +707,10 @@ class TritonXdnaBdistWheel(bdist_wheel):
         if not deps_inserted:
             # Find the last header line and insert after it
             insert_pos = len(new_lines)
+            for line_ in extra_lines:
+                if line_ not in content:
+                    new_lines.insert(insert_pos, line_)
+                    insert_pos += 1
             for dep in our_deps:
                 dep_line = f"Requires-Dist: {dep}"
                 if dep_line not in content:
@@ -1024,6 +1054,7 @@ setup(
         "Programming Language :: Python :: 3.13",
     ],
     extras_require={
+        **get_extras_require(),
         "build": [
             "cmake>=3.20",
             "ninja",

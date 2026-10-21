@@ -5,6 +5,7 @@ on:
     branches:
       - main
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -53,6 +54,11 @@ jobs:
           path: clang-format.diff
           name: clang_format_diffs
 
+      # reviewdog reports only on pull requests, and passes otherwise.
+      - name: Fail on C/C++ formatting changes in the merge queue
+        if: github.event_name == 'merge_group'
+        run: git diff --exit-code
+
       - name: Check C/C++ format
         uses: reviewdog/action-suggester@v1.24
         with:
@@ -75,6 +81,10 @@ jobs:
         with:
           path: black-format.diff
           name: black_format_diffs
+
+      - name: Fail on Python formatting changes in the merge queue
+        if: github.event_name == 'merge_group' && (success() || failure())
+        run: git diff --exit-code
 
       - name: Check Python format
         if: success() || failure()

@@ -94,6 +94,8 @@ This will automatically install all required dependencies:
 
 The mlir-air version is pinned in `utils/mlir-air-hash.txt`. The matching mlir-aie commit is pinned by the mlir-air wheel's `[aie]` extra, so it's resolved transitively. llvm-aie is pinned in `utils/peano-requirements.txt`, to the nightly that the pinned mlir-aie was itself built against -- the `[aie]` extra requires it without a version, so otherwise an install would take whatever nightly happened to be newest that day.
 
+The HSA launch runtime's ROCm is optional and pinned separately, in `utils/rocm-requirements.txt`. It is the `hsa` extra rather than a requirement, so the default XRT install does not pull it in; see [Launch runtime](#launch-runtime-xrt-default-or-hsa).
+
 #### Option 3: Build from Source (Using Cmake)
 
 ```bash
@@ -132,25 +134,39 @@ By default kernels are dispatched through XRT (xclbin on npu1, ELF on npu2). An 
 | Value | Behavior |
 | --- | --- |
 | `xrt` (default) | Dispatch via XRT; artifact is `xclbin` (npu1) or `elf` (npu2). |
-| `hsa` | Dispatch via HSA; the backend produces `pdi` + `insts.bin` and launches them on the AIE agent. |
+| `hsa` | Dispatch via HSA; the backend packs the same artifact into an hsaco (HSA code object), loads it through ROCR, and dispatches it on the AIE agent by kernel object. |
 
-Under HSA the output format is `pdi`. The HSA runtime is Linux-only and requires
-an **AIE-capable ROCR** — one that provides the AIE dispatch extension header
-(`include/hsa/hsa_ext_amd_aie.h`) and `libhsa-runtime64`.
+Under HSA the output format is the same as under XRT (`xclbin` on npu1, `elf`
+on npu2); `pdi` is refused, because the packer reads the partition's column
+count from the xclbin or ELF. Packing runs mlir-aie's `aie-hsaco`
+(`aie.compiler.hsaco.pack`). The HSA runtime is Linux-only and requires an
+**AIE-capable ROCR** that loads AIE hsacos: rocm-systems `develop` at or after
+[`7a71bfb`](https://github.com/ROCm/rocm-systems/commit/7a71bfb024e106a0941d14ad560a2befc5277227)
+("feat(rocr/aie): hsaco support for AIE agents"), which provides the AIE
+dispatch extension header (`include/hsa/hsa_ext_amd_aie.h`) and
+`libhsa-runtime64`.
 
-Install one from [TheRock](https://github.com/ROCm/TheRock)'s nightly ROCm wheels;
-the backend picks it up automatically, with no environment variables to set:
+Install the pinned one from [TheRock](https://github.com/ROCm/TheRock)'s nightly
+ROCm wheels; the backend picks it up automatically, with no environment
+variables to set:
 
 ```bash
-pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ rocm-sdk-core
+pip install -r utils/rocm-requirements.txt          # from a checkout
+pip install "triton-xdna[hsa]" \
+  --extra-index-url https://nightly.repo.amd.com/rocm/whl-next/   # with the wheel
 ```
 
 `rocm-sdk-core` is the only package needed — it carries both the headers and
-`libhsa-runtime64`. AIE dispatch requires a build from **2026-07-16 or later**;
-earlier ones lack the memory-handle resolution fix and abort at dispatch. Note
-that the older per-GPU-family indexes (`https://rocm.nightlies.amd.com/v2/<target>/`)
-are deprecated and frozen — they still resolve under pip, so pointing at one
-silently installs a runtime too old to work.
+`libhsa-runtime64`. The pin in `utils/rocm-requirements.txt` is a nightly with
+everything the HSA path uses, including the device-address reporting the
+full-ELF decode needs. `10.2.0a20261020` is the first nightly with hsaco
+support (TheRock moved its rocm-systems pin past `7a71bfb` on 2026-10-19); an
+older one fails to build the HSA runtime, since its dispatch packet has no
+kernel-object field. The
+older indexes no longer receive builds but still resolve under pip:
+`https://rocm.nightlies.amd.com/whl-multi-arch/` stopped at 2026-08-22, and the
+per-GPU-family indexes (`https://rocm.nightlies.amd.com/v2/<target>/`) install a
+runtime too old to work.
 
 The backend searches, in order: `AMD_NPU_ROCR_PATH`, `ROCM_PATH`, a pip-installed ROCm (TheRock's `rocm-sdk` wheels), then `/opt/rocm`. A candidate is accepted only if it provides *all* the headers the runtime includes — including `hsa/hsa_ext_amd_aie.h` — plus `libhsa-runtime64`, so an installation without AIE support is reported at startup rather than failing later in the compile. If nothing qualifies, the error lists every candidate and what each was missing. Set `AMD_NPU_ROCR_PATH` to override the search with a specific prefix — a locally built rocr-runtime, for instance.
 

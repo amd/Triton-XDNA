@@ -52,6 +52,12 @@ EXAMPLES = [
     },
     {
         "category": "Matrix",
+        "name": "Matrix Multiplication (BF16, K Loop)",
+        "path": "matmul_bf16_k_loop",
+        "datatypes": "bf16",
+    },
+    {
+        "category": "Matrix",
         "name": "Matrix Multiplication (Autotune)",
         "path": "autotune-matmul",
         "datatypes": "bf16",
@@ -78,6 +84,12 @@ EXAMPLES = [
         "category": "Element-wise",
         "name": "GELU",
         "path": "gelu",
+        "datatypes": "bf16",
+    },
+    {
+        "category": "Element-wise",
+        "name": "Erf / exact GELU",
+        "path": "erf",
         "datatypes": "bf16",
     },
     {

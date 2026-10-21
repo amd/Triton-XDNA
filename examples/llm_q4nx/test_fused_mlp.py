@@ -15,7 +15,7 @@ without changing the shape of the answer:
 
 Not an example: `scripts/run_tests.py` runs every *.py directly under an
 example directory, and `llm_q4nx` is excluded from the sweep as a library.
-Invoke it by hand.
+CI runs it from the test action.
 """
 
 from __future__ import annotations
@@ -27,23 +27,29 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fused_mlp import FusedMLP  # noqa: E402
+from kernels import row_tier  # noqa: E402
 
 D = 1536  # Gemma4's model dim
 
 
-def reference(h, gate_up, down, inter):
+def reference(h, gate_up, down, inter, epilogue):
     """What the device computes, in the device's precision.
 
     bf16 operands with f32 accumulation, and the merge rounded to bf16 before
     `down` -- rounding here rather than keeping f32 throughout is not cosmetic:
     it is the same source of error the chain has, so a mismatch means the chain
-    is wrong rather than merely less precise.
+    is wrong rather than merely less precise. With `epilogue`, gate and up
+    write bf16 (the gate after its GELU) and the product of those is rounded
+    again, as the epilogue path does.
     """
     a = h.to(torch.bfloat16).to(torch.float32)
     gu = gate_up.to(torch.bfloat16).to(torch.float32)
-    g = a @ gu[:, :inter]
+    g = torch.nn.functional.gelu(a @ gu[:, :inter], approximate="tanh")
     u = a @ gu[:, inter:]
-    merged = (torch.nn.functional.gelu(g, approximate="tanh") * u).to(torch.bfloat16)
+    if epilogue:
+        g = g.to(torch.bfloat16).to(torch.float32)
+        u = u.to(torch.bfloat16).to(torch.float32)
+    merged = (g * u).to(torch.bfloat16)
     return merged.to(torch.float32) @ down.to(torch.bfloat16).to(torch.float32)
 
 
@@ -60,12 +66,14 @@ def check(inter, n_rows, layers=(0, 1)):
         mlp.add_layer(L, gate_up, down)
 
     h = (torch.randn(n_rows, D) * 0.5).to(torch.float32)
+    epilogue = FusedMLP._gate_epilogue(row_tier(n_rows))
+    print(f"  gate/up epilogue: {epilogue}")
     ok = True
 
     firsts = {}
     for L in layers:
         got = mlp.run(L, h)
-        ref = reference(h, *w[L], inter)
+        ref = reference(h, *w[L], inter, epilogue)
         scale = ref.abs().max().item()
         err = (got - ref).abs().max().item()
         rel = err / scale
@@ -103,6 +111,9 @@ def main():
     ok &= check(6144, 6)
     ok &= check(6144, 163)
     ok &= check(12288, 6)
+    # A tier wide enough for the gate/up epilogues (GATE_EPILOGUE_MIN_ROWS).
+    ok &= check(6144, 600)
+    ok &= check(12288, 600)
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

@@ -15,6 +15,13 @@ slope reference.
 
     python decode_build.py                      # both templates
     python decode_build.py --context-length 2048   # one, in this process
+    python decode_build.py --format elf         # one full ELF for every L
+
+The full ELF is what the HSA decode runs on a ROCR that can resolve the device
+address of a host allocation: the context length reaches it as scratchpad
+parameters, so one artifact serves every L and there is no template pair to
+dispatch. `--format elf` and `--format pdi` also build the xclbin pair, which
+mlir-air's decoder loads at construction.
 
 Both templates are built in one process. `build_module()` reads its geometry
 from the environment at import time, which is why this used to fork per context
@@ -57,6 +64,14 @@ ENGINE_OBJECTS = {
 
 DEFAULT_L = 2048
 
+#: The full ELF's artifacts, written beside the templates.
+ELF_NAME = "decode_scratchpad.elf"
+ELF_PARAMS = "decode_scratchpad.params.txt"
+ELF_MAXL = "decode_scratchpad.maxl"
+#: The model the ELF was built for. Separate from STAMP, which every template
+#: build rewrites while leaving the ELF in place.
+ELF_MODEL = "decode_scratchpad.model"
+
 
 #: Written beside the artifacts, naming the model that built them.
 #:
@@ -90,6 +105,26 @@ def check_stamp(model, out_dir=None):
         )
 
 
+def check_elf_stamp(model, out_dir=None):
+    """Refuse to run the full ELF built for another model.
+
+    The ELF keeps its own stamp because a template build rewrites `STAMP` and
+    leaves the ELF in place, so `check_stamp` passing says nothing about it.
+    """
+    out_dir = out_dir or airsrc.fused_decode_dir(model.engine)
+    try:
+        with open(os.path.join(out_dir, ELF_MODEL)) as f:
+            built = f.read().strip()
+    except OSError:
+        built = None
+    if built != model.name:
+        what = f"was built for {built!r}" if built else "has no model stamp"
+        raise SystemExit(
+            f"the full ELF in {out_dir} {what}, not {model.name!r}; rebuild it:\n"
+            f"  make compile-decode MODEL={model.name} DECODE_ELF=1"
+        )
+
+
 def lower_template(L, out_dir=None, output_format="xclbin", model=None):
     """Lower one decode template -- the binary + insts pair for context length L.
 
@@ -118,7 +153,12 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
 
     from triton.language.extra.npu import fused_decode
 
-    cfg = model.decode_config(L)
+    if output_format == "elf" and model.engine != "fused_decode":
+        raise SystemExit(
+            f"--format elf builds the shared engine's decode; {model.name} uses "
+            f"the {model.engine!r} engine, which has no full-ELF build."
+        )
+    cfg = model.decode_config(L, dynseq=1 if output_format == "elf" else None)
     print(f"[decode-build] L={L} {cfg}", flush=True)
     t0 = time.time()
     art = fused_decode(
@@ -126,13 +166,17 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
         fd_dir,
         kernel_objects=objs,
         output_format=output_format,
-        name=f"fused_decode_{model.name}_L{L}",
+        name=f"fused_decode_{model.name}_L{L}"
+        + ("_elf" if output_format == "elf" else ""),
     )
     print(
         f"[decode-build] L={L} ATTN_MAXL={art['attn_maxl']} lowered in "
         f"{time.time() - t0:.1f}s",
         flush=True,
     )
+
+    if output_format == "elf":
+        return _copy_elf(art, out_dir, model)
 
     # Name them the way the decode's template loader expects to find them.
     ext = "pdi" if output_format == "pdi" else "xclbin"
@@ -144,6 +188,32 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
         f.write(model.name + "\n")
     print(f"[decode-build] L={L} -> {dst_x}", flush=True)
     return dst_x, dst_i
+
+
+def _copy_elf(art, out_dir, model):
+    """Copy the full ELF, its parameter list and its ATTN_MAXL into `out_dir`."""
+    # aiecc writes params.txt beside the ELF. Without it the host cannot find
+    # the parameters in the scratchpad, so a build that emitted none is an error.
+    params = os.path.join(os.path.dirname(art["elf_path"]), "params.txt")
+    if not os.path.exists(params):
+        raise SystemExit(
+            f"{params} is missing: the build emitted no scratchpad parameters, "
+            "so the context length has no way to reach the device. It needs an "
+            "mlir-air whose fused_decode honours DECODE_DYNSEQ."
+        )
+    dst_e = os.path.join(out_dir, ELF_NAME)
+    shutil.copyfile(art["elf_path"], dst_e)
+    shutil.copyfile(params, os.path.join(out_dir, ELF_PARAMS))
+    # Recorded, not defaulted: a driver assuming another ATTN_MAXL mis-sizes the
+    # KV cache and the mask threshold.
+    with open(os.path.join(out_dir, ELF_MAXL), "w") as f:
+        f.write(f"{art['attn_maxl']}\n")
+    with open(os.path.join(out_dir, ELF_MODEL), "w") as f:
+        f.write(model.name + "\n")
+    with open(os.path.join(out_dir, STAMP), "w") as f:
+        f.write(model.name + "\n")
+    print(f"[decode-build] -> {dst_e} + {ELF_PARAMS}", flush=True)
+    return dst_e, os.path.join(out_dir, ELF_PARAMS)
 
 
 def main(argv=None):
@@ -170,8 +240,10 @@ def main(argv=None):
     ap.add_argument(
         "--format",
         default="xclbin",
-        choices=("xclbin", "pdi"),
-        help="pdi is what the HSA runtime consumes; xclbin is XRT's",
+        choices=("xclbin", "pdi", "elf"),
+        help="elf: one full ELF for every context length, for the HSA decode on "
+        "a ROCR that resolves device addresses; pdi: the template pair as PDIs; "
+        "xclbin: XRT's. elf and pdi also build the xclbin pair",
     )
     args = ap.parse_args(argv)
     model = registry.spec(args.model)
@@ -180,18 +252,28 @@ def main(argv=None):
         lower_template(args.context_length, args.out_dir, args.format, model)
         return 0
 
-    # The loader wants the L template and an L-1 slope reference. Both in this
-    # process: the builder's geometry used to be import-time state that a
-    # second build in the same process would have inherited, which is why this
-    # forked. `tl.extra.npu.fused_decode` takes the configuration as arguments
-    # and scopes the environment to one build, so it no longer can.
-    for L in (args.max_context_length, args.max_context_length - 1):
-        lower_template(L, args.out_dir, args.format, model)
+    # The ELF takes L at dispatch, so one build serves every context length.
+    if args.format == "elf":
+        lower_template(args.max_context_length, args.out_dir, "elf", model)
+    else:
+        _lower_pair(args.max_context_length, args.out_dir, args.format, model)
+
+    # The HSA decoders subclass mlir-air's, which loads the xclbin pair to set
+    # up weights and geometry even though HSA dispatches the ELF or PDIs.
+    if args.format != "xclbin":
+        _lower_pair(args.max_context_length, args.out_dir, "xclbin", model)
+    return 0
+
+
+def _lower_pair(L, out_dir, output_format, model):
+    """The template at L and the L-1 build the loader takes the slope from."""
+    for l in (L, L - 1):
+        lower_template(l, out_dir, output_format, model)
     print(
-        "[decode-build] both templates lowered through tl.extra.npu.fused_decode.",
+        f"[decode-build] both {output_format} templates lowered through "
+        "tl.extra.npu.fused_decode.",
         flush=True,
     )
-    return 0
 
 
 if __name__ == "__main__":

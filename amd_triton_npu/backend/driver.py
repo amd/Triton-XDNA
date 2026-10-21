@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import struct
 import tempfile
 import threading
 import sys
@@ -577,10 +578,11 @@ def _get_rocr_install() -> _RocrInstall:
         "(AMD_TRITON_NPU_RUNTIME=hsa) needs a ROCm prefix providing "
         + ", ".join("include/" + h for h in _ROCR_HEADERS)
         + " and lib/libhsa-runtime64.so. Stock ROCm releases do not ship "
-        "hsa/hsa_ext_amd_aie.h; install an AIE-capable ROCm with "
-        "'pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ "
-        "rocm-sdk-core' (2026-07-16 or later), or point AMD_NPU_ROCR_PATH at "
-        "the install prefix of one you built yourself." + detail
+        "hsa/hsa_ext_amd_aie.h; install the pinned one with 'pip install -r "
+        "utils/rocm-requirements.txt' (or the triton-xdna[hsa] extra, with "
+        "--extra-index-url https://nightly.repo.amd.com/rocm/whl-next/), or "
+        "point AMD_NPU_ROCR_PATH at the install prefix of one you built "
+        "yourself." + detail
     )
 
 
@@ -1338,6 +1340,40 @@ def _extract_elf_kernel_name(config_json_path):
     return f"{last_kernel['name']}:{instance_id}"
 
 
+_FOLD_ADD_SCRIPT = """
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    transform.include @fold_add_into_matmul_init failures(propagate) (%arg1)
+      : (!transform.any_op) -> ()
+    transform.yield
+  }
+}
+"""
+
+
+@functools.lru_cache(maxsize=64)
+def _fold_accumulator_adds(asm_src_text):
+    """`asm_src_text` with each contraction's accumulator add folded into its
+    `outs`, as the generated schedule's first phase does.
+
+    Returned unchanged when there is no generic to fold, or when the fold
+    does not apply; detection then declines the module as before. Cached,
+    because detection runs on every launch.
+    """
+    if "linalg.generic" not in asm_src_text or "linalg.matmul" not in asm_src_text:
+        return asm_src_text
+    try:
+        context = air.ir.Context()
+        module = Module.parse(asm_src_text, context=context)
+        script = Module.parse(
+            _inject_transform_library(_FOLD_ADD_SCRIPT), context=context
+        )
+        run_transform(script, module)
+    except Exception:
+        return asm_src_text
+    return str(module)
+
+
 def _detect_matmul(asm_src_text):
     """Detect a single plain matmul in the TritonShared IR.
 
@@ -1346,13 +1382,14 @@ def _detect_matmul(asm_src_text):
     ``fill`` (fused epilogues are out of scope). Returns None otherwise, in
     which case the caller keeps the built-in default tiling.
 
-    A ``tt.dot`` carrying a live accumulator is declined: it lowers to a
-    contraction plus a ``linalg.generic`` add, which fails the subset test
-    above. ``@fold_add_into_matmul_init`` removes that generic, but schedules
-    are selected after this runs, so such a kernel needs an explicit
-    ``transform_script``.
+    A ``tt.dot`` carrying a live accumulator, as in a K loop, lowers to a
+    contraction plus a ``linalg.generic`` add. Detection looks at the module
+    with that add folded into the contraction, which is what the generated
+    schedule does first, so only other fused epilogues are declined.
     """
     import re
+
+    asm_src_text = _fold_accumulator_adds(asm_src_text)
 
     # Bail if any linalg op other than matmul / fill is present (fusion).
     linalg_ops = set(re.findall(r"linalg\.(\w+)", asm_src_text))
@@ -1374,7 +1411,17 @@ def _detect_matmul(asm_src_text):
     # Defensive shape consistency: A[MxK] * B[KxN] = C[MxN].
     if k != k2 or m != m2 or n != n2 or in_elem != in_elem2:
         return None
-    return {"m": m, "k": k, "n": n, "in_elem": in_elem, "out_elem": out_elem}
+    # A kernel K loop carries the accumulator tensor through an scf.for; the
+    # shapes above are then one K step.
+    k_loop = bool(re.search(r"scf\.for\b[^\n]*iter_args\([^\n]*tensor<", asm_src_text))
+    return {
+        "m": m,
+        "k": k,
+        "n": n,
+        "in_elem": in_elem,
+        "out_elem": out_elem,
+        "k_loop": k_loop,
+    }
 
 
 def _matmul_transform_params(info, npu_version):
@@ -1445,14 +1492,22 @@ def _matmul_transform_params(info, npu_version):
             l2_k = v
             break
 
+    # In a kernel K loop each step is one L2 tile, and the tile above is the
+    # per-core one inside it.
+    l1_k = None
+    if info.get("k_loop", False):
+        l1_k, l2_k = l2_k, k
+
     return {
         "l1_m": l1_m,
         "l1_n": l1_n,
         "l2_k": l2_k,
+        "l1_k": l1_k,
         "pack_sizes": (pack_m, pack_n, pack_k),
         "accum_type": accum_type,
         "contract_input_type": contract_input_type,
         "bf16_emulation": bf16_emulation,
+        "k_loop": info.get("k_loop", False),
     }
 
 
@@ -2457,7 +2512,78 @@ def _put_aircc_artifacts(cache, artifacts, output_format):
 _NPU_VERSION_TO_ARCH = {v: k for k, v in NPU_AGENT_NAMES.items()}
 
 
-def _pack_hsaco(output_format, artifacts, arch, kernel_name):
+# The relocation symbol naming a full ELF's control scratchpad, as aiecc emits
+# it; the symbol's st_size is the scratchpad's size in bytes.
+_SCRATCHPAD_SYMBOL = b"scratch-pad-ctrl"
+# The patch scheme a scratchpad site uses: a plain 64-bit store.
+_ADDRESS64 = 8
+
+
+def _scratchpad_relocs(blob):
+    """Find a full ELF's control-scratchpad relocations.
+
+    Returns ``(size, relocs)``: the scratchpad's size in bytes (0 if the ELF
+    has none) and, for each relocation naming it, ``(rela_offset,
+    site_offset, addend)`` -- where the ``Elf32_Rela`` entry is in the file,
+    and the file offset and addend of the control-code word it patches.
+    """
+    from aie.compiler.hsaco.elf import ElfFile
+
+    f = ElfFile(blob)
+    rela = f.section_by_name(".rela.dyn")
+    dynsym = f.section_by_name(".dynsym")
+    if rela is None or dynsym is None:
+        return 0, []
+    dynstr = f.sections[dynsym.link]
+    abi_version = blob[8]  # e_ident[EI_ABIVERSION]
+    size, relocs = 0, []
+    for off in range(rela.offset, rela.offset + rela.size, 12):  # Elf32_Rela
+        r_offset, r_info, r_addend = struct.unpack_from("<IIi", blob, off)
+        sym = dynsym.offset + (r_info >> 8) * 16  # Elf32_Sym
+        st_name, _, st_size, _, _, st_shndx = struct.unpack_from("<IIIBBH", blob, sym)
+        name_at = dynstr.offset + st_name
+        if blob[name_at : blob.index(b"\0", name_at)] != _SCRATCHPAD_SYMBOL:
+            continue
+        if abi_version == 1:
+            scheme, addend = r_addend & 0xF, (r_addend & 0xFFFFFFFF) >> 4
+        else:
+            scheme, addend = r_info & 0xFF, r_addend
+        # Only control code is patched, as in ROCR; this also keeps a symbol
+        # with no section (or a special index) from naming a bogus offset.
+        if st_shndx >= len(f.sections) or not f.sections[st_shndx].name.startswith(
+            ".ctrltext"
+        ):
+            continue
+        if scheme != _ADDRESS64:
+            raise ValueError(f"scratchpad relocation with patch scheme {scheme}")
+        size = st_size
+        relocs.append((off, f.sections[st_shndx].offset + r_offset, addend))
+    return size, relocs
+
+
+def full_elf_scratchpad_size(elf_path):
+    """The size in bytes of a full ELF's control scratchpad, or 0 if it has none."""
+    return _scratchpad_relocs(Path(elf_path).read_bytes())[0]
+
+
+def _bake_scratchpad(blob, dev_addr):
+    """Write a scratchpad's device address into a full ELF's control code.
+
+    ROCR's hsaco loader patches only PDI and argument addresses, and refuses a
+    full ELF that relocates anything else. So the address is stored at each
+    scratchpad site here, as ROCR would store a PDI's, and each relocation is
+    pointed at symbol 0: ROCR skips a relocation whose symbol is not in a
+    control-code section, and the null symbol is in none.
+    """
+    out = bytearray(blob)
+    for rela_offset, site, addend in _scratchpad_relocs(blob)[1]:
+        struct.pack_into("<Q", out, site, dev_addr + addend)
+        r_info = struct.unpack_from("<I", out, rela_offset + 4)[0]
+        struct.pack_into("<I", out, rela_offset + 4, r_info & 0xFF)
+    return bytes(out)
+
+
+def _pack_hsaco(output_format, artifacts, arch, kernel_name, scratchpad_addr=None):
     """Pack aircc's artifacts (see ``_aircc_compile``) into hsaco bytes.
 
     ``kernel_name`` is the string the packed kernel is looked up by at
@@ -2468,45 +2594,45 @@ def _pack_hsaco(output_format, artifacts, arch, kernel_name):
     ``hsa_executable_get_symbol_by_name`` only have to agree with each
     other, not with any real ELF symbol.
 
+    ``scratchpad_addr``, for a full ELF with a control scratchpad, is the
+    device address of the scratchpad it reads (see ``_bake_scratchpad``). The
+    hsaco is then good only for that allocation, so it is not cached.
+
     Returns:
         bytes: the packed hsaco.
 
     Raises:
-        ValueError: via aie.compiler.hsaco.pack, if the xclbin/full-ELF
-            artifacts are malformed (e.g. a missing partition column count, or
-            ``kernel_name`` not found in a full ELF's kernel list).
-        RuntimeError: via aie.compiler.hsaco.pack, if xclbinutil/llvm-objcopy
-            cannot be located or fail.
+        subprocess.CalledProcessError: if the packer rejects the artifacts
+            (e.g. ``kernel_name`` is not a kernel of the full ELF), or cannot
+            find xclbinutil/llvm-objcopy; its report is echoed to stderr.
     """
-    try:
-        from aie.compiler.hsaco import pack
-    except ImportError as e:
-        raise RuntimeError(
-            "could not import aie.compiler.hsaco: the installed mlir-aie "
-            "does not have hsaco packing support yet. This needs an "
-            "mlir-aie build from (or after) branch "
-            "ypapadop-amd/hsa-hsaco-loading -- utils/mlir-air-hash.txt is not "
-            "yet pinned to one (see this change's PR description)."
-        ) from e
-
-    if output_format == "elf":
-        (kernel,) = pack.kernels_from_full_elf(
-            artifacts["elf_path"], names=[kernel_name]
-        )
-    else:
-        pdi, num_cols = pack.partition_from_xclbin(artifacts["bin_path"])
-        insts = Path(artifacts["insts_path"]).read_bytes()
-        kernel = {
-            "name": kernel_name,
-            "pdi": pdi,
-            "num_cols": num_cols,
-            "insts": insts,
-        }
-    section = pack.build_section(arch, [kernel])
     with tempfile.TemporaryDirectory() as scratch:
         path = os.path.join(scratch, "kernel.hsaco")
-        pack.ensure_hsaco(path)
-        pack.inject(path, arch, section)
+        if output_format == "elf":
+            elf = artifacts["elf_path"]
+            if scratchpad_addr is not None:
+                baked = os.path.join(scratch, "aie.elf")
+                Path(baked).write_bytes(
+                    _bake_scratchpad(Path(elf).read_bytes(), scratchpad_addr)
+                )
+                elf = baked
+            kernel = ["--kernel-elf", elf, "--kernel-elf-name", kernel_name]
+        else:
+            kernel = [
+                "--kernel-name",
+                kernel_name,
+                "--kernel-xclbin",
+                artifacts["bin_path"],
+                "--kernel-insts",
+                artifacts["insts_path"],
+            ]
+        # A subprocess, like aircc: the packer imports mlir-aie's MLIR bindings
+        # to find llvm-objcopy, and this process already holds mlir-air's LLVM.
+        # Two in one process abort on a command-line option registered twice.
+        _run_compile(
+            [sys.executable, "-m", "aie.compiler.hsaco.pack", "--hsaco", path]
+            + ["--arch", arch, *kernel]
+        )
         return Path(path).read_bytes()
 
 

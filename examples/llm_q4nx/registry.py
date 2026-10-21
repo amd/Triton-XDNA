@@ -81,6 +81,9 @@ class ModelSpec:
     #: prefill must store K/V through `_kv_store`; set only where the decode has
     #: been verified on hardware.
     supports_xrt_zero_copy: bool = False
+    #: Whether the model has an iGPU forward: `--prefill-engine igpu` and
+    #: `--decode gpu` (`Gemma4GpuDecode`, or `llama_prefill.LlamaGpuDecode`).
+    supports_igpu: bool = False
     #: Host memory the prefill needs to hold this model's dequantized bf16
     #: weights, in GiB. Checked before anything is allocated: an undersized
     #: host is SIGKILLed partway through the load, and a process cannot catch
@@ -107,7 +110,7 @@ class ModelSpec:
     #: The op owns that split; see `tl.extra.npu.DecodeEngine`.
     engine: str = "fused_decode"
 
-    def decode_config(self, context_length):
+    def decode_config(self, context_length, dynseq=None):
         """This spec as a `tl.extra.npu.DecodeConfig`.
 
         The mapping lives here, once, rather than at each call site: every knob
@@ -121,6 +124,9 @@ class ModelSpec:
         here too, leaving the builder its own default -- which is deliberate for
         `UNIFIED`, `DECODE_WGROUP`, `DECODE_STACK`, `DECODE_UNI_DEC` and
         `PROJ_RC_CACHE`, each documented above where it is or is not set.
+
+        `dynseq` is not a property of the model but of the artifact: set for
+        the full ELF that takes its context length at dispatch.
         """
         from triton.language.extra.npu import DecodeConfig
 
@@ -145,6 +151,7 @@ class ModelSpec:
             decode_waves=e.get("DECODE_UNI_DEC"),
             kv_src=self.kv_source_map(),
             engine=self.engine,
+            dynseq=dynseq,
         )
 
     def kv_source_map(self):
@@ -195,6 +202,7 @@ class ModelSpec:
 #: not carry this one's over.
 LLAMA_3_2_1B = ModelSpec(
     name="llama-3.2-1b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="llama-3.2-1b",
         VOCAB_CHUNK_I2="18",
@@ -209,12 +217,7 @@ LLAMA_3_2_1B = ModelSpec(
     air_inference="llama32_1b_q4nx_inference.py",
     tokenizer_fallback="~/q4nx_data/tokenizer/Llama-3.2-1B",
     extra_packages=("llama32_1b",),
-    # HSA decode needs per-token instruction-stream patching
-    # (triton_npu_hsa_patch_insts), which the hsaco/kernel-object HSA dispatch
-    # model does not support -- the instruction stream now lives inside a
-    # frozen ROCr executable rather than a runtime-owned buffer. See
-    # examples/llm_q4nx/hsa_decode.py's HsaProgram docstring.
-    supports_hsa=False,
+    supports_hsa=True,
     supports_xrt_zero_copy=True,
 )
 
@@ -240,6 +243,7 @@ LLAMA_3_2_1B = ModelSpec(
 #:   and ours would silently stop matching.
 LLAMA_3_2_3B = ModelSpec(
     name="llama-3.2-3b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="llama-3.2-3b",
         VOCAB_CHUNK_I2="9",
@@ -256,9 +260,7 @@ LLAMA_3_2_3B = ModelSpec(
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",
     decoder_class="FusedDecode3B",
-    # See the 1B entry above: HSA decode needs per-token instruction-stream
-    # patching, which the hsaco/kernel-object HSA dispatch model dropped.
-    supports_hsa=False,
+    supports_hsa=True,
     supports_xrt_zero_copy=True,
 )
 
@@ -279,6 +281,7 @@ LLAMA_3_2_3B = ModelSpec(
 #: `W_DUAL_CHAN=1` again arrives by a bare `export`, not in `DECODE_ENV`.
 LLAMA_3_1_8B = ModelSpec(
     name="llama-3.1-8b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="llama-3.1-8b",
         VOCAB_CHUNK_I2="16",
@@ -301,6 +304,7 @@ LLAMA_3_1_8B = ModelSpec(
     extra_packages=("llama32_3b", "llama32_1b_q4nx"),
     driver_api="prefiller",
     decoder_class="FusedDecode8B",
+    supports_hsa=True,
     supports_xrt_zero_copy=True,
 )
 
@@ -325,6 +329,7 @@ LLAMA_3_1_8B = ModelSpec(
 #: host, which is a second reason not to pin a value we do not need.
 QWEN3_4B = ModelSpec(
     name="qwen3-4b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="qwen3-4b",
         VOCAB_CHUNK_I2="30",
@@ -350,9 +355,7 @@ QWEN3_4B = ModelSpec(
     # resident at once.
     min_host_gib=14.0,
     extra_packages=("qwen3_8b_q4nx", "qwen3_4b"),
-    # See the 1B entry above: HSA decode needs per-token instruction-stream
-    # patching, which the hsaco/kernel-object HSA dispatch model dropped.
-    supports_hsa=False,
+    supports_hsa=True,
     supports_xrt_zero_copy=True,
 )
 
@@ -372,6 +375,7 @@ QWEN3_4B = ModelSpec(
 #: from the builder rather than repeating a number.
 GEMMA3_4B = ModelSpec(
     name="gemma3-4b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="gemma3-4b",
         VOCAB_CHUNK_I2="5",
@@ -396,9 +400,7 @@ GEMMA3_4B = ModelSpec(
     # because its 262208-row LM head is a separate tensor where Qwen3-4B's is
     # tied.
     min_host_gib=17.0,
-    # See the 1B entry above: HSA decode needs per-token instruction-stream
-    # patching, which the hsaco/kernel-object HSA dispatch model dropped.
-    supports_hsa=False,
+    supports_hsa=True,
     supports_xrt_zero_copy=True,
 )
 
@@ -419,6 +421,7 @@ GEMMA3_4B = ModelSpec(
 #: read from the environment rather than from `_MODELS` -- see `engine`.
 GEMMA4_E2B = ModelSpec(
     name="gemma4-e2b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="gemma4-e2b",
         VOCAB_CHUNK_I2="27",
@@ -443,10 +446,9 @@ GEMMA4_E2B = ModelSpec(
     # Gemma3-4B's 15.1 despite the extra 35-layer depth -- this model's D is
     # 1536 against Gemma3's 2560, and its LM head is the same 262144 rows.
     min_host_gib=16.0,
-    # Routes through the same HsaProgram as the other FusedDecoder models
-    # (via engine="ple"'s _make_hsa_ple_decoder_class, which still calls
-    # _programs() -> HsaProgram): per-token instruction-stream patching has
-    # no home under the hsaco/kernel-object HSA dispatch model.
+    # Its PLE engine is built only as instruction-stream templates, whose
+    # per-token patching hsaco dispatch has no counterpart for; the HSA decode
+    # runs only the shared engine's scratchpad ELF (see hsa_decode.py).
     supports_hsa=False,
 )
 
@@ -478,6 +480,7 @@ GEMMA4_E2B = ModelSpec(
 #:   mlir-air's driver does from its own `DECODE_WGROUP = 9`.
 QWEN3_8B = ModelSpec(
     name="qwen3-8b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="qwen3-8b",
         VOCAB_CHUNK_I2="8",
@@ -507,7 +510,7 @@ QWEN3_8B = ModelSpec(
     # `LlamaConfig` lives there), but naming it here keeps the path set the
     # same whichever module gets imported first.
     extra_packages=("qwen3_4b",),
-    supports_hsa=False,
+    supports_hsa=True,
 )
 
 
@@ -539,6 +542,7 @@ QWEN3_8B = ModelSpec(
 #:   the 4 GiB a shim BD's uint32 byte offset can address in one BO.
 QWEN2_5_7B = ModelSpec(
     name="qwen2.5-7b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="qwen2.5-7b",
         VOCAB_CHUNK_I2="7",
@@ -595,6 +599,7 @@ QWEN2_5_7B = ModelSpec(
 #: deadlock this model's vocab wave.
 PHI4_MINI = ModelSpec(
     name="phi4-mini",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="phi4-mini",
         VOCAB_CHUNK_I2="18",
@@ -625,7 +630,7 @@ PHI4_MINI = ModelSpec(
     # allocation serves both.
     min_host_gib=14.0,
     extra_packages=("llama32_1b_q4nx", "llama32_3b"),
-    supports_hsa=False,
+    supports_hsa=True,
     supports_xrt_zero_copy=True,
 )
 
@@ -654,6 +659,7 @@ PHI4_MINI = ModelSpec(
 #: divisibility rule and still deadlock the vocab wave on device.
 QWEN2_5_3B = ModelSpec(
     name="qwen2.5-3b",
+    supports_igpu=True,
     decode_env=dict(
         DECODE_MODEL="qwen2.5-3b",
         VOCAB_CHUNK_I2="12",
@@ -675,7 +681,7 @@ QWEN2_5_3B = ModelSpec(
     # inside CI's runner -- unlike its 7B sibling, which declines there.
     min_host_gib=12.0,
     extra_packages=("qwen25_3b",),
-    supports_hsa=False,
+    supports_hsa=True,
 )
 
 

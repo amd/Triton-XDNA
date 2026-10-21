@@ -154,6 +154,9 @@ BOS = 2
 #: cache, and the stop does not.
 EXPECT_IDS = [9079, 236761, 106]
 
+#: The same from the iGPU decode (`--decode gpu`), whichever engine prefilled.
+EXPECT_IDS_IGPU = [9079, 236761, 106]
+
 #: Stop tokens for the GPU decode loop. mlir-air's own gate requires the run
 #: to stop on 106 (<end_of_turn>) after EXPECT_IDS; the NPU path leaves that to
 #: its driver, and the GPU path here honours it directly.

@@ -269,13 +269,12 @@ class bo:
         exists, because there is nothing left to patch in place.
 
         Porting this would need a per-instruction-stream packed-executable
-        cache (mirroring mlir-aie's own per-call-sequence executable LRU) and
-        the same new from-memory C ABI entry point the decode path would have
-        needed (`triton_npu_hsa_prepare` here still takes a file path, not
-        bytes) -- not built or measured. Unlike the decode path's
-        ever-increasing context length, a fused prefill's ops may repeat the
-        same instruction-stream shapes across calls, so an LRU might actually
-        help here; that is a hypothesis, not something this has verified.
+        cache (mirroring mlir-aie's own per-call-sequence executable LRU) --
+        not built or measured. A fused prefill's ops may repeat the same
+        instruction-stream shapes across calls, so an LRU might help here;
+        that is a hypothesis, not something this has verified. (The decode
+        sidesteps the question: its context length goes through a full ELF's
+        scratchpad, see examples/llm_q4nx/hsa_decode.py.)
         Fails here, before any dispatch, rather than silently doing the wrong
         thing.
         """

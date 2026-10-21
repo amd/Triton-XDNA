@@ -16,9 +16,11 @@ def select_npu_backend():
 def select_cpu_backend():
     triton.runtime.driver.set_active(CPUDriver())
 
+
 def select_gpu_backend():
     triton.runtime.driver.reset_active()
-    
+
+
 # Unfortunately, we can't use triton.testing.perf_report and triton.testing.do_bench for NPU backend because
 # they are very specific to cuda
 

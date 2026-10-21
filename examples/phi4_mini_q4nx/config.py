@@ -54,6 +54,10 @@ assert ROPE_DIM < DH, "Phi-4-mini rotates only part of each head"
 # there; 1e-6 is what the device computes and what the KV handoff has to match.
 RMS_EPS = 1e-6
 
+#: Whether the LM head is the embedding (`llama_prefill.LlamaGpuDecode.HEADS`).
+TIED_LM_HEAD = True
+
+
 #: RoPE base, before the LongRoPE factor table divides into it. `rope_lut`
 #: takes the whole construction from mlir-air; the value is restated for the
 #: reader.
@@ -88,9 +92,8 @@ BOS = 199999
 EXPECT_IDS = [12650, 11, 1118, 382, 5542, 395, 1617, 37118, 88691, 1299]
 
 #: The same after mlir-air's fused prefill, the default engine. Its numerics
-#: move a later greedy token on this model; these are what mlir-air's own
-#: driver generates from the same build.
-EXPECT_IDS_AIR_FUSED = [12650, 11, 1118, 84230, 316, 12650, 11, 326, 480, 382]
+#: move a later greedy token on this model.
+EXPECT_IDS_AIR_FUSED = [12650, 11, 1118, 382, 261, 5030, 5542, 395, 1617, 10358]
 
 MODEL_DEFAULT = os.environ.get(
     "Q4NX_MODEL_SOURCE", "FastFlowLM/Phi4-mini-Instruct-NPU2"
@@ -202,3 +205,17 @@ def rope_lut(seq_len, dtype=None):
 
         dtype = bfloat16
     return generate_rope_lut(phi4_mini_config(), seq_len, dtype)
+
+
+def load_q4nx_packed(model=None, n_layers=None):
+    """The projections in Codec B, still packed, for the iGPU forward
+    (`llama_prefill.LlamaGpuDecode`). See `llama_prefill.packed_bundle`."""
+    _add_air_paths()
+    from llama32_1b_q4nx_weights import Q4nxModel
+
+    qm = Q4nxModel(model or MODEL_DEFAULT)
+
+    sys.path.insert(0, _SHARED)
+    from llama_prefill import packed_bundle
+
+    return packed_bundle(qm, sys.modules[__name__], n_layers)

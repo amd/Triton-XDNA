@@ -18,10 +18,13 @@ shared  := $(realpath $(srcdir)/../llm_q4nx)
 root    := $(realpath $(srcdir)/../..)
 
 # Dispatch runtime: xrt, or hsa for models with `supports_hsa` in
-# registry.py. Under hsa the decode is built as PDI.
+# registry.py. Under hsa the decode is a full ELF, whose context length the
+# host writes into its scratchpad (hsa_decode.py); it also gets the xclbin pair.
 RUNTIME  ?= xrt
 export AMD_TRITON_NPU_RUNTIME = $(RUNTIME)
-DECODE_FORMAT := $(if $(filter hsa,$(RUNTIME)),pdi,xclbin)
+# Under xrt, DECODE_ELF=1 builds and runs mlir-air's full-ELF decode instead
+# of the xclbin templates.
+DECODE_FORMAT = $(if $(filter hsa,$(RUNTIME)),elf,$(if $(filter 1,$(DECODE_ELF)),elf,xclbin))
 
 # Prefill engine. triton: this repository's prefill, placed by BACKEND and
 # OPS. auto: mlir-air's fused prefill where the model has one (BACKEND and OPS
@@ -80,6 +83,7 @@ help:
 	@echo "  make preflight        Check the environment is set up"
 	@echo ""
 	@echo "  RUNTIME=xrt|hsa       Dispatch runtime (default: xrt)"
+	@echo "  DECODE_ELF=1          (xrt) mlir-air's full-ELF decode instead of the xclbin"
 	@echo "  ENGINE=triton|auto    Prefill engine (default: triton; auto = fused where available)"
 	@echo "  BACKEND=npu|hetero|cpu Where the Triton prefill's operators run (default: npu)"
 	@echo "  OPS=all|matmul,...    Which operators go to the NPU (default: the model's)"

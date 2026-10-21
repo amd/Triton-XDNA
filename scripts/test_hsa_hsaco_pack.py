@@ -16,6 +16,7 @@ needing.
 Exercises both packed-kernel kinds `_pack_hsaco` supports: PDI+insts (forcing
 xclbin output format) and full ELF (npu2's default format).
 """
+
 from __future__ import annotations
 
 import os
@@ -111,9 +112,7 @@ def main():
             )
             for k in info["kernels"]:
                 if k["num_cols"] <= 0:
-                    print(
-                        f"FAIL: kernel {k['name']!r} has num_cols={k['num_cols']}"
-                    )
+                    print(f"FAIL: kernel {k['name']!r} has num_cols={k['num_cols']}")
                     ok = False
 
     return 0 if ok else 1

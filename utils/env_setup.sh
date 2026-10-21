@@ -33,6 +33,12 @@ python3 -m pip install "mlir_air[aie]==$MLIR_AIR_VERSION.$MLIR_AIR_TIMESTAMP+$SH
 # utils/peano-requirements.txt for which version and why.
 python3 -m pip install --upgrade --force-reinstall -r "$(dirname "${SCRIPT_PATH}")/peano-requirements.txt"
 
+# The HSA launch runtime's ROCm is optional; set TRITON_XDNA_HSA=1 to install
+# the pinned one. See utils/rocm-requirements.txt.
+if [[ "${TRITON_XDNA_HSA:-0}" == "1" ]]; then
+    python3 -m pip install -r "$(dirname "${SCRIPT_PATH}")/rocm-requirements.txt"
+fi
+
 fi  # TRITON_XDNA_ENV_INSTALL
 
 if [[ "$MLIR_AIE_INSTALL_DIR" == "" ]]; then
