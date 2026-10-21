@@ -1371,6 +1371,48 @@ def _fold_accumulator_adds(asm_src_text):
     return str(module)
 
 
+@functools.lru_cache(maxsize=64)
+def _generics_follow_matmul(asm_src_text):
+    """Whether every ``linalg.generic`` in the module is computed from the
+    result of its single ``linalg.matmul``, i.e. is part of an output tail
+    rather than preprocessing of A or B."""
+    try:
+        context = air.ir.Context()
+        module = Module.parse(asm_src_text, context=context)
+    except Exception:
+        return False
+
+    generics, matmuls = [], []
+
+    def collect(op):
+        for region in op.regions:
+            for block in region.blocks:
+                for child in block.operations:
+                    if child.operation.name == "linalg.generic":
+                        generics.append(child.operation)
+                    elif child.operation.name == "linalg.matmul":
+                        matmuls.append(child.operation)
+                    collect(child.operation)
+
+    collect(module.operation)
+    if len(matmuls) != 1:
+        return False
+
+    reached = []
+    pending = list(matmuls[0].results)
+    while pending:
+        for use in pending.pop().uses:
+            user = use.owner.operation
+            # A matmul in a K loop reaches the tail through the loop's result.
+            if user.name == "scf.yield":
+                user = user.parent
+            if any(user == r for r in reached):
+                continue
+            reached.append(user)
+            pending.extend(user.results)
+    return all(any(g == r for r in reached) for g in generics)
+
+
 def _detect_matmul(asm_src_text):
     """Detect a single plain matmul in the TritonShared IR.
 
@@ -1382,9 +1424,10 @@ def _detect_matmul(asm_src_text):
     A ``tt.dot`` carrying a live accumulator, as in a K loop, lowers to a
     contraction plus a ``linalg.generic`` add. Detection looks at the module
     with that add folded into the contraction, which is what the generated
-    schedule does first. Any generic left after that is an elementwise tail
-    (a scale, an activation, a cast) and sets ``epilogue``. Tails that read
-    another tensor from DDR, such as a bias, are declined.
+    schedule does first. Generics left after that set ``epilogue`` when all
+    of them are computed from the matmul's result, as an elementwise tail
+    (a scale, an activation, a cast) is. Generics on the inputs, and tails
+    that read another tensor from DDR such as a bias, are declined.
     """
     import re
 
@@ -1402,6 +1445,8 @@ def _detect_matmul(asm_src_text):
             return None
         # A and B are the only tensors read in from DDR.
         if asm_src_text.count("bufferization.to_tensor") != 2:
+            return None
+        if not _generics_follow_matmul(asm_src_text):
             return None
 
     matmuls = re.findall(
