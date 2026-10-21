@@ -24,5 +24,7 @@ DECODE_L   ?= 128
 # those ids. Setting PROMPT sends text, ungated.
 PROMPT     ?=
 PROMPT_IDS ?= 2,818,5279,529,7001,563
+# The prefill this example is built and gated on.
+ENGINE     ?= air-fused
 
 include $(dir $(lastword $(MAKEFILE_LIST)))../llm_q4nx/q4nx.mk

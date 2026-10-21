@@ -41,10 +41,9 @@ if "--example" in sys.argv:
 sys.path.insert(0, os.path.join(os.path.dirname(_HERE), _EXAMPLE))
 sys.path.insert(0, _HERE)
 
-import config  # noqa: E402
-import kv_layout as KVL  # noqa: E402
-
-REGIONS = (KVL.K_REGION, KVL.V_REGION)
+# Imported in `main`: E4B's config loads mlir-air's weights module, so a
+# missing mlir-air checkout is a skip there rather than a traceback here.
+config = KVL = None
 
 
 class _HostBO:
@@ -87,8 +86,12 @@ def _ours(ks, vs, head_dim, n_layers, attn_maxl, bf16):
 
 
 def main():
+    global config, KVL
     try:
         import importlib
+
+        import config
+        import kv_layout as KVL
 
         _air_llms()
         gw = importlib.import_module(f"{config.AIR_PACKAGES[0]}_weights")
@@ -155,7 +158,7 @@ def main():
     # into the cache differently -- which no gate would catch at one token.
     # It writes one head, the iGPU decode's, which runs only with one.
     for dh in (256, 512) if KVL.N_KV == 1 else ():
-        for reg in REGIONS:
+        for reg in (KVL.K_REGION, KVL.V_REGION):
             row = np.arange(1, dh + 1, dtype=np.float32).reshape(1, dh)
             a = np.zeros((1, KVL.REGION_W), np.float32)
             KVL.scatter_rows(a, row, dh, reg)
@@ -170,7 +173,7 @@ def main():
     # The lane map the Triton kernels spell inline must agree with this one.
     for dh in (256, 512):
         half = dh // 2
-        for reg in REGIONS:
+        for reg in (KVL.K_REGION, KVL.V_REGION):
             shift = KVL.lane_shift(dh, reg)
             for d in range(dh):
                 inline = d if d < half else d + shift
