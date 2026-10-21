@@ -176,20 +176,20 @@ def _mlir_aie_root():
 
 
 def _complete(build_dir):
-    """True if `build_dir` holds a manifest, every artifact it names, and the
-    host library the runtime loads when it is constructed."""
-    m = Path(build_dir) / "manifest.json"
-    if not m.is_file() or not (Path(build_dir) / "libhostops.so").is_file():
+    """True if `build_dir` holds a manifest, the device every op runs on (its
+    xclbin and the TXN builder header of the ops' runtime sequences), the LM
+    head's own build if the manifest names one, and the host library the
+    runtime loads when it is constructed."""
+    d = Path(build_dir)
+    m = d / "manifest.json"
+    if not m.is_file():
         return False
     man = json.loads(m.read_text())
+    files = ["libhostops.so", "fused_prefill.xclbin", "fused_prefill.txn.h"]
     # A dense model's LM head runs as GEMMs, so it has no "lm" op.
-    names = list(man["gemm"]) + ([man["lm"]] if man.get("lm") else [])
-    names += [n for pts in man["attn"].values() for n in pts.values()]
-    return all(
-        (Path(build_dir) / f"{n}{ext}").is_file()
-        for n in names
-        for ext in (".xclbin", ".insts.bin")
-    )
+    if man.get("lm"):
+        files += [f"{man['lm']}.xclbin", f"{man['lm']}.insts.bin"]
+    return all((d / f).is_file() for f in files)
 
 
 def default_cache_root():

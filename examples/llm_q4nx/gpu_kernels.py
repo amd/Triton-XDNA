@@ -998,8 +998,6 @@ def _qkv_post_kernel(
     K_SHIFT: tl.constexpr,
     V_SHIFT: tl.constexpr,
     REGION_W: tl.constexpr,
-    DH_A: tl.constexpr,
-    N_CU: tl.constexpr,
     HAS_KV: tl.constexpr,
     DENSE_KV: tl.constexpr,
 ):
@@ -1010,7 +1008,7 @@ def _qkv_post_kernel(
     order, as `_rmsnorm_kernel` followed by `_rope_kernel`. Program `NQ` is
     the single KV head: `k` gets the same with `KN`, `v` the weightless norm,
     and both are rounded to bf16 and written to row `pos` of every slab in
-    `FAN`, at both attention CUs' copies and each region's padded-head lane map
+    `FAN`, at each region's padded-head lane map
     in `kv_layout` -- what `Gemma4GpuDecode._append_kv` did with ~9 launches.
 
     Grid axis 1 is the token, written to row `pos + t`: one token for a
@@ -1063,12 +1061,11 @@ def _qkv_post_kernel(
         v2 = v2.to(tl.bfloat16)
         for f in range(0, n_fan):
             row = SLAB + tl.load(FAN + f).to(tl.int64) * layer_stride + pos * REGION_W
-            for cu in tl.static_range(N_CU):
-                lo = row + cu * DH_A + o
-                tl.store(lo, k1)
-                tl.store(lo + HALF + K_SHIFT, k2)
-                tl.store(lo + region_stride, v1)
-                tl.store(lo + region_stride + HALF + V_SHIFT, v2)
+            lo = row + o
+            tl.store(lo, k1)
+            tl.store(lo + HALF + K_SHIFT, k2)
+            tl.store(lo + region_stride, v1)
+            tl.store(lo + region_stride + HALF + V_SHIFT, v2)
 
 
 def qkv_post(
@@ -1100,7 +1097,7 @@ def qkv_post(
     `out_dtype` is the dtype of q and of the dense K/V. The prefill passes
     fp16, which `attn_prefill_fa` takes; the slab is bf16 either way.
     """
-    from kv_layout import DH_A, K_REGION, N_ATTN_CU, REGION_W, V_REGION, lane_shift
+    from kv_layout import K_REGION, REGION_W, V_REGION, lane_shift
 
     lut_rows = lut_rows.reshape(-1, dh)
     T = lut_rows.shape[0]
@@ -1141,8 +1138,6 @@ def qkv_post(
         K_SHIFT=lane_shift(dh, K_REGION),
         V_SHIFT=lane_shift(dh, V_REGION),
         REGION_W=REGION_W,
-        DH_A=DH_A,
-        N_CU=N_ATTN_CU,
         HAS_KV=kv is not None,
         DENSE_KV=dense_kv,
     )

@@ -16,14 +16,16 @@ is a layout that will eventually be re-derived wrongly in one of them.
 
 The layout, as the decode template is built:
 
-    slab[L]  =  [ K region: ATTN_MAXL x REGION_W ][ V region: same ]
+    slab[L]  =  [ K region: ATTN_MAXL x REGION_W ][ V region: same ][ copies ]
 
-    REGION_W = N_ATTN_CU(2) * DH_A(512) = 1024
+    REGION_W = DH_A(512)
 
-One device row holds the model's single MQA head TWICE, once per attention
-compute unit. Every layer is built at the widest layer's geometry, so a sliding
-layer's 256-wide head does not fill its 512-wide slot. Where it sits depends on
-the region:
+One device row holds the model's single MQA head once; the decode reads it
+back once and fans it to both attention compute units. The decode's append
+also writes each row a second time, past the K and V regions, where nothing
+reads it back; a prefill leaves that part zero. Every layer is built at
+the widest layer's geometry, so a sliding layer's 256-wide head does not fill
+its 512-wide slot. Where it sits depends on the region:
 
     K:  [ real_lo 128 | zeros 128 | real_hi 128 | zeros 128 ]
     V:  [ real 256                | zeros 256               ]
@@ -42,13 +44,14 @@ so the template on disk is identity-mapped -- layer L reads and appends to slab
 L. Filling only the 15 owning slabs decodes to garbage; that was measured.
 """
 
-#: Attention compute units the decode template fans the KV head across.
-N_ATTN_CU = 2
+#: Copies of the K and V regions in one layer's slab (the builder's
+#: `KV_COPIES`).
+KV_COPIES = 2
 #: The build's head dim -- the full-attention layers' width. Sliding layers are
 #: half this and are padded up to it, as the module docstring describes.
 DH_A = 512
-#: One device row: the head once per CU.
-REGION_W = N_ATTN_CU * DH_A
+#: One device row.
+REGION_W = DH_A
 #: Regions per layer: K then V.
 N_REGIONS = 2
 
@@ -61,8 +64,8 @@ def region_stride(attn_maxl):
 
 
 def layer_elems(attn_maxl):
-    """Elements in one layer's slab -- both regions."""
-    return N_REGIONS * region_stride(attn_maxl)
+    """Elements in one layer's slab -- both regions, and their copies."""
+    return KV_COPIES * N_REGIONS * region_stride(attn_maxl)
 
 
 def slab_shape(n_layers, attn_maxl):
@@ -117,7 +120,7 @@ def _runs(dh, region):
 
 
 def scatter_rows(dst, src, dh, region):
-    """Write `src` `[n, dh]` into `dst` `[n, REGION_W]`, padded and duplicated.
+    """Write `src` `[n, dh]` into `dst` `[n, REGION_W]`, padded.
 
     `dst` is a `region_view` slice; `src` is the prefill's dense head. numpy and
     torch both take this unchanged, and both convert on assignment -- but pass
@@ -128,41 +131,32 @@ def scatter_rows(dst, src, dh, region):
     is zeroed before a prefill writes into it, and nothing ever writes them.
     Zeroing them per row would be half again the write volume for no effect.
     """
-    for cu in range(N_ATTN_CU):
-        base = cu * DH_A
-        for d0, s0, w in _runs(dh, region):
-            dst[:, base + d0 : base + d0 + w] = src[:, s0 : s0 + w]
+    for d0, s0, w in _runs(dh, region):
+        dst[:, d0 : d0 + w] = src[:, s0 : s0 + w]
 
 
 def lane_index(dh, region):
-    """Destination lanes for ONE row's real dimensions, all CU copies, in order.
+    """Destination lanes for ONE row's real dimensions, in order.
 
     `scatter_rows` is the right shape for a prefill, which writes P rows at
     once and wants contiguous runs. A decode writes a single row per layer per
     token, where the cost is the number of operations rather than the bytes:
-    the four slice assignments become four kernel launches. Paired with the
-    source repeated once per CU,
+    the slice assignments become one kernel launch each. With
 
-        dst[pos:pos + 1, lane_index(dh, region)] = row.repeat(1, N_ATTN_CU)
+        dst[pos:pos + 1, lane_index(dh, region)] = row
 
     is one launch and lands the identical bytes. Derived from the same `_runs`
     so the two spellings cannot drift.
     """
     import numpy as np
 
-    out = []
-    for cu in range(N_ATTN_CU):
-        base = cu * DH_A
-        for d0, _s0, w in _runs(dh, region):
-            out.append(np.arange(base + d0, base + d0 + w))
-    return np.concatenate(out)
+    return np.concatenate([np.arange(d0, d0 + w) for d0, _s0, w in _runs(dh, region)])
 
 
 def gather_rows(src, dh, region, out=None):
     """The inverse of `scatter_rows`: `[n, REGION_W]` -> `[n, dh]`.
 
-    For `kv_stack()` and `--compare-cpu`, which want the dense head back. Reads
-    the first CU's copy; the second is identical by construction.
+    For `kv_stack()` and `--compare-cpu`, which want the dense head back.
     """
     import numpy as np
 

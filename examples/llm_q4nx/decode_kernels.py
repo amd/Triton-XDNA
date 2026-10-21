@@ -107,6 +107,32 @@ def _aie_include():
     return inc
 
 
+def _builder_const(spec, name, env):
+    """The builder's value of `name` under `env`, or None if it declines.
+
+    Cheap and XRT-free: the print hook returns before `run()` imports pyxrt.
+    Asked of the engine this model actually builds through, not of the shared
+    one: the two derive their constants from different model tables.
+    """
+    from triton.language.extra.npu import ENGINES
+
+    engine = ENGINES[spec.engine]
+    eng_dir = airsrc.fused_decode_dir(spec.engine)
+    # As a build sees it: the variables the engine reads are only those given.
+    base = {k: v for k, v in os.environ.items() if k not in engine.env}
+    r = subprocess.run(
+        [sys.executable, os.path.join(eng_dir, engine.module)],
+        capture_output=True,
+        text=True,
+        cwd=eng_dir,
+        env=dict(base, **env, FUSED_DECODE_PRINT_CONST=name),
+    )
+    out = r.stdout.strip().splitlines()
+    if r.returncode != 0 or not out or not out[-1].strip().isdigit():
+        return None
+    return out[-1].strip()
+
+
 def glu_slice_expected(spec):
     """The builder's own GLU_SLICE for this model, or None.
 
@@ -114,32 +140,25 @@ def glu_slice_expected(spec):
     builder derives that from the model's egress-round parity, so the two have
     to be told the same thing. mlir-air's Makefile asks the builder rather than
     tabulating it (fused_decode/Makefile:65), and so does this -- a table would
-    be one more thing to get silently wrong per model.
-
-    Cheap and XRT-free: the print hook returns before `run()` imports pyxrt.
-    Returns None if the builder declines to answer, which leaves the define off
-    exactly as the Makefile's `$(if ...)` does.
-
-    Asked of the engine this model actually builds through, not of the shared
-    one: the two derive it from the same rule but from different models, and
-    the fork is the only engine that knows Gemma4's.
+    be one more thing to get silently wrong per model. None leaves the define
+    off, exactly as the Makefile's `$(if ...)` does.
     """
-    from triton.language.extra.npu import ENGINES
+    return _builder_const(spec, "GLU_SLICE", spec.decode_env)
 
-    engine = ENGINES[spec.engine]
-    eng_dir = airsrc.fused_decode_dir(spec.engine)
-    env = dict(os.environ, **spec.decode_env, FUSED_DECODE_PRINT_CONST="GLU_SLICE")
-    r = subprocess.run(
-        [sys.executable, os.path.join(eng_dir, engine.module)],
-        capture_output=True,
-        text=True,
-        cwd=eng_dir,
-        env=env,
-    )
-    out = r.stdout.strip().splitlines()
-    if r.returncode != 0 or not out or not out[-1].strip().isdigit():
+
+def kv_parts(spec, config):
+    """How many parts the PLE builder splits attention into for the build
+    `config` (a `DecodeConfig`), or None for the shared engine.
+
+    The kernels are compiled for that count (`-DATTN_KV_PARTS`), and it depends
+    on the build, not only on the model: a short context or a run-time context
+    length is never split. `fused_decode_ple/Makefile` asks the builder per
+    target with the target's own environment, and so does this.
+    """
+    if spec.engine != "ple":
         return None
-    return out[-1].strip()
+    n = _builder_const(spec, "KV_PARTS", {**spec.decode_env, **config.env()})
+    return int(n) if n else None
 
 
 def _command(clang, src_dir, src, out, opt, extra=(), defines=()):
@@ -184,30 +203,35 @@ def _fingerprint(clang, src, cmd):
     return h.hexdigest()[:16]
 
 
-def kernel_dir(spec, src_dir=None):
+def kernel_dir(spec, src_dir=None, parts=None):
     """Where this model's kernel objects are built.
 
     Per model, because the objects carry the model in their defines while
     keeping fixed names: one shared directory and two models would silently
     hand each other the wrong `proj_qmm.o`. Under the model's own ENGINE
     directory, because the same is true one level up -- the PLE fork links a
-    seventh object the shared engine has no place for.
+    seventh object the shared engine has no place for. Per KV part count too,
+    for the same reason, when attention is split.
     """
     src_dir = src_dir or airsrc.fused_decode_dir(spec.engine)
-    return os.path.join(src_dir, f"kernels_{spec.model_type.lower()}")
+    name = f"kernels_{spec.model_type.lower()}"
+    if parts and parts > 1:
+        name += f"_kv{parts}"
+    return os.path.join(src_dir, name)
 
 
-def build(spec=None, src_dir=None, out_dir=None, force=False, verbose=True):
+def build(spec=None, src_dir=None, out_dir=None, force=False, verbose=True, parts=None):
     """Compile every kernel `spec`'s engine links. Returns their paths.
 
     `src_dir` is the SHARED engine's directory whichever engine is in play: it
     holds the six kernels and the headers both engines compile against. Only
-    the extras in `ENGINE_KERNELS` come from elsewhere.
+    the extras in `ENGINE_KERNELS` come from elsewhere. `parts` is the build's
+    `kv_parts`, if any.
     """
     spec = spec or registry.spec()
     src_dir = src_dir or airsrc.fused_decode_dir()
     eng_dir = airsrc.fused_decode_dir(spec.engine)
-    out_dir = out_dir or kernel_dir(spec, eng_dir)
+    out_dir = out_dir or kernel_dir(spec, eng_dir, parts)
     if not os.path.isdir(os.path.join(src_dir, "kernels")):
         raise SystemExit(f"no kernels/ under {src_dir}")
     os.makedirs(out_dir, exist_ok=True)
@@ -219,6 +243,9 @@ def build(spec=None, src_dir=None, out_dir=None, force=False, verbose=True):
     glu_slice = glu_slice_expected(spec)
     if glu_slice is not None:
         defines.append(f"-DGLU_SLICE_EXPECTED={glu_slice}")
+    # The kernels' default is one part.
+    if parts and parts > 1:
+        defines.append(f"-DATTN_KV_PARTS={parts}")
 
     clang = _peano_clang()
     cache_path = os.path.join(
