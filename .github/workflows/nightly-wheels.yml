@@ -82,8 +82,8 @@ jobs:
           android: true
           dotnet: true
           haskell: true
-          # Removes a fixed list of apt packages and fails when one of them is
-          # not in the runner image; it frees little next to the options above.
+          # Off: it apt-removes a hardcoded package list and fails if any of
+          # those packages is missing from the runner image.
           large-packages: false
           swap-storage: false
 
