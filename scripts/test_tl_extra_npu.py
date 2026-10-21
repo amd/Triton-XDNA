@@ -365,6 +365,8 @@ def test_prefill_config_refuses_other_models():
     npu = tl.extra.npu
     g4 = npu.PrefillConfig("gemma4-e2b")
     assert (g4.dense, g4.package) == (None, "gemma4_e2b_q4nx"), g4
+    e4 = npu.PrefillConfig("gemma4-e4b")
+    assert (e4.dense, e4.package) == (None, "gemma4_e4b_q4nx"), e4
     ll = npu.PrefillConfig("llama-3.2-1b")
     assert (ll.dense, ll.package) == ("llama32_1b_q4nx", "shared"), ll
     try:
@@ -390,9 +392,8 @@ import json, sys
 from pathlib import Path
 out = Path(sys.argv[1])
 (out / "manifest.json").write_text(json.dumps(dict(gemm=["g"], attn={}, lm="lm")))
-for n in ("g", "lm"):
-    for ext in (".xclbin", ".insts.bin"):
-        (out / (n + ext)).write_bytes(b"")
+for f in ("fused_prefill.xclbin", "fused_prefill.txn.h", "lm.xclbin", "lm.insts.bin"):
+    (out / f).write_bytes(b"")
 (out / "libhostops.so").write_bytes(b"")
 """
 
@@ -464,8 +465,8 @@ from pathlib import Path
 out = Path(sys.argv[3])
 (out / "argv.json").write_text(json.dumps(sys.argv[1:]))
 (out / "manifest.json").write_text(json.dumps(dict(gemm=["g"], attn={}, lm=None)))
-for ext in (".xclbin", ".insts.bin"):
-    (out / ("g" + ext)).write_bytes(b"")
+for f in ("fused_prefill.xclbin", "fused_prefill.txn.h"):
+    (out / f).write_bytes(b"")
 (out / "libhostops.so").write_bytes(b"")
 """
 
@@ -519,6 +520,35 @@ def test_prefill_max_len():
         drv.find_peano_root, m._mlir_aie_root = saved
 
 
+def test_prefill_fingerprint_follows_gemma4_base():
+    """Gemma4-E4B's builder runs E2B's spec and weights module at its own dims,
+    so its digest follows those as well as its own wrappers; E2B's does not
+    follow E4B's files."""
+    import tempfile
+
+    m = importlib.import_module("triton.language.extra.npu.fused_prefill")
+
+    e2b, e4b = m.PrefillConfig("gemma4-e2b"), m.PrefillConfig("gemma4-e4b")
+    with tempfile.TemporaryDirectory() as tmp:
+        d2, ex = _fake_air_tree(tmp)
+        d4 = ex / "llms" / "gemma4_e4b_q4nx" / "fused_prefill"
+        d4.mkdir(parents=True)
+        (d4 / "build.py").write_text("# runs the e4b spec\n")
+        (d4.parent / "gemma4_e4b_variant.py").write_text("VARIANT = 'e4b'\n")
+        fp = lambda c, d: m.fingerprint(c, d, "/p", "/a")  # noqa: E731
+        a2, a4 = fp(e2b, d2), fp(e4b, d4)
+        assert a2 != a4
+        (d2 / "spec.py").write_text("# e2b spec edited\n")
+        b2, b4 = fp(e2b, d2), fp(e4b, d4)
+        assert b4 != a4, "E4B ignores E2B's fused prefill spec"
+        (d2.parent / "gemma4_e2b_q4nx_weights.py").write_text("D = 1\n")
+        c2, c4 = fp(e2b, d2), fp(e4b, d4)
+        assert c4 != b4, "E4B ignores E2B's weights module"
+        (d4.parent / "gemma4_e4b_variant.py").write_text("VARIANT = 'x'\n")
+        assert fp(e4b, d4) != c4, "E4B ignores its own wrapper modules"
+        assert fp(e2b, d2) == c2, "E2B follows E4B's files"
+
+
 def test_prefill_reuses_a_complete_build():
     """A complete build under the current fingerprint is returned as is (the
     fake builder in `_fake_air_tree` fails if it runs), and a build missing the
@@ -540,11 +570,12 @@ def test_prefill_reuses_a_complete_build():
             cache = Path(tmp) / "cache"
             out = cache / f"gemma4-e2b_{m.fingerprint(cfg, d, '/peano', '/aie')}"
             out.mkdir(parents=True)
-            man = dict(gemm=["g"], attn={"a": {"base": "b"}}, lm="lm")
+            man = dict(gemm=["g"], attn={"a": "a_8"}, lm="lm")
             (out / "manifest.json").write_text(json.dumps(man))
-            for n in ("g", "b", "lm"):
-                for ext in (".xclbin", ".insts.bin"):
-                    (out / f"{n}{ext}").write_bytes(b"")
+            for f in ("fused_prefill.xclbin", "fused_prefill.txn.h"):
+                (out / f).write_bytes(b"")
+            for ext in (".xclbin", ".insts.bin"):
+                (out / f"lm{ext}").write_bytes(b"")
             (out / "libhostops.so").write_bytes(b"")
             r = m.fused_prefill(cfg, d, cache_root=cache)
             assert r["cached"] and r["build_dir"] == str(out.resolve()), r
@@ -575,11 +606,10 @@ def test_prefill_reuses_a_dense_build():
             cache = Path(tmp) / "cache"
             out = cache / f"llama-3.2-1b_{m.fingerprint(cfg, d, '/peano', '/aie')}"
             out.mkdir(parents=True)
-            man = dict(gemm=["g"], attn={"a": {"base": "b"}}, lm=None)
+            man = dict(gemm=["g"], attn={"a": "a_8"}, lm=None)
             (out / "manifest.json").write_text(json.dumps(man))
-            for n in ("g", "b"):
-                for ext in (".xclbin", ".insts.bin"):
-                    (out / f"{n}{ext}").write_bytes(b"")
+            for f in ("fused_prefill.xclbin", "fused_prefill.txn.h"):
+                (out / f).write_bytes(b"")
             (out / "libhostops.so").write_bytes(b"")
             r = m.fused_prefill(cfg, d, cache_root=cache)
             assert r["cached"] and r["build_dir"] == str(out.resolve()), r
@@ -669,6 +699,10 @@ def main():
             test_prefill_rebuild_publishes_a_new_generation,
         ),
         ("max_len is a dense build option", test_prefill_max_len),
+        (
+            "Gemma4-E4B's fingerprint follows E2B's sources",
+            test_prefill_fingerprint_follows_gemma4_base,
+        ),
     ]
     print("tl.extra.npu:")
     failed = sum(not check(n, f) for n, f in tests)

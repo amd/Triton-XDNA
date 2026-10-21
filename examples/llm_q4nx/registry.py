@@ -685,6 +685,35 @@ QWEN2_5_3B = ModelSpec(
 )
 
 
+#: Gemma4-E4B: mlir-air runs E2B's driver and builders at E4B's dims
+#: (`GEMMA4_VARIANT=e4b`, set by its `gemma4_e4b_q4nx` wrappers), so this is
+#: E2B's spec with E4B's names, layer count and LM-head chunking. Its PLE
+#: decode holds the two KV heads one per attention CU, unreplicated
+#: (`kv_layout`). The iGPU and HSA paths are E2B-only for now.
+GEMMA4_E4B = ModelSpec(
+    name="gemma4-e4b",
+    decode_env=dict(
+        DECODE_MODEL="gemma4-e4b",
+        VOCAB_CHUNK_I2="5",
+        UNIFIED="1",
+        LM_HEAD="0",
+        NLAYERS="42",
+        DECODE_GOLDEN="1",
+        DECODE_UNI_DEC="42",
+    ),
+    model_type="GEMMA4_E4B",
+    engine="ple",
+    air_package="gemma4_e4b_q4nx",
+    air_inference="gemma4_e4b_q4nx_inference.py",
+    tokenizer_fallback="FastFlowLM/Gemma4-E4B-IT-NPU2",
+    driver_api="kv_arrays",
+    decoder_class="FusedDecoder",
+    decode_dir_env="Q4NX_GEMMA4_DECODE_DIR",
+    extra_packages=("gemma4_e2b_q4nx",),
+    # Measured: peak RSS of `--prefill-only` is 26.9 GiB.
+    min_host_gib=29.0,
+)
+
 SPECS = {
     s.name: s
     for s in (
@@ -698,6 +727,7 @@ SPECS = {
         PHI4_MINI,
         GEMMA3_4B,
         GEMMA4_E2B,
+        GEMMA4_E4B,
     )
 }
 

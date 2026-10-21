@@ -190,9 +190,27 @@ def _gemv_q4nx(G, dev):
     return ok
 
 
+def _e2b_kv_layout():
+    """`kv_layout` at Gemma4-E2B's one KV head, which the iGPU kernels write.
+
+    `kv_layout` reads the head count from the example's `config`; this file
+    binds none (see `_phi4_partial_rope`), so a stand-in holds it for the
+    import only and is gone before anything else imports `config`.
+    """
+    import types
+
+    if "kv_layout" not in sys.modules:
+        sys.modules["config"] = types.SimpleNamespace(N_KV_HEADS=1)
+        try:
+            import kv_layout  # noqa: F401
+        finally:
+            del sys.modules["config"]
+    return sys.modules["kv_layout"]
+
+
 def _qkv_post(G, dev):
     """`qkv_post` against the separate norm / rope / scatter it fuses."""
-    import kv_layout
+    kv_layout = _e2b_kv_layout()
 
     print("\nqkv_post  head norms + rope + KV append")
     ok = True
@@ -643,7 +661,7 @@ def main():
     # text. Compared against the dense call rather than against torch so that
     # only the layout is under test.
     print("\nattn_decode  (shared cache layout: strided rows, padded head)")
-    import kv_layout as KVL
+    KVL = _e2b_kv_layout()
 
     for S, dh in (
         (7, DH_SLIDING),

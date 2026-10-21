@@ -16,6 +16,9 @@ layout.
 Needs no hardware, but does need mlir-air's sources and its Python bindings
 for the builder.
 
+`--example gemma4_e4b_q4nx` checks Gemma4-E4B's layout (two KV heads per row);
+the default is Gemma4-E2B's.
+
 Not picked up by `scripts/run_tests.py` -- `llm_q4nx` is excluded from the
 sweep as a library, like `test_gpu_kernels.py`. Run it by hand. Exits 77 --
 graded as a skip -- when mlir-air's sources are not present.
@@ -29,11 +32,18 @@ from types import SimpleNamespace
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_EXAMPLE = "gemma4_e2b_q4nx"
+if "--example" in sys.argv:
+    _EXAMPLE = sys.argv[sys.argv.index("--example") + 1]
+# `kv_layout` takes the KV head count from the model's config, so the example
+# goes on the path first; E4B's config also selects mlir-air's E4B dims.
+sys.path.insert(0, os.path.join(os.path.dirname(_HERE), _EXAMPLE))
+sys.path.insert(0, _HERE)
 
-import kv_layout as KVL
-
-REGIONS = (KVL.K_REGION, KVL.V_REGION)
+# Imported in `main`: E4B's config loads mlir-air's weights module, so a
+# missing mlir-air checkout is a skip there rather than a traceback here.
+config = KVL = None
 
 
 class _HostBO:
@@ -76,10 +86,16 @@ def _ours(ks, vs, head_dim, n_layers, attn_maxl, bf16):
 
 
 def main():
+    global config, KVL
     try:
-        sys.path.insert(0, _air_llms())
+        import importlib
+
+        import config
+        import kv_layout as KVL
+
+        _air_llms()
+        gw = importlib.import_module(f"{config.AIR_PACKAGES[0]}_weights")
         import gemma4_e2b_q4nx_inference as air
-        import gemma4_e2b_q4nx_weights as gw
         from ml_dtypes import bfloat16
     except Exception as e:  # noqa: BLE001
         print(f"SKIP: mlir-air's gemma4 sources are not importable: {e}")
@@ -88,24 +104,27 @@ def main():
     rng = np.random.default_rng(0)
     ok = True
     head_dim = lambda L: gw.head_dim(gw.kv_source_layer(L))  # noqa: E731
-    n_layers = gw.NUM_LAYERS
+    n_layers, n_kv = gw.NUM_LAYERS, gw.N_KV_HEADS
     kv_src = [gw.kv_source_layer(L) for L in range(n_layers)]
     # Both head widths, a context that is not a multiple of anything, and one
     # that is -- the interleave is per row, so a ragged P is the interesting
     # case for the reshape rather than for the scatter.
     for attn_maxl, P in ((128, 6), (256, 163)):
         fd = air._load_builder(n_layers, attn_maxl, kv_src)
-        if (fd.DH_A, fd.REGION_W) != (KVL.DH_A, KVL.REGION_W):
+        theirs = (fd.DH_A, fd.REGION_W, fd.KV_LAYER)
+        ours = (KVL.DH_A, KVL.REGION_W, KVL.layer_elems(attn_maxl))
+        if theirs != ours:
             print(
-                f"  builder geometry DH_A={fd.DH_A} REGION_W={fd.REGION_W}, "
-                f"kv_layout has {KVL.DH_A} {KVL.REGION_W}  FAIL"
+                f"  builder geometry DH_A, REGION_W, KV_LAYER = {theirs}, "
+                f"kv_layout has {ours}  FAIL"
             )
             ok = False
             continue
         ks, vs = [], []
         for L in range(n_layers):
-            ks.append(rng.standard_normal((P, head_dim(L)), dtype=np.float32))
-            vs.append(rng.standard_normal((P, head_dim(L)), dtype=np.float32))
+            w = n_kv * head_dim(L)
+            ks.append(rng.standard_normal((P, w), dtype=np.float32))
+            vs.append(rng.standard_normal((P, w), dtype=np.float32))
 
         want = _upstream_slab(air, gw, fd, ks, vs, attn_maxl, bfloat16)
         got = _ours(ks, vs, head_dim, n_layers, attn_maxl, bfloat16)
@@ -137,22 +156,24 @@ def main():
     # `lane_index` is the decode's one-launch spelling of `scatter_rows`. The
     # two must land the same bytes or the prompt and the generated tokens go
     # into the cache differently -- which no gate would catch at one token.
-    for dh in (256, 512):
-        for reg in REGIONS:
+    # It writes one head, the iGPU decode's, which runs only with one.
+    for dh in (256, 512) if KVL.N_KV == 1 else ():
+        for reg in (KVL.K_REGION, KVL.V_REGION):
             row = np.arange(1, dh + 1, dtype=np.float32).reshape(1, dh)
             a = np.zeros((1, KVL.REGION_W), np.float32)
             KVL.scatter_rows(a, row, dh, reg)
             b = np.zeros((1, KVL.REGION_W), np.float32)
-            b[0, KVL.lane_index(dh, reg)] = np.tile(row, (1, KVL.N_ATTN_CU))
+            b[0, KVL.lane_index(dh, reg)] = row
             if not np.array_equal(a, b):
                 print(f"  lane_index disagrees with scatter_rows at dh={dh}  FAIL")
                 ok = False
-    print("  lane_index lands the same bytes as scatter_rows")
+    if KVL.N_KV == 1:
+        print("  lane_index lands the same bytes as scatter_rows")
 
     # The lane map the Triton kernels spell inline must agree with this one.
     for dh in (256, 512):
         half = dh // 2
-        for reg in REGIONS:
+        for reg in (KVL.K_REGION, KVL.V_REGION):
             shift = KVL.lane_shift(dh, reg)
             for d in range(dh):
                 inline = d if d < half else d + shift
@@ -167,12 +188,12 @@ def main():
 
 
 def _air_llms():
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import airsrc
 
-    root = airsrc.air_llms_root()
-    airsrc.add_air_paths("gemma4_e2b_q4nx")
-    return str(root / "gemma4_e2b_q4nx")
+    airsrc.add_air_paths(*config.AIR_PACKAGES)
+    # E2B's driver and builder serve both models; E4B's package holds
+    # same-named wrapper scripts, so E2B's goes first.
+    airsrc.prefer_air_paths("gemma4_e2b_q4nx")
 
 
 if __name__ == "__main__":

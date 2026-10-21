@@ -44,7 +44,7 @@ import registry  # noqa: E402
 
 # The kernels aircc links into the module. Built by decode_kernels.py with
 # Peano (`make compile-decode` builds them before the templates); this step
-# consumes them rather than rebuilding them.
+# consumes them, and builds only the variants for a split attention.
 KERNEL_OBJECTS = (
     "proj_qmm.o",
     "rms_residual.o",
@@ -137,7 +137,21 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
     fd_dir = airsrc.fused_decode_dir(model.engine)
     out_dir = out_dir or fd_dir
 
-    kdir = decode_kernels.kernel_dir(model, fd_dir)
+    from triton.language.extra.npu import fused_decode
+
+    if output_format == "elf" and model.engine != "fused_decode":
+        raise SystemExit(
+            f"--format elf builds the shared engine's decode; {model.name} uses "
+            f"the {model.engine!r} engine, which has no full-ELF build."
+        )
+    cfg = model.decode_config(L, dynseq=1 if output_format == "elf" else None)
+
+    # A build that splits attention links kernels compiled for its part count;
+    # those are built here, from the cache when nothing changed.
+    parts = decode_kernels.kv_parts(model, cfg)
+    if parts and parts > 1:
+        decode_kernels.build(model, parts=parts)
+    kdir = decode_kernels.kernel_dir(model, fd_dir, parts)
     objs = [
         os.path.join(kdir, o) for o in KERNEL_OBJECTS + ENGINE_OBJECTS[model.engine]
     ]
@@ -150,15 +164,6 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
             + "\n\nBuild them first (they are Peano compiles, not AIR):\n"
             f"  make compile-decode MODEL={model.name}"
         )
-
-    from triton.language.extra.npu import fused_decode
-
-    if output_format == "elf" and model.engine != "fused_decode":
-        raise SystemExit(
-            f"--format elf builds the shared engine's decode; {model.name} uses "
-            f"the {model.engine!r} engine, which has no full-ELF build."
-        )
-    cfg = model.decode_config(L, dynseq=1 if output_format == "elf" else None)
     print(f"[decode-build] L={L} {cfg}", flush=True)
     t0 = time.time()
     art = fused_decode(
