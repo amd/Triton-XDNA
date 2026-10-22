@@ -974,8 +974,8 @@ def rope(x, lut_row, n_heads, dh):
     return out.reshape(1, n_heads * dh)
 
 
-# `pos` moves every token and `n_fan` per layer: neither may specialize.
-@triton.jit(do_not_specialize=["pos", "n_fan"])
+# `pos` moves every token and `slot` per layer: neither may specialize.
+@triton.jit(do_not_specialize=["pos", "slot"])
 def _qkv_post_kernel(
     QKV,
     QN,
@@ -983,10 +983,9 @@ def _qkv_post_kernel(
     ROW,
     QOUT,
     SLAB,
-    FAN,
     KOUT,
     VOUT,
-    n_fan,
+    slot,
     pos,
     eps,
     layer_stride,
@@ -1007,9 +1006,8 @@ def _qkv_post_kernel(
     RoPE against the position's table row -- the same arithmetic, in the same
     order, as `_rmsnorm_kernel` followed by `_rope_kernel`. Program `NQ` is
     the single KV head: `k` gets the same with `KN`, `v` the weightless norm,
-    and both are rounded to bf16 and written to row `pos` of every slab in
-    `FAN`, at each region's padded-head lane map
-    in `kv_layout` -- what `Gemma4GpuDecode._append_kv` did with ~9 launches.
+    and both are rounded to bf16 and written to row `pos` of slab `slot`, at
+    each region's padded-head lane map in `kv_layout`.
 
     Grid axis 1 is the token, written to row `pos + t`: one token for a
     decode step, the whole prompt for a prefill. With `DENSE_KV` the roped K
@@ -1059,13 +1057,11 @@ def _qkv_post_kernel(
         k2 = k2.to(tl.bfloat16)
         v1 = v1.to(tl.bfloat16)
         v2 = v2.to(tl.bfloat16)
-        for f in range(0, n_fan):
-            row = SLAB + tl.load(FAN + f).to(tl.int64) * layer_stride + pos * REGION_W
-            lo = row + o
-            tl.store(lo, k1)
-            tl.store(lo + HALF + K_SHIFT, k2)
-            tl.store(lo + region_stride, v1)
-            tl.store(lo + region_stride + HALF + V_SHIFT, v2)
+        lo = SLAB + slot.to(tl.int64) * layer_stride + pos * REGION_W + o
+        tl.store(lo, k1)
+        tl.store(lo + HALF + K_SHIFT, k2)
+        tl.store(lo + region_stride, v1)
+        tl.store(lo + region_stride + HALF + V_SHIFT, v2)
 
 
 def qkv_post(
@@ -1089,10 +1085,10 @@ def qkv_post(
     `[T, n_q * dh]` -- and with `dense_kv`, also the roped K and normed V
     as `[T, dh]`.
 
-    `kv`, where the layer owns its cache, is `(slab, fan, pos, region_stride)`:
-    the `[n_layers, layer_elems]` bf16 slab, a device int32 tensor of the
-    layers whose slabs take these rows (`kv_layout`'s fan-out), the first row,
-    and the K-to-V region offset in elements. Token `t` lands in row `pos + t`.
+    `kv`, where the layer owns its cache, is `(slab, slot, pos, region_stride)`:
+    the `[n_slabs, layer_elems]` bf16 slab, the layer's slab in it
+    (`kv_layout.kv_slots`), the first row, and the K-to-V region offset in
+    elements. Token `t` lands in row `pos + t`.
 
     `out_dtype` is the dtype of q and of the dense K/V. The prefill passes
     fp16, which `attn_prefill_fa` takes; the slab is bf16 either way.
@@ -1110,7 +1106,7 @@ def qkv_post(
     kd = torch.empty((T, dh), dtype=out_dtype, device=qkv.device) if dense_kv else q
     vd = torch.empty_like(kd) if dense_kv else q
     if kv is not None:
-        slab, fan, pos, region_stride = kv
+        slab, slot, pos, region_stride = kv
         if slab.stride(1) != 1:
             raise ValueError("the KV slab's rows must be contiguous")
         # The kernel writes rows `pos .. pos + T - 1` by raw offset, so a row
@@ -1121,9 +1117,9 @@ def qkv_post(
             raise ValueError(
                 f"KV rows {pos}..{pos + T - 1} are outside the slab's {attn_maxl} rows"
             )
-        args = (slab, fan, kd, vd, fan.numel(), pos, eps, slab.stride(0), region_stride)
+        args = (slab, kd, vd, slot, pos, eps, slab.stride(0), region_stride)
     else:
-        args = (q, q, q, q, 0, 0, eps, 0, 0)
+        args = (q, q, q, 0, 0, eps, 0, 0)
     _qkv_post_kernel[(n_q + (kv is not None), T)](
         qkv,
         q_norm.contiguous(),

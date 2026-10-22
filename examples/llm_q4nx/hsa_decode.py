@@ -684,7 +684,7 @@ def _make_hsa_ple_decoder_class(base, artifact_dir):
             )
             self._r = copy_of(norms)
             self._y = shared_array(lib, (self.ny,), bf16)
-            self._kv = shared_array(lib, (self.UNI * self.KV_LAYER,), bf16)
+            self._kv = shared_array(lib, (self.KV.size,), bf16)
             self._kv[:] = 0
             self._pw = copy_of(self.ple.reshape(-1))
             # The weights and the KV cache are the device's once written. The
@@ -710,7 +710,7 @@ def _make_hsa_ple_decoder_class(base, artifact_dir):
             """The resident KV buffer and its geometry, for a producer to fill."""
             return dict(
                 buf=self._kv,
-                n_layers=self.UNI,
+                n_slabs=self.KV.shape[0],
                 lreg=self.KV_LAYER,
                 region_stride=self.ATTN_MAXL * self.REGION_W,
                 region_w=self.REGION_W,

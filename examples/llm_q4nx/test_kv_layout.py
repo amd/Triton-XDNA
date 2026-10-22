@@ -45,6 +45,9 @@ class _HostBO:
     def sync(self, *a):
         pass
 
+    def write_layers(self, *a):
+        pass
+
 
 def _upstream_slab(air, gw, fd, ks, vs, attn_maxl, bf16):
     """`FusedDecoder.seed_kv` itself, on a decoder with only what it reads."""
@@ -54,23 +57,29 @@ def _upstream_slab(air, gw, fd, ks, vs, attn_maxl, bf16):
     dec.xrt = SimpleNamespace(
         xclBOSyncDirection=SimpleNamespace(XCL_BO_SYNC_BO_TO_DEVICE=0)
     )
-    dec.kvc = _HostBO()
+    dec.kvc = dec.kvb = _HostBO()
     dec.UNI, dec.ATTN_MAXL = n, attn_maxl
     dec.DH_A, dec.REGION_W = fd.DH_A, fd.REGION_W
-    # As `FusedDecoder.__init__` sets it.
+    # As `FusedDecoder.__init__` sets them.
     dec.SWA = {L for L in range(n) if fd.arm_of_layer(L) & fd.SWA_ARM_BIT}
-    dec.KV = np.zeros((n, KVL.layer_elems(attn_maxl)), dtype=bf16)
+    dec.KV_SLABS, dec.KV_SLOT = fd.KV_SLABS, fd.KV_SLOT_RD
+    dec.KV_OWNERS = [L for L in range(n) if fd.KV_SLOT_WR[L] == fd.KV_SLOT_RD[L]]
+    dec.KV = np.zeros((fd.KV_SLABS, KVL.layer_elems(attn_maxl)), dtype=bf16)
     dec.seed_kv(ks, vs, ks[0].shape[0])
     return dec.KV
 
 
-def _ours(ks, vs, head_dim, n_layers, attn_maxl, bf16):
-    KV = np.zeros((n_layers, KVL.layer_elems(attn_maxl)), dtype=bf16)
+def _ours(ks, vs, head_dim, kv_src, attn_maxl, bf16):
+    """The slab as the prefill writes it: each owning layer into its slab."""
+    n_slabs, _, slot = KVL.kv_slots(kv_src)
+    KV = np.zeros(KVL.slab_shape(n_slabs, attn_maxl), dtype=bf16)
     P = ks[0].shape[0]
-    for L in range(n_layers):
+    for L, src_layer in enumerate(kv_src):
+        if src_layer != L:
+            continue
         dh = head_dim(L)
         for reg, src in ((KVL.K_REGION, ks[L]), (KVL.V_REGION, vs[L])):
-            dst = KVL.region_view(KV, L, reg, attn_maxl)[:P]
+            dst = KVL.region_view(KV, slot[L], reg, attn_maxl)[:P]
             KVL.scatter_rows(dst, np.asarray(src, np.float32).astype(bf16), dh, reg)
     return KV
 
@@ -104,33 +113,54 @@ def main():
             )
             ok = False
             continue
+        slots = KVL.kv_slots(kv_src)
+        if slots != (fd.KV_SLABS, fd.KV_SLOT_WR, fd.KV_SLOT_RD):
+            print(
+                f"  slabs, append and read slab per layer: kv_layout {slots}, "
+                f"the builder {(fd.KV_SLABS, fd.KV_SLOT_WR, fd.KV_SLOT_RD)}  FAIL"
+            )
+            ok = False
+            continue
+        print(
+            f"  ATTN_MAXL={attn_maxl} slab map ({slots[0]} slabs) matches the builder"
+        )
         ks, vs = [], []
         for L in range(n_layers):
             ks.append(rng.standard_normal((P, head_dim(L)), dtype=np.float32))
             vs.append(rng.standard_normal((P, head_dim(L)), dtype=np.float32))
 
         want = _upstream_slab(air, gw, fd, ks, vs, attn_maxl, bfloat16)
-        got = _ours(ks, vs, head_dim, n_layers, attn_maxl, bfloat16)
+        got = _ours(ks, vs, head_dim, kv_src, attn_maxl, bfloat16)
+        if want.shape != got.shape:
+            print(f"  slab {got.shape}, upstream's {want.shape}  FAIL")
+            ok = False
+            continue
         for reg, name in ((KVL.K_REGION, "K"), (KVL.V_REGION, "V")):
             bad = [
-                L
-                for L in range(n_layers)
+                s
+                for s in range(want.shape[0])
                 if not np.array_equal(
-                    KVL.region_view(want, L, reg, attn_maxl).view(np.uint16),
-                    KVL.region_view(got, L, reg, attn_maxl).view(np.uint16),
+                    KVL.region_view(want, s, reg, attn_maxl).view(np.uint16),
+                    KVL.region_view(got, s, reg, attn_maxl).view(np.uint16),
                 )
             ]
             print(
-                f"  layers={n_layers} ATTN_MAXL={attn_maxl} P={P} {name}  "
-                + ("identical" if not bad else f"DIFFER on layers {bad}")
+                f"  slabs={want.shape[0]} ATTN_MAXL={attn_maxl} P={P} {name}  "
+                + ("identical" if not bad else f"DIFFER on slabs {bad}")
             )
             ok &= not bad
 
-        # And the round trip, since kv_stack() and --compare-cpu depend on it.
+        # And the round trip of every layer through the slab it reads, since
+        # kv_stack() and --compare-cpu depend on it.
+        slot = slots[2]
         for L in range(n_layers):
-            for reg, src in ((KVL.K_REGION, ks[L]), (KVL.V_REGION, vs[L])):
+            src_layer = kv_src[L]
+            for reg, src in (
+                (KVL.K_REGION, ks[src_layer]),
+                (KVL.V_REGION, vs[src_layer]),
+            ):
                 back = KVL.gather_rows(
-                    KVL.region_view(got, L, reg, attn_maxl)[:P], head_dim(L), reg
+                    KVL.region_view(got, slot[L], reg, attn_maxl)[:P], head_dim(L), reg
                 )
                 if not np.array_equal(back, src.astype(bfloat16).astype(np.float32)):
                     print(f"  layer {L} region {reg}: no round trip  FAIL")

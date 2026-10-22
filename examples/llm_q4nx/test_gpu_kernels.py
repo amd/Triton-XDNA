@@ -196,7 +196,8 @@ def _qkv_post(G, dev):
 
     print("\nqkv_post  head norms + rope + KV append")
     ok = True
-    maxl, pos, fan = 16, 5, [0, 2, 3]
+    # A slab other than 0, so a kernel that ignores `slot` fails.
+    maxl, pos, slot = 16, 5, 2
     for dh, owns in ((256, True), (512, True), (256, False)):
         n = N_Q_HEADS * dh + (2 * dh if owns else 0)
         qkv = torch.randn(1, n, device=dev)
@@ -205,10 +206,7 @@ def _qkv_post(G, dev):
         slab = torch.zeros(
             kv_layout.slab_shape(4, maxl), dtype=torch.bfloat16, device=dev
         )
-        kv = None
-        if owns:
-            fan_t = torch.tensor(fan, dtype=torch.int32, device=dev)
-            kv = (slab, fan_t, pos, kv_layout.region_stride(maxl))
+        kv = (slab, slot, pos, kv_layout.region_stride(maxl)) if owns else None
         q = G.qkv_post(qkv, qn, kn if owns else None, row, N_Q_HEADS, dh, RMS_EPS, kv)
 
         def normed_roped(x, w, heads):
@@ -222,18 +220,16 @@ def _qkv_post(G, dev):
         k = normed_roped(qkv[:, qd : qd + dh], kn, 1)
         v = G.rmsnorm(qkv[:, qd + dh :], None, RMS_EPS)
         want = torch.zeros_like(slab)
-        for L in fan:
-            for region, t in ((kv_layout.K_REGION, k), (kv_layout.V_REGION, v)):
-                view = kv_layout.region_view(want, L, region, maxl)
-                kv_layout.scatter_rows(
-                    view[pos : pos + 1], t.to(torch.bfloat16), dh, region
-                )
+        for region, t in ((kv_layout.K_REGION, k), (kv_layout.V_REGION, v)):
+            view = kv_layout.region_view(want, slot, region, maxl)
+            kv_layout.scatter_rows(
+                view[pos : pos + 1], t.to(torch.bfloat16), dh, region
+            )
         ok &= check(f"kv slab dh={dh}", slab.float(), want.float(), tol=1e-6)
 
     # The prefill's form: T tokens in one launch, rows pos .. pos + T - 1, and
     # the dense K/V its attention reads. Must equal T single-token calls.
     T, pos0 = 5, 3
-    fan_t = torch.tensor(fan, dtype=torch.int32, device=dev)
     for dh in (256, 512):
         n = N_Q_HEADS * dh + 2 * dh
         qkv = torch.randn(T, n, device=dev)
@@ -242,14 +238,14 @@ def _qkv_post(G, dev):
         slab = torch.zeros(
             kv_layout.slab_shape(4, maxl), dtype=torch.bfloat16, device=dev
         )
-        kv = (slab, fan_t, pos0, kv_layout.region_stride(maxl))
+        kv = (slab, slot, pos0, kv_layout.region_stride(maxl))
         q, kd, vd = G.qkv_post(
             qkv, qn, kn, rows, N_Q_HEADS, dh, RMS_EPS, kv, dense_kv=True
         )
         one = torch.zeros_like(slab)
         q1 = []
         for t in range(T):
-            kv1 = (one, fan_t, pos0 + t, kv_layout.region_stride(maxl))
+            kv1 = (one, slot, pos0 + t, kv_layout.region_stride(maxl))
             q1.append(
                 G.qkv_post(qkv[t : t + 1], qn, kn, rows[t], N_Q_HEADS, dh, RMS_EPS, kv1)
             )
@@ -272,7 +268,7 @@ def _qkv_post(G, dev):
             N_Q_HEADS,
             dh,
             RMS_EPS,
-            (slab, fan_t, maxl - 2, kv_layout.region_stride(maxl)),
+            (slab, slot, maxl - 2, kv_layout.region_stride(maxl)),
         )
         print("  rows past the slab: no error  FAIL")
         ok = False

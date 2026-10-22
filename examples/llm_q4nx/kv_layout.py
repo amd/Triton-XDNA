@@ -16,7 +16,7 @@ is a layout that will eventually be re-derived wrongly in one of them.
 
 The layout, as the decode template is built:
 
-    slab[L]  =  [ K region: ATTN_MAXL x REGION_W ][ V region: same ][ copies ]
+    slab[s]  =  [ K region: ATTN_MAXL x REGION_W ][ V region: same ][ copies ]
 
     REGION_W = DH_A(512)
 
@@ -37,11 +37,12 @@ contiguous alternative as measured-wrong for K. V is not roped, and the decode
 streams a sliding layer's o-proj weights for the front half of the slot only,
 so its V is contiguous there. `FusedDecoder.seed_kv` is the reference for both.
 
-All 35 layer slabs are live, including the 20 that read a lower layer's cache:
-`DECODE_KV_SRC` only reaches the builder when a Makefile sets `KV_SRC`, and
-neither this repo's `decode_build.py` nor mlir-air's own `compile-decode` does,
-so the template on disk is identity-mapped -- layer L reads and appends to slab
-L. Filling only the 15 owning slabs decodes to garbage; that was measured.
+Only the layers that own a KV cache have a slab, in layer order, plus one
+scratch slab. A KV-shared layer reads its source's slab; the decode still
+appends its k/v every token, into the scratch slab, which nothing reads.
+`kv_slots` is that map. The decode template is built with the same source map
+(`DECODE_KV_SRC`), and its builder assigns slabs by the same rule; the NPU
+decoder hand-off checks the two agree.
 """
 
 #: Copies of the K and V regions in one layer's slab (the builder's
@@ -68,8 +69,20 @@ def layer_elems(attn_maxl):
     return KV_COPIES * N_REGIONS * region_stride(attn_maxl)
 
 
-def slab_shape(n_layers, attn_maxl):
-    return (n_layers, layer_elems(attn_maxl))
+def kv_slots(kv_src):
+    """(slab count, append slab per layer, read slab per layer) for the
+    per-layer KV source map `kv_src` (`kv_src[L]` is the layer whose cache
+    layer L attends), as mlir-air's decode builder assigns them."""
+    owners = [L for L, src in enumerate(kv_src) if src == L]
+    rank = {L: i for i, L in enumerate(owners)}
+    scratch = len(owners) if len(owners) < len(kv_src) else None
+    append = [rank.get(L, scratch) for L in range(len(kv_src))]
+    read = [rank[src] for src in kv_src]
+    return len(owners) + (scratch is not None), append, read
+
+
+def slab_shape(n_slabs, attn_maxl):
+    return (n_slabs, layer_elems(attn_maxl))
 
 
 def lane_shift(dh, region):
@@ -96,14 +109,14 @@ def lane(d, dh, region):
     return d if d < half else d + lane_shift(dh, region)
 
 
-def region_view(slab, layer_idx, region, attn_maxl):
-    """The `[attn_maxl, REGION_W]` view of one layer's K or V region.
+def region_view(slab, slot, region, attn_maxl):
+    """The `[attn_maxl, REGION_W]` view of slab `slot`'s K or V region.
 
     Works on a numpy array or a torch tensor -- it is basic slicing and a
-    reshape, so neither copies. `slab` is the `[n_layers, layer_elems]` buffer.
+    reshape, so neither copies. `slab` is the `[n_slabs, layer_elems]` buffer.
     """
     rs = region_stride(attn_maxl)
-    flat = slab[layer_idx][region * rs : (region + 1) * rs]
+    flat = slab[slot][region * rs : (region + 1) * rs]
     return flat.reshape(attn_maxl, REGION_W)
 
 
