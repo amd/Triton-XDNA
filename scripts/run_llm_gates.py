@@ -58,8 +58,8 @@ MODELS = {
     "gemma4_e4b_q4nx": "gemma4-e4b",
 }
 
-# On PRs: Llama-3.2-1B takes the KV handoffs, Gemma4-E2B the other model family
-# and the hetero prefill. Case names are those in `plan`.
+# On PRs: Llama-3.2-1B takes the KV handoffs and the full-ELF decode, Gemma4-E2B
+# the other model family and the hetero prefill. Case names are those in `plan`.
 PR_CASES = {
     "llama32_1b_q4nx": {
         "default",
@@ -69,6 +69,7 @@ PR_CASES = {
         "igpu-npu",
         "zero-copy",
         "dense-decode-vs-prefill",
+        "elf",
     },
     "gemma4_e2b_q4nx": {
         "default",
@@ -101,6 +102,8 @@ class Case:
     env: dict = field(default_factory=dict)
     # Needs the model's NPU decode built.
     npu_decode: bool = False
+    # Needs it built as mlir-air's full ELF (DECODE_ELF=1).
+    elf: bool = False
     # Check that the KV cache reached the NPU decode in place.
     zero_copy: bool = False
 
@@ -204,6 +207,19 @@ def plan(ex, spec, fused):
                 npu_decode=True,
             )
         )
+    if spec.engine == "fused_decode":
+        # mlir-air's full-ELF decode under XRT, which only the shared decode
+        # engine builds.
+        cases.append(
+            Case(
+                "elf",
+                entry + gen,
+                d,
+                {**HIDE_IGPU, "DECODE_ELF": "1"},
+                npu_decode=True,
+                elf=True,
+            )
+        )
     return cases
 
 
@@ -245,11 +261,13 @@ def run(cmd, cwd, env, capture=False):
     return p.returncode, p.stdout if capture else ""
 
 
-def build_decode(ex, report):
-    """`make compile-decode` for one model. Returns whether it succeeded."""
-    what = f"{ex}: decode build"
+def build_decode(ex, elf, report):
+    """`make compile-decode` for one model, as the xclbin templates or as the
+    full ELF (which also builds the templates). Returns whether it succeeded."""
+    what = f"{ex}: decode build ({'elf' if elf else 'xclbin'})"
     print(f"📁 {what}", flush=True)
-    rc, _ = run(["make", "compile-decode"], EXAMPLES / ex, HIDE_IGPU)
+    env = {**HIDE_IGPU, "DECODE_ELF": "1"} if elf else HIDE_IGPU
+    rc, _ = run(["make", "compile-decode"], EXAMPLES / ex, env)
     if rc == 0:
         report.ok(what)
         return True
@@ -309,15 +327,17 @@ def main():
         print(f"\n========== {ex} ({len(cases)} cases) ==========", flush=True)
         if args.list:
             for c in cases:
-                decode = "npu-decode" if c.npu_decode else ""
+                decode = (
+                    ("elf-decode" if c.elf else "npu-decode") if c.npu_decode else ""
+                )
                 print(f"  {c.name:24} {decode:11} {' '.join(c.cmd[1:])}")
             continue
 
-        built = None
+        built = {}
         for case in cases:
-            if case.npu_decode and built is None:
-                built = build_decode(ex, report)
-            if case.npu_decode and not built:
+            if case.npu_decode and case.elf not in built:
+                built[case.elf] = build_decode(ex, case.elf, report)
+            if case.npu_decode and not built[case.elf]:
                 report.skip(f"{ex}: {case.name}", "its decode build failed")
                 continue
             run_case(ex, case, report)
