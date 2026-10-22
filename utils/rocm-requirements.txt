@@ -3,9 +3,9 @@
 # `hsa` extra. Optional: the default XRT runtime needs none of it, so nothing
 # installs it unless asked.
 #
-# The pin is a nightly that carries everything the HSA path uses: AIE
-# dispatch, and an hsa_amd_pointer_info that reports an AIE allocation's
-# device address, which the full-ELF decode needs. Without a pin pip takes
-# whatever nightly is newest that day.
+# The pin is a nightly that carries everything the HSA path uses: AIE hsaco
+# loading and dispatch, and resolution of a full ELF's control scratchpad,
+# which the decode needs. Without a pin pip takes whatever nightly is newest
+# that day.
 --extra-index-url https://nightly.repo.amd.com/rocm/whl-next/
-rocm-sdk-core==10.2.0a20261020
+rocm-sdk-core==10.3.0a20261027

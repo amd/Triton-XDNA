@@ -42,9 +42,8 @@
 #include <utility>
 #include <vector>
 
-#include <immintrin.h> // _mm_clflush, for scratchpad_flush
-#include <sys/stat.h>  // fstat(), to size the object a dma-buf names
-#include <unistd.h>    // close(), for the dma-buf an import is reached through
+#include <sys/stat.h> // fstat(), to size the object a dma-buf names
+#include <unistd.h>   // close(), for the dma-buf an import is reached through
 
 #include "hsa/hsa.h"
 #include "hsa/hsa_ext_amd.h"
@@ -54,50 +53,6 @@ namespace {
 
 // Queue depth cap. Also bounds the kernarg slot pool (one slot per ring slot).
 constexpr std::uint32_t QUEUE_SIZE = 32;
-
-// The address the NPU sees for `ptr`, or 0 if this ROCR cannot say.
-//
-// A ROCR that knows AIE allocations reports the agent's address in
-// hsa_amd_pointer_info's agentBaseAddress, as it does for a GPU. One that does
-// not reports them as HSA_EXT_POINTER_TYPE_UNKNOWN.
-//
-// The ROCR a launcher runs against need not be the one it was compiled
-// against (it binds by DT_RPATH), so only the running process can answer.
-inline std::uint64_t query_device_address(void *ptr) {
-  hsa_amd_pointer_info_t info{};
-  info.size = sizeof(info);
-  if (hsa_amd_pointer_info(ptr, &info, nullptr, nullptr, nullptr) !=
-      HSA_STATUS_SUCCESS)
-    return 0;
-  if (info.type == HSA_EXT_POINTER_TYPE_UNKNOWN ||
-      info.hostBaseAddress == nullptr)
-    return 0;
-
-  // pointer_info reports the allocation, so an interior pointer needs its
-  // offset carried across.
-  const auto offset = static_cast<std::uint8_t *>(ptr) -
-                      static_cast<std::uint8_t *>(info.hostBaseAddress);
-  const auto base = reinterpret_cast<std::uint64_t>(info.agentBaseAddress);
-  if (base == 0 || info.agentBaseAddress == info.hostBaseAddress)
-    return 0; // reachable only at its host address, which is not patchable
-  return base + static_cast<std::uint64_t>(offset);
-}
-
-// Write [p, p + n) back from the CPU cache to memory, as ROCR's FlushCpuCache
-// does for the buffers a packet lists, so that the device reads what the host
-// wrote.
-void flush_cpu_cache(const void *p, std::size_t n) {
-  static const std::uintptr_t line = [] {
-    const long sz = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
-    return static_cast<std::uintptr_t>(sz > 0 ? sz : 64);
-  }();
-  const auto begin = reinterpret_cast<std::uintptr_t>(p) & ~(line - 1);
-  const auto end = reinterpret_cast<std::uintptr_t>(p) + n;
-  _mm_mfence();
-  for (std::uintptr_t a = begin; a < end; a += line)
-    _mm_clflush(reinterpret_cast<const void *>(a));
-  _mm_mfence();
-}
 
 // Bytes in the AIE dispatch packet after completion_signal up to
 // kernarg_address; the ABI requires this to be exactly 24.
@@ -372,6 +327,13 @@ struct SharedRegion {
 //
 // hsaco_ is held, not just read once: ROCR reads the code object in place
 // for as long as the reader exists, so these bytes must outlive it.
+// A variable defined in an executable before its code object is loaded, by
+// name and host address.
+struct Variable {
+  std::string name;
+  void *address;
+};
+
 class LoadedExecutable {
 public:
   LoadedExecutable() = default;
@@ -404,10 +366,14 @@ public:
   std::uint32_t kernarg_size() const { return kernarg_size_; }
 
   // Load hsaco_bytes on `agent` and resolve kernel_name to its kernel
-  // object. Throws std::runtime_error (via HSA_CHECK) naming the failing
-  // call; already-acquired state is torn down before rethrowing.
+  // object. `variables` are defined for the agent before the load, so that
+  // a full ELF's references to buffers it does not carry (such as the
+  // control scratchpad) resolve to them. Throws std::runtime_error (via
+  // HSA_CHECK) naming the failing call; already-acquired state is torn down
+  // before rethrowing.
   static LoadedExecutable load(hsa_agent_t agent, std::vector<char> hsaco_bytes,
-                               const char *kernel_name) {
+                               const char *kernel_name,
+                               const std::vector<Variable> &variables) {
     LoadedExecutable exe;
     exe.hsaco_ = std::move(hsaco_bytes);
     try {
@@ -416,6 +382,9 @@ public:
       HSA_CHECK(hsa_executable_create_alt(
           HSA_PROFILE_FULL, HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT, nullptr,
           &exe.executable_));
+      for (const Variable &v : variables)
+        HSA_CHECK(hsa_executable_agent_global_variable_define(
+            exe.executable_, agent, v.name.c_str(), v.address));
       HSA_CHECK(hsa_executable_load_agent_code_object(
           exe.executable_, agent, exe.reader_, nullptr, nullptr));
       HSA_CHECK(hsa_executable_freeze(exe.executable_, nullptr));
@@ -510,68 +479,42 @@ public:
     return std::string(buf);
   }
 
-  // Load + cache the hsaco at hsaco_path and resolve kernel_name to a kernel
-  // object; return its program handle. Keyed by (hsaco_path, kernel_name) so
-  // repeated prepares reuse the same loaded executable. Thread-safe.
+  // Load + cache the hsaco at hsaco_path, with `variables` defined, and
+  // resolve kernel_name to a kernel object; return its program handle. Keyed
+  // by the path, the kernel and the variables, so repeated prepares reuse
+  // the same loaded executable. Thread-safe.
   triton_npu_hsa_program *prepare(const char *hsaco_path,
-                                  const char *kernel_name) {
+                                  const char *kernel_name,
+                                  const std::vector<Variable> &variables) {
     std::string key = std::string(hsaco_path) + '\0' + kernel_name;
+    for (const Variable &v : variables)
+      key += '\0' + v.name + '=' +
+             std::to_string(reinterpret_cast<std::uintptr_t>(v.address));
     std::lock_guard<std::mutex> lock(programs_mtx_);
     auto it = programs_.find(key);
     if (it != programs_.end())
       return it->second.get();
     auto prog = std::make_unique<triton_npu_hsa_program>();
     prog->exe = LoadedExecutable::load(aie_agent_, read_host_file(hsaco_path),
-                                       kernel_name);
+                                       kernel_name, variables);
     triton_npu_hsa_program *raw = prog.get();
     programs_.emplace(std::move(key), std::move(prog));
     return raw;
   }
 
-  // Load + resolve an hsaco already in memory, as prepare() does for one on
-  // disk. Not cached: bytes_programs_ only owns the result so its lifetime
-  // outlives this call, the same guarantee prepare()'s cache gives by
-  // accident. Thread-safe.
-  triton_npu_hsa_program *prepare_bytes(std::vector<char> hsaco_bytes,
-                                        const char *kernel_name) {
-    auto prog = std::make_unique<triton_npu_hsa_program>();
-    prog->exe =
-        LoadedExecutable::load(aie_agent_, std::move(hsaco_bytes), kernel_name);
-    triton_npu_hsa_program *raw = prog.get();
-    std::lock_guard<std::mutex> lock(programs_mtx_);
-    bytes_programs_.push_back(std::move(prog));
-    return raw;
-  }
-
-  // Allocate a zeroed control scratchpad and return its host address, with the
-  // address the NPU reaches it by in *dev_addr. Kept until teardown: that
-  // address is baked into a program's control code, and programs are never
-  // unloaded either. Thread-safe.
-  void *scratchpad_alloc(std::size_t size, std::uint64_t *dev_addr) {
+  // Allocate a zeroed control scratchpad from the dev pool and return its host
+  // address. Kept until teardown, like the programs whose control code holds
+  // its address. Thread-safe.
+  void *scratchpad_alloc(std::size_t size) {
     PoolBuffer b = alloc_dev(size);
     // The host writes parameters into this by index and the device reads every
     // slot, so an unwritten one has to be a zero rather than whatever the pool
     // last held.
     std::memset(b.va(), 0, size);
-    flush_cpu_cache(b.va(), size);
-    *dev_addr = device_address(b.va());
     void *va = b.va();
     std::lock_guard<std::mutex> lock(programs_mtx_);
     scratchpads_.emplace(va, std::move(b));
     return va;
-  }
-
-  // Flush the host's writes to a scratchpad, so the next dispatch reads them.
-  void scratchpad_flush(void *va) {
-    std::size_t size = 0;
-    {
-      std::lock_guard<std::mutex> lock(programs_mtx_);
-      auto it = scratchpads_.find(va);
-      if (it == scratchpads_.end())
-        throw std::runtime_error("address is not a scratchpad");
-      size = it->second.size();
-    }
-    flush_cpu_cache(va, size);
   }
 
   // Run one dispatch of `program` over num_tensors (host_ptr, size) pairs.
@@ -936,7 +879,7 @@ private:
   // cannot be reliably re-reserved+mapped, and reuse removes per-launch cost).
   std::unordered_map<std::size_t, std::vector<DeviceBuffer>> vmem_pool_;
 
-  // Prepared programs, keyed by "hsaco_path\0kernel_name"; owns the loaded
+  // Prepared programs, keyed by path, kernel and variables; owns the loaded
   // executable and makes prepare() idempotent (a repeated (hsaco_path,
   // kernel_name) reuses the same loaded executable rather than loading/
   // leaking a second copy).
@@ -945,11 +888,6 @@ private:
   // destructor freeing them all. Unlike regions_ below, which cannot be.
   std::unordered_map<std::string, std::unique_ptr<triton_npu_hsa_program>>
       programs_;
-  // Programs from prepare_bytes(), which has no key to look one up by (each
-  // is loaded from an hsaco meant for a single use). Owns them so they
-  // outlive the call, same as programs_ for the path-keyed ones; the one
-  // iteration is the destructor freeing them all, like programs_.
-  std::vector<std::unique_ptr<triton_npu_hsa_program>> bytes_programs_;
   // Control scratchpads by host address (see scratchpad_alloc). Guarded by
   // programs_mtx_, since each one belongs to a program.
   std::unordered_map<void *, PoolBuffer> scratchpads_;
@@ -1100,7 +1038,6 @@ private:
         vmem_free(b);
     vmem_pool_.clear();
     programs_.clear();
-    bytes_programs_.clear();
     scratchpads_.clear();
     kernarg_buffer_ = PoolBuffer{};
     if (signal_.handle) {
@@ -1366,21 +1303,6 @@ private:
     return ((n + data_granule_ - 1) / data_granule_) * data_granule_;
   }
 
-  // The address the NPU sees for `ptr`, which differs from the host address.
-  //
-  // The control code names every buffer by this address, and a host address in
-  // a patch site does not fault (the design waits for data that never arrives),
-  // so a buffer with no device address is refused here.
-  std::uint64_t device_address(void *ptr) {
-    const std::uint64_t dev = query_device_address(ptr);
-    if (dev == 0)
-      throw std::runtime_error(
-          "this ROCR does not report a device address for an AIE allocation, "
-          "so a full-ELF design's scratchpad address cannot be resolved; "
-          "dispatching it would hang");
-    return dev;
-  }
-
   // A fresh dev-pool allocation of `size` bytes.
   PoolBuffer alloc_dev(std::size_t size) {
     if (size == 0)
@@ -1629,8 +1551,20 @@ extern "C" int triton_npu_hsa_agent_name(char *buf, size_t buf_len,
 extern "C" triton_npu_hsa_program_t
 triton_npu_hsa_prepare(const char *hsaco_path, const char *kernel_name,
                        char *errbuf, size_t errbuf_len) {
+  return triton_npu_hsa_prepare_with_variables(
+      hsaco_path, kernel_name, 0, nullptr, nullptr, errbuf, errbuf_len);
+}
+
+extern "C" triton_npu_hsa_program_t triton_npu_hsa_prepare_with_variables(
+    const char *hsaco_path, const char *kernel_name, uint32_t num_variables,
+    const char *const *names, void *const *addresses, char *errbuf,
+    size_t errbuf_len) {
   try {
-    return runtime().prepare(hsaco_path, kernel_name);
+    std::vector<Variable> variables;
+    variables.reserve(num_variables);
+    for (uint32_t i = 0; i < num_variables; ++i)
+      variables.push_back({names[i], addresses[i]});
+    return runtime().prepare(hsaco_path, kernel_name, variables);
   } catch (const std::exception &e) {
     write_err(errbuf, errbuf_len, "HSA prepare failed", e.what());
     return nullptr;
@@ -1640,34 +1574,10 @@ triton_npu_hsa_prepare(const char *hsaco_path, const char *kernel_name,
   }
 }
 
-extern "C" triton_npu_hsa_program_t
-triton_npu_hsa_prepare_bytes(const void *hsaco_data, uint64_t hsaco_size,
-                             const char *kernel_name, char *errbuf,
-                             size_t errbuf_len) {
-  try {
-    if (!hsaco_data || !kernel_name)
-      throw std::runtime_error("null hsaco_data or kernel_name");
-    const auto *bytes = static_cast<const char *>(hsaco_data);
-    return runtime().prepare_bytes(std::vector<char>(bytes, bytes + hsaco_size),
-                                   kernel_name);
-  } catch (const std::exception &e) {
-    write_err(errbuf, errbuf_len, "HSA prepare (bytes) failed", e.what());
-    return nullptr;
-  } catch (...) {
-    write_err(errbuf, errbuf_len, "HSA prepare (bytes) failed",
-              "unknown error");
-    return nullptr;
-  }
-}
-
-extern "C" void *triton_npu_hsa_scratchpad_alloc(uint64_t size,
-                                                 uint64_t *dev_addr,
-                                                 char *errbuf,
+extern "C" void *triton_npu_hsa_scratchpad_alloc(uint64_t size, char *errbuf,
                                                  size_t errbuf_len) {
   try {
-    if (!dev_addr)
-      throw std::runtime_error("null dev_addr");
-    return runtime().scratchpad_alloc(static_cast<std::size_t>(size), dev_addr);
+    return runtime().scratchpad_alloc(static_cast<std::size_t>(size));
   } catch (const std::exception &e) {
     write_err(errbuf, errbuf_len, "HSA scratchpad alloc failed", e.what());
     return nullptr;
@@ -1675,21 +1585,6 @@ extern "C" void *triton_npu_hsa_scratchpad_alloc(uint64_t size,
     write_err(errbuf, errbuf_len, "HSA scratchpad alloc failed",
               "unknown error");
     return nullptr;
-  }
-}
-
-extern "C" int triton_npu_hsa_scratchpad_flush(void *va, char *errbuf,
-                                               size_t errbuf_len) {
-  try {
-    runtime().scratchpad_flush(va);
-    return 0;
-  } catch (const std::exception &e) {
-    write_err(errbuf, errbuf_len, "HSA scratchpad flush failed", e.what());
-    return -1;
-  } catch (...) {
-    write_err(errbuf, errbuf_len, "HSA scratchpad flush failed",
-              "unknown error");
-    return -1;
   }
 }
 
@@ -1749,46 +1644,6 @@ extern "C" int triton_npu_hsa_shared_mark_dirty(void *va, char *errbuf,
               "unknown error");
     return -1;
   }
-}
-
-extern "C" int triton_npu_hsa_scratchpad_supported(void) {
-  // No runtime() here, and nothing that can throw: a caller choosing which
-  // shape to build should not have to claim the device to find out. This takes
-  // hsa_init (refcounted) and allocates one page from the dev pool, but creates
-  // no queue and dispatches nothing.
-  //
-  // Whether ROCR reports a device address for AIE memory is not visible in any
-  // symbol or version, so the probe asks about a real allocation. A scratchpad
-  // needs a full ELF, which is aie2p-only, so another generation answers 0
-  // without asking.
-  if (hsa_init() != HSA_STATUS_SUCCESS)
-    return 0;
-
-  int supported = 0;
-  std::vector<hsa_agent_t> aies;
-  AgentSearch as_aie{HSA_DEVICE_TYPE_AIE, &aies};
-  char name[64] = {};
-  if (hsa_iterate_agents(collect_agents, &as_aie) == HSA_STATUS_SUCCESS &&
-      !aies.empty() &&
-      hsa_agent_get_info(aies.front(), HSA_AGENT_INFO_NAME, name) ==
-          HSA_STATUS_SUCCESS &&
-      std::strncmp(name, "aie2p", sizeof(name)) == 0) {
-    PoolSearch s{
-        HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED, false, {}, false};
-    const hsa_status_t st =
-        hsa_amd_agent_iterate_memory_pools(aies.front(), find_pool, &s);
-    if ((st == HSA_STATUS_SUCCESS || st == HSA_STATUS_INFO_BREAK) && s.found) {
-      void *probe = nullptr;
-      if (hsa_amd_memory_pool_allocate(s.pool, 4096, 0, &probe) ==
-          HSA_STATUS_SUCCESS) {
-        supported = query_device_address(probe) != 0 ? 1 : 0;
-        hsa_amd_memory_pool_free(probe);
-      }
-    }
-  }
-
-  hsa_shut_down();
-  return supported;
 }
 
 extern "C" void triton_npu_hsa_dispatch_counts(uint64_t *in_place,

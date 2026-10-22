@@ -9,13 +9,9 @@ The context length changes every token, and reaches the design as scratchpad
 parameters of a full ELF: two scalars in device memory that the design reads in
 its dispatch preamble, so one ELF serves every L.
 
-ROCR loads the ELF from an hsaco and patches only PDI and argument addresses
-into its control code, so the scratchpad's address is written in before
-packing (`driver._pack_hsaco`). That has to be the NPU's address for it, so
-this needs a ROCR whose `hsa_amd_pointer_info` reports an AIE allocation's
-device address; `use_scratchpad` asks. The instruction-stream alternative --
-patching the L-dependent words per token -- has no counterpart under hsaco
-dispatch, where the stream belongs to a loaded executable.
+The host allocates the scratchpad and defines it as the ELF's
+`scratch-pad-ctrl` variable when the hsaco is loaded. ROCR flushes it on every
+dispatch, so L is written with plain stores.
 
 Weights and the KV cache live in shared regions, so they are dispatched on in
 place. Copying 0.7 GB of weights per token would cap throughput near 23 tok/s
@@ -23,6 +19,7 @@ before any compute.
 """
 
 import ctypes
+import hashlib
 import os
 import re
 import threading
@@ -126,81 +123,71 @@ def mark_resident(lib, arr):
         raise HsaDecodeError(buf.value.decode())
 
 
-def use_scratchpad(engine="fused_decode"):
-    """Whether the HSA decode can run: the scratchpad ELF is its only artifact.
+#: The name aiecc gives a full ELF's control scratchpad.
+SCRATCHPAD_SYMBOL = b"scratch-pad-ctrl"
 
-    Decided by the loaded ROCR: the ELF needs `hsa_amd_pointer_info` to report
-    the device address of an AIE allocation. Only the shared engine's decoder
-    is built as an ELF; the PLE engine has none, so it cannot run on HSA.
-    """
-    if engine != "fused_decode":
-        return False
-    from triton.backends.amd_triton_npu.driver import load_hsa_runtime
 
-    return bool(load_hsa_runtime().triton_npu_hsa_scratchpad_supported())
+def _decode_hsaco(elf_path, kernel_name):
+    """The decode ELF packed into an hsaco, cached on the ELF's contents."""
+    from triton.backends.amd_triton_npu.driver import _pack_hsaco
+    from triton.runtime.cache import get_cache_manager
+
+    with open(elf_path, "rb") as f:
+        elf = f.read()
+    cache = get_cache_manager(
+        hashlib.sha256(elf + b"\0" + kernel_name.encode()).hexdigest()
+    )
+    path = cache.get_file("decode.hsaco")
+    if path is None:
+        # Full ELF is aie2p only.
+        hsaco = _pack_hsaco("elf", {"elf_path": str(elf_path)}, "aie2p", kernel_name)
+        path = cache.put(hsaco, "decode.hsaco", binary=True)
+    return path
 
 
 class HsaElfProgram:
     """A full-ELF kernel and the scratchpad the host writes before each dispatch.
 
-    The scratchpad is allocated first, its device address written into the
-    ELF, and the result packed into an hsaco and loaded, so each instance is
-    its own program. Hold `lock` from writing the scratchpad through the
-    dispatch that reads it, and `flush` in between.
+    Each instance has its own scratchpad, and so its own loaded program. Hold
+    `lock` from writing the scratchpad through the dispatch that reads it.
     """
 
-    def __init__(self, elf_path, kernel_name):
-        from triton.backends.amd_triton_npu.driver import (
-            _pack_hsaco,
-            full_elf_scratchpad_size,
-            load_hsa_runtime,
-        )
+    def __init__(self, elf_path, kernel_name, words):
+        from triton.backends.amd_triton_npu.driver import load_hsa_runtime
 
         self.lib = load_hsa_runtime()
-        size = full_elf_scratchpad_size(elf_path)
-        if not size:
-            raise HsaDecodeError(
-                f"'{kernel_name}' declares no scratchpad parameters, so there "
-                "is no way to give it a context length"
-            )
-        dev_addr = ctypes.c_uint64()
         buf, n = _errbuf()
         self.lib.triton_npu_hsa_scratchpad_alloc.restype = ctypes.c_void_p
         va = self.lib.triton_npu_hsa_scratchpad_alloc(
-            ctypes.c_uint64(size), ctypes.byref(dev_addr), buf, n
+            ctypes.c_uint64(4 * words), buf, n
         )
         if not va:
             raise HsaDecodeError(buf.value.decode())
-        self._scratchpad = va
-        # A view of device memory, not a copy; `flush` makes writes visible.
+        # A view of the scratchpad, not a copy.
         self.params = np.ctypeslib.as_array(
-            ctypes.cast(va, ctypes.POINTER(ctypes.c_uint32)), (size // 4,)
+            ctypes.cast(va, ctypes.POINTER(ctypes.c_uint32)), (words,)
         )
 
-        # Full ELF is aie2p only. This hsaco is good only for this scratchpad
-        # (it is baked with this one's device address), so prepare_bytes loads
-        # it straight from memory rather than caching it by a path nothing else
-        # would ever share.
-        hsaco = _pack_hsaco(
-            "elf", {"elf_path": str(elf_path)}, "aie2p", kernel_name, dev_addr.value
-        )
+        names = (ctypes.c_char_p * 1)(SCRATCHPAD_SYMBOL)
+        addresses = (ctypes.c_void_p * 1)(va)
         buf, n = _errbuf()
-        self.lib.triton_npu_hsa_prepare_bytes.restype = ctypes.c_void_p
-        self.handle = self.lib.triton_npu_hsa_prepare_bytes(
-            hsaco, ctypes.c_uint64(len(hsaco)), kernel_name.encode(), buf, n
+        self.lib.triton_npu_hsa_prepare_with_variables.restype = ctypes.c_void_p
+        self.handle = self.lib.triton_npu_hsa_prepare_with_variables(
+            _decode_hsaco(elf_path, kernel_name).encode(),
+            kernel_name.encode(),
+            ctypes.c_uint32(1),
+            names,
+            addresses,
+            buf,
+            n,
         )
         if not self.handle:
-            raise HsaDecodeError(buf.value.decode())
+            raise HsaDecodeError(
+                f"{buf.value.decode()}\nThe decode needs a ROCR whose AIE loader "
+                "resolves a full ELF's control scratchpad; use one from "
+                "utils/rocm-requirements.txt"
+            )
         self.lock = threading.Lock()
-
-    def flush(self):
-        """Make the host's writes to `params` visible to the next dispatch."""
-        buf, n = _errbuf()
-        rc = self.lib.triton_npu_hsa_scratchpad_flush(
-            ctypes.c_void_p(self._scratchpad), buf, n
-        )
-        if rc != 0:
-            raise HsaDecodeError(buf.value.decode())
 
     def dispatch(self, arrays):
         """One enqueue over `arrays` in kernel-argument order."""
@@ -221,7 +208,8 @@ class HsaElfProgram:
 class Params:
     """Where the two parameters live in the scratchpad, and what to write there."""
 
-    def __init__(self, append_slot, scale, addend, mask_slot):
+    def __init__(self, words, append_slot, scale, addend, mask_slot):
+        self.words = words
         self.append_slot = append_slot
         self.scale = scale
         self.addend = addend
@@ -265,7 +253,7 @@ def parse_params(path):
         raise HsaDecodeError(f"{path}: cannot read affine coefficients from {addr[0]}")
     scale = int(m.group(2))
     addend = int(m.group(4)) * (-1 if m.group(3) == "m" else 1)
-    return Params(slot[addr[0]], scale, addend, slot[core[0]])
+    return Params(int(lines[0][0]), slot[addr[0]], scale, addend, slot[core[0]])
 
 
 def _elf_file(artifact_dir, name):
@@ -325,7 +313,7 @@ def _elf_program(artifact_dir, attn_maxl, region_w, model=None):
             f"the decoder's REGION_W is {region_w}; the ELF and the decoder "
             "disagree"
         )
-    return params, HsaElfProgram(elf, ELF_KERNEL_NAME)
+    return params, HsaElfProgram(elf, ELF_KERNEL_NAME, params.words)
 
 
 def require_xclbin_pair(artifact_dir):
@@ -388,12 +376,6 @@ def make_hsa_decoder_class(
 
         def __init__(self, *a, **kw):
             require_xclbin_pair(artifact_dir)
-            if not use_scratchpad(engine):
-                raise HsaDecodeError(
-                    "this ROCR does not report a device address for an AIE "
-                    "allocation, which the decode's scratchpad needs; use a "
-                    "ROCR from utils/rocm-requirements.txt"
-                )
             kw["max_L"] = elf_window(artifact_dir, kw.get("max_L"))
             super().__init__(*a, **kw)
             self._params, self._prog = _elf_program(
@@ -546,7 +528,6 @@ def make_hsa_decoder_class(
             self._write_rms_rope(p)
             with self._prog.lock:
                 self._params.write(self._prog.params, L)
-                self._prog.flush()
                 # 8B split-weight tail follows the fixed five (base's w_bos[1:]
                 # order).
                 self._prog.dispatch(

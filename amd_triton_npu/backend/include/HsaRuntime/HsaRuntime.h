@@ -55,58 +55,26 @@ triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *hsaco_path,
                                                 char *errbuf,
                                                 size_t errbuf_len);
 
-// Like triton_npu_hsa_prepare, but pack-loads an hsaco already in memory
-// instead of reading one from a file. The bytes are copied before this call
-// returns, so hsaco_data need not outlive it.
-//
-// Unlike triton_npu_hsa_prepare, not cached by path -- there is no path to key
-// on. Meant for an hsaco that is good for only one load (e.g. one baked with a
-// single scratchpad's device address, which no other hsaco shares); preparing
-// the same bytes twice loads two independent programs rather than reusing one.
-triton_npu_hsa_program_t triton_npu_hsa_prepare_bytes(const void *hsaco_data,
-                                                      uint64_t hsaco_size,
-                                                      const char *kernel_name,
-                                                      char *errbuf,
-                                                      size_t errbuf_len);
+// Like triton_npu_hsa_prepare, but first defines num_variables agent
+// variables, names[i] at addresses[i], with
+// hsa_executable_agent_global_variable_define. A full ELF that references a
+// buffer it does not carry, such as the control scratchpad
+// ("scratch-pad-ctrl"), loads only if that buffer is defined. Cached by path,
+// kernel and variables, so each scratchpad gets its own program.
+triton_npu_hsa_program_t triton_npu_hsa_prepare_with_variables(
+    const char *hsaco_path, const char *kernel_name, uint32_t num_variables,
+    const char *const *names, void *const *addresses, char *errbuf,
+    size_t errbuf_len);
 
 // Initialize the runtime (idempotent) and allocate a zeroed control scratchpad
-// of `size` bytes for a full-ELF design that declares parameters. Returns its
-// host address and writes the address the NPU reaches it by to *dev_addr, or
-// returns NULL on error (with a message written to errbuf). It lives as long
-// as the runtime does, like the programs it is baked into.
+// of `size` bytes from the AIE dev pool. Returns its host address, or NULL on
+// error (with a message written to errbuf). It lives as long as the runtime
+// does.
 //
-// ROCR's hsaco loader patches only PDI and argument addresses into a full ELF's
-// control code, and refuses one that relocates anything else. So the caller
-// writes *dev_addr into the control code at the scratchpad's relocation sites
-// itself, drops those relocations, and packs the result (see driver.py's
-// _pack_hsaco). The scratchpad is device-visible memory the host writes and
-// the device reads in its dispatch preamble; which uint32 a parameter takes and
-// how it is encoded come from the build's params.txt, which this runtime does
-// not read.
-//
-// Needs a ROCR whose hsa_amd_pointer_info reports an AIE allocation's device
-// address; see triton_npu_hsa_scratchpad_supported.
-void *triton_npu_hsa_scratchpad_alloc(uint64_t size, uint64_t *dev_addr,
-                                      char *errbuf, size_t errbuf_len);
-
-// Flush host writes to a scratchpad from the CPU cache, so that the next
-// dispatch reads them. Returns 0 on success, or a negative value on error (with
-// a message written to errbuf); `va` must be an address
-// triton_npu_hsa_scratchpad_alloc returned.
-//
-// Nothing else does it: the packet lists only the kernel's arguments, which a
-// full ELF has to match exactly, so the scratchpad cannot ride along as an
-// extra argument for ROCR to flush.
-int triton_npu_hsa_scratchpad_flush(void *va, char *errbuf, size_t errbuf_len);
-
-// Whether this ROCR can resolve a scratchpad's device address: 1 if it can, 0
-// if it cannot, including on an AIE agent other than aie2p. Never fails, and
-// creates no queue. It allocates a page to ask, and so calls hsa_init (which is
-// refcounted).
-//
-// Meant to be asked before choosing which artifact to build or load. A full
-// ELF with no scratchpad dispatches without it.
-int triton_npu_hsa_scratchpad_supported(void);
+// ROCR flushes it on every dispatch, so the host writes parameters with plain
+// stores; their slots and encoding come from the build's params.txt.
+void *triton_npu_hsa_scratchpad_alloc(uint64_t size, char *errbuf,
+                                      size_t errbuf_len);
 
 // Dispatch a prepared program: acquire vmem I/O buffers, copy inputs in, fill
 // kernargs, enqueue the AIE packet, wait for completion, copy outputs back, and

@@ -140,11 +140,8 @@ Under HSA the output format is the same as under XRT (`xclbin` on npu1, `elf`
 on npu2); `pdi` is refused, because the packer reads the partition's column
 count from the xclbin or ELF. Packing runs mlir-aie's `aie-hsaco`
 (`aie.compiler.hsaco.pack`). The HSA runtime is Linux-only and requires an
-**AIE-capable ROCR** that loads AIE hsacos: rocm-systems `develop` at or after
-[`7a71bfb`](https://github.com/ROCm/rocm-systems/commit/7a71bfb024e106a0941d14ad560a2befc5277227)
-("feat(rocr/aie): hsaco support for AIE agents"), which provides the AIE
-dispatch extension header (`include/hsa/hsa_ext_amd_aie.h`) and
-`libhsa-runtime64`.
+**AIE-capable ROCR** that loads AIE hsacos and provides the AIE dispatch
+extension header (`include/hsa/hsa_ext_amd_aie.h`) and `libhsa-runtime64`.
 
 Install the pinned one from [TheRock](https://github.com/ROCm/TheRock)'s nightly
 ROCm wheels; the backend picks it up automatically, with no environment
@@ -158,12 +155,9 @@ pip install "triton-xdna[hsa]" \
 
 `rocm-sdk-core` is the only package needed — it carries both the headers and
 `libhsa-runtime64`. The pin in `utils/rocm-requirements.txt` is a nightly with
-everything the HSA path uses, including the device-address reporting the
-full-ELF decode needs. `10.2.0a20261020` is the first nightly with hsaco
-support (TheRock moved its rocm-systems pin past `7a71bfb` on 2026-10-19); an
-older one fails to build the HSA runtime, since its dispatch packet has no
-kernel-object field. The
-older indexes no longer receive builds but still resolve under pip:
+everything the HSA path uses; an older one may fail to build the HSA runtime,
+give wrong results on repeated full-ELF dispatches, or refuse to load the
+decode. The older indexes no longer receive builds but still resolve under pip:
 `https://rocm.nightlies.amd.com/whl-multi-arch/` stopped at 2026-08-22, and the
 per-GPU-family indexes (`https://rocm.nightlies.amd.com/v2/<target>/`) install a
 runtime too old to work.

@@ -228,17 +228,12 @@ scratchpad parameters, two scalars in device memory that the design reads in
 its dispatch preamble, so one full ELF serves every context length and nothing
 rewrites the instruction stream per token.
 
-ROCR loads the ELF from an hsaco and patches only PDI and argument addresses
-into its control code; it refuses one that relocates anything else. So
-`../llm_q4nx/hsa_decode.py` allocates the scratchpad first, asks ROCR for its
-device address (`hsa_amd_pointer_info`, which needs a ROCR that reports one for
-an AIE allocation), writes that into the control code, and packs the result.
-The host then writes L before each dispatch and flushes it from the CPU cache.
+`../llm_q4nx/hsa_decode.py` allocates the scratchpad and defines it as the
+ELF's `scratch-pad-ctrl` variable when the hsaco is loaded. ROCR flushes it on
+every dispatch, so the host writes L before each dispatch with plain stores.
 
 `make compile-decode RUNTIME=hsa` builds the ELF plus the xclbin template pair
-that mlir-air's decoder loads at construction. The patched-instruction-stream
-alternative from before hsaco dispatch is gone: the stream now belongs to a
-loaded ROCR executable, with no buffer left to patch per token.
+that mlir-air's decoder loads at construction.
 
 `--ops` takes `all` or a comma list of `matmul,rms_norm,swiglu`, so a
 numerical regression can be bisected to a single kernel against the same CPU

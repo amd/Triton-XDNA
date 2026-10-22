@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import re
-import struct
 import tempfile
 import threading
 import sys
@@ -2512,84 +2511,7 @@ def _put_aircc_artifacts(cache, artifacts, output_format):
 _NPU_VERSION_TO_ARCH = {v: k for k, v in NPU_AGENT_NAMES.items()}
 
 
-# The relocation symbol naming a full ELF's control scratchpad, as aiecc emits
-# it; the symbol's st_size is the scratchpad's size in bytes.
-_SCRATCHPAD_SYMBOL = b"scratch-pad-ctrl"
-# The patch scheme a scratchpad site uses: a plain 64-bit store.
-_ADDRESS64 = 8
-
-
-def _scratchpad_relocs(blob):
-    """Find a full ELF's control-scratchpad relocations.
-
-    Returns ``(size, relocs)``: the scratchpad's size in bytes (0 if the ELF
-    has none) and, for each relocation naming it, ``(rela_offset,
-    site_offset, addend)`` -- where the ``Elf32_Rela`` entry is in the file,
-    and the file offset and addend of the control-code word it patches.
-    """
-    from aie.compiler.hsaco.elf import ElfFile
-
-    f = ElfFile(blob)
-    rela = f.section_by_name(".rela.dyn")
-    dynsym = f.section_by_name(".dynsym")
-    if rela is None or dynsym is None:
-        return 0, []
-    dynstr = f.sections[dynsym.link]
-    abi_version = blob[8]  # e_ident[EI_ABIVERSION]
-    size, relocs = 0, []
-    for off in range(rela.offset, rela.offset + rela.size, 12):  # Elf32_Rela
-        r_offset, r_info, r_addend = struct.unpack_from("<IIi", blob, off)
-        sym = dynsym.offset + (r_info >> 8) * 16  # Elf32_Sym
-        st_name, _, st_size, _, _, st_shndx = struct.unpack_from("<IIIBBH", blob, sym)
-        name_at = dynstr.offset + st_name
-        if blob[name_at : blob.index(b"\0", name_at)] != _SCRATCHPAD_SYMBOL:
-            continue
-        if abi_version == 1:
-            scheme, addend = r_addend & 0xF, (r_addend & 0xFFFFFFFF) >> 4
-        else:
-            scheme, addend = r_info & 0xFF, r_addend
-        # Only control code is patched, as in ROCR; this also keeps a symbol
-        # with no section (or a special index) from naming a bogus offset.
-        if st_shndx >= len(f.sections) or not f.sections[st_shndx].name.startswith(
-            ".ctrltext"
-        ):
-            continue
-        if scheme != _ADDRESS64:
-            raise ValueError(f"scratchpad relocation with patch scheme {scheme}")
-        size = st_size
-        relocs.append((off, f.sections[st_shndx].offset + r_offset, addend))
-    # hsa_decode.py views the scratchpad as whole uint32 words
-    # (size // 4); a size that isn't a multiple of 4 would silently truncate
-    # the last partial word instead of failing where the build is actually
-    # broken.
-    if size % 4 != 0:
-        raise ValueError(f"scratchpad size {size} is not a multiple of 4")
-    return size, relocs
-
-
-def full_elf_scratchpad_size(elf_path):
-    """The size in bytes of a full ELF's control scratchpad, or 0 if it has none."""
-    return _scratchpad_relocs(Path(elf_path).read_bytes())[0]
-
-
-def _bake_scratchpad(blob, dev_addr):
-    """Write a scratchpad's device address into a full ELF's control code.
-
-    ROCR's hsaco loader patches only PDI and argument addresses, and refuses a
-    full ELF that relocates anything else. So the address is stored at each
-    scratchpad site here, as ROCR would store a PDI's, and each relocation is
-    pointed at symbol 0: ROCR skips a relocation whose symbol is not in a
-    control-code section, and the null symbol is in none.
-    """
-    out = bytearray(blob)
-    for rela_offset, site, addend in _scratchpad_relocs(blob)[1]:
-        struct.pack_into("<Q", out, site, dev_addr + addend)
-        r_info = struct.unpack_from("<I", out, rela_offset + 4)[0]
-        struct.pack_into("<I", out, rela_offset + 4, r_info & 0xFF)
-    return bytes(out)
-
-
-def _pack_hsaco(output_format, artifacts, arch, kernel_name, scratchpad_addr=None):
+def _pack_hsaco(output_format, artifacts, arch, kernel_name):
     """Pack aircc's artifacts (see ``_aircc_compile``) into hsaco bytes.
 
     ``kernel_name`` is the string the packed kernel is looked up by at
@@ -2599,10 +2521,6 @@ def _pack_hsaco(output_format, artifacts, arch, kernel_name, scratchpad_addr=Non
     plain Triton kernel name for PDI+insts -- packing and the later
     ``hsa_executable_get_symbol_by_name`` only have to agree with each
     other, not with any real ELF symbol.
-
-    ``scratchpad_addr``, for a full ELF with a control scratchpad, is the
-    device address of the scratchpad it reads (see ``_bake_scratchpad``). The
-    hsaco is then good only for that allocation, so it is not cached.
 
     Returns:
         bytes: the packed hsaco.
@@ -2615,14 +2533,12 @@ def _pack_hsaco(output_format, artifacts, arch, kernel_name, scratchpad_addr=Non
     with tempfile.TemporaryDirectory() as scratch:
         path = os.path.join(scratch, "kernel.hsaco")
         if output_format == "elf":
-            elf = artifacts["elf_path"]
-            if scratchpad_addr is not None:
-                baked = os.path.join(scratch, "aie.elf")
-                Path(baked).write_bytes(
-                    _bake_scratchpad(Path(elf).read_bytes(), scratchpad_addr)
-                )
-                elf = baked
-            kernel = ["--kernel-elf", elf, "--kernel-elf-name", kernel_name]
+            kernel = [
+                "--kernel-elf",
+                artifacts["elf_path"],
+                "--kernel-elf-name",
+                kernel_name,
+            ]
         else:
             kernel = [
                 "--kernel-name",
