@@ -417,6 +417,23 @@ runs:
             # corrupted cache still says " Paris." first. The decode's packed
             # weight cache is built here on first use, and the NPU-decode row
             # of test_decode_vs_prefill.py in STEP 10 reuses it.
+            # The triton-fused device's GEMM and its LM head, each against a
+            # reference, packed and dispatched by mlir-air's own runtime
+            # pieces: a change on either side of that interface fails here
+            # rather than as wrong tokens in the gate below.
+            for t in test_gemma4_gemm.py test_gemma4_lm_gemv.py; do
+              rc=0
+              echo "📁 Example: llm_q4nx/$t"
+              ( cd examples/llm_q4nx && python3 "$t" ) || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                echo "   ✅ PASS: $t"
+                q_pass=$((q_pass + 1))
+              else
+                echo "   ❌ FAIL: $t (exit code $rc)"
+                q_fail=$((q_fail + 1))
+              fi
+            done
+
             build_rc=0
             echo "📁 Example: gemma4_e2b_q4nx (decode build)"
             ( cd examples/gemma4_e2b_q4nx && make compile-decode ) || build_rc=$?

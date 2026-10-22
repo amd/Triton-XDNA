@@ -737,7 +737,7 @@ def fused_prefill_cls(cfg, prefill_cls, config, triton=False):
     import triton.language as tl
 
     if triton:
-        # The same device with its GEMMs compiled from Triton.
+        # The same device with its GEMMs and LM head compiled from Triton.
         from gemma4_fused_prefill import Gemma4TritonFusedPrefill as cls
         from gemma4_triton_fused import triton_fused_prefill
 

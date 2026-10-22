@@ -6,8 +6,8 @@
 mlir-air's `fused_prefill` runs every op of a 128-token chunk on one configured
 device, with the int4 weights dequantized on the cores. This class drives it
 in place of `Gemma4Prefill`'s own forward and keeps everything a decoder reads
-from a prefiller: the shared KV slab, its fan-out to KV-shared layers, the
-context length and the first token.
+from a prefiller: the shared KV slab, the context length and the first
+token.
 
 The K/V handoff stays zero-copy. The fused prefill computes each chunk's roped
 K and normed V on the host and hands them to `_kv_append`, which writes its own
@@ -77,18 +77,16 @@ class Gemma4FusedPrefill(Gemma4Prefill):
         """
 
     def _store_kv_rows(self, layer_idx, r0, k, v):
-        """Rows [r0, r0+t) of an owning layer, into every slab that reads it."""
+        """Rows [r0, r0+t) of an owning layer, into its slab."""
         t = k.shape[0]
         dh = head_dim(layer_idx)
-        pair = (
+        for region, src in (
             (kv_layout.K_REGION, _bf16_np(torch.from_numpy(np.asarray(k, np.float32)))),
             (kv_layout.V_REGION, _bf16_np(torch.from_numpy(np.asarray(v, np.float32)))),
-        )
-        for L in self._kv_fanout[layer_idx]:
-            for region, src in pair:
-                kv_layout.scatter_rows(
-                    self._region(L, region)[r0 : r0 + t], src, dh, region
-                )
+        ):
+            kv_layout.scatter_rows(
+                self._region(layer_idx, region)[r0 : r0 + t], src, dh, region
+            )
         if layer_idx in self._kv_src:
             kf, vf = self._kv_src[layer_idx]
             kf[r0 : r0 + t] = k
@@ -118,7 +116,7 @@ class Gemma4FusedPrefill(Gemma4Prefill):
 
 
 class Gemma4TritonFusedPrefill(Gemma4FusedPrefill):
-    """`Gemma4FusedPrefill` on the device whose GEMMs are Triton's
-    (`gemma4_triton_fused`)."""
+    """`Gemma4FusedPrefill` on the devices whose GEMMs and LM head are
+    Triton's (`gemma4_triton_fused`)."""
 
     ENGINE = "triton-fused"

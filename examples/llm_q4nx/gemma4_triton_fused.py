@@ -7,9 +7,11 @@ mlir-air's fused prefill (`--prefill-engine air-fused`) runs every op of a
 128-token chunk on one device. This builds the same device with every GEMM
 compiled from `gemma4_gemm.mm_g` instead of mlir-air's GEMM herd, and the
 attention ops from mlir-air's own builder, linked into one module by
-`fused_device.FusedDevice`. The kernel objects, the host library and the LM
-head come from mlir-air's builder functions, so its runtime drives the device
-unchanged.
+`fused_device.FusedDevice`. The LM head is `gemma4_lm_gemv.gemv_q4` on a
+device of its own, on the buffers of mlir-air's `lm_gemv`. The kernel objects
+and the host library come from mlir-air's builder functions, and the manifest
+tells mlir-air's runtime that the GEMMs read bf16 operands, so the runtime
+drives both devices unchanged.
 """
 
 import contextlib
@@ -33,9 +35,19 @@ AIRCC_ARGS = (
     "--use-lock-race-condition-fix-auto=false",
 )
 STACK_SIZE = 4096
+LM_SCHEDULE = HERE / "transform_gemma4_lm_gemv_aie2p.mlir"
+#: What aircc builds the LM head with, beyond the defaults.
+LM_AIRCC_ARGS = ("--air-channel-multiplexing=L1", "--omit-ping-pong-transform=L1")
 SPEC = "air_examples.llms.gemma4_e2b_q4nx.fused_prefill.spec"
 #: This module's own inputs, beyond mlir-air's sources.
-_SOURCES = (HERE / "gemma4_gemm.py", HERE / "fused_device.py", SCHEDULE, Path(__file__))
+_SOURCES = (
+    HERE / "gemma4_gemm.py",
+    HERE / "gemma4_lm_gemv.py",
+    HERE / "fused_device.py",
+    SCHEDULE,
+    LM_SCHEDULE,
+    Path(__file__),
+)
 
 
 def _toolchain():
@@ -65,7 +77,7 @@ def fingerprint():
     h.update(
         air_fingerprint(config, airsrc.fused_prefill_dir(), *_toolchain()).encode()
     )
-    h.update(json.dumps(AIRCC_ARGS).encode() + str(STACK_SIZE).encode())
+    h.update(json.dumps([AIRCC_ARGS, LM_AIRCC_ARGS, STACK_SIZE]).encode())
     h.update(triton.__version__.encode())
     backend_dir = Path(backend.__file__).parent
     sources = sorted(p for p in backend_dir.rglob("*") if p.suffix in (".py", ".mlir"))
@@ -95,6 +107,43 @@ def _air_build_env():
                 os.environ[k] = v
 
 
+def _build_lm(out, lm_gemv):
+    """The LM head as `lm.xclbin` and `lm.insts.bin` in `out`, for the buffers
+    of mlir-air's `lm_gemv` module."""
+    import torch
+    from triton.backends.amd_triton_npu.config import config_context
+    from triton.backends.amd_triton_npu.driver import _aircc_compile, _ttshared_to_air
+    from triton.backends.amd_triton_npu.driver_scope import driver_scope
+
+    import gemma4_lm_gemv as L
+
+    G = lm_gemv
+    w = torch.zeros(G.NC, G.TILES * G.KC * G.NR * G.PKT, dtype=torch.uint8)
+    x = torch.zeros(G.K, dtype=torch.bfloat16)
+    y = torch.zeros(G.V, dtype=torch.bfloat16)
+    with driver_scope("npu"), config_context(compile_only=True):
+        c = L.gemv_q4.warmup(*L.args(G, w, x, y), grid=(1, 1, 1))
+    with config_context(transform_tiling_script=str(LM_SCHEDULE)):
+        m = _ttshared_to_air(c.asm["ttsharedir"], 1, 1, 1)
+    work = out / "work" / "lm"
+    work.mkdir(parents=True, exist_ok=True)
+    path = work / "lm.air.mlir"
+    path.write_text(str(m))
+    # aircc writes its project into the working directory
+    os.chdir(work)
+    art = _aircc_compile(
+        str(path),
+        "xclbin",
+        "npu2",
+        str(work),
+        bf16_emulation=False,
+        extra_args=LM_AIRCC_ARGS,
+        runtime_loop_tiling_sizes=(),
+    )
+    shutil.copy(art["bin_path"], out / "lm.xclbin")
+    shutil.copy(art["insts_path"], out / "lm.insts.bin")
+
+
 def build(out):
     """Build the device, its kernels and its LM head into `out`, which then
     loads like a build of mlir-air's."""
@@ -110,13 +159,14 @@ def build(out):
     airsrc.add_air_paths("gemma4_e2b_q4nx")
     from air_examples.llms.shared.fused_prefill import build as B
     from air_examples.llms.shared.fused_prefill import device as D
+    from air_examples.llms.shared.fused_prefill import lm_gemv
 
     spec = importlib.import_module(SPEC)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     with _air_build_env():
         B.build_kernels(out, spec.CFG)
-        B._compile((SPEC, str(out), "lm"))
+        _build_lm(out, lm_gemv)
     heads = spec.ATTN_POINTS["base"][0]
     dev = FusedDevice("fused_prefill", str(out / "proj"))
     for op in D.attn_ops(spec.CFG):
@@ -149,6 +199,7 @@ def build(out):
         attn={a: B.seq_name(a, (heads,)) for a in D.attn_ops(spec.CFG)},
         heads=heads,
         lm="lm",
+        gemm_format="bf16",
         device="triton",
         max_len=getattr(spec, "max_len", None),
     )
