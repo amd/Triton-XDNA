@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Small Benchmark/Test Suite
+name: Build and Test on NPU
 
 on:
  push:
@@ -18,10 +18,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Build on a GitHub-hosted runner and hand Test a wheel, so the NPU runner
-  # only runs tests. The job name is a required status check on main.
+  # Build on a GitHub-hosted runner and hand the NPU job a wheel, so the NPU
+  # runner only runs tests. Both job names are required status checks on main.
   build-wheel:
-    name: Build Triton Repo
+    name: Build Wheel
     # Not ubuntu-latest: the wheel only loads on a glibc at least as new as
     # the one it was built against, so this must not be newer than the NPU
     # runner's container.
@@ -46,7 +46,7 @@ jobs:
           submodules: recursive
 
       - name: Ccache for C++ compilation
-        uses: hendrikmuhs/ccache-action@v1.2.12
+        uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: ${{ runner.os }}-clangreleaseasserts
           max-size: 1G
@@ -70,6 +70,8 @@ jobs:
       - name: Build wheel
         env:
           TRITON_BUILD_WITH_CLANG_LLD: "true"
+          # Triton's C++ unit tests are not part of the wheel.
+          TRITON_APPEND_CMAKE_ARGS: "-DTRITON_BUILD_UT=OFF"
         run: |
           python -m pip wheel . --no-build-isolation --no-deps -w dist -v
           ls -la dist
@@ -82,7 +84,8 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  Test:
+  npu-test:
+    name: NPU Examples and LLM Gates
     needs: build-wheel
     runs-on: [self-hosted, docker]
     steps:
