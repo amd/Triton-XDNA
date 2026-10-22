@@ -167,11 +167,14 @@ def mm_g(
         )
 
 
-def args(a, w, c, n, k, act, wq):
+def args(a, w, c, n, k, act, wq, k_pad=None):
     """w: uint8 packets, pack_q4's [N / 64, K / 128, 5120] if wq else
-    pack_bf16's [N / 64, K / 32, 5120]."""
+    pack_bf16's [N / 64, K / 32, 5120]; a: A tiled [M / 32, K / 128, 32, 128].
+    Both may be padded with zeros to depth `k_pad`; only the first k of K is
+    read."""
     import torch
 
+    k_pad = k_pad or k
     return (
         a,
         w.view(torch.int16),
@@ -180,12 +183,12 @@ def args(a, w, c, n, k, act, wq):
         k,
         float(act),
         int(wq),
-        k,
+        k_pad,
         n,
         64,
         5120,
-        k // 128 * 2560,
-        k // 128 * 4 * 2560,
+        k_pad // 128 * 2560,
+        k_pad // 128 * 4 * 2560,
         384,
         128,
         512,

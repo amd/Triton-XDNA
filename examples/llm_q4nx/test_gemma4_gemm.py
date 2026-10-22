@@ -6,7 +6,8 @@ GEMMs and dispatched as mlir-air's runtime dispatches a GEMM. The weights are
 packed by mlir-air's own `pack_q4` and `pack_bf16`, and A is laid out as its
 runtime lays it out, all in its "bf16" GEMM format, so a change on either side
 of that interface shows up here rather than as a wrong prefill. Checked: int4
-weights with and without the GELU drain, and bf16 weights.
+weights with and without the GELU drain, and bf16 weights at a depth the
+device pads.
 
 Not an example: `scripts/run_tests.py` runs every *.py directly under an
 example directory, and `llm_q4nx` is excluded from the sweep as a library.
@@ -32,14 +33,21 @@ airsrc.add_air_paths("gemma4_e2b_q4nx")
 from air_examples.llms.shared.fused_prefill import device as D  # noqa: E402
 from air_examples.llms.shared.fused_prefill import packing as P  # noqa: E402
 
-K = 512
-
 
 def tiled_a(x):
-    """x [M, K] -> A as bf16 tiles [M / TM, K / TK, TM, TK] (packing.a_layout)."""
-    dt, shape = P.a_layout("bf16", x.shape[1])
-    hr, ks, tm, tk = shape
-    return x.reshape(hr, tm, ks, tk).permute(0, 2, 1, 3).contiguous()
+    """x [M, k] -> one chunk's A as mlir-air's runtime lays it out: bf16 tiles
+    [M / TM, k_pad / TK, TM, TK], zero past k (packing.a_layout)."""
+    _, (hr, steps, _, tm, tk) = P.a_layout("bf16", x.shape[1])
+    a = torch.zeros(hr * tm, steps * tk, dtype=torch.bfloat16)
+    a[:, : x.shape[1]] = x
+    return a.reshape(hr, tm, steps, tk).permute(0, 2, 1, 3).contiguous()
+
+
+def padded(packed, k):
+    """Weight packets padded with zero packets to the device's depth, as
+    mlir-air's runtime pads them."""
+    kp = packed.shape[1] * D.k_pad(k) // k
+    return np.pad(packed, ((0, 0), (0, kp - packed.shape[1]), (0, 0)))
 
 
 def bfp16(x):
@@ -67,16 +75,14 @@ def build(proj, n, cases):
     from triton.backends.amd_triton_npu.config import config_context
 
     dev = FusedDevice("fused_prefill", str(proj))
-    a = torch.zeros(D.M, K, dtype=torch.bfloat16)
     c = torch.zeros(D.M, n, dtype=torch.bfloat16)
     with config_context(bf16_emulation=True):
-        for name, (act, wq, packed) in cases.items():
-            w = torch.from_numpy(np.zeros_like(packed))
+        for name, (act, wq, k, a, w, _) in cases.items():
             dev.add(
                 name,
                 G.mm_g,
                 (1,),
-                G.args(a, w, c, n, K, act, wq),
+                G.args(a, torch.from_numpy(w), c, n, k, act, wq, D.k_pad(k)),
                 transform_script=str(T.SCHEDULE),
             )
     return dev.compile(
@@ -87,22 +93,21 @@ def build(proj, n, cases):
     )
 
 
-def run(xclbin, header, cases, a, n):
-    """Each case's op on A, as mlir-air's runtime dispatches a GEMM."""
+def run(xclbin, header, cases, n):
+    """Each case's op, dispatched as mlir-air's runtime dispatches a GEMM."""
     import pyxrt as xrt
     from air.backend.txn_builder import TxnBuilder
     from air_examples.llms.shared.fused_prefill.engine import FROM, TO, Ctx, view
 
     ctx = Ctx(xrt.device(0), xclbin)
     txn = TxnBuilder(str(header))
-    ta = tiled_a(a).view(torch.int16).numpy()
-    ba = ctx.bo(ta.nbytes, 0)
-    ba.write(ta.tobytes(), 0)
-    ba.sync(TO)
     out = {}
-    for name, (act, wq, packed) in cases.items():
-        bw, bc = ctx.bo(packed.nbytes, 1), ctx.bo(D.M * n * 2, 2)
-        bw.write(packed.tobytes(), 0)
+    for name, (act, wq, k, a, w, _) in cases.items():
+        ta = a.view(torch.int16).numpy()
+        ba, bw, bc = ctx.bo(ta.nbytes, 0), ctx.bo(w.nbytes, 1), ctx.bo(D.M * n * 2, 2)
+        ba.write(ta.tobytes(), 0)
+        ba.sync(TO)
+        bw.write(w.tobytes(), 0)
         bw.sync(TO)
         ins = np.asarray(txn(f"seg_{name}"), np.uint32)
         ib, _ = ctx.insts(ins)
@@ -111,8 +116,7 @@ def run(xclbin, header, cases, a, n):
         st = r.r.wait()
         assert "COMPLETED" in str(st), (name, st)
         bc.sync(FROM)
-        c = view(bc, bfloat16, (D.M, n)).astype(np.float32)
-        out[name] = torch.from_numpy(c)
+        out[name] = torch.from_numpy(view(bc, bfloat16, (D.M, n)).astype(np.float32))
     ctx.close()
     return out
 
@@ -126,37 +130,43 @@ def check(name, out, ref):
 def main():
     rng = np.random.default_rng(0)
     n = P.n_pad(2 * 384)
-    a = torch.from_numpy(rng.standard_normal((D.M, K)).astype(np.float32))
-    a = a.to(torch.bfloat16)
-    # the cores round A and B to bfp16 in the matmul
-    af = bfp16(a.float().numpy())
+
+    def act_rows(k):
+        x = torch.from_numpy(rng.standard_normal((D.M, k)).astype(np.float32))
+        return x.to(torch.bfloat16)
 
     # int4: w = q * scale + min, each weight rounded to bf16 as the kernel does
-    q = rng.integers(0, 16, (n, K)).astype(np.uint8)
-    s = (rng.standard_normal((n, K // 32)) * 0.02).astype(np.float32)
-    m = (rng.standard_normal((n, K // 32)) * 0.05).astype(np.float32)
+    k4 = 512
+    a4 = act_rows(k4)
+    q = rng.integers(0, 16, (n, k4)).astype(np.uint8)
+    s = (rng.standard_normal((n, k4 // 32)) * 0.02).astype(np.float32)
+    m = (rng.standard_normal((n, k4 // 32)) * 0.05).astype(np.float32)
     sb = torch.from_numpy(s).to(torch.bfloat16).float().repeat_interleave(32, 1)
     mb = torch.from_numpy(m).to(torch.bfloat16).float().repeat_interleave(32, 1)
     w4 = ((torch.from_numpy(q).float() + 128) * sb + (mb - 128 * sb)).to(torch.bfloat16)
-    acc4 = af @ bfp16(w4.float().numpy()).T
-    q4 = P.pack_q4(q, s, m, "bf16")
+    # the cores round A and B to bfp16 in the matmul
+    acc4 = bfp16(a4.float().numpy()) @ bfp16(w4.float().numpy()).T
+    q4 = padded(P.pack_q4(q, s, m, "bf16"), k4)
 
-    wb = torch.from_numpy(rng.standard_normal((n, K)).astype(np.float32) * 0.05)
+    # bf16 weights at a depth the device pads, as Gemma4's PLE projection
+    kb = 256
+    assert D.k_pad(kb) > kb
+    ab = act_rows(kb)
+    wb = torch.from_numpy(rng.standard_normal((n, kb)).astype(np.float32) * 0.05)
     wb = wb.to(torch.bfloat16)
-    b16 = P.pack_bf16(wb.float().numpy(), "bf16")
+    b16 = padded(P.pack_bf16(wb.float().numpy(), "bf16"), kb)
+    accb = bfp16(ab.float().numpy()) @ bfp16(wb.float().numpy()).T
 
     cases = {
-        "int4": (0, 1, q4),
-        "int4_gelu": (1, 1, q4),
-        "bf16": (0, 0, b16),
+        "int4": (0, 1, k4, tiled_a(a4), q4, acc4),
+        "int4_gelu": (1, 1, k4, tiled_a(a4), q4, gelu(acc4)),
+        "bf16": (0, 0, kb, tiled_a(ab), b16, accb),
     }
-    accb = af @ bfp16(wb.float().numpy()).T
-    refs = {"int4": acc4, "int4_gelu": gelu(acc4), "bf16": accb}
     with tempfile.TemporaryDirectory() as d:
         xclbin, header = build(Path(d) / "proj", n, cases)
-        out = run(xclbin, header, cases, a, n)
-    for name, ref in refs.items():
-        check(name, out[name], ref)
+        out = run(xclbin, header, cases, n)
+    for name, case in cases.items():
+        check(name, out[name], case[-1])
     print("PASS")
 
 

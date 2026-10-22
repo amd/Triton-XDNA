@@ -10,8 +10,8 @@ attention ops from mlir-air's own builder, linked into one module by
 `fused_device.FusedDevice`. The LM head is `gemma4_lm_gemv.gemv_q4` on a
 device of its own, on the buffers of mlir-air's `lm_gemv`. The kernel objects
 and the host library come from mlir-air's builder functions, and the manifest
-tells mlir-air's runtime that the GEMMs read bf16 operands, so the runtime
-drives both devices unchanged.
+tells mlir-air's runtime that the GEMMs read bf16 operands and take one chunk
+per dispatch, so the runtime drives both devices unchanged.
 """
 
 import contextlib
@@ -178,11 +178,12 @@ def build(out):
             a = torch.zeros(128, k, dtype=torch.bfloat16)
             c = torch.zeros(128, n, dtype=torch.bfloat16)
             w = torch.zeros(n // 64, k // (128 if wq else 32), 5120, dtype=torch.uint8)
+            # one chunk per dispatch: there are no ops for chunk pairs
             dev.add(
-                B.op_name("g", (k, n, act, wq)),
+                B.op_name("g", (k, n, act, wq, 0)),
                 G.mm_g,
                 (1,),
-                G.args(a, w, c, n, k, act, wq),
+                G.args(a, w, c, n, k, act, wq, D.k_pad(k)),
                 transform_script=str(SCHEDULE),
             )
     xclbin, header = dev.compile(
@@ -195,11 +196,12 @@ def build(out):
     shutil.copy(xclbin, out / "fused_prefill.xclbin")
     shutil.copy(header, out / "fused_prefill.txn.h")
     manifest = dict(
-        gemm=[B.op_name("g", s) for s in spec.gemm_shapes()],
+        gemm=[B.op_name("g", (*s, 0)) for s in spec.gemm_shapes()],
         attn={a: B.seq_name(a, (heads,)) for a in D.attn_ops(spec.CFG)},
         heads=heads,
         lm="lm",
         gemm_format="bf16",
+        gemm_pairs=False,
         device="triton",
         max_len=getattr(spec, "max_len", None),
     )
