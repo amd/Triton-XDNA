@@ -22,7 +22,10 @@ jobs:
   # only runs tests. The job name is a required status check on main.
   build-wheel:
     name: Build Triton Repo
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: the wheel only loads on a glibc at least as new as
+    # the one it was built against, so this must not be newer than the NPU
+    # runner's container.
+    runs-on: ubuntu-24.04
     steps:
       - name: Free disk space
         uses: descriptinc/free-disk-space@main
