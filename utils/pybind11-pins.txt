@@ -1,0 +1,12 @@
+# Sources for the pybind11 build (TRITON_XDNA_BINDINGS=pybind11).
+#
+# triton is the commit a PyTorch release pins in
+# .ci/docker/ci_commit_pins/triton.txt on its release branch, still from before
+# Triton moved its bindings to nanobind. triton_shared is a commit that builds
+# against it.
+#
+# scripts/fetch_pybind11_sources.py checks both out under third_party/pybind11/.
+# The matching patches are third_party/triton-pybind11.patch and
+# third_party/triton_shared-pybind11.patch.
+triton: 675c59878aa2280b31f722aaf42b825fcee21de8
+triton_shared: b32f76945570b198279226cf9e89f9ee7be58da7

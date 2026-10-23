@@ -113,6 +113,20 @@ ninja
 Cmake shall install the C++ binaries under `third_party/triton/python/build`.
 A triton python package with a new amd_triton_npu backend is also pip installed to the virtual environment `sandbox`.
 
+#### Building against a pybind11-era Triton
+
+The submodules track a Triton that uses nanobind for its Python bindings. To build against the Triton that a PyTorch release pins, from before Triton moved to nanobind, set `TRITON_XDNA_BINDINGS=pybind11`:
+
+```bash
+pip install "cmake<4" pybind11 wheel ninja setuptools
+TRITON_XDNA_BINDINGS=pybind11 pip install . --no-build-isolation \
+  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
+  --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
+  --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
+```
+
+This checks out the Triton and triton_shared commits in `utils/pybind11-pins.txt` under `third_party/pybind11/` and applies `third_party/*-pybind11.patch` to them. The wheel's version carries a `.pybind11` suffix. Linux only. CI builds it and runs a few examples on the NPU (`.github/workflows/pybind11.yml`); the full test suite runs only against the nanobind build. Once PyTorch's pinned Triton uses nanobind, this build is no longer needed and will be removed.
+
 ### Run examples
 
 Browse the full set of available operators, their supported datatypes, and AIE2/AIE2P coverage in the live [examples dashboard](https://amd.github.io/Triton-XDNA/).

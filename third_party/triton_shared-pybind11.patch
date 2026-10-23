@@ -1,0 +1,127 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5792dcb..aa80cf5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,6 +28,11 @@ if (TRITON_SHARED_BUILD_CPU_BACKEND)
+ 
+     add_triton_plugin(TritonShared ${CMAKE_CURRENT_SOURCE_DIR}/triton_shared.cc LINK_LIBS TritonSharedAnalysis TritonTilingExtIR ${conversion_libs} ${extension_libs} MLIRSparseTensorTransforms MLIRControlFlowTransforms MLIRTensorInferTypeOpInterfaceImpl)
+     target_link_libraries(TritonShared PRIVATE Python3::Module pybind11::headers)
++    # triton_shared.cc includes TPtrDialect.h -> TPtrDialect.h.inc, which is
++    # emitted by the TPtrTableGen target. Without this explicit dependency a
++    # parallel/cold build can compile triton_shared.cc before tablegen runs,
++    # failing with "TPtrDialect.h.inc file not found".
++    add_dependencies(TritonShared TPtrTableGen)
+ endif()
+ 
+ # Add symlinks to selected pytest files in triton. The tests are imported into triton-shared’s test folder to
+diff --git a/backend/driver.py b/backend/driver.py
+index a4ac9ef..69f50b3 100644
+--- a/backend/driver.py
++++ b/backend/driver.py
+@@ -9,6 +9,7 @@ import subprocess
+ import platform
+ import importlib.util
+ import sys
++import time
+ 
+ from pathlib import Path
+ 
+@@ -461,9 +462,56 @@ class CPUDriver(DriverBase):
+     def is_active():
+         return False
+ 
++    def do_bench(self, fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean"):
++        assert return_mode in ["min", "max", "mean", "median", "all"]
++        fn()
++
++        # cache = runtime.driver.active.get_empty_cache_for_benchmark()
++
++        # Estimate the runtime of the function
++        start_event = time.perf_counter()
++        for _ in range(5):
++            # runtime.driver.active.clear_cache(cache)
++            fn()
++        end_event = time.perf_counter()
++        estimate_ms = int((end_event - start_event)*1000 / 5)
++
++        from triton import knobs
++        verbose = knobs.autotuning.print
++        if verbose:
++            print("CPU estimate ms: ", estimate_ms)
++
++        # compute number of warmup and repeat
++        n_warmup = max(1, int(warmup / estimate_ms))
++        n_repeat = max(5, int(rep / estimate_ms))
++        start_event = [0 for i in range(n_repeat)]
++        end_event = [0 for i in range(n_repeat)]
++        # Warm-up
++        for _ in range(n_warmup):
++            fn()
++        # Benchmark
++        for i in range(n_repeat):
++            # we don't want `fn` to accumulate gradient values
++            # if it contains a backward pass. So we clear the
++            # provided gradients
++            if grad_to_none is not None:
++                for x in grad_to_none:
++                    x.grad = None
++            # we clear the L2 cache before each run
++            # runtime.driver.active.clear_cache(cache)
++            # record time of `fn`
++            start_event[i] = time.perf_counter()
++            fn()
++            end_event[i] = time.perf_counter()
++        times = [(e-s)*1000 for s, e in zip(start_event, end_event)]
++        if verbose:
++            print("KERNEL TIMES: ", ", ".join(str(t) for t in times))
++
++        from triton.testing import _summarize_statistics
++        return _summarize_statistics(times, quantiles, return_mode)
++
+     def get_benchmarker(self):
+-        from triton.testing import do_bench
+-        return do_bench
++        return self.do_bench
+ 
+     def get_device_capability(self):
+         return ("cpu", 0)
+diff --git a/lib/Analysis/PtrAnalysis.cpp b/lib/Analysis/PtrAnalysis.cpp
+index 5da26c7..066868c 100644
+--- a/lib/Analysis/PtrAnalysis.cpp
++++ b/lib/Analysis/PtrAnalysis.cpp
+@@ -977,7 +977,7 @@ void PtrAnalysis::visitOperandUnrealizedCast(
+ struct ModuloChunkInitArg {
+   Value reinterpretCast = nullptr;
+   // where in the init args is the first chunk placed
+-  size_t initArgIndex = -1;
++  size_t initArgIndex = ~0ULL;
+ };
+ 
+ void PtrAnalysis::rewriteForOp(
+diff --git a/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt b/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt
+index 904e6a1..485cb7a 100644
+--- a/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt
++++ b/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt
+@@ -1,12 +1,17 @@
+ add_library(SanitizerAttributes SHARED SanitizerAttributes.cpp)
+ 
+-# Allow undefined symbols in shared objects on Darwin (this is the default
+-# behaviour on Linux)
+-target_link_libraries(SanitizerAttributes "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>")
++if(MSVC)
++  # can't have undefined symbols
++  target_link_libraries(SanitizerAttributes PRIVATE LLVMCore;LLVMBitReader)
++else()
++  # Allow undefined symbols in shared objects on Darwin (this is the default
++  # behaviour on Linux)
++  target_link_libraries(SanitizerAttributes "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>")
++endif()
+ 
+ # This is set to -fvisibility=hidden in the top level CMake file
+ # which causes the llvmGetPassPluginInfo symbol to be hidden and
+ # an "entry point not found" error. Reset it just for this target
+ if(NOT MSVC)
+   target_compile_options(SanitizerAttributes PRIVATE -fvisibility=default -fno-rtti)
+-endif()
+\ No newline at end of file
++endif()

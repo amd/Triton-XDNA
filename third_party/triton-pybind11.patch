@@ -1,0 +1,43 @@
+diff --git a/include/triton/Dialect/Triton/IR/Traits.h b/include/triton/Dialect/Triton/IR/Traits.h
+index 392436308..21ff88021 100644
+--- a/include/triton/Dialect/Triton/IR/Traits.h
++++ b/include/triton/Dialect/Triton/IR/Traits.h
+@@ -21,7 +21,15 @@ namespace impl {
+ // of size up to 256K elements. It will spill for datatypes wider than 1B,
+ // but we probably should limit number of elements (rather than bytes) to
+ // keep specs simple
+-int constexpr maxTensorNumElements = 1048576;
++//
++// NOTE: This increases Triton's block-tensor element limit globally (all backends).
++// It is needed for the XDNA/AIE backend where block tensors don't become GPU
++// register tiles: tl.load/tl.dot lowers to linalg.matmul and is tiled on-device,
++// so the original register-pressure rationale does not apply.
++// Raised from 2**20 to 2**22 so single-block NPU matmuls can express full K
++// (e.g. 256 x 8192) without chunking the reduction on the host. Keep in sync
++// with the Python-side guard (TRITON_MAX_TENSOR_NUMEL) lifted in amd_triton_npu/backend/driver.py.
++int constexpr maxTensorNumElements = 4194304;
+ 
+ LogicalResult verifyTensorSize(Operation *op);
+ LogicalResult verifyTensorLayouts(Operation *op);
+diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
+index c6d638687..d606b44a5 100644
+--- a/python/triton/runtime/autotuner.py
++++ b/python/triton/runtime/autotuner.py
+@@ -124,7 +124,7 @@ class Autotuner(KernelInterface):
+             )
+             return
+ 
+-    @cached_property
++    @property
+     def do_bench(self):
+         if self._do_bench is None:
+             return driver.active.get_benchmarker()
+@@ -225,6 +225,8 @@ class Autotuner(KernelInterface):
+                 if hasattr(arg, "dtype"):
+                     key.append(str(arg.dtype))
+             key = tuple(key)
++            # Include backend in the key so switching backends triggers retune 
++            key = (driver.active.get_current_target().backend, *key)
+             if key not in self.cache:
+                 used_cached_result = False
+                 pruned_configs = self.prune_configs(kwargs)

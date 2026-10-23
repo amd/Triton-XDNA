@@ -51,3 +51,6 @@ third_party/llvm-*
 
 # mlir-air sources, fetched at the pinned commit by utils/fetch_mlir_air_src.py
 third_party/mlir-air-src/
+
+# Sources for the pybind11 build, fetched by scripts/fetch_pybind11_sources.py
+third_party/pybind11/

@@ -58,8 +58,6 @@ if not (IS_LINUX or IS_WINDOWS):
 
 BASE_DIR = Path(__file__).parent.resolve()
 THIRD_PARTY_DIR = BASE_DIR / "third_party"
-TRITON_SOURCE_DIR = THIRD_PARTY_DIR / ("triton-windows" if IS_WINDOWS else "triton")
-TRITON_SHARED_DIR = THIRD_PARTY_DIR / "triton_shared"
 AMD_TRITON_NPU_DIR = BASE_DIR / "amd_triton_npu"
 
 # same strategy as used in TheRock
@@ -70,8 +68,12 @@ AMD_TRITON_NPU_DIR = BASE_DIR / "amd_triton_npu"
 # near-duplicates that had drifted: only one passed --ignore-whitespace, and
 # only the other knew Windows patches triton-windows rather than triton.
 sys.path.insert(0, str(BASE_DIR / "scripts"))
+from patching import BINDINGS, TRITON_SUBDIR, TRITON_SHARED_SUBDIR  # noqa: E402
 from patching import PatchError  # noqa: E402
 from patching import apply_patches as _apply_patches  # noqa: E402
+
+TRITON_SOURCE_DIR = THIRD_PARTY_DIR / TRITON_SUBDIR
+TRITON_SHARED_DIR = THIRD_PARTY_DIR / TRITON_SHARED_SUBDIR
 
 
 def apply_patches():
@@ -83,6 +85,10 @@ def apply_patches():
     back to patching. sys.exit keeps the explanation readable instead of
     burying it under a pip traceback.
     """
+    if BINDINGS == "pybind11":
+        from fetch_pybind11_sources import fetch_all
+
+        fetch_all()
     try:
         _apply_patches()
     except PatchError as e:
@@ -198,7 +204,8 @@ def get_version():
         "DATETIME", f"{now.year}{now.month:02}{now.day:02}{now.hour:02}"
     )
 
-    return f"{release_version}.{timestamp}+{commit_hash}"
+    local = commit_hash if BINDINGS == "nanobind" else f"{commit_hash}.{BINDINGS}"
+    return f"{release_version}.{timestamp}+{local}"
 
 
 def _get_installed_version(pkg_name):
@@ -466,13 +473,13 @@ class TritonXdnaBdistWheel(bdist_wheel):
         # Get the project root (works both on host and in container)
         # Use the current working directory if it looks like a container mount
         cwd = Path.cwd()
-        if (cwd / "third_party" / "triton").exists():
+        if (cwd / "third_party" / TRITON_SUBDIR).exists():
             project_root = cwd
         else:
             project_root = BASE_DIR
 
         # Set plugin directories relative to project root
-        triton_shared_dir = project_root / "third_party" / "triton_shared"
+        triton_shared_dir = project_root / "third_party" / TRITON_SHARED_SUBDIR
         amd_npu_dir = project_root / "amd_triton_npu"
 
         plugin_dirs = f"{triton_shared_dir};{amd_npu_dir}"
@@ -484,7 +491,7 @@ class TritonXdnaBdistWheel(bdist_wheel):
         if not IS_WINDOWS and check_env_flag("TRITON_BUILD_WITH_CLANG_LLD", "true"):
             env["TRITON_BUILD_WITH_CLANG_LLD"] = "true"
 
-        triton_source = project_root / "third_party" / "triton"
+        triton_source = project_root / "third_party" / TRITON_SUBDIR
 
         # Use subprocess with pip wheel - this properly inherits environment
         # Find a working Python with pip

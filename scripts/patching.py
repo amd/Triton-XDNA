@@ -30,6 +30,7 @@ patch exists to prevent, which is a miserable way to learn that patching was
 silently a no-op.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -43,16 +44,34 @@ IS_WINDOWS = sys.platform == "win32"
 # builds do not re-run the patch machinery.
 MARKER_FILE = ".patches_applied"
 
-# (submodule directory, patch file). Windows builds triton-windows instead of
-# triton -- keep this in step with TRITON_SOURCE_DIR in setup.py.
-PATCHES = [
-    (
-        ("triton-windows", "triton-windows.patch")
-        if IS_WINDOWS
-        else ("triton", "triton.patch")
-    ),
-    ("triton_shared", "triton_shared.patch"),
-]
+# Which Python binding framework Triton is built with. "nanobind" uses the
+# submodules; "pybind11" uses the older Triton and triton_shared pinned in
+# utils/pybind11-pins.txt, checked out by scripts/fetch_pybind11_sources.py.
+BINDINGS = os.environ.get("TRITON_XDNA_BINDINGS", "nanobind")
+if BINDINGS not in ("nanobind", "pybind11"):
+    sys.exit(f"TRITON_XDNA_BINDINGS must be nanobind or pybind11, not {BINDINGS!r}")
+if BINDINGS == "pybind11" and IS_WINDOWS:
+    sys.exit("TRITON_XDNA_BINDINGS=pybind11 is not supported on Windows")
+
+# Source directories under third_party/. setup.py builds from these.
+if BINDINGS == "pybind11":
+    TRITON_SUBDIR = "pybind11/triton"
+    TRITON_SHARED_SUBDIR = "pybind11/triton_shared"
+else:
+    TRITON_SUBDIR = "triton-windows" if IS_WINDOWS else "triton"
+    TRITON_SHARED_SUBDIR = "triton_shared"
+
+# (source directory, patch file), both relative to third_party/.
+if BINDINGS == "pybind11":
+    PATCHES = [
+        (TRITON_SUBDIR, "triton-pybind11.patch"),
+        (TRITON_SHARED_SUBDIR, "triton_shared-pybind11.patch"),
+    ]
+else:
+    PATCHES = [
+        (TRITON_SUBDIR, f"{TRITON_SUBDIR}.patch"),
+        (TRITON_SHARED_SUBDIR, "triton_shared.patch"),
+    ]
 
 
 class PatchError(RuntimeError):
