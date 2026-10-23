@@ -52,14 +52,14 @@ ATTN_MAXL, P = 48, 19
 
 
 class _HostBO:
-    """Where `seed_kv` uploads. Keeps what the per-layer-list drivers write."""
+    """Where `seed_kv` uploads: host memory taking writes at byte offsets."""
 
-    def __init__(self):
-        self.buf = None
+    def __init__(self, nbytes):
+        self.buf = np.zeros(nbytes, np.uint8)
 
     def write(self, buf, off=0):
-        if off == 0 and self.buf is None:
-            self.buf = np.array(buf, copy=True)
+        data = np.ascontiguousarray(buf).view(np.uint8).reshape(-1)
+        self.buf[off : off + data.size] = data
 
     def sync(self, *a):
         pass
@@ -86,8 +86,11 @@ def _upstream_slab(cls, fd, n, ks, vs, bf16):
     from dense_kv_layout import DenseKVGeometry
 
     geom = DenseKVGeometry(n, ATTN_MAXL, fd.NGRP, fd.REGION_W)
+    from kv_bos import KVBuffers
+
     dec = object.__new__(cls)
-    kvc = _HostBO()
+    # The decoder's own KV buffers, over host memory.
+    kvb = KVBuffers(fd, ATTN_MAXL, lambda nbytes, arg: _HostBO(nbytes))
     to = 0
     for name, value in dict(
         np=np,
@@ -96,7 +99,8 @@ def _upstream_slab(cls, fd, n, ks, vs, bf16):
             xclBOSyncDirection=SimpleNamespace(XCL_BO_SYNC_BO_TO_DEVICE=to)
         ),
         TO=to,
-        kvc=kvc,
+        kvb=kvb,
+        kvc=kvb.kvc,
         fd=SimpleNamespace(REGION_W=fd.REGION_W, NGRP=fd.NGRP),
         REGION_W=fd.REGION_W,
         NGRP=fd.NGRP,
@@ -116,7 +120,8 @@ def _upstream_slab(cls, fd, n, ks, vs, bf16):
         dec.seed_kv(np.stack(ks), np.stack(vs), P)
         return np.asarray(dec.KV).reshape(geom.slab_shape())
     dec.seed_kv(ks, vs)
-    return kvc.buf.view(bf16).reshape(geom.slab_shape())
+    kv = np.concatenate([bo.buf for bo in kvb.bos]).view(bf16)
+    return kv[: np.prod(geom.slab_shape())].reshape(geom.slab_shape())
 
 
 def check_model(name):

@@ -74,6 +74,9 @@ PR_CASES = {
     "gemma4_e2b_q4nx": {
         "default",
         "triton",
+        "triton-fused",
+        "triton-fused-gemm",
+        "triton-fused-lm-head",
         "hetero",
         "triton-gpu",
         "igpu-gpu",
@@ -189,6 +192,25 @@ def plan(ex, spec, fused):
             )
         )
     if ex == "gemma4_e2b_q4nx":
+        # mlir-air's fused prefill device with its GEMMs and LM head from
+        # Triton, then its NPU decode; and the GEMM and the LM head alone
+        # against a reference, packed and dispatched by mlir-air's runtime.
+        cases.append(
+            Case(
+                "triton-fused",
+                entry + ["--prefill-engine", "triton-fused"] + gen,
+                d,
+                HIDE_IGPU,
+                npu_decode=True,
+            )
+        )
+        cases += [
+            Case(name, [sys.executable, test], SHARED, HIDE_IGPU)
+            for name, test in (
+                ("triton-fused-gemm", "test_gemma4_gemm.py"),
+                ("triton-fused-lm-head", "test_gemma4_lm_gemv.py"),
+            )
+        ]
         # Each decode against a prefill re-run over the growing prefix, and
         # mlir-air's NPU decode from the prefill's slab against its own
         # `seed_kv`. Needs the iGPU for its other rows.
