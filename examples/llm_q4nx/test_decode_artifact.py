@@ -44,7 +44,7 @@ def test_refuses_mlir_airs_full_elf_on_hsa():
     try:
         airsrc.select_decode_artifact(env)
     except airsrc.DecodeArtifactError as e:
-        assert "AMD_TRITON_NPU_HSA_DECODE" in str(e)
+        assert "scratchpad ELF" in str(e)
     else:
         raise AssertionError("DECODE_ELF=1 under HSA should have been refused")
 
@@ -259,13 +259,6 @@ def test_xrt_elf_checks_its_own_model_stamp():
             assert "no model stamp" in str(e)
         else:
             raise AssertionError("an unstamped ELF accepted")
-
-
-def test_programs_sharing_a_handle_share_a_lock():
-    import hsa_decode
-
-    assert hsa_decode._program_lock(0x1000) is hsa_decode._program_lock(0x1000)
-    assert hsa_decode._program_lock(0x1000) is not hsa_decode._program_lock(0x2000)
 
 
 def main():

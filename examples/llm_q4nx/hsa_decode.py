@@ -5,21 +5,17 @@
 mlir-air's decoder dispatches through pyxrt. This runs the same design on
 HsaRuntime instead, which is what makes a fully-HSA chatbot possible.
 
-The context length changes every token, and the design can take it two
-ways:
+The context length changes every token, and reaches the design as scratchpad
+parameters of a full ELF: two scalars in device memory that the design reads in
+its dispatch preamble, so one ELF serves every L.
 
-* as scratchpad parameters of a full ELF: two scalars in device memory that the
-  design reads in its dispatch preamble. One ELF serves every L and nothing
-  rewrites the instruction stream. The control code reaches the scratchpad
-  through an address the host patches in, which has to be the NPU's address
-  for it, so this needs a ROCR whose `hsa_amd_pointer_info` reports an AIE
-  allocation's device address.
-* in the instruction stream, which encodes L in a handful of words. Two
-  builds at adjacent L give each word's base and slope, and `patch_insts`
-  rewrites those words per token in the buffer the dispatch packet points at.
-  The PDI is the same for every L.
-
-`use_scratchpad` picks the first where the loaded ROCR supports it.
+ROCR loads the ELF from an hsaco and patches only PDI and argument addresses
+into its control code, so the scratchpad's address is written in before
+packing (`driver._pack_hsaco`). That has to be the NPU's address for it, so
+this needs a ROCR whose `hsa_amd_pointer_info` reports an AIE allocation's
+device address; `use_scratchpad` asks. The instruction-stream alternative --
+patching the L-dependent words per token -- has no counterpart under hsaco
+dispatch, where the stream belongs to a loaded executable.
 
 Weights and the KV cache live in shared regions, so they are dispatched on in
 place. Copying 0.7 GB of weights per token would cap throughput near 23 tok/s
@@ -130,52 +126,78 @@ def mark_resident(lib, arr):
         raise HsaDecodeError(buf.value.decode())
 
 
-_PROGRAM_LOCKS = {}
-_PROGRAM_LOCKS_MTX = threading.Lock()
+def use_scratchpad(engine="fused_decode"):
+    """Whether the HSA decode can run: the scratchpad ELF is its only artifact.
 
-
-def _program_lock(handle):
-    """The lock for one prepared program, shared by every holder of it.
-
-    The runtime caches programs by path, so two decoders can share a
-    scratchpad or an instruction stream. Whatever the host writes there has
-    to stay put until the dispatch that reads it completes.
+    Decided by the loaded ROCR: the ELF needs `hsa_amd_pointer_info` to report
+    the device address of an AIE allocation. Only the shared engine's decoder
+    is built as an ELF; the PLE engine has none, so it cannot run on HSA.
     """
-    with _PROGRAM_LOCKS_MTX:
-        return _PROGRAM_LOCKS.setdefault(handle, threading.Lock())
+    if engine != "fused_decode":
+        return False
+    from triton.backends.amd_triton_npu.driver import load_hsa_runtime
+
+    return bool(load_hsa_runtime().triton_npu_hsa_scratchpad_supported())
 
 
-class HsaProgram:
-    """A prepared PDI + instruction stream, with the stream patchable per token.
+class HsaElfProgram:
+    """A full-ELF kernel and the scratchpad the host writes before each dispatch.
 
-    Hold `lock` from patching the stream through the dispatch that runs it.
+    The scratchpad is allocated first, its device address written into the
+    ELF, and the result packed into an hsaco and loaded, so each instance is
+    its own program. Hold `lock` from writing the scratchpad through the
+    dispatch that reads it, and `flush` in between.
     """
 
-    def __init__(self, pdi_path, insts_path):
-        from triton.backends.amd_triton_npu.driver import load_hsa_runtime
+    def __init__(self, elf_path, kernel_name):
+        from triton.backends.amd_triton_npu.driver import (
+            _pack_hsaco,
+            full_elf_scratchpad_size,
+            load_hsa_runtime,
+        )
 
         self.lib = load_hsa_runtime()
+        size = full_elf_scratchpad_size(elf_path)
+        if not size:
+            raise HsaDecodeError(
+                f"'{kernel_name}' declares no scratchpad parameters, so there "
+                "is no way to give it a context length"
+            )
+        dev_addr = ctypes.c_uint64()
         buf, n = _errbuf()
-        self.lib.triton_npu_hsa_prepare.restype = ctypes.c_void_p
-        self.handle = self.lib.triton_npu_hsa_prepare(
-            pdi_path.encode(), insts_path.encode(), buf, n
+        self.lib.triton_npu_hsa_scratchpad_alloc.restype = ctypes.c_void_p
+        va = self.lib.triton_npu_hsa_scratchpad_alloc(
+            ctypes.c_uint64(size), ctypes.byref(dev_addr), buf, n
+        )
+        if not va:
+            raise HsaDecodeError(buf.value.decode())
+        self._scratchpad = va
+        # A view of device memory, not a copy; `flush` makes writes visible.
+        self.params = np.ctypeslib.as_array(
+            ctypes.cast(va, ctypes.POINTER(ctypes.c_uint32)), (size // 4,)
+        )
+
+        # Full ELF is aie2p only. This hsaco is good only for this scratchpad
+        # (it is baked with this one's device address), so prepare_bytes loads
+        # it straight from memory rather than caching it by a path nothing else
+        # would ever share.
+        hsaco = _pack_hsaco(
+            "elf", {"elf_path": str(elf_path)}, "aie2p", kernel_name, dev_addr.value
+        )
+        buf, n = _errbuf()
+        self.lib.triton_npu_hsa_prepare_bytes.restype = ctypes.c_void_p
+        self.handle = self.lib.triton_npu_hsa_prepare_bytes(
+            hsaco, ctypes.c_uint64(len(hsaco)), kernel_name.encode(), buf, n
         )
         if not self.handle:
             raise HsaDecodeError(buf.value.decode())
-        self.lock = _program_lock(self.handle)
-        self.insts_words = os.path.getsize(insts_path) // 4
+        self.lock = threading.Lock()
 
-    def patch_insts(self, word_offset, words):
-        """Overwrite `words` (uint32) at `word_offset` in the live stream."""
-        a = np.ascontiguousarray(words, dtype=np.uint32)
+    def flush(self):
+        """Make the host's writes to `params` visible to the next dispatch."""
         buf, n = _errbuf()
-        rc = self.lib.triton_npu_hsa_patch_insts(
-            ctypes.c_void_p(self.handle),
-            ctypes.c_uint64(word_offset * 4),
-            a.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_uint64(a.nbytes),
-            buf,
-            n,
+        rc = self.lib.triton_npu_hsa_scratchpad_flush(
+            ctypes.c_void_p(self._scratchpad), buf, n
         )
         if rc != 0:
             raise HsaDecodeError(buf.value.decode())
@@ -194,101 +216,6 @@ class HsaProgram:
         )
         if rc != 0:
             raise HsaDecodeError(buf.value.decode())
-
-
-class InstsForL:
-    """The L-dependent words of the decode's instruction stream.
-
-    Calibrated exactly as mlir-air's DecodeInstsGen does: two builds at the
-    same ATTN_MAXL and adjacent L differ only in the words that encode L, and
-    those move linearly, so a diff of the two gives base and slope.
-    """
-
-    def __init__(self, insts_lo, insts_hi, l_lo, l_hi):
-        i1 = np.fromfile(insts_lo, dtype=np.uint32)
-        i2 = np.fromfile(insts_hi, dtype=np.uint32)
-        if i1.size != i2.size:
-            raise HsaDecodeError("calibration streams differ in length")
-        self.ld = np.where(i1 != i2)[0]
-        if self.ld.size == 0:
-            raise HsaDecodeError("the two calibration builds are identical")
-        self.lo, self.hi = int(self.ld.min()), int(self.ld.max()) + 1
-        self.base = i1[self.ld].astype(np.int64)
-        self.slope = (i2[self.ld].astype(np.int64) - self.base) // (l_hi - l_lo)
-        self.base_L = l_lo
-        self.full = i1.copy()
-
-    def slice_for(self, L):
-        """The [lo:hi] window of the stream at context length L."""
-        out = self.full[self.lo : self.hi].copy()
-        vals = self.base + (L - self.base_L) * self.slope
-        out[self.ld - self.lo] = vals.astype(np.uint32)
-        return out
-
-
-def use_scratchpad(engine="fused_decode"):
-    """Whether the decode runs the scratchpad ELF rather than the patched stream.
-
-    Decided by the loaded ROCR: the ELF needs `hsa_amd_pointer_info` to report
-    the device address of an AIE allocation. Only the shared engine's decoder
-    drives the ELF; the PLE engine always takes the patched stream.
-
-    AMD_TRITON_NPU_HSA_DECODE=elf|insts forces one, for comparing the two.
-    """
-    if engine != "fused_decode":
-        return False
-    want = os.environ.get("AMD_TRITON_NPU_HSA_DECODE", "").lower()
-    if want in ("elf", "insts"):
-        return want == "elf"
-    if want:
-        raise HsaDecodeError(
-            f"AMD_TRITON_NPU_HSA_DECODE={want!r}; expected 'elf' or 'insts'"
-        )
-    from triton.backends.amd_triton_npu.driver import load_hsa_runtime
-
-    return bool(load_hsa_runtime().triton_npu_hsa_full_elf_supported())
-
-
-class HsaElfProgram(HsaProgram):
-    """A full-ELF kernel and the scratchpad the host writes before each dispatch.
-
-    Hold `lock` from writing the scratchpad through the dispatch that reads it.
-    """
-
-    def __init__(self, elf_path, kernel_name):
-        from triton.backends.amd_triton_npu.driver import load_hsa_runtime
-
-        self.lib = load_hsa_runtime()
-        buf, n = _errbuf()
-        self.lib.triton_npu_hsa_prepare_elf.restype = ctypes.c_void_p
-        self.handle = self.lib.triton_npu_hsa_prepare_elf(
-            str(elf_path).encode(), kernel_name.encode(), buf, n
-        )
-        if not self.handle:
-            raise HsaDecodeError(buf.value.decode())
-        self.lock = _program_lock(self.handle)
-
-        addr = ctypes.c_void_p()
-        size = ctypes.c_uint64()
-        buf, n = _errbuf()
-        rc = self.lib.triton_npu_hsa_scratchpad(
-            ctypes.c_void_p(self.handle), ctypes.byref(addr), ctypes.byref(size), buf, n
-        )
-        if rc != 0:
-            raise HsaDecodeError(buf.value.decode())
-        if not addr.value or not size.value:
-            raise HsaDecodeError(
-                f"'{kernel_name}' declares no scratchpad parameters, so there "
-                "is no way to give it a context length"
-            )
-        # A view of device memory, not a copy. The runtime declares the buffer
-        # in full on every dispatch, so what is written here is flushed first.
-        self.params = np.ctypeslib.as_array(
-            ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint32)), (size.value // 4,)
-        )
-
-    def patch_insts(self, word_offset, words):
-        raise HsaDecodeError("a full-ELF program takes L in its scratchpad")
 
 
 class Params:
@@ -401,25 +328,11 @@ def _elf_program(artifact_dir, attn_maxl, region_w, model=None):
     return params, HsaElfProgram(elf, ELF_KERNEL_NAME)
 
 
-def _programs(artifact_dir, attn_maxl):
-    """The PDI and the L-patching generator for a template built at `attn_maxl`."""
-    pdi = os.path.join(artifact_dir, f"decode_L{attn_maxl}.pdi")
-    lo = os.path.join(artifact_dir, f"decode_L{attn_maxl - 1}.insts.bin")
-    hi = os.path.join(artifact_dir, f"decode_L{attn_maxl}.insts.bin")
-    for f in (pdi, lo, hi):
-        if not os.path.exists(f):
-            raise HsaDecodeError(
-                f"{f} is missing; build the PDI templates with\n"
-                "    make compile-decode RUNTIME=hsa"
-            )
-    return InstsForL(lo, hi, attn_maxl - 1, attn_maxl), HsaProgram(pdi, hi)
-
-
 def require_xclbin_pair(artifact_dir):
     """Fail early if the xclbin pair mlir-air's decoder loads is missing.
 
     The HSA decoders subclass mlir-air's, and its `__init__` needs the pair
-    even when HSA dispatches the ELF or PDIs. Its own error does not say so.
+    even though HSA dispatches the ELF. Its own error does not say so.
     """
     names = os.listdir(artifact_dir) if os.path.isdir(artifact_dir) else ()
     built = {
@@ -444,19 +357,23 @@ def make_hsa_decoder_class(
     Everything host-side stays theirs -- weight load, the region-major KV
     layout, `seed_kv`, sampling. Only `dispatch` changes: instead of handing
     XRT an instruction-stream BO as a kernel argument, it gives the program the
-    context length (see `use_scratchpad`) and enqueues the kernel's tensors.
+    context length in its scratchpad and enqueues the kernel's tensors.
 
     Their `__init__` still runs, so the XRT BOs it builds exist and go unused.
     That costs the weight allocation twice. Worth fixing before this is more
     than a demonstration; not worth forking their setup to avoid today.
 
     `decoder_class` names the base to wrap (3B/8B are not `FusedDecoder`).
-    `engine` is the decode engine the model was built with; the per-layer
-    embedding engine ("ple", Gemma4-E2B) has its own operand set.
+    `engine` is the decode engine the model was built with. Only the shared
+    engine is built as a scratchpad ELF; the per-layer embedding engine
+    ("ple", Gemma4-E2B) is not, and so has no HSA decode.
     """
+    if engine != "fused_decode":
+        raise HsaDecodeError(
+            f"the {engine!r} decode engine has no scratchpad ELF, which is the "
+            "only decode HSA can dispatch; use the XRT runtime"
+        )
     base = getattr(air, decoder_class)
-    if engine == "ple":
-        return _make_hsa_ple_decoder_class(base, artifact_dir)
 
     class HsaFusedDecoder(base):
         def _g(self, name):
@@ -471,18 +388,17 @@ def make_hsa_decoder_class(
 
         def __init__(self, *a, **kw):
             require_xclbin_pair(artifact_dir)
-            elf = use_scratchpad(engine)
-            if elf:
-                kw["max_L"] = elf_window(artifact_dir, kw.get("max_L"))
-            super().__init__(*a, **kw)
-            if elf:
-                self._params, self._prog = _elf_program(
-                    artifact_dir, self.ATTN_MAXL, self._g("REGION_W"), model
+            if not use_scratchpad(engine):
+                raise HsaDecodeError(
+                    "this ROCR does not report a device address for an AIE "
+                    "allocation, which the decode's scratchpad needs; use a "
+                    "ROCR from utils/rocm-requirements.txt"
                 )
-                self._gen = None
-            else:
-                self._params = None
-                self._gen, self._prog = _programs(artifact_dir, self.ATTN_MAXL)
+            kw["max_L"] = elf_window(artifact_dir, kw.get("max_L"))
+            super().__init__(*a, **kw)
+            self._params, self._prog = _elf_program(
+                artifact_dir, self.ATTN_MAXL, self._g("REGION_W"), model
+            )
             # Host mirrors of the five kernel tensors. The XRT path keeps these
             # in BOs; HSA takes plain pointers and stages them itself.
             lib = self._prog.lib
@@ -506,14 +422,9 @@ def make_hsa_decoder_class(
             for b in self._w_tail:
                 mark_resident(lib, b)
             mark_resident(lib, self._kv)
-            if self._gen is None:
-                what = "ONE full ELF"
-                how = f"L in {self._prog.params.size} scratchpad words"
-            else:
-                what = "ONE PDI + patched insts"
-                how = f"{self._gen.ld.size} L-dependent words"
             print(
-                f"[hsa-decode] {what}: ATTN_MAXL={self.ATTN_MAXL}, {how}",
+                f"[hsa-decode] ONE full ELF: ATTN_MAXL={self.ATTN_MAXL}, "
+                f"L in {self._prog.params.size} scratchpad words",
                 flush=True,
             )
 
@@ -634,10 +545,8 @@ def make_hsa_decoder_class(
             self._x[:] = np.asarray(self.embed[tok], self._bf16)
             self._write_rms_rope(p)
             with self._prog.lock:
-                if self._gen is None:
-                    self._params.write(self._prog.params, L)
-                else:
-                    self._prog.patch_insts(self._gen.lo, self._gen.slice_for(L))
+                self._params.write(self._prog.params, L)
+                self._prog.flush()
                 # 8B split-weight tail follows the fixed five (base's w_bos[1:]
                 # order).
                 self._prog.dispatch(
@@ -647,111 +556,3 @@ def make_hsa_decoder_class(
             return voc[: self.VOCAB_SIZE].astype(np.float32)
 
     return HsaFusedDecoder
-
-
-def _make_hsa_ple_decoder_class(base, artifact_dir):
-    """The per-layer-embedding decoder (Gemma4-E2B) on HSA.
-
-    Its kernel takes seven tensors: x, the weights, the norm/rope buffer, y,
-    the KV cache, the PLE slab and px (the token embedding again, which the PLE
-    branch reads). Per token the host writes x and px, this token's embedding
-    rows into the PLE slab, and the position's rope into the norm buffer. The
-    logits come back softcapped, as the base's do.
-    """
-
-    class HsaPleDecoder(base):
-        def __init__(self, *a, **kw):
-            require_xclbin_pair(artifact_dir)
-            super().__init__(*a, **kw)
-            self._gen, self._prog = _programs(artifact_dir, self.ATTN_MAXL)
-            lib = self._prog.lib
-            bf16 = self.bf16
-
-            def copy_of(arr):
-                out = shared_array(lib, arr.shape, arr.dtype)
-                out[:] = arr
-                return out
-
-            self._x = shared_array(lib, (self.K,), bf16)
-            self._px = shared_array(lib, (self.K,), bf16)
-            self._w = copy_of(np.frombuffer(self.w_bo.map(), dtype=np.int16))
-            norms = np.concatenate(
-                [
-                    self.rms_slabs,
-                    np.zeros(self._RMS_SIZE - self._rope_base - self.K, bf16),
-                    self.final_norm,
-                ]
-            )
-            self._r = copy_of(norms)
-            self._y = shared_array(lib, (self.ny,), bf16)
-            self._kv = shared_array(lib, (self.UNI * self.KV_LAYER,), bf16)
-            self._kv[:] = 0
-            self._pw = copy_of(self.ple.reshape(-1))
-            # The weights and the KV cache are the device's once written. The
-            # PLE slab is too, apart from the embedding rows patched per token,
-            # which `dispatch` marks dirty.
-            for buf in (self._w, self._kv, self._pw):
-                mark_resident(lib, buf)
-            # The XRT copies of the two big buffers are not read again.
-            self.w_bo = None
-            self.pw_bo = None
-            print(
-                f"[hsa-decode] gemma4 PLE: ONE PDI + patched insts, "
-                f"ATTN_MAXL={self.ATTN_MAXL}, {self._gen.ld.size} L-dependent words",
-                flush=True,
-            )
-
-        def seed_kv(self, ks, vs, P):
-            super().seed_kv(ks, vs, P)
-            self._kv[:] = np.ascontiguousarray(self.KV).reshape(-1)
-            mark_dirty(self._prog.lib, self._kv)
-
-        def kv_sink(self):
-            """The resident KV buffer and its geometry, for a producer to fill."""
-            return dict(
-                buf=self._kv,
-                n_layers=self.UNI,
-                lreg=self.KV_LAYER,
-                region_stride=self.ATTN_MAXL * self.REGION_W,
-                region_w=self.REGION_W,
-                ngrp=self.NGRP,
-                dtype=self.bf16,
-            )
-
-        def seed_direct(self, P):
-            """Mark the KV a producer wrote through `kv_sink`."""
-            self.current_seed_P = P
-            mark_dirty(self._prog.lib, self._kv)
-
-        def dispatch(self, tok, p):
-            L = p + 1
-            if not (1 <= L <= self.maxL):
-                raise ValueError(f"position {p} is outside [0,{self.maxL - 1}]")
-            x0 = np.asarray(
-                self.qm.embed_rows("model.embed_tokens.weight", [tok])[0], self.bf16
-            )
-            self._x[:] = x0
-            self._px[:] = x0
-            emb = self._ple_embed(tok)
-            for i in range(self.UNI):
-                off = i * self.PLE_LAYER + self.PLE_EMB_OFF
-                self._pw[off : off + emb[i].size] = emb[i]
-            mark_dirty(self._prog.lib, self._pw)
-            rope = self._rope_slab(p)
-            self._r[self._rope_base : self._rope_base + rope.size] = rope
-            with self._prog.lock:
-                self._prog.patch_insts(self._gen.lo, self._gen.slice_for(L))
-                self._prog.dispatch(
-                    [self._x, self._w, self._r, self._y, self._kv, self._pw, self._px]
-                )
-            n = self.UNI_LM * self.VP
-            yv = self._y[self.decode_y : self.decode_y + n].astype(np.float32)
-            yv = yv[: self.VOCAB_SIZE]
-            cap = self.gw.FINAL_LOGIT_SOFTCAP
-            if cap:
-                yv /= cap
-                np.tanh(yv, out=yv)
-                yv *= cap
-            return yv
-
-    return HsaPleDecoder

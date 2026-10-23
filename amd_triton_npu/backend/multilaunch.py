@@ -33,6 +33,8 @@ from .driver import (
     _get_output_format,
     _get_cached_aircc_artifacts,
     _put_aircc_artifacts,
+    _cached_hsaco,
+    _pack_and_cache_hsaco,
     detect_npu_version,
     npu_wait_module,
     release_external_contexts,
@@ -265,17 +267,20 @@ module {{
         )
         return hashlib.md5(key_data.encode("utf-8")).hexdigest()
 
-    def compile(self, output_format=None):
-        """Stitch + compile the chain to one ELF (or xclbin).
+    def compile(self, output_format=None, link_profile="xrt"):
+        """Stitch + compile the chain to one ELF (or xclbin), packed into an
+        hsaco for the HSA runtime.
 
         The compiled artifacts are persisted in Triton's on-disk cache keyed by
         the stitched module text (+ format/npu/bf16). On a hit, aircc is skipped
         entirely and the cached paths are returned -- mirrors the per-kernel
-        ``compile_module`` cache in driver.py.
+        ``compile_module`` cache in driver.py, including its hsaco packing for
+        ``link_profile == "hsa"``.
 
         Returns:
-            elf:           (elf_path, kernel_name)
-            xclbin / pdi:  (bin_path, insts_path)
+            xrt, elf:          (elf_path, kernel_name)
+            xrt, xclbin / pdi: (bin_path, insts_path)
+            hsa (either format, packed into one hsaco): (hsaco_path, kernel_name)
         """
         output_format = output_format or _get_output_format()
         npu_version = detect_npu_version()
@@ -285,10 +290,21 @@ module {{
         cache = get_cache_manager(key)
         cached = _get_cached_aircc_artifacts(cache, output_format)
         if cached is not None:
+            elf_kernel_name = None
             if output_format == "elf":
                 with open(cached["elf_kernel_name_path"]) as f:
-                    return cached["elf_path"], f.read()
-            return cached["bin_path"], cached["insts_path"]
+                    elf_kernel_name = f.read()
+            if link_profile == "hsa":
+                cached_hsaco = _cached_hsaco(
+                    cache, output_format, elf_kernel_name, self.name
+                )
+                if cached_hsaco is not None:
+                    return cached_hsaco
+                cached = None  # hsaco missing: force a rebuild below
+            elif output_format == "elf":
+                return cached["elf_path"], elf_kernel_name
+            else:
+                return cached["bin_path"], cached["insts_path"]
 
         air_proj = self.air_project_path
         os.makedirs(air_proj, exist_ok=True)
@@ -305,6 +321,15 @@ module {{
         )
         # Cache the format-specific artifacts and return the cached paths.
         cached = _put_aircc_artifacts(cache, artifacts, output_format)
+        if link_profile == "hsa":
+            return _pack_and_cache_hsaco(
+                cache,
+                output_format,
+                artifacts,
+                npu_version,
+                artifacts.get("elf_kernel_name"),
+                self.name,
+            )
         if output_format == "elf":
             return cached["elf_path"], artifacts["elf_kernel_name"]
         return cached["bin_path"], cached["insts_path"]
@@ -518,21 +543,22 @@ class MultiLaunchRunner:
 class HsaChainRunner:
     """``MultiLaunchRunner``'s contract on the HSA runtime.
 
-    The chain is compiled to one PDI and instruction stream and dispatched as
-    one HSA program. Each ``bo_key`` owns a shared region per operand the
-    caller does not bind; a static operand is written on the first call and
-    made resident, an intermediate is zeroed on the first call, and every
-    other operand is copied in per call. A bound operand is the caller's own
-    shared pages: whatever ``bound_buffers`` maps it to, the caller's array is
-    what the dispatch runs on, in place.
+    The chain is compiled to one hsaco (packed by ``MultiLaunchBuilder.compile``
+    from whichever aircc format it chose -- PDI+insts or full ELF) and
+    dispatched by its kernel object. Each ``bo_key`` owns a shared region per
+    operand the caller does not bind; a static operand is written on the first
+    call and made resident, an intermediate is zeroed on the first call, and
+    every other operand is copied in per call. A bound operand is the caller's
+    own shared pages: whatever ``bound_buffers`` maps it to, the caller's array
+    is what the dispatch runs on, in place.
     """
 
-    def __init__(self, pdi_path, insts_path):
+    def __init__(self, hsaco_path, kernel_name):
         from .hsa_xrt import HsaXrtError, _errbuf, _runtime
 
         buf, n = _errbuf()
         self._handle = _runtime().triton_npu_hsa_prepare(
-            pdi_path.encode(), insts_path.encode(), buf, n
+            hsaco_path.encode(), kernel_name.encode(), buf, n
         )
         if not self._handle:
             raise HsaXrtError(buf.value.decode())
@@ -802,7 +828,13 @@ class NPUChain:
             fmt = "elf"
         else:
             fmt = _get_output_format(runtime=self._runtime)
-        self._elf_path, self._kernel_name = b.compile(output_format=fmt)
+        # _elf_path/_kernel_name hold whatever compile() returns for this
+        # runtime: an elf path + kernel name for xrt, or an hsaco path +
+        # kernel name for hsa (packed from whichever aircc format compile()
+        # chose, via _get_output_format's own xrt/hsa-aware auto-detect).
+        self._elf_path, self._kernel_name = b.compile(
+            output_format=fmt, link_profile=self._runtime
+        )
 
     @staticmethod
     def _close_stalest():

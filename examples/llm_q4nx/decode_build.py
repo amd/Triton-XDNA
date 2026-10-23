@@ -145,8 +145,7 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
     if output_format == "elf" and model.engine != "fused_decode":
         raise SystemExit(
             f"--format elf builds the shared engine's decode; {model.name} uses "
-            f"the {model.engine!r} engine, whose HSA decode runs the PDI "
-            f"templates (--format pdi)."
+            f"the {model.engine!r} engine, which has no full-ELF build."
         )
     cfg = model.decode_config(L, dynseq=1 if output_format == "elf" else None)
 
@@ -265,7 +264,7 @@ def main(argv=None):
         default="xclbin",
         choices=("xclbin", "pdi", "elf"),
         help="elf: one full ELF for every context length, for the HSA decode on "
-        "a ROCR that resolves device addresses; pdi: the HSA template pair; "
+        "a ROCR that resolves device addresses; pdi: the template pair as PDIs; "
         "xclbin: XRT's. elf and pdi also build the xclbin pair",
     )
     args = ap.parse_args(argv)

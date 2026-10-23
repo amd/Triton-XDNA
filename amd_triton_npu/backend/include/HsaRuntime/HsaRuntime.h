@@ -28,7 +28,8 @@ extern "C" {
 // ring slot (a few KiB in total).
 #define TRITON_NPU_HSA_MAX_KERNARGS 16
 
-// Opaque handle to a prepared (pdi, insts) program, owned by the runtime.
+// Opaque handle to a prepared kernel, loaded from an hsaco and dispatched by
+// its kernel object, owned by the runtime.
 typedef struct triton_npu_hsa_program *triton_npu_hsa_program_t;
 
 // Initialize the runtime (idempotent) and write the AIE agent's device name
@@ -39,68 +40,73 @@ typedef struct triton_npu_hsa_program *triton_npu_hsa_program_t;
 int triton_npu_hsa_agent_name(char *buf, size_t buf_len, char *errbuf,
                               size_t errbuf_len);
 
-// Initialize the runtime (idempotent) and load + cache the PDI and instruction
-// binaries for one kernel. Returns an opaque program handle, or NULL on error
-// (with a message written to errbuf). Call once per launcher module.
-triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *pdi_path,
-                                                const char *insts_path,
+// Initialize the runtime (idempotent), pack-load an hsaco, and resolve
+// kernel_name to a kernel object. Returns an opaque program handle, or NULL
+// on error (with a message written to errbuf). Call once per launcher
+// module.
+//
+// hsaco_path must name a code object ROCR's AIE loader recognises -- an
+// architecture-named (aie2/aie2p) section carrying either a PDI plus
+// instruction sequence, or a full ELF (aie2p only). The hsaco's bytes are
+// read into this call and kept alive for as long as the returned program is
+// prepared, since ROCR reads the code object in place.
+triton_npu_hsa_program_t triton_npu_hsa_prepare(const char *hsaco_path,
+                                                const char *kernel_name,
                                                 char *errbuf,
                                                 size_t errbuf_len);
 
-// Initialize the runtime (idempotent) and load one kernel out of a full ELF,
-// as `aiecc --get-full-elf` emits it. Returns an opaque program handle, or
-// NULL on error (with a message written to errbuf).
+// Like triton_npu_hsa_prepare, but pack-loads an hsaco already in memory
+// instead of reading one from a file. The bytes are copied before this call
+// returns, so hsaco_data need not outlive it.
 //
-// `kernel_name` is "<device>:<sequence>" as aiecc names it, e.g.
-// "main:q4nx_decode". If it does not match, the error lists the kernels the
-// file holds.
-//
-// Unlike the (pdi, insts) pair, where the hardware patches the arguments into
-// the instruction stream as it runs, a full ELF's control code loads its own
-// configuration and this runtime patches the argument addresses into it before
-// each enqueue. In exchange the design can have a scratchpad (below).
-//
-// Only aie2p (npu2) supports this shape.
-triton_npu_hsa_program_t triton_npu_hsa_prepare_elf(const char *elf_path,
-                                                    const char *kernel_name,
-                                                    char *errbuf,
-                                                    size_t errbuf_len);
+// Unlike triton_npu_hsa_prepare, not cached by path -- there is no path to key
+// on. Meant for an hsaco that is good for only one load (e.g. one baked with a
+// single scratchpad's device address, which no other hsaco shares); preparing
+// the same bytes twice loads two independent programs rather than reusing one.
+triton_npu_hsa_program_t triton_npu_hsa_prepare_bytes(const void *hsaco_data,
+                                                      uint64_t hsaco_size,
+                                                      const char *kernel_name,
+                                                      char *errbuf,
+                                                      size_t errbuf_len);
 
-// Where a full-ELF program's control scratchpad lives, and how many bytes of it
-// the ELF declared. Either pointer may be NULL. Returns 0 on success, or a
-// negative value on error (with a message written to errbuf); asking a program
-// that was not prepared from an ELF is an error.
+// Initialize the runtime (idempotent) and allocate a zeroed control scratchpad
+// of `size` bytes for a full-ELF design that declares parameters. Returns its
+// host address and writes the address the NPU reaches it by to *dev_addr, or
+// returns NULL on error (with a message written to errbuf). It lives as long
+// as the runtime does, like the programs it is baked into.
 //
-// The scratchpad is device-visible memory the host writes and the device reads
-// in its dispatch preamble. It is `4 * parameter_count` bytes, one uint32 per
-// parameter, indexed by the parameter's `state_table_idx`. Both outputs are
-// zero for a design that declares no parameters.
+// ROCR's hsaco loader patches only PDI and argument addresses into a full ELF's
+// control code, and refuses one that relocates anything else. So the caller
+// writes *dev_addr into the control code at the scratchpad's relocation sites
+// itself, drops those relocations, and packs the result (see driver.py's
+// _pack_hsaco). The scratchpad is device-visible memory the host writes and
+// the device reads in its dispatch preamble; which uint32 a parameter takes and
+// how it is encoded come from the build's params.txt, which this runtime does
+// not read.
 //
-// The caller writes the values: which index a parameter has, and that a
-// `core`-kind parameter is stored shifted left by 2 while an `addr`-kind one is
-// stored as is, come from the build's params.txt, which this runtime does not
-// read.
-//
-// Each dispatch names the scratchpad as an operand at its full size, so ROCR
-// flushes it from the CPU cache before the device reads it. A write is visible
-// to the device only once a dispatch follows it.
-int triton_npu_hsa_scratchpad(triton_npu_hsa_program_t program, void **addr,
-                              uint64_t *size, char *errbuf, size_t errbuf_len);
+// Needs a ROCR whose hsa_amd_pointer_info reports an AIE allocation's device
+// address; see triton_npu_hsa_scratchpad_supported.
+void *triton_npu_hsa_scratchpad_alloc(uint64_t size, uint64_t *dev_addr,
+                                      char *errbuf, size_t errbuf_len);
 
-// Whether this ROCR can dispatch a full ELF whose design needs an address
-// resolved for it: a control scratchpad, or a further configuration it
-// switches to. Returns 1 if it can, 0 if it cannot, including on an AIE agent
-// other than aie2p. Never fails, and creates no queue.
+// Flush host writes to a scratchpad from the CPU cache, so that the next
+// dispatch reads them. Returns 0 on success, or a negative value on error (with
+// a message written to errbuf); `va` must be an address
+// triton_npu_hsa_scratchpad_alloc returned.
 //
-// The control code reaches those buffers through device addresses patched into
-// it, so this asks whether hsa_amd_pointer_info reports a device address for an
-// AIE allocation. It allocates a page to ask, and so calls hsa_init (which is
+// Nothing else does it: the packet lists only the kernel's arguments, which a
+// full ELF has to match exactly, so the scratchpad cannot ride along as an
+// extra argument for ROCR to flush.
+int triton_npu_hsa_scratchpad_flush(void *va, char *errbuf, size_t errbuf_len);
+
+// Whether this ROCR can resolve a scratchpad's device address: 1 if it can, 0
+// if it cannot, including on an AIE agent other than aie2p. Never fails, and
+// creates no queue. It allocates a page to ask, and so calls hsa_init (which is
 // refcounted).
 //
-// Meant to be asked before choosing which artifact to build or load. A design
-// with no scratchpad and a single configuration dispatches as a full ELF
-// without it.
-int triton_npu_hsa_full_elf_supported(void);
+// Meant to be asked before choosing which artifact to build or load. A full
+// ELF with no scratchpad dispatches without it.
+int triton_npu_hsa_scratchpad_supported(void);
 
 // Dispatch a prepared program: acquire vmem I/O buffers, copy inputs in, fill
 // kernargs, enqueue the AIE packet, wait for completion, copy outputs back, and
@@ -153,21 +159,6 @@ int triton_npu_hsa_dispatch_ex(triton_npu_hsa_program_t program,
                                uint32_t num_tensors, void *const *host_ptrs,
                                const uint64_t *sizes, const uint8_t *writeback,
                                char *errbuf, size_t errbuf_len);
-
-// Overwrite nbytes of a prepared program's instruction stream at byte_offset.
-// Returns 0 on success, or a negative value (with a message in errbuf).
-//
-// The dispatch packet carries the stream's address and size per enqueue, so the
-// stream is an input to each dispatch and not a property of the program. A
-// decode needs that: its context length is encoded in a few stream words and
-// changes every token.
-//
-// Serialised against dispatch internally. The GIL does not do it: the dispatch
-// path releases the GIL, and so does the ctypes call that reaches this.
-int triton_npu_hsa_patch_insts(triton_npu_hsa_program_t program,
-                               uint64_t byte_offset, const void *src,
-                               uint64_t nbytes, char *errbuf,
-                               size_t errbuf_len);
 
 // ---------------------------------------------------------------------------
 // Shared regions

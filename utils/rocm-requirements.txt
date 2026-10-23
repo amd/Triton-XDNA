@@ -8,4 +8,4 @@
 # device address, which the full-ELF decode needs. Without a pin pip takes
 # whatever nightly is newest that day.
 --extra-index-url https://nightly.repo.amd.com/rocm/whl-next/
-rocm-sdk-core==10.2.0a20261013
+rocm-sdk-core==10.2.0a20261020

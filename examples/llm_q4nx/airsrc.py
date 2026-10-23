@@ -184,8 +184,7 @@ def select_decode_artifact(env=None):
     ``DECODE_ELF=1`` selects mlir-air's full ELF on XRT (build it with
     ``make compile-decode DECODE_ELF=1``; ``xrt_elf.install`` makes it
     importable next to Triton). Under HSA it is refused: there the HSA decoder
-    dispatches and picks its own artifact, through
-    ``AMD_TRITON_NPU_HSA_DECODE``.
+    dispatches its own scratchpad ELF.
 
     Returns the value written, so a caller (and a test) can check it.
     """
@@ -196,8 +195,8 @@ def select_decode_artifact(env=None):
     if asked == "1" and env.get("AMD_TRITON_NPU_RUNTIME", "xrt") == "hsa":
         raise DecodeArtifactError(
             "DECODE_ELF=1 selects mlir-air's XRT full-ELF decode, but the "
-            "runtime is HSA, whose decoder chooses its own artifact. Unset "
-            "DECODE_ELF; use AMD_TRITON_NPU_HSA_DECODE=elf|insts instead."
+            "runtime is HSA, whose decoder always runs its own scratchpad ELF. "
+            "Unset DECODE_ELF."
         )
     env["DECODE_ELF"] = asked
     return asked
