@@ -1,0 +1,163 @@
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+# Builds against the pybind11-era Triton pinned in utils/pybind11-pins.txt and
+# runs a few examples on the NPU. Not a required check.
+
+name: pybind11 Build
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "amd_triton_npu/**"
+      - "setup.py"
+      - "scripts/patching.py"
+      - "scripts/fetch_pybind11_sources.py"
+      - "third_party/*pybind11.patch"
+      - "utils/pybind11-pins.txt"
+      - "utils/mlir-air-hash.txt"
+      - "utils/peano-requirements.txt"
+      - ".github/workflows/pybind11.yml"
+      - ".github/actions/build/**"
+  pull_request:
+    paths:
+      - "amd_triton_npu/**"
+      - "setup.py"
+      - "scripts/patching.py"
+      - "scripts/fetch_pybind11_sources.py"
+      - "third_party/*pybind11.patch"
+      - "utils/pybind11-pins.txt"
+      - "utils/mlir-air-hash.txt"
+      - "utils/peano-requirements.txt"
+      - ".github/workflows/pybind11.yml"
+      - ".github/actions/build/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheel:
+    name: Build Wheel (pybind11)
+    # The wheel only loads on a glibc at least as new as the one it was built
+    # against, so this must not be newer than the NPU runner's container.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        uses: descriptinc/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      # The pybind11 sources are fetched by setup.py, not from submodules.
+      - name: Get repo
+        uses: actions/checkout@v4
+
+      - name: Ccache for C++ compilation
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: ${{ runner.os }}-clangreleaseasserts-pybind11
+          max-size: 1G
+
+      # Must match the Python of ci_env on the NPU runner.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build build-essential clang lld
+
+      - name: Install python packages
+        run: |
+          pip install --upgrade pip
+          pip install lit "cmake<4" joblib pybind11 wheel setuptools
+
+      - name: Build wheel
+        env:
+          TRITON_XDNA_BINDINGS: pybind11
+          TRITON_BUILD_WITH_CLANG_LLD: "true"
+          TRITON_APPEND_CMAKE_ARGS: "-DTRITON_BUILD_UT=OFF"
+        run: |
+          python -m pip wheel . --no-build-isolation --no-deps -w dist -v
+          ls -la dist
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton-xdna-wheel-pybind11
+          path: dist/triton_xdna-*.whl
+          retention-days: 1
+          if-no-files-found: error
+
+  npu-smoke:
+    name: NPU Smoke Tests (pybind11)
+    needs: build-wheel
+    runs-on: [self-hosted, docker]
+    steps:
+      - name: Pull
+        uses: actions/checkout@v4
+        env:
+          HOME: /workspace
+        with:
+          token: ${{ secrets.RUNNER_PAT }}
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: triton-xdna-wheel-pybind11
+          path: prebuilt-wheel
+
+      - name: Build
+        uses: ./.github/actions/build
+        with:
+          env_name: ci_env
+          wheel_dir: prebuilt-wheel
+
+      - name: Smoke tests
+        env:
+          HOME: /workspace
+        shell: bash
+        run: |
+          source /opt/xilinx/xrt/setup.sh
+          source ci_env/bin/activate
+          source utils/env_setup.sh
+
+          # Only the pybind11 build of the plugin defines DLPackArray.
+          python -c "from triton._C.libtriton import amd_triton_npu as p; p.DLPackArray"
+          python scripts/test_tl_extra_npu.py
+
+          DEVICE=$(python -c "
+          import pyxrt
+          name = pyxrt.device(0).get_info(pyxrt.xrt_info_device.name).lower()
+          print('aie2' if any(k in name for k in ('npu1', 'phoenix')) else 'aie2p')
+          ")
+          echo "Device: $DEVICE"
+
+          CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+            python scripts/run_tests.py --device "$DEVICE" --verbose \
+              -t axpy -t matmul_bf16_m64_n64_k64
+
+          # The same matmul without a transform script, so the driver
+          # generates the schedule.
+          ( cd examples/matmul_bf16_m64_n64_k64 && python matmul_bf16_m64_n64_k64.py )
+
+          # The DLPack producer differs between the two builds. Exit 77 means
+          # the runner cannot run this test.
+          rc=0
+          HSA_OVERRIDE_GFX_VERSION=11.5.1 \
+            python examples/zero_copy/shared_buffer_test.py || rc=$?
+          if [ "$rc" -eq 77 ]; then
+            echo "SKIP: shared_buffer_test.py"
+          elif [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
