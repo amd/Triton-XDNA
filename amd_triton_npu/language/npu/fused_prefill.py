@@ -38,11 +38,12 @@ from pathlib import Path
 
 #: The models with an example here that mlir-air has a fused prefill for, by
 #: this repository's model name: the key of the model in
-#: `shared/fused_prefill/models.py`, or None for Gemma4-E2B, whose builder is
-#: `gemma4_e2b_q4nx/fused_prefill/build.py`. Rows of that table with no
-#: example here are left out.
+#: `shared/fused_prefill/models.py`, or None for a Gemma4 model, whose builder
+#: is its own package's `fused_prefill/build.py` (`GEMMA4`). Rows of that table
+#: with no example here are left out.
 MODELS = {
     "gemma4-e2b": None,
+    "gemma4-e4b": None,
     "llama-3.2-1b": "llama32_1b_q4nx",
     "llama-3.2-3b": "llama32_3b_q4nx",
     "llama-3.1-8b": "llama31_8b_q4nx",
@@ -51,6 +52,11 @@ MODELS = {
     "phi4-mini": "phi4_mini_q4nx",
     "gemma3-4b": "gemma3_4b_q4nx",
 }
+
+#: The `llms/` package of each Gemma4 model. E4B's is a thin layer that runs
+#: E2B's spec and weights module at its own dims.
+GEMMA4 = {"gemma4-e2b": "gemma4_e2b_q4nx", "gemma4-e4b": "gemma4_e4b_q4nx"}
+GEMMA4_BASE = GEMMA4["gemma4-e2b"]
 
 #: Sources outside `fused_prefill/` that the builder compiles, relative to
 #: mlir-air's `programming_examples/`. Whole directories, because the kernels
@@ -105,7 +111,7 @@ class PrefillConfig:
     def package(self):
         """The `llms/` directory holding this model's builder: `shared` for a
         dense model, `airsrc.fused_prefill_dir(config.package)`."""
-        return "shared" if self.dense else "gemma4_e2b_q4nx"
+        return "shared" if self.dense else GEMMA4[self.model]
 
     def __repr__(self):
         return (
@@ -148,8 +154,15 @@ def fingerprint(config, fused_prefill_dir, peano_root, aie_root):
     _hash_tree(h, shared, examples)
     if not config.dense:
         _hash_tree(h, d, examples)
-        # The model's constants: its spec sizes every op from them.
-        h.update((d.parent / "gemma4_e2b_q4nx_weights.py").read_bytes())
+        # The model's constants: its spec sizes every op from them. A variant's
+        # spec and constants are E2B's, selected by its own wrapper modules.
+        base = d.parents[1] / GEMMA4_BASE
+        if d.parent != base:
+            _hash_tree(h, base / "fused_prefill", examples)
+            for p in sorted(d.parent.glob("*.py")):
+                h.update(p.name.encode())
+                h.update(p.read_bytes())
+        h.update((base / f"{GEMMA4_BASE}_weights.py").read_bytes())
     for rel in KERNEL_SOURCE_DIRS:
         src = examples / rel
         if not src.is_dir():

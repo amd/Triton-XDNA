@@ -13,6 +13,13 @@ inputs:
       Leave empty to detect it from the NPU the runner actually has.
     required: false
     default: ""
+  llm_scope:
+    description: >
+      Which LLM gates to run: "pr" runs the representative models that
+      together cover every prefill/decode placement, "nightly" runs every
+      model.
+    required: false
+    default: "pr"
 
 
 runs:
@@ -26,6 +33,7 @@ runs:
         # capped at 21000 characters, and this one is longer.
         TEST_ENV_NAME: ${{ inputs.env_name }}
         TEST_DEVICE: ${{ inputs.device }}
+        TEST_LLM_SCOPE: ${{ inputs.llm_scope }}
       shell: "bash"
       run: |
         set -x  # Enable command tracing
@@ -201,14 +209,21 @@ runs:
         echo "=========================================="
         # gpt2/qwen are the end-to-end iGPU-free gate. They default to --backend npu
         # if the HuggingFace hub is unreachable the examples exit 77 = SKIP.
+        # On PRs gpt2 stands in for both; nightly runs qwen too.
+        LLM_SCOPE="${TEST_LLM_SCOPE:-pr}"
+        echo "LLM scope: $LLM_SCOPE"
+        hf_examples="gpt2"
+        if [ "$LLM_SCOPE" = "nightly" ]; then
+          hf_examples="gpt2 qwen2_5"
+        fi
         pip install --no-cache-dir transformers numpy ml_dtypes
         CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
           python scripts/run_tests.py --device "$DEVICE" --verbose --timeout 1200 \
-            -t gpt2 -t qwen2_5
+            $(printf -- '-t %s ' $hf_examples)
 
         echo ""
         echo "=========================================="
-        echo "STEP 9b: Q4NX prefill gates"
+        echo "STEP 9b: Q4NX gates"
         echo "=========================================="
         # Invoked directly rather than through run_tests.py, which would run the
         # entry point with no arguments and so try to generate -- and generation
@@ -283,198 +298,28 @@ runs:
           if [ "$air_rc" -ne 0 ]; then
             echo "SKIP: Q4NX examples (mlir-air sources unavailable)"
           else
-            # Reported the way scripts/run_tests.py reports the operator
-            # examples -- same markers, same roll-up -- because these used to
-            # print raw driver output instead. Searching a CI log for
-            # "PASS:" found every operator test and none of these, and the
-            # "Total:" above counts only run_tests.py's, so a reader had no
-            # way to see that the Q4NX gates ran at all.
-            #
-            # They are not run *through* run_tests.py because each needs its
-            # own arguments: it invokes an entry point bare, which for these
-            # means generating, and generation needs a decode build.
-            q_pass=0; q_fail=0; q_skip=0
-
-            # The gates run the default prefill engine: mlir-air's fused
-            # prefill for the models it has one for, the Triton prefill for
-            # the rest. The Triton prefill of those models is gated
-            # separately, after the per-model gates.
-
-            # gate <example> <args...>
-            gate() {
-              local ex="$1"; shift
-              local rc=0
-              echo "📁 Example: $ex"
-              echo "   🔄 Running: ${ex}_inference.py $*"
-              ( cd "examples/$ex" \
-                && CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
-                   python "${ex}_inference.py" "$@" ) || rc=$?
-              if [ "$rc" -eq 0 ]; then
-                echo "   ✅ PASS: ${ex}_inference.py $*"
-                q_pass=$((q_pass + 1))
-              elif [ "$rc" -eq 77 ]; then
-                echo "   ⏭️  SKIP: ${ex}_inference.py -- example declined (exit 77)"
-                q_skip=$((q_skip + 1))
-              else
-                echo "   ❌ FAIL: ${ex}_inference.py (exit code $rc)"
-                q_fail=$((q_fail + 1))
-              fi
-            }
-
-            # Full inference where it is affordable, prefill-only otherwise. A
-            # prefill gate cannot see anything the decode carries -- the
-            # builder environment, -DMODEL_TYPE, GLU_SLICE, the core stack,
-            # which driver API is used -- and that is most of what a new model
-            # adds. The 1B pays 10 s to build its decode and 15 s to generate,
-            # so it runs the real thing and compares against recorded ids.
-            #
-            # The 3B stays prefill-only, and the reason is cost rather than
-            # principle: its decode needs a requantized weight cache that a
-            # fresh runner does not have, measured at ~7 min. Worth revisiting
-            # if that can be cached between runs.
-            build_rc=0
-            echo "📁 Example: llama32_1b_q4nx (decode build)"
-            ( cd examples/llama32_1b_q4nx && make compile-decode ) || build_rc=$?
-            if [ "$build_rc" -ne 0 ]; then
-              echo "   ❌ FAIL: make compile-decode (exit code $build_rc)"
-              q_fail=$((q_fail + 1))
-            else
-              echo "   ✅ PASS: make compile-decode"
-              q_pass=$((q_pass + 1))
-              gate llama32_1b_q4nx --max-tokens 8 --greedy
-              gate llama32_1b_q4nx --prefill-engine triton --max-tokens 8 --greedy
-            fi
-
-            gate llama32_3b_q4nx --prefill-only
-
-            # The 8B is prefill-only for the 3B's reason and skips itself for
-            # one of its own: its dequantized bf16 weights do not fit every
-            # runner, and an undersized host does not raise -- it SIGKILLs the
-            # load, which no `except` can turn into a skip. `min_host_gib` is
-            # checked before anything is allocated, so this reports SKIP rather
-            # than dying at exit 137.
-            gate llama31_8b_q4nx --prefill-only
-
-            # Qwen3-4B is prefill-only for the 3B's reason -- its decode needs
-            # a requantized weight cache a fresh runner does not have -- and
-            # carries a min_host_gib of its own. Its prefill gate is still the
-            # first coverage of a non-Llama forward: the per-head qk-norm and
-            # the decoupled q dim are both in it.
-            gate qwen3_4b_q4nx --prefill-only
-
-            # Qwen3-8B runs the same forward as the 4B, so its gate is not
-            # there to cover the block a second time -- it covers the two
-            # things the 4B's cannot: an untied LM head (the failure mode is
-            # fluent text off a plausible logit vector, which cost a gate
-            # failure to find on Llama-3.1-8B) and, in the decode it does not
-            # reach here, a core stack and a weight split that are this
-            # model's alone. Like the 8B it may decline on min_host_gib; a
-            # SKIP is not a PASS.
-            gate qwen3_8b_q4nx --prefill-only
-
-            # Qwen2.5-7B, prefill-only, and the one gate here that is not
-            # reading a prepared weight bundle: there is no FastFlowLM
-            # Qwen2.5-7B NPU2 bundle, so it quantizes an upstream checkpoint on
-            # load. That makes it the slowest of these and gives it a
-            # min_host_gib of its own, but it is also the only coverage of a
-            # biased projection -- every other forward here is y = x @ W.
-            gate qwen25_7b_q4nx --prefill-only
-
-            # Qwen2.5-3B, prefill-only. Same forward as the 7B, so its value
-            # here is not the block: it is the only model whose decode env sets
-            # W_DUAL_CHAN=0, and unlike the 7B it fits the runner, so it is the
-            # one Qwen2.5 gate that actually executes rather than declining.
-            gate qwen25_3b_q4nx --prefill-only
-
-            # Phi-4-mini, prefill-only. Its gate is the only coverage of a
-            # partial rotation: 96 of 128 lanes rotated and the rest copied
-            # through, on LongRoPE frequencies. Getting either wrong leaves the
-            # head boundary intact and the text fluent, so nothing but the
-            # first-token comparison catches it.
-            gate phi4_mini_q4nx --prefill-only
-
-            # Gemma3-4B, prefill-only for the same two reasons. Its gate is
-            # worth more than the others' despite being the same shape: four
-            # bundle conventions, a norm sandwich, dual-theta RoPE and a GELU
-            # GLU all have to be right for the first token to come out, and
-            # each of them fails into fluent wrong text rather than an error.
-            # What it does NOT cover is the 1024-token sliding window -- the
-            # canonical prompt is six tokens, so the window never binds. Only
-            # the decode comparison against mlir-air's own generation does.
-            gate gemma3_4b_q4nx --prefill-only
-
-            # Gemma4-E2B. The widest gate here per token of prompt: the first
-            # token cannot come out unless the per-layer embeddings, the
-            # per-layer class map (which layers slide, which share a KV cache,
-            # which carry the wide FFN), the 1.0 attention scale and the
-            # per-layer output scalar are all right, and every one of them
-            # fails into fluent wrong text rather than an error.
-            #
-            # Then the NPU decode, reading the prefill's KV slab in place --
-            # the handoff no other gate reaches, since the iGPU decode below
-            # reads whatever layout `kv_layout` defines. The recorded
-            # continuation ends with the stop token: a decode reading a
-            # corrupted cache still says " Paris." first. The decode's packed
-            # weight cache is built here on first use, and the NPU-decode row
-            # of test_decode_vs_prefill.py in STEP 10 reuses it.
-            # The triton-fused device's GEMM and its LM head, each against a
-            # reference, packed and dispatched by mlir-air's own runtime
-            # pieces: a change on either side of that interface fails here
-            # rather than as wrong tokens in the gate below.
-            for t in test_gemma4_gemm.py test_gemma4_lm_gemv.py; do
-              rc=0
-              echo "📁 Example: llm_q4nx/$t"
-              ( cd examples/llm_q4nx && python3 "$t" ) || rc=$?
-              if [ "$rc" -eq 0 ]; then
-                echo "   ✅ PASS: $t"
-                q_pass=$((q_pass + 1))
-              else
-                echo "   ❌ FAIL: $t (exit code $rc)"
-                q_fail=$((q_fail + 1))
-              fi
-            done
-
-            build_rc=0
-            echo "📁 Example: gemma4_e2b_q4nx (decode build)"
-            ( cd examples/gemma4_e2b_q4nx && make compile-decode ) || build_rc=$?
-            if [ "$build_rc" -ne 0 ]; then
-              echo "   ❌ FAIL: make compile-decode (exit code $build_rc)"
-              q_fail=$((q_fail + 1))
-              gate gemma4_e2b_q4nx --prefill-engine triton-fused --prefill-only
-            else
-              echo "   ✅ PASS: make compile-decode"
-              q_pass=$((q_pass + 1))
-              # The prefill is the fused device with its GEMMs from Triton;
-              # mlir-air's own fused prefill is gated by test_decode_vs_prefill.
-              gate gemma4_e2b_q4nx --prefill-engine triton-fused --decode npu \
-                --max-tokens 8 --greedy
-            fi
-
-            # The Triton prefill of the models whose default is the fused one.
-            # Gemma4's runs in its decode gate above; its layer-by-layer Triton
-            # prefill is gated by the hetero runs.
-            for ex in llama32_3b_q4nx llama31_8b_q4nx qwen3_4b_q4nx \
-                      qwen3_8b_q4nx phi4_mini_q4nx gemma3_4b_q4nx; do
-              gate "$ex" --prefill-engine triton --prefill-only
-            done
+            # Every prefill/decode placement of each model; see the script for
+            # which models and cases each scope runs.
+            q_fail=0
+            python3 scripts/run_llm_gates.py --scope "$LLM_SCOPE" || q_fail=1
 
             # The KV layout our prefills hand the NPU decode in place, against
             # mlir-air's own `seed_kv` run on the same K/V. The decode gate
             # above sees a wrong layout only as wrong tokens; this names the
             # layer and lane. No NPU and no weights: the fetched sources only.
-            rc=0
-            echo "📁 Example: llm_q4nx/test_kv_layout.py"
-            ( cd examples/llm_q4nx && python3 test_kv_layout.py ) || rc=$?
-            if [ "$rc" -eq 0 ]; then
-              echo "   ✅ PASS: test_kv_layout.py"
-              q_pass=$((q_pass + 1))
-            elif [ "$rc" -eq 77 ]; then
-              echo "   ⏭️  SKIP: test_kv_layout.py -- declined (exit 77)"
-              q_skip=$((q_skip + 1))
-            else
-              echo "   ❌ FAIL: test_kv_layout.py (exit code $rc)"
-              q_fail=$((q_fail + 1))
-            fi
+            for kv_ex in gemma4_e2b_q4nx gemma4_e4b_q4nx; do
+              rc=0
+              echo "📁 Example: llm_q4nx/test_kv_layout.py --example $kv_ex"
+              ( cd examples/llm_q4nx && python3 test_kv_layout.py --example "$kv_ex" ) || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                echo "   ✅ PASS: test_kv_layout.py --example $kv_ex"
+              elif [ "$rc" -eq 77 ]; then
+                echo "   ⏭️  SKIP: test_kv_layout.py --example $kv_ex -- declined (exit 77)"
+              else
+                echo "   ❌ FAIL: test_kv_layout.py --example $kv_ex (exit code $rc)"
+                q_fail=1
+              fi
+            done
 
             # The same for the other models' layout (`dense_kv_layout`),
             # against each model's own `seed_kv`.
@@ -483,22 +328,13 @@ runs:
             ( cd examples/llm_q4nx && python3 test_dense_kv_layout.py ) || rc=$?
             if [ "$rc" -eq 0 ]; then
               echo "   ✅ PASS: test_dense_kv_layout.py"
-              q_pass=$((q_pass + 1))
             elif [ "$rc" -eq 77 ]; then
               echo "   ⏭️  SKIP: test_dense_kv_layout.py -- declined (exit 77)"
-              q_skip=$((q_skip + 1))
             else
               echo "   ❌ FAIL: test_dense_kv_layout.py (exit code $rc)"
-              q_fail=$((q_fail + 1))
+              q_fail=1
             fi
 
-            echo ""
-            echo "--------------------------------------------------"
-            echo "Q4NX Gate Results:"
-            echo "  ✅ Passed:  $q_pass"
-            echo "  ❌ Failed:  $q_fail"
-            echo "  ⏭️  Skipped: $q_skip"
-            echo "  📊 Total:   $((q_pass + q_fail + q_skip))"
             if [ "$q_fail" -ne 0 ]; then
               echo "❌ Q4NX gates failed"
               exit 1
@@ -518,7 +354,7 @@ runs:
         if [ "$DEVICE" = "aie2p" ]; then
           export HSA_OVERRIDE_GFX_VERSION=11.5.1
           hetero_rc=0
-          for ex in gpt2 qwen2_5; do
+          for ex in $hf_examples; do
             echo "--- hetero: $ex ---"
             entry=$(ls examples/$ex/*_inference.py | head -1)
             rc=0
@@ -530,140 +366,6 @@ runs:
               hetero_rc=1
             fi
           done
-
-          # Gemma4-E2B on the iGPU. STEP 9b runs every Q4NX gate with the iGPU
-          # hidden, so `hetero`, `--decode gpu` and `--prefill-engine igpu`
-          # have no coverage there at all -- which is what this step is for.
-          # Three runs, because they fail differently:
-          #
-          #   --prefill-engine triton --backend hetero
-          #       the prefill's RoPE and attention on the iGPU, the rest on
-          #       the NPU. Gates the first token, like 9b.
-          #   --prefill-engine triton --backend npu --decode gpu
-          #       the Triton NPU prefill plus the Triton iGPU decode, gating
-          #       the recorded continuation. The decode under test is ours,
-          #       not mlir-air's template, so it needs no `make compile-decode`.
-          #   --prefill-engine igpu --decode gpu
-          #       the whole run on the iGPU: `Gemma4GpuDecode.prefill`, then
-          #       the decode from the slab it wrote.
-          #
-          # Skipped rather than failed when the weights or mlir-air's sources
-          # are unreachable; the example exits 77 for both.
-          for args in "--prefill-engine triton --backend hetero --prefill-only" \
-                      "--prefill-engine triton --backend npu --decode gpu --prompt 2,818,5279,529,7001,563 --max-tokens 3 --greedy" \
-                      "--prefill-engine igpu --decode gpu --prompt 2,818,5279,529,7001,563 --max-tokens 3 --greedy"; do
-            echo "--- hetero: gemma4_e2b_q4nx $args ---"
-            rc=0
-            ( cd examples/gemma4_e2b_q4nx \
-              && python gemma4_e2b_q4nx_inference.py $args ) || rc=$?
-            if [ "$rc" -eq 77 ]; then
-              echo "SKIP: gemma4_e2b_q4nx $args (exit 77)"
-            elif [ "$rc" -ne 0 ]; then
-              echo "FAIL: gemma4_e2b_q4nx $args (exit $rc)"
-              hetero_rc=1
-            fi
-          done
-
-          # Each decode against a prefill re-run over the growing prefix, and
-          # mlir-air's NPU decode from the prefill's slab against the tokens
-          # its own `seed_kv` gives for the same K/V. Here and not in 9b
-          # because its other rows need the iGPU; the decode template and
-          # weight cache come from the Gemma4 gate in 9b.
-          echo "--- gemma4_e2b_q4nx: test_decode_vs_prefill.py --npu-decode ---"
-          rc=0
-          ( cd examples/llm_q4nx \
-            && python test_decode_vs_prefill.py --npu-decode \
-                 --prefill-engine air-fused ) || rc=$?
-          if [ "$rc" -eq 77 ]; then
-            echo "SKIP: test_decode_vs_prefill.py --npu-decode (exit 77)"
-          elif [ "$rc" -ne 0 ]; then
-            echo "FAIL: test_decode_vs_prefill.py --npu-decode (exit $rc)"
-            hetero_rc=1
-          fi
-
-          # XRT zero-copy needs the iGPU, so it runs here, not in 9b (which hides
-          # it). The golden gate passes on the staged fallback too, so the output
-          # is checked below: engaged is a pass, and a fallback for want of shared
-          # pages is a skip (this runner may have no ROCm torch, like STEP 8's
-          # shared_buffer_test). A green gate with neither marker is the failure
-          # -- zero-copy silently stopped running where it should have.
-          echo "--- xrt zero-copy: llama32_1b_q4nx (iGPU visible) ---"
-          rc=0
-          zc_out=$( cd examples/llama32_1b_q4nx \
-            && python llama32_1b_q4nx_inference.py --max-tokens 8 --greedy 2>&1 ) || rc=$?
-          echo "$zc_out"
-          if [ "$rc" -eq 77 ]; then
-            echo "SKIP: llama32_1b_q4nx xrt zero-copy (exit 77)"
-          elif [ "$rc" -ne 0 ]; then
-            echo "FAIL: llama32_1b_q4nx xrt zero-copy (exit $rc)"
-            hetero_rc=1
-          elif echo "$zc_out" | grep -q "KV handed over in place" \
-               && ! echo "$zc_out" | grep -q "copied once"; then
-            echo "PASS: llama32_1b_q4nx xrt zero-copy engaged"
-          elif echo "$zc_out" | grep -q "XRT zero-copy unavailable"; then
-            echo "SKIP: llama32_1b_q4nx xrt zero-copy -- no shared pages here"
-          else
-            echo "FAIL: llama32_1b_q4nx decode gated green but zero-copy neither"
-            echo "      engaged nor reported it was unavailable."
-            hetero_rc=1
-          fi
-
-          # The Llama-family iGPU forward (`LlamaGpuDecode`), on the smallest
-          # model: iGPU prefill then iGPU decode, and the Triton NPU prefill
-          # writing the iGPU decoder's shared cache. Both gate the recorded
-          # iGPU continuation.
-          for args in "--prefill-engine igpu --decode gpu --max-tokens 9 --greedy" \
-                      "--prefill-engine triton --backend npu --decode gpu --max-tokens 9 --greedy"; do
-            echo "--- igpu: llama32_1b_q4nx $args ---"
-            rc=0
-            ( cd examples/llama32_1b_q4nx \
-              && python llama32_1b_q4nx_inference.py $args ) || rc=$?
-            if [ "$rc" -eq 77 ]; then
-              echo "SKIP: llama32_1b_q4nx $args (exit 77)"
-            elif [ "$rc" -ne 0 ]; then
-              echo "FAIL: llama32_1b_q4nx $args (exit $rc)"
-              hetero_rc=1
-            fi
-          done
-
-          # The iGPU prefill writing the NPU decoder's cache, through the
-          # zero-copy path. No continuation is recorded for this pair yet, so
-          # the exit status covers the first token only; the handoff itself is
-          # checked by its marker, as for the zero-copy row above.
-          echo "--- igpu prefill, npu decode: llama32_1b_q4nx ---"
-          rc=0
-          zc_out=$( cd examples/llama32_1b_q4nx \
-            && python llama32_1b_q4nx_inference.py --prefill-engine igpu \
-                 --max-tokens 8 --greedy 2>&1 ) || rc=$?
-          echo "$zc_out"
-          if [ "$rc" -eq 77 ]; then
-            echo "SKIP: llama32_1b_q4nx igpu prefill, npu decode (exit 77)"
-          elif [ "$rc" -ne 0 ]; then
-            echo "FAIL: llama32_1b_q4nx igpu prefill, npu decode (exit $rc)"
-            hetero_rc=1
-          elif echo "$zc_out" | grep -q "KV handed over in place" \
-               && ! echo "$zc_out" | grep -q "copied once"; then
-            echo "PASS: llama32_1b_q4nx igpu prefill handed its KV to the NPU decode in place"
-          elif echo "$zc_out" | grep -q "XRT zero-copy unavailable"; then
-            echo "SKIP: llama32_1b_q4nx igpu prefill, npu decode -- no shared pages here"
-          else
-            echo "FAIL: llama32_1b_q4nx igpu prefill gated green but the KV handoff"
-            echo "      neither engaged nor reported it was unavailable."
-            hetero_rc=1
-          fi
-
-          # Each iGPU decode step against a prefill re-run over the growing
-          # prefix, after both the host and the iGPU prefill.
-          echo "--- llama32_1b_q4nx: test_dense_decode_vs_prefill.py ---"
-          rc=0
-          ( cd examples/llm_q4nx \
-            && python test_dense_decode_vs_prefill.py --example llama32_1b_q4nx ) || rc=$?
-          if [ "$rc" -eq 77 ]; then
-            echo "SKIP: test_dense_decode_vs_prefill.py (exit 77)"
-          elif [ "$rc" -ne 0 ]; then
-            echo "FAIL: test_dense_decode_vs_prefill.py (exit $rc)"
-            hetero_rc=1
-          fi
 
           exit $hetero_rc
         else

@@ -107,6 +107,20 @@ def add_air_paths(*packages):
             sys.path.insert(0, p)
 
 
+def prefer_air_paths(*packages):
+    """Move these llms packages to the front of sys.path, in this order.
+
+    For a driver that puts its own directory first when imported: mlir-air's
+    Gemma4-E4B wrappers do, and that directory holds same-named wrapper scripts
+    for the E2B modules the driver imports later.
+    """
+    llms = air_llms_root()
+    for pkg in reversed(packages):
+        want = (llms / pkg).resolve()
+        sys.path[:] = [p for p in sys.path if not p or Path(p).resolve() != want]
+        sys.path.insert(0, str(llms / pkg))
+
+
 def decode_attn_maxl(engine="fused_decode", want=None, artifact_dir=None):
     """The calibrated ATTN_MAXL a decode of reach `want` will resolve to.
 

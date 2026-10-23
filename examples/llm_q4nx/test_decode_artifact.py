@@ -155,7 +155,7 @@ def test_hsa_decoder_names_the_missing_xclbin_pair():
         hsa_decode.require_xclbin_pair(d)
 
 
-def _elf_dir(d, model, maxl=2048):
+def _elf_dir(d, model, maxl=2048, scalars=None):
     """An artifact directory as `decode_build.py --format elf` leaves it."""
     import types
 
@@ -165,8 +165,34 @@ def _elf_dir(d, model, maxl=2048):
     os.makedirs(src)
     for n in ("decode.elf", "params.txt"):
         open(os.path.join(src, n), "w").close()
-    art = {"elf_path": os.path.join(src, "decode.elf"), "attn_maxl": maxl}
+    art = {
+        "elf_path": os.path.join(src, "decode.elf"),
+        "attn_maxl": maxl,
+        "seq_scalar_args": {"L": 5} if scalars is None else scalars,
+    }
     decode_build._copy_elf(art, d, types.SimpleNamespace(name=model))
+
+
+def test_elf_names_its_scalar_arguments():
+    # mlir-air's ElfDecode refuses an ELF without decode_scratchpad.args, and
+    # computes every scratchpad parameter from the arguments it names. The
+    # format is the one mlir-air's own ELF build writes.
+    import tempfile
+
+    import decode_build
+
+    with tempfile.TemporaryDirectory() as d:
+        _elf_dir(d, "llama-3.2-1b", scalars={"L": 5})
+        with open(os.path.join(d, decode_build.ELF_ARGS)) as f:
+            assert f.read() == "arg 5 L\nalign 1\nparts 1\n"
+
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            _elf_dir(d, "llama-3.2-1b", scalars={})
+        except SystemExit as e:
+            assert "SEQ_SCALAR_ARGS" in str(e)
+        else:
+            raise AssertionError("an ELF build without its scalar arguments accepted")
 
 
 def test_elf_window_is_the_one_the_elf_was_built_for():

@@ -113,6 +113,11 @@ def air_inference_module(model):
     mod = importlib.util.module_from_spec(spec)
     sys.modules["q4nx_inference"] = mod
     spec.loader.exec_module(mod)
+    # mlir-air's Gemma4-E4B driver is a wrapper that puts E2B's driver, run at
+    # E4B's dims, in its own place in sys.modules, and its own directory first
+    # on sys.path, ahead of the package whose modules that driver imports.
+    mod = sys.modules["q4nx_inference"]
+    airsrc.prefer_air_paths(*model.extra_packages)
     if elf:
         import xrt_elf
 
@@ -644,9 +649,15 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     return list(out)
 
 
+def is_gemma4(cfg):
+    """Gemma4 models have their own prefill and decoder classes
+    (`gemma4_prefill`) rather than the Llama family's."""
+    return cfg.MODEL_NAME.startswith("gemma4-")
+
+
 def igpu_prefill_cls(cfg, prefill_cls):
     """`--prefill-engine igpu`'s prefiller for this model."""
-    if cfg.MODEL_NAME == "gemma4-e2b":
+    if is_gemma4(cfg):
         from gemma4_prefill import Gemma4IgpuPrefill
 
         return Gemma4IgpuPrefill
@@ -685,7 +696,7 @@ def attach_gpu_decoder(cfg, prefiller):
     pages, `generate_on_gpu` copies them across instead. Gemma4's prefiller
     already writes a shared slab, and its decoder is built from it afterwards.
     """
-    if cfg.MODEL_NAME == "gemma4-e2b" or hasattr(prefiller, "gpu_decoder"):
+    if is_gemma4(cfg) or hasattr(prefiller, "gpu_decoder"):
         return
     # The decoder starts ROCm, and the prefill has not opened the NPU yet.
     hold_npu()
@@ -777,7 +788,7 @@ def generate_on_gpu(cfg, args, prefiller, first, ids):
     (`attach_gpu_decoder`, or the iGPU prefill's own).
     """
     eos = tuple(getattr(cfg, "EOS_IDS", ()) or ())
-    if cfg.MODEL_NAME != "gemma4-e2b":
+    if not is_gemma4(cfg):
         dec = prefiller._gpu_decoder
         if not hasattr(prefiller, "gpu_decoder") and prefiller._kv_sink is None:
             # The cache is not shared: bring the host prefill's K/V across.
@@ -1024,7 +1035,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
 
     # Sized for the Triton prefill's bf16 weights. The dense fused and iGPU
     # prefills keep them packed and load no host copy; Gemma4's still do.
-    dense = cfg.MODEL_NAME != "gemma4-e2b"
+    dense = not is_gemma4(cfg)
     if not ((one_device and fused.dense) or (igpu and dense)):
         check_host_memory(spec)
 

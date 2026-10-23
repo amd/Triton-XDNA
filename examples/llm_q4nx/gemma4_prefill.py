@@ -220,8 +220,8 @@ class Gemma4Prefill(LlamaPrefill):
         self._kv_host = _host_view(self._kv_slab)
         self._kv_src = {
             src: (
-                np.zeros((self.max_seq, head_dim(src)), np.float32),
-                np.zeros((self.max_seq, head_dim(src)), np.float32),
+                np.zeros((self.max_seq, N_KV_HEADS * head_dim(src)), np.float32),
+                np.zeros((self.max_seq, N_KV_HEADS * head_dim(src)), np.float32),
             )
             for src in sorted({s for L, s in enumerate(kv_src) if s != L})
         }

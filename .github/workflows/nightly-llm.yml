@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The full test suite with every LLM gate. PRs run the same suite with only
+# the representative LLMs (small.yml).
+name: Nightly LLM Test Suite
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Test:
+    runs-on: [self-hosted, docker]
+    steps:
+      - name: Pull
+        uses: actions/checkout@v4
+        env:
+          HOME: /workspace
+        with:
+          fetch-depth: 2
+          submodules: recursive
+          token: ${{ secrets.RUNNER_PAT }}
+
+      - name: Build
+        uses: ./.github/actions/build
+        with:
+          env_name: ci_env
+
+      - name: Test
+        id: test
+        continue-on-error: true
+        uses: ./.github/actions/test
+        with:
+          env_name: ci_env
+          llm_scope: nightly
+
+      - name: Mark workflow as failed if tests failed
+        if: steps.test.outcome == 'failure'
+        run: exit 1

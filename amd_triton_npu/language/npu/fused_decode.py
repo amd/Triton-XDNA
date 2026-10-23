@@ -530,7 +530,7 @@ def fused_decode(
     """Build one fused decode artifact for `config`.
 
     Returns the dict `FusedDecodeOp.lower` returns -- the binary and its
-    instruction stream.
+    instruction stream -- plus `config`, `attn_maxl` and `seq_scalar_args`.
 
     Args:
         config: a `DecodeConfig`.
@@ -593,4 +593,7 @@ def fused_decode(
 
     artifacts["config"] = config
     artifacts["attn_maxl"] = builder.ATTN_MAXL
+    # The sequence argument index of each runtime scalar, which a full ELF's
+    # scratchpad parameters are computed from. Filled in by build_module().
+    artifacts["seq_scalar_args"] = dict(getattr(builder, "SEQ_SCALAR_ARGS", {}))
     return artifacts
