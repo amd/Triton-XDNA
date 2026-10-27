@@ -8,7 +8,7 @@ mlir-air's fused prefill (`--prefill-engine air-fused`) runs every op of a
 GEMM from `gemma4_gemm.mm_g` and the attention ops from
 `gemma4_attention.attn`, linked into one module by `fused_device.FusedDevice`.
 The LM head is `gemma4_lm_gemv.gemv_q4` on a device of its own, on the buffers
-of mlir-air's `lm_gemv`. The host library comes from mlir-air's builder, and the
+of mlir-air's `lm_gemv`. The host library is mlir-air's, and the
 manifest tells mlir-air's runtime that the GEMMs read bf16 operands and take
 one chunk per dispatch, so the runtime drives both devices unchanged.
 """
@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -145,6 +146,27 @@ def _build_lm(out, lm_gemv):
     shutil.copy(art["insts_path"], out / "lm.insts.bin")
 
 
+def _build_hostops(out, B):
+    """mlir-air's host library, `libhostops.so`, built as its builder does.
+    None of the builder's kernel objects are linked: every core runs Triton."""
+    subprocess.run(
+        [
+            "gcc",
+            "-O3",
+            "-march=native",
+            "-ffp-contract=off",
+            "-fopenmp",
+            "-shared",
+            "-fPIC",
+            str(B.HERE / "kernels" / "hostops.c"),
+            "-o",
+            str(out / "libhostops.so"),
+            "-lm",
+        ],
+        check=True,
+    )
+
+
 def add_attention(dev, spec, heads):
     """Add the spec's attention ops to `dev`, from `gemma4_attention.attn`,
     with the interface of mlir-air's device: the GEMM's buffers, then each
@@ -192,8 +214,8 @@ def add_attention(dev, spec, heads):
 
 
 def build(out):
-    """Build the device, its kernels and its LM head into `out`, which then
-    loads like a build of mlir-air's."""
+    """Build the device, its LM head and mlir-air's host library into `out`,
+    which then loads like a build of mlir-air's."""
     import importlib
 
     import torch
@@ -212,7 +234,7 @@ def build(out):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     with _air_build_env():
-        B.build_kernels(out, spec.CFG)
+        _build_hostops(out, B)
         _build_lm(out, lm_gemv)
     heads = spec.ATTN_POINTS["base"][0]
     dev = FusedDevice("fused_prefill", str(out / "proj"))
