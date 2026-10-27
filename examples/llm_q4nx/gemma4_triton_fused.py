@@ -1,17 +1,16 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Gemma4-E2B's fused one-device NPU prefill with the GEMMs in Triton.
+"""Gemma4-E2B's fused one-device NPU prefill, every op from Triton.
 
 mlir-air's fused prefill (`--prefill-engine air-fused`) runs every op of a
-128-token chunk on one device. This builds the same device with every GEMM
-compiled from `gemma4_gemm.mm_g` instead of mlir-air's GEMM herd, and the
-attention ops from mlir-air's own builder, linked into one module by
-`fused_device.FusedDevice`. The LM head is `gemma4_lm_gemv.gemv_q4` on a
-device of its own, on the buffers of mlir-air's `lm_gemv`. The kernel objects
-and the host library come from mlir-air's builder functions, and the manifest
-tells mlir-air's runtime that the GEMMs read bf16 operands and take one chunk
-per dispatch, so the runtime drives both devices unchanged.
+128-token chunk on one device. This builds the same device from Triton: every
+GEMM from `gemma4_gemm.mm_g` and the attention ops from
+`gemma4_attention.attn`, linked into one module by `fused_device.FusedDevice`.
+The LM head is `gemma4_lm_gemv.gemv_q4` on a device of its own, on the buffers
+of mlir-air's `lm_gemv`. The host library comes from mlir-air's builder, and the
+manifest tells mlir-air's runtime that the GEMMs read bf16 operands and take
+one chunk per dispatch, so the runtime drives both devices unchanged.
 """
 
 import contextlib
@@ -42,9 +41,11 @@ SPEC = "air_examples.llms.gemma4_e2b_q4nx.fused_prefill.spec"
 #: This module's own inputs, beyond mlir-air's sources.
 _SOURCES = (
     HERE / "gemma4_gemm.py",
+    HERE / "gemma4_attention.py",
     HERE / "gemma4_lm_gemv.py",
     HERE / "fused_device.py",
     SCHEDULE,
+    HERE / "transform_gemma4_attention_aie2p.mlir.in",
     LM_SCHEDULE,
     Path(__file__),
 )
@@ -144,6 +145,52 @@ def _build_lm(out, lm_gemv):
     shutil.copy(art["insts_path"], out / "lm.insts.bin")
 
 
+def add_attention(dev, spec, heads):
+    """Add the spec's attention ops to `dev`, from `gemma4_attention.attn`,
+    with the interface of mlir-air's device: the GEMM's buffers, then each
+    attention group's q, KV and o in config order; an attention op takes
+    (nkv, q0, k0) at run time."""
+    import torch
+
+    import gemma4_attention as A
+    from air_examples.llms.shared.fused_prefill import build as B
+    from air_examples.llms.shared.fused_prefill import device as D
+
+    for op, groups in D.attn_ops(spec.CFG).items():
+        if len(groups) != 1:
+            raise NotImplementedError(f"attention op {op} drives {groups}")
+        (grp,) = groups
+        g = spec.CFG.attn[grp]
+        rounds = heads * (D.M // (A.NQT.value * g.lkp))
+        q = torch.zeros(rounds * A.NQT.value * g.lkp, g.dh, dtype=torch.bfloat16)
+        kv = torch.zeros(2 * g.lkp * g.dh, dtype=torch.bfloat16)
+        dev.add(
+            B.seq_name(op, (heads,)),
+            A.attn,
+            (1,),
+            A.args(
+                g,
+                rounds,
+                1,
+                0,
+                0,
+                q,
+                kv,
+                torch.zeros_like(q),
+                rows=D.M,
+                window=(spec.CFG.windows or {}).get(op, g.window),
+            ),
+            transform_script=str(A.schedule(g.lkp, g.dh, g.dvt, dev.proj)),
+            slot=3 + 3 * list(spec.CFG.attn).index(grp),
+            runtime=("nk", "q0", "k0"),
+            key=f"attn_{grp}",
+            pin_l2=True,
+            # K and V come into L2 through one channel, as the records of the
+            # KV buffer hold them: its memtile has no DMA channel to spare.
+            multiplex=("L2",),
+        )
+
+
 def build(out):
     """Build the device, its kernels and its LM head into `out`, which then
     loads like a build of mlir-air's."""
@@ -169,11 +216,8 @@ def build(out):
         _build_lm(out, lm_gemv)
     heads = spec.ATTN_POINTS["base"][0]
     dev = FusedDevice("fused_prefill", str(out / "proj"))
-    for op in D.attn_ops(spec.CFG):
-        name = B.seq_name(op, (heads,))
-        lch = D.build(spec.CFG, op, heads, 1, 0, 0, name=name, own=True)
-        dev.add_air(name, str(lch.build(target="npu2")))
     with config_context(bf16_emulation=True):
+        add_attention(dev, spec, heads)
         for k, n, act, wq in spec.gemm_shapes():
             a = torch.zeros(128, k, dtype=torch.bfloat16)
             c = torch.zeros(128, n, dtype=torch.bfloat16)
@@ -187,7 +231,6 @@ def build(out):
                 transform_script=str(SCHEDULE),
             )
     xclbin, header = dev.compile(
-        objects=sorted(str(p) for p in out.glob("*.o")),
         runtime_loop_tiling_sizes=(),
         bf16_emulation=True,
         extra_args=AIRCC_ARGS,

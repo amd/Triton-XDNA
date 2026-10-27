@@ -76,6 +76,7 @@ PR_CASES = {
         "triton",
         "triton-fused",
         "triton-fused-gemm",
+        "triton-fused-attention",
         "triton-fused-lm-head",
         "hetero",
         "triton-gpu",
@@ -192,8 +193,8 @@ def plan(ex, spec, fused):
             )
         )
     if ex == "gemma4_e2b_q4nx":
-        # mlir-air's fused prefill device with its GEMMs and LM head from
-        # Triton, then its NPU decode; and the GEMM and the LM head alone
+        # mlir-air's fused prefill device with its GEMMs, attention and LM
+        # head from Triton, then its NPU decode; and each of the three alone
         # against a reference, packed and dispatched by mlir-air's runtime.
         cases.append(
             Case(
@@ -208,6 +209,7 @@ def plan(ex, spec, fused):
             Case(name, [sys.executable, test], SHARED, HIDE_IGPU)
             for name, test in (
                 ("triton-fused-gemm", "test_gemma4_gemm.py"),
+                ("triton-fused-attention", "test_gemma4_attention.py"),
                 ("triton-fused-lm-head", "test_gemma4_lm_gemv.py"),
             )
         ]
