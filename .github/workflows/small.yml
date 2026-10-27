@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Small Benchmark/Test Suite
+name: Build and Test on NPU
 
 on:
  push:
@@ -18,7 +18,75 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  Test:
+  # Build on a GitHub-hosted runner and hand the NPU job a wheel, so the NPU
+  # runner only runs tests. Both job names are required status checks on main.
+  build-wheel:
+    name: Build Wheel
+    # Not ubuntu-latest: the wheel only loads on a glibc at least as new as
+    # the one it was built against, so this must not be newer than the NPU
+    # runner's container.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        uses: descriptinc/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          # Off: it apt-removes a hardcoded package list and fails if any of
+          # those packages is missing from the runner image.
+          large-packages: false
+          swap-storage: false
+
+      - name: Get repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          submodules: recursive
+
+      - name: Ccache for C++ compilation
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: ${{ runner.os }}-clangreleaseasserts
+          max-size: 1G
+
+      # Must match the Python of ci_env on the NPU runner.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build build-essential cmake clang lld
+
+      - name: Install python packages
+        run: |
+          pip install --upgrade pip
+          pip install lit cmake joblib pybind11 nanobind wheel setuptools
+
+      - name: Build wheel
+        env:
+          TRITON_BUILD_WITH_CLANG_LLD: "true"
+          # Triton's C++ unit tests are not part of the wheel.
+          TRITON_APPEND_CMAKE_ARGS: "-DTRITON_BUILD_UT=OFF"
+        run: |
+          python -m pip wheel . --no-build-isolation --no-deps -w dist -v
+          ls -la dist
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton-xdna-wheel
+          path: dist/triton_xdna-*.whl
+          retention-days: 1
+          if-no-files-found: error
+
+  npu-test:
+    name: NPU Examples and LLM Gates
+    needs: build-wheel
     runs-on: [self-hosted, docker]
     steps:
       - name: Pull
@@ -30,10 +98,17 @@ jobs:
           submodules: recursive
           token: ${{ secrets.RUNNER_PAT }}
 
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: triton-xdna-wheel
+          path: prebuilt-wheel
+
       - name: Build
         uses: ./.github/actions/build
         with:
           env_name: ci_env
+          wheel_dir: prebuilt-wheel
 
       - name: Test
         id: test

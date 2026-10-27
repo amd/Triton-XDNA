@@ -99,7 +99,7 @@ runs:
         echo "STEP 4: Set LLVM_BINARY_DIR"
         echo "=========================================="
         
-        LLVM_BIN_PATH=$(find ~/.triton/llvm/ -name bin 2>/dev/null | head -1)
+        LLVM_BIN_PATH=$(find ~/.triton/llvm/ -name bin 2>/dev/null | head -1 || true)
         if [ -n "$LLVM_BIN_PATH" ]; then
           export LLVM_BINARY_DIR="$LLVM_BIN_PATH"
           echo "LLVM_BINARY_DIR set to: $LLVM_BINARY_DIR"
@@ -130,7 +130,7 @@ runs:
         echo "STEP 6: Set TRITON_SHARED_OPT_PATH"
         echo "=========================================="
         echo "Searching for triton-shared-opt..."
-        TRITON_SHARED_OPT=$(find "$GITHUB_WORKSPACE/third_party/triton/build" -name triton-shared-opt 2>/dev/null | head -1)
+        TRITON_SHARED_OPT=$(find "$GITHUB_WORKSPACE/third_party/triton/build" -name triton-shared-opt 2>/dev/null | head -1 || true)
         if [ -n "$TRITON_SHARED_OPT" ]; then
           export TRITON_SHARED_OPT_PATH="$TRITON_SHARED_OPT"
           echo "TRITON_SHARED_OPT_PATH set to: $TRITON_SHARED_OPT_PATH"

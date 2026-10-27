@@ -10,6 +10,12 @@ inputs:
   cmake_extra_flags:
     required: false
     default: ""
+  wheel_dir:
+    description: >
+      Directory holding a prebuilt triton_xdna wheel. When set, the wheel is
+      installed instead of building from source.
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -75,11 +81,24 @@ runs:
       echo "PYTHONPATH=${MLIR_AIE_INSTALL_DIR_STR}/python${PYTHONPATH:+:$PYTHONPATH}" >> $GITHUB_ENV
       echo "LD_LIBRARY_PATH=${MLIR_AIE_INSTALL_DIR_STR}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
    - name: Build
+     if: inputs.wheel_dir == ''
      env:
        HOME: /workspace
      shell: bash
      run: |
       source ${{ inputs.env_name }}/bin/activate
       mkdir build
-      cmake -GNinja -S . -Bbuild 
+      cmake -GNinja -S . -Bbuild
       ninja -Cbuild
+   - name: Install prebuilt wheel
+     if: inputs.wheel_dir != ''
+     env:
+       HOME: /workspace
+       WHEEL_DIR: ${{ inputs.wheel_dir }}
+     shell: bash
+     run: |
+      source ${{ inputs.env_name }}/bin/activate
+      # --no-deps: mlir-air and llvm-aie are installed above, and pip cannot
+      # resolve them from PyPI.
+      python3 -m pip install --no-deps "$WHEEL_DIR"/triton_xdna-*.whl
+      python3 -m pip show triton_xdna
