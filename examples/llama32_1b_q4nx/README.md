@@ -203,14 +203,15 @@ stays opt-in. It is the same artifact the HSA decode runs.
 ### Running on the HSA runtime
 
 ```bash
-make compile-decode RUNTIME=hsa   # the decode for HSA (ELF or PDI, see below)
+make compile-decode RUNTIME=hsa   # the decode's full ELF, see below
 make chat RUNTIME=hsa
 ```
 
 Both halves then dispatch through `HsaRuntime` rather than XRT, and the
 decode's logits are bit-identical to the XRT path.
 
-It is not as fast. Measured on Strix, 60 tokens, runtimes alternated:
+It is not as fast. Measured on Strix, 60 tokens, runtimes alternated, before
+the move to hsaco dispatch (ROCR before `7a71bfb`):
 
 | | tok/s |
 |---|---|
@@ -222,28 +223,17 @@ not the per-dispatch cache flush -- that is what resident regions removed, and
 without them the gap is roughly three times larger. What remains has not been
 attributed, so treat the HSA path as correct and close, not as a replacement.
 
-The interesting part is how the context length gets to the device. There are
-two ways, and the loaded ROCR decides which one runs:
+The interesting part is how the context length gets to the device: as
+scratchpad parameters, two scalars in device memory that the design reads in
+its dispatch preamble, so one full ELF serves every context length and nothing
+rewrites the instruction stream per token.
 
-**Scratchpad parameters** — two scalars in device memory that the design reads
-in its dispatch preamble, so one full ELF serves every context length and
-nothing rewrites the instruction stream per token. The control code reaches the
-scratchpad through an address the host patches in, so this needs a ROCR whose
-`hsa_amd_pointer_info` reports an AIE allocation's device address.
+`../llm_q4nx/hsa_decode.py` allocates the scratchpad and defines it as the
+ELF's `scratch-pad-ctrl` variable when the hsaco is loaded. ROCR flushes it on
+every dispatch, so the host writes L before each dispatch with plain stores.
 
-**A patched instruction stream** — the fallback. Two builds at adjacent L differ
-only in the words encoding it, so a diff gives base and slope, and 248 words are
-patched per token. One PDI serves every context length.
-
-`../llm_q4nx/hsa_decode.py`'s `use_scratchpad()` asks the question, and
-`make compile-decode RUNTIME=hsa` builds whichever artifact the answer calls
-for, plus the xclbin template pair that mlir-air's decoder loads at
-construction. `AMD_TRITON_NPU_HSA_DECODE=elf|insts` forces one; forcing
-`insts` after an ELF build also needs `decode_build.py --format pdi`.
-
-On Strix the ELF measured about 1.5% slower than the patched stream (ten
-alternated pairs at 60 and 120 tokens). Its control code is larger — aiecc
-inlines each `load_pdi` — so there is more of it to fetch per token.
+`make compile-decode RUNTIME=hsa` builds the ELF plus the xclbin template pair
+that mlir-air's decoder loads at construction.
 
 `--ops` takes `all` or a comma list of `matmul,rms_norm,swiglu`, so a
 numerical regression can be bisected to a single kernel against the same CPU

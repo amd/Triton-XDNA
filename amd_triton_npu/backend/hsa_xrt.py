@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: MIT
 """The subset of pyxrt that mlir-air's fused prefill engine uses, on HSA.
 
+**The instruction-stream-BO path is currently disabled** (`bo._prepared`
+raises) -- see its docstring for why. Everything else here (shared-region
+BOs, residency, the worker-thread run queue) is unaffected and still works;
+only an op whose dispatch depends on a varying instruction stream fails.
+
 That engine (`llms/shared/fused_prefill/engine.py`) is written against pyxrt:
 one xclbin on a hardware context, host-only BOs, an instruction-stream BO per
 op, and runs started and waited on. Assigning this module to the engine's
@@ -23,7 +28,8 @@ How each piece maps:
   its parent.
 * An instruction-stream BO becomes an HSA program: the xclbin's PDI with that
   stream, prepared on first use and patched whenever the host has changed the
-  stream since the last dispatch.
+  stream since the last dispatch. Under the hsaco/kernel-object HSA dispatch
+  model there is no buffer left to patch in place -- see `bo._prepared`.
 * `run.start()` queues the dispatch on one worker thread and `wait()` joins it,
   so host work between the two still overlaps the device. HSA dispatches are
   synchronous and serialised by the runtime.
@@ -250,40 +256,35 @@ class bo:
             r.make_resident()
 
     def _prepared(self, pdi, nwords):
-        """This BO as the instruction stream of an HSA program over `pdi`."""
-        words = np.frombuffer(self.map(), np.uint32, count=nwords)
-        if self._program is None or self._program[0] != pdi:
-            # The runtime reads the stream from a file once, at prepare.
-            fd, path = tempfile.mkstemp(suffix=".insts.bin")
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    f.write(words.tobytes())
-                buf, n = _errbuf()
-                handle = _runtime().triton_npu_hsa_prepare(
-                    pdi.encode(), path.encode(), buf, n
-                )
-            finally:
-                os.unlink(path)
-            if not handle:
-                raise HsaXrtError(buf.value.decode())
-            self._program = (pdi, handle, words.copy())
-            return handle
-        _, handle, sent = self._program
-        if not np.array_equal(sent, words):
-            buf, n = _errbuf()
-            _check(
-                _runtime().triton_npu_hsa_patch_insts(
-                    ctypes.c_void_p(handle),
-                    ctypes.c_uint64(0),
-                    words.ctypes.data_as(ctypes.c_void_p),
-                    ctypes.c_uint64(words.nbytes),
-                    buf,
-                    n,
-                ),
-                buf,
-            )
-            sent[:] = words
-        return handle
+        """Disabled: this BO as the instruction stream of an HSA program over
+        `pdi`.
+
+        This used to `triton_npu_hsa_prepare(pdi, insts_path)` once per
+        distinct instruction stream and `triton_npu_hsa_patch_insts` it in
+        place, in the runtime-owned buffer the dispatch packet pointed at, as
+        the host rewrote it between ops. ROCr's AIE hsaco support removed that
+        buffer: `triton_npu_hsa_prepare` now takes `(hsaco_path, kernel_name)`,
+        loads the stream into a frozen ROCr executable, and dispatches it by
+        an opaque kernel object -- `triton_npu_hsa_patch_insts` no longer
+        exists, because there is nothing left to patch in place.
+
+        Porting this would need a per-instruction-stream packed-executable
+        cache (mirroring mlir-aie's own per-call-sequence executable LRU) --
+        not built or measured. A fused prefill's ops may repeat the same
+        instruction-stream shapes across calls, so an LRU might help here;
+        that is a hypothesis, not something this has verified. (The decode
+        sidesteps the question: its context length goes through a full ELF's
+        scratchpad, see examples/llm_q4nx/hsa_decode.py.)
+        Fails here, before any dispatch, rather than silently doing the wrong
+        thing.
+        """
+        raise HsaXrtError(
+            "HSA fused-prefill dispatch (per-op instruction-stream patching "
+            "via triton_npu_hsa_patch_insts) is not supported under the "
+            "hsaco/kernel-object HSA dispatch model -- that C ABI entry "
+            "point no longer exists. Use the default XRT runtime for fused "
+            "prefill."
+        )
 
 
 _worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
