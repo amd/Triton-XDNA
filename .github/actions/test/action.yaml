@@ -285,10 +285,6 @@ runs:
           # path only runs on wide chains. No weights, no mlir-air sources.
           ( cd examples/llm_q4nx && python3 test_fused_mlp.py )
 
-          # How a Triton kernel's func is rewritten before it joins the fused
-          # prefill device. No NPU, no weights, no mlir-air sources.
-          ( cd examples/llm_q4nx && python3 test_fused_device.py )
-
           # The weight loader lives in mlir-air's sources, which the wheel does
           # not ship, so fetch them at the pinned commit first. Sparse and
           # blobless: ~1.7 MB of two directories. Without this the example
@@ -298,9 +294,14 @@ runs:
           if [ "$air_rc" -ne 0 ]; then
             echo "SKIP: Q4NX examples (mlir-air sources unavailable)"
           else
+            q_fail=0
+            # How a Triton kernel's func is rewritten before it joins the fused
+            # prefill device, and how the device module is put together. No
+            # NPU and no weights: the fetched sources only.
+            ( cd examples/llm_q4nx && python3 test_fused_device.py ) || q_fail=1
+
             # Every prefill/decode placement of each model; see the script for
             # which models and cases each scope runs.
-            q_fail=0
             python3 scripts/run_llm_gates.py --scope "$LLM_SCOPE" || q_fail=1
 
             # The KV layout our prefills hand the NPU decode in place, against
