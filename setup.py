@@ -166,6 +166,20 @@ def parse_hash_file(filepath, key):
     raise ValueError(f"Key '{key}' not found in {filepath}")
 
 
+def _triton_version():
+    """The version of the Triton this build bundles, which ours extends."""
+    init = TRITON_SOURCE_DIR / "python" / "triton" / "__init__.py"
+    if not init.exists():
+        raise RuntimeError(
+            f"{init} not found: check out the submodules "
+            "(git submodule update --init)"
+        )
+    for line in init.read_text().splitlines():
+        if line.startswith("__version__"):
+            return line.split("=", 1)[1].strip().strip("'\"")
+    raise RuntimeError(f"no __version__ in {init}")
+
+
 def get_version():
     """Generate version string from environment or git commit."""
     if "TRITON_XDNA_WHEEL_VERSION" in os.environ:
@@ -173,8 +187,7 @@ def get_version():
         if version:
             return version
 
-    # Base version - use triton's version as base
-    release_version = "3.6.0"
+    release_version = _triton_version()
 
     # Get commit hash
     commit_hash = os.environ.get("TRITON_XDNA_PROJECT_COMMIT", "")
@@ -744,7 +757,7 @@ class TritonXdnaBdistWheel(bdist_wheel):
 
         # Parse the original wheel name to extract tags
         # Format: triton-{version}-{python_tag}-{abi_tag}-{platform_tag}.whl
-        # e.g., triton-3.6.0-cp313-cp313-linux_x86_64.whl
+        # e.g., triton-<version>-cp313-cp313-linux_x86_64.whl
         import re
 
         wheel_pattern = re.compile(r"triton-[^-]+-([^-]+)-([^-]+)-(.+)\.whl")
