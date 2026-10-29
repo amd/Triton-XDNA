@@ -148,11 +148,12 @@ def fetch(dest=None, commit=None, quiet=False):
 
     if not quiet:
         print(f"[air-src] checking out {commit}...", flush=True)
-    # The commit may predate what a shallow clone fetched, or postdate it.
+    # The commit may postdate the clone. The pin is an abbreviated hash, which
+    # a server will not fetch by name, so fetch the branches it is on instead.
     try:
         _git("checkout", "--detach", commit, cwd=dest, quiet=True)
     except subprocess.CalledProcessError:
-        _git("fetch", "--filter=blob:none", "origin", commit, cwd=dest)
+        _git("fetch", "--filter=blob:none", "origin", cwd=dest)
         _git("checkout", "--detach", commit, cwd=dest)
 
     if not quiet:

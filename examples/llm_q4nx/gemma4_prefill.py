@@ -208,15 +208,14 @@ class Gemma4Prefill(LlamaPrefill):
           head. Keeping these makes the prefill bit-identical to before this
           change: a layer that owns its cache uses the `k`/`v` in hand and
           never reads the slab at all.
-        * `_kv_fanout` -- which slabs each source layer must also fill. The
-          decode template on disk is identity-mapped (see `kv_layout`), so all
-          35 slabs are read and a shared layer's slab has to carry a copy.
+        * `_kv_slot` -- the slab each layer reads (`kv_layout.kv_slots`): its
+          own if it owns a cache, its source's if it shares one. Only the
+          owning layers write.
         """
         super().__init__(*a, **kw)
         self.kv_attn_maxl = self._resolve_attn_maxl()
-        self._kv_fanout = {}
-        for L in range(self.n_layers):
-            self._kv_fanout.setdefault(kv_source_layer(L), []).append(L)
+        kv_src = [kv_source_layer(L) for L in range(self.n_layers)]
+        self._kv_slabs, _, self._kv_slot = kv_layout.kv_slots(kv_src)
         self._kv_slab = self._alloc_kv()
         self._kv_host = _host_view(self._kv_slab)
         self._kv_src = {
@@ -224,8 +223,7 @@ class Gemma4Prefill(LlamaPrefill):
                 np.zeros((self.max_seq, N_KV_HEADS * head_dim(src)), np.float32),
                 np.zeros((self.max_seq, N_KV_HEADS * head_dim(src)), np.float32),
             )
-            for src, users in self._kv_fanout.items()
-            if users != [src]
+            for src in sorted({s for L, s in enumerate(kv_src) if s != L})
         }
 
     def _alloc_base_kv(self, n_layers, max_seq):
@@ -257,7 +255,7 @@ class Gemma4Prefill(LlamaPrefill):
         return self.max_seq if got is None else got
 
     def _alloc_kv(self):
-        """The `[n_layers, layer_elems]` bf16 slab, in shared pages if possible.
+        """The `[slabs, layer_elems]` bf16 slab, in shared pages if possible.
 
         Falls back to plain numpy when the interop is unavailable -- no pyxrt,
         no ROCm torch, no visible device. The distinction that matters is that
@@ -267,7 +265,7 @@ class Gemma4Prefill(LlamaPrefill):
         deliberate -- shared buffers silently fall back in CI (#136), so a
         design that only existed on the shared path would never be gated.
         """
-        shape = kv_layout.slab_shape(self.n_layers, self.kv_attn_maxl)
+        shape = kv_layout.slab_shape(self._kv_slabs, self.kv_attn_maxl)
         try:
             import kernels
             from triton.backends.amd_triton_npu import shared
@@ -294,9 +292,9 @@ class Gemma4Prefill(LlamaPrefill):
         geometry is checked against `kv_layout`: a mismatch would put every
         row at the wrong offset without failing.
         """
-        shape = kv_layout.slab_shape(self.n_layers, self.kv_attn_maxl)
+        shape = kv_layout.slab_shape(self._kv_slabs, self.kv_attn_maxl)
         want = dict(
-            n_layers=self.n_layers,
+            n_slabs=self._kv_slabs,
             lreg=shape[1],
             region_w=kv_layout.REGION_W,
             region_stride=kv_layout.region_stride(self.kv_attn_maxl),
@@ -309,26 +307,22 @@ class Gemma4Prefill(LlamaPrefill):
         self._kv_host = sink["buf"].reshape(shape)
 
     def _region(self, layer_idx, region):
-        """One layer's K or V region as `[attn_maxl, REGION_W]`."""
+        """The K or V region layer `layer_idx` reads, as `[attn_maxl, REGION_W]`."""
         return kv_layout.region_view(
-            self._kv_host, layer_idx, region, self.kv_attn_maxl
+            self._kv_host, self._kv_slot[layer_idx], region, self.kv_attn_maxl
         )
 
     def _store_kv(self, layer_idx, k, v, keep):
-        """Write this layer's roped K / normed V into every slab that reads it.
-
-        `layer_idx` owns the cache; `_kv_fanout` names the KV-shared layers
-        whose own slab has to carry the same rows, because the built template
-        is identity-mapped.
-        """
+        """Write this layer's roped K / normed V into its slab; the layers that
+        share its cache read the same slab."""
         dh = head_dim(layer_idx)
-        pair = (
+        for region, src in (
             (kv_layout.K_REGION, _bf16_np(k[:keep])),
             (kv_layout.V_REGION, _bf16_np(v[:keep])),
-        )
-        for L in self._kv_fanout[layer_idx]:
-            for region, src in pair:
-                kv_layout.scatter_rows(self._region(L, region)[:keep], src, dh, region)
+        ):
+            kv_layout.scatter_rows(
+                self._region(layer_idx, region)[:keep], src, dh, region
+            )
         if layer_idx in self._kv_src:
             kf, vf = self._kv_src[layer_idx]
             kf[:keep] = k[:keep].to(torch.float32).numpy()
@@ -901,9 +895,8 @@ class Gemma4GpuDecode:
     The cache is the prefill's slab, in the layout mlir-air's fused NPU decode
     also reads -- see `kv_layout`. So this reads the prompt's K/V where the
     prefill left it, and a step's own K/V is appended to the same rows the NPU
-    decode would have appended to. A KV-shared layer still attends
-    `kv_source_layer(L)`, and still carries a copy in its own slab, because the
-    built decode template is identity-mapped.
+    decode would have appended to. A KV-shared layer attends
+    `kv_source_layer(L)` by reading that layer's slab, as the NPU decode does.
 
     Every operator is a Triton kernel from `gpu_kernels`
     ----------------------------------------------------
@@ -1045,26 +1038,19 @@ class Gemma4GpuDecode:
         self._slab_t = slab_t
         self._slab_shared = hasattr(slab, "torch")
         self.k = [
-            kv_layout.region_view(slab_t, L, kv_layout.K_REGION, self.attn_maxl)
-            for L in range(pf.n_layers)
+            kv_layout.region_view(slab_t, s, kv_layout.K_REGION, self.attn_maxl)
+            for s in pf._kv_slot
         ]
         self.v = [
-            kv_layout.region_view(slab_t, L, kv_layout.V_REGION, self.attn_maxl)
-            for L in range(pf.n_layers)
+            kv_layout.region_view(slab_t, s, kv_layout.V_REGION, self.attn_maxl)
+            for s in pf._kv_slot
         ]
         # The buffers outlive this object only if something holds them; `pf`
         # does, and the decode is built from it, so the pages cannot go away
         # underneath the views above.
         self._kv_owner = pf
-        # Per owning layer, the layers whose slabs take its K/V row, as the
-        # device int32 list `gpu_kernels.qkv_post` walks. The same fan-out the
-        # prefill does, for the same reason: the decode template on disk is
-        # identity-mapped, so a KV-shared layer reads its own slab and that
-        # slab has to carry the row too.
-        self._fan = {
-            L: torch.tensor(users, dtype=torch.int32, device=device)
-            for L, users in pf._kv_fanout.items()
-        }
+        # The slab each layer's K/V rows go to; only owning layers append.
+        self._slot = pf._kv_slot
         self._region_stride = kv_layout.region_stride(self.attn_maxl)
 
     def _packed(self, data, N, K):
@@ -1251,7 +1237,7 @@ class Gemma4GpuDecode:
                     N_Q_HEADS,
                     dh,
                     RMS_EPS,
-                    kv=(self._slab_t, self._fan[L], 0, self._region_stride),
+                    kv=(self._slab_t, self._slot[L], 0, self._region_stride),
                     dense_kv=True,
                     out_dtype=torch.float16,
                 )
@@ -1360,7 +1346,7 @@ class Gemma4GpuDecode:
                 dh,
                 RMS_EPS,
                 kv=(
-                    (self._slab_t, self._fan[L], pos, self._region_stride)
+                    (self._slab_t, self._slot[L], pos, self._region_stride)
                     if owns
                     else None
                 ),
@@ -1558,6 +1544,15 @@ def make_npu_decoder_class(air, prefiller):
                     f"remove the stray pair from "
                     f"{os.environ.get('Q4NX_GEMMA4_DECODE_DIR', 'the decode dir')}."
                 )
+            if (self.KV_SLABS, list(self.KV_SLOT)) != (
+                prefiller._kv_slabs,
+                prefiller._kv_slot,
+            ):
+                raise RuntimeError(
+                    f"the decoder reads layer L's KV from slab "
+                    f"{list(self.KV_SLOT)} of {self.KV_SLABS}, but this prefill "
+                    f"writes slab {prefiller._kv_slot} of {prefiller._kv_slabs}"
+                )
             if self.KV.shape != prefiller._kv_host.shape:
                 raise RuntimeError(
                     f"KV slab shape {prefiller._kv_host.shape} != the decoder's "
@@ -1589,11 +1584,17 @@ def make_npu_decoder_class(air, prefiller):
             import kernels
 
             bo = kernels.xrt_bo(self._pf._kv_slab)
-            if bo is None:
+            # One slab, one BO: a cache the decoder splits over several
+            # buffers is written instead.
+            if bo is None or self.kvb.extra:
                 self._shared = False
                 return
             self.kvc = bo
             self.KV = self._pf._kv_host
+            if getattr(self, "elf_mode", False):
+                # The ELF run binds its buffers once, in this order.
+                bos = (self.x_bo, self.w_bo, self.r_bo, self.y_bo, self.kvc)
+                self._elfdec.bind([*bos, self.pw_bo, self.px_bo, *self.kvb.extra])
             self._shared = True
 
         def seed_kv(self, ks, vs, P):
@@ -1614,10 +1615,9 @@ def make_npu_decoder_class(air, prefiller):
             if not self._shared:
                 # Same layout, so this is one contiguous write, not a scatter.
                 self.KV[:] = self._pf._kv_host
-                self.kvc.write(
-                    self.np.ascontiguousarray(self.KV).reshape(-1).view(self.np.int16),
-                    0,
-                )
+                kv = self.np.ascontiguousarray(self.KV).view(self.np.int16)
+                self.kvb.write_layers(kv, TO)
+                return
             self.kvc.sync(TO)
 
     return Gemma4NpuDecode
