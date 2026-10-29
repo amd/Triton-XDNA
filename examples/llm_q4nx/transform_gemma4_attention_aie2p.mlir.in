@@ -1,7 +1,7 @@
-// Schedule of gemma4_attention.attn on one attention column (aie2p): one
-// herd of NQT cores in a column. gemma4_attention.schedule
-// fills in R (q rows a round), R8 = R / 8, MB = LKP / 8 (8-row blocks a core
-// takes, and K blocks of S), KB = DH / 8, DVC = DH / DVT and VB = DVT / 8.
+// Schedule of gemma4_attention.attn (aie2p): each of its round loops becomes
+// a herd of NQT cores in one column. gemma4_attention.render expands the
+// tagged blocks for the loops and fills in the names in braces from what
+// `_keys` computes for a group's shape.
 //
 // Both matmuls work on 8x8 blocks (pack [8, 8, 8]); the DMAs into the cores
 // do the blocking. S, P, the row state and acc stay blocked, so the softmax
@@ -22,7 +22,8 @@ module attributes {transform.with_named_sequence} {
     %a, %b, %c, %d, %e = transform.structured.lower_unpack %t : (!transform.op<"linalg.unpack">) -> (!transform.op<"tensor.empty">, !transform.op<"linalg.transpose">, !transform.op<"tensor.collapse_shape">, !transform.op<"tensor.extract_slice">, !transform.op<"linalg.copy">)
     transform.yield
   }
-  transform.named_sequence @lower_row_packs(%f: !transform.any_op {transform.readonly}) {
+  // @group
+  transform.named_sequence @lower_row_packs{G}(%f: !transform.any_op {transform.readonly}) {
     %p0 = transform.structured.match ops{["linalg.pack"]} filter_result_type = tensor<{R8}x8xbf16> in %f : (!transform.any_op) -> !transform.any_op
     transform.foreach %p0 : !transform.any_op { ^bb0(%x: !transform.any_op): transform.include @lower_pack failures(propagate) (%x) : (!transform.any_op) -> () }
     %p1 = transform.structured.match ops{["linalg.pack"]} filter_result_type = tensor<{R8}x8xf32> in %f : (!transform.any_op) -> !transform.any_op
@@ -58,13 +59,15 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %f : !transform.any_op
     transform.yield
   }
+  // @end
   // Vector tiles, chosen per op by the matchers below in order; a 4-D
   // elementwise op or fill none of them takes goes two rows of a block at a
   // time.
   // P V's contraction on one block of acc: its K loop unrolled, so the P
   // blocks it reads are the same for every block of acc and come out of
   // acc's loops. On two by two blocks it goes as Q K's does, below.
-  transform.named_sequence @match_pv_contract(%op: !transform.any_op {transform.readonly}) -> !transform.any_op {
+  // @group
+  transform.named_sequence @match_pv_contract{G}(%op: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %op ["linalg.generic"] : !transform.any_op
     %r, %k, %i = transform.match.structured %op : (!transform.any_op) -> (!transform.param<i64>, !transform.param<i64>, !transform.param<i64>) {
     ^bb0(%s: !transform.any_op):
@@ -81,11 +84,14 @@ module attributes {transform.with_named_sequence} {
     transform.match.param.cmpi eq %i, %one : !transform.param<i64>
     transform.yield %op : !transform.any_op
   }
-  transform.named_sequence @tile_pv_contract(%op: !transform.any_op {transform.consumed}) {
+  // @end
+  // @group
+  transform.named_sequence @tile_pv_contract{G}(%op: !transform.any_op {transform.consumed}) {
     %t, %l:3 = transform.structured.tile_using_for %op tile_sizes [1, 1, 1, 0, 0, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
     transform.loop.unroll %l#2 factor = {MB} : !transform.any_op
     transform.yield
   }
+  // @end
   // P and the output's scaling, which spread a row value over a block, a
   // block at a time: the spread is then one transpose of the block.
   transform.named_sequence @match_row_scaled(%op: !transform.any_op {transform.readonly}) -> !transform.any_op {
@@ -248,33 +254,76 @@ module attributes {transform.with_named_sequence} {
     %mg = transform.structured.generalize %merge : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
+  // Ops made once ahead of the round loops and shared by them.
+  transform.named_sequence @match_shared(%op: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %op ["linalg.generic", "linalg.fill", "tensor.expand_shape", "tensor.empty", "bufferization.alloc_tensor"] : !transform.any_op
+    %p = transform.get_parent_op %op <{nth_parent = 1 : i64}> : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %p ["func.func"] : !transform.any_op
+    transform.yield %op : !transform.any_op
+  }
+  transform.named_sequence @take(%op: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.yield %op : !transform.any_op
+  }
   transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
     %f = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    // The loads' L2 buffers allocated once, outside the loops. They are the
-    // only allocations at this point.
-    transform.air.hoist_static_alloc %f : (!transform.any_op) -> ()
     %loops0 = transform.structured.match ops{["scf.for"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %kv_loop0, %rounds_loop = transform.split_handle %loops0 : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.annotate %kv_loop0 "kv_loop" : !transform.any_op
-    transform.annotate %rounds_loop "rounds_loop" : !transform.any_op
+    {LOOP_SPLIT}
+    // The loads' L2 buffers, the only allocations at this point.
+    // @each
+    %l2q{N} = transform.structured.match ops{["memref.alloc"]} filter_result_type = memref<{L2Q}x8x8xbf16, 1 : i32> in %rounds_loop{N} : (!transform.any_op) -> !transform.any_op
+    %l2k{N} = transform.structured.match ops{["memref.alloc"]} filter_result_type = memref<{L2K}x8x8xbf16, 1 : i32> in %rounds_loop{N} : (!transform.any_op) -> !transform.any_op
+    %l2v{N} = transform.structured.match ops{["memref.alloc"]} filter_result_type = memref<{L2V}x8x8xbf16, 1 : i32> in %rounds_loop{N} : (!transform.any_op) -> !transform.any_op
+    // @end
+    // Allocated once, outside the loops.
+    transform.air.hoist_static_alloc %f : (!transform.any_op) -> ()
+    // The round loops of one column run one after the other through its
+    // memtile, so they load into the same L2 buffers.
+    // @column
+    %s2q{C} = transform.merge_handles {EACH:%l2q} : !transform.any_op
+    %s2q2{C} = transform.air.share_alloc %s2q{C} : (!transform.any_op) -> !transform.any_op
+    %s2k{C} = transform.merge_handles {EACH:%l2k} : !transform.any_op
+    %s2k2{C} = transform.air.share_alloc %s2k{C} : (!transform.any_op) -> !transform.any_op
+    %s2v{C} = transform.merge_handles {EACH:%l2v} : !transform.any_op
+    %s2v2{C} = transform.air.share_alloc %s2v{C} : (!transform.any_op) -> !transform.any_op
+    // @end
+    // @each
+    transform.annotate %kv_loop0{N} "kv_loop{N}" : !transform.any_op
+    transform.annotate %rounds_loop{N} "rounds_loop{N}" : !transform.any_op
+    // @end
+    // With several round loops, each gets its own copy of what they share,
+    // so that every step below finds a loop's ops inside that loop.
+    // @multi
+    %fsh{N} = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %sh_r{N}, %sh{N} = transform.foreach_match flatten_results in %fsh{N} @match_shared -> @take : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.sequence %sh{N}, %rounds_loop{N} : !transform.any_op, !transform.any_op failures(suppress) {
+    ^bb0(%t: !transform.any_op, %rl: !transform.any_op):
+      %shf, %shl = transform.structured.fuse_into_containing_op %t into %rl : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    }
+    // @end
     // Row reductions over the innermost dim, as generics.
     %reds = transform.structured.match ops{["linalg.reduce"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %reds2 = transform.air.transpose_reduce %reds : (!transform.any_op) -> !transform.any_op
     %reds3 = transform.structured.match ops{["linalg.reduce"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %red_g = transform.structured.generalize %reds3 : (!transform.any_op) -> !transform.any_op
     // Both matmuls in 8x8 blocks; QK reads K as stored, [n, k].
-    %mm0 = transform.structured.match ops{["linalg.matmul"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %mm_qk, %mm_pv = transform.split_handle %mm0 : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %qk_tb = transform.structured.transpose_matmul %mm_qk <rhs> : (!transform.any_op) -> !transform.any_op
-    %pqk = transform.structured.pack %qk_tb packed_sizes = [8, 8, 8] : (!transform.any_op) -> (!transform.any_op)
-    %ppv = transform.structured.pack %mm_pv packed_sizes = [8, 8, 8] : (!transform.any_op) -> (!transform.any_op)
+    // @each
+    %sc{N}_1 = transform.structured.match ops{["scf.for"]} attributes{rounds_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %mm0{N} = transform.structured.match ops{["linalg.matmul"]} in %sc{N}_1 : (!transform.any_op) -> !transform.any_op
+    %mm_qk{N}, %mm_pv{N} = transform.split_handle %mm0{N} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %qk_tb{N} = transform.structured.transpose_matmul %mm_qk{N} <rhs> : (!transform.any_op) -> !transform.any_op
+    %pqk{N} = transform.structured.pack %qk_tb{N} packed_sizes = [8, 8, 8] : (!transform.any_op) -> (!transform.any_op)
+    %ppv{N} = transform.structured.pack %mm_pv{N} packed_sizes = [8, 8, 8] : (!transform.any_op) -> (!transform.any_op)
     // V's blocks as stored, [k, n]: a DMA moves 16-bit data only with unit
     // innermost stride.
-    %pv_b = transform.get_producer_of_operand %ppv[1] : (!transform.any_op) -> !transform.any_op
-    %ppv2, %pv_bp, %pv_bu = transform.structured.pack_transpose %pv_b with_compute_op(%ppv) inner_perm = [1, 0] : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
-    transform.annotate %pqk "qk_mm" : !transform.any_op
+    %pv_b{N} = transform.get_producer_of_operand %ppv{N}[1] : (!transform.any_op) -> !transform.any_op
+    %ppv2{N}, %pv_bp{N}, %pv_bu{N} = transform.structured.pack_transpose %pv_b{N} with_compute_op(%ppv{N}) inner_perm = [1, 0] : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    transform.annotate %pqk{N} "qk_mm{N}" : !transform.any_op
+    // @end
+    // q, K and V come blocked as the packs want them: their transposes into
+    // [rows, cols] fold into the packs, which then copy blocks as they are.
     transform.apply_patterns to %f {
       transform.apply_patterns.linalg.data_layout_propagation
+      transform.apply_patterns.tensor.fold_into_pack_and_unpack
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     // The row reductions in the blocks S comes in.
@@ -288,230 +337,281 @@ module attributes {transform.with_named_sequence} {
     } : !transform.any_op
     transform.apply_cse to %f : !transform.any_op
     // The state stays packed across the K loop.
-    %kvl = transform.structured.match ops{["scf.for"]} attributes{kv_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %kvl2, %hp = transform.air.hoist_loop_carried_pack %kvl : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.include @lower_row_packs failures(propagate) (%f) : (!transform.any_op) -> ()
+    // @each
+    %kvl{N} = transform.structured.match ops{["scf.for"]} attributes{kv_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %kvl2{N}, %hp{N} = transform.air.hoist_loop_carried_pack %kvl{N} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // @end
+    // @each
+    transform.include @lower_row_packs{G} failures(propagate) (%f) : (!transform.any_op) -> ()
+    // @end
     // The epilogue on the packed acc.
     transform.apply_patterns to %f {
       transform.apply_patterns.linalg.data_layout_propagation
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.include @lower_row_packs failures(propagate) (%f) : (!transform.any_op) -> ()
-    %kvl3 = transform.structured.match ops{["scf.for"]} attributes{kv_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.apply_licm to %kvl3 : !transform.any_op
+    // @each
+    transform.include @lower_row_packs{G} failures(propagate) (%f) : (!transform.any_op) -> ()
+    // @end
+    // @each
+    %kvl3{N} = transform.structured.match ops{["scf.for"]} attributes{kv_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_licm to %kvl3{N} : !transform.any_op
+    // @end
     // In-place state updates: m and l read and write their state; acc's
     // rescale, P V add and rounding in one op that updates acc.
-    %kvl5 = transform.structured.match ops{["scf.for"]} attributes{kv_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %y0 = transform.structured.match ops{["scf.yield"]} in %kvl5 : (!transform.any_op) -> !transform.any_op
+    // @each
+    %kvl5{N} = transform.structured.match ops{["scf.for"]} attributes{kv_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %y0{N} = transform.structured.match ops{["scf.yield"]} in %kvl5{N} : (!transform.any_op) -> !transform.any_op
     // m crosses the loop as [R], reshaped to its blocks.
-    %m_c0 = transform.get_producer_of_operand %y0[0] : (!transform.any_op) -> !transform.any_op
-    %m_op0 = transform.get_producer_of_operand %m_c0[0] : (!transform.any_op) -> !transform.any_op
-    %l_op0 = transform.get_producer_of_operand %y0[1] : (!transform.any_op) -> !transform.any_op
-    %a_op0 = transform.get_producer_of_operand %y0[2] : (!transform.any_op) -> !transform.any_op
-    transform.annotate %m_op0 "res_m" : !transform.any_op
-    transform.annotate %l_op0 "res_l" : !transform.any_op
-    %l_mul = transform.get_producer_of_operand %l_op0[0] : (!transform.any_op) -> !transform.any_op
-    %a_add = transform.get_producer_of_operand %a_op0[0] : (!transform.any_op) -> !transform.any_op
-    %a_ext = transform.get_producer_of_operand %a_add[0] : (!transform.any_op) -> !transform.any_op
-    %a_mm = transform.get_producer_of_operand %a_add[1] : (!transform.any_op) -> !transform.any_op
-    %a_mul = transform.get_producer_of_operand %a_ext[0] : (!transform.any_op) -> !transform.any_op
-    transform.annotate %a_mm "pv_mm" : !transform.any_op
-    %a_me = transform.air.fuse_multi_op_linalg %a_mul, %a_ext : (!transform.any_op, !transform.any_op) -> !transform.any_op
-    %a_mea = transform.air.fuse_multi_op_linalg %a_me, %a_add : (!transform.any_op, !transform.any_op) -> !transform.any_op
-    %a_upd = transform.air.fuse_truncf_linalg %a_op0, %a_mea : (!transform.any_op, !transform.any_op) -> !transform.any_op
-    transform.annotate %a_upd "res_acc" : !transform.any_op
-    %ri_m = transform.air.reuse_input_as_init %m_op0 : (!transform.any_op) -> !transform.any_op
-    %l_upd = transform.air.fuse_multi_op_linalg %l_mul, %l_op0 : (!transform.any_op, !transform.any_op) -> !transform.any_op
-    transform.annotate %l_upd "res_l" : !transform.any_op
-    %ri_l = transform.air.reuse_input_as_init %l_upd : (!transform.any_op) -> !transform.any_op
-    %ri_a = transform.air.reuse_input_as_init %a_upd : (!transform.any_op) -> !transform.any_op
+    %m_c0{N} = transform.get_producer_of_operand %y0{N}[0] : (!transform.any_op) -> !transform.any_op
+    %m_op0{N} = transform.get_producer_of_operand %m_c0{N}[0] : (!transform.any_op) -> !transform.any_op
+    %l_op0{N} = transform.get_producer_of_operand %y0{N}[1] : (!transform.any_op) -> !transform.any_op
+    %a_op0{N} = transform.get_producer_of_operand %y0{N}[2] : (!transform.any_op) -> !transform.any_op
+    transform.annotate %m_op0{N} "res_m{N}" : !transform.any_op
+    transform.annotate %l_op0{N} "res_l{N}" : !transform.any_op
+    %l_mul{N} = transform.get_producer_of_operand %l_op0{N}[0] : (!transform.any_op) -> !transform.any_op
+    %a_add{N} = transform.get_producer_of_operand %a_op0{N}[0] : (!transform.any_op) -> !transform.any_op
+    %a_ext{N} = transform.get_producer_of_operand %a_add{N}[0] : (!transform.any_op) -> !transform.any_op
+    %a_mm{N} = transform.get_producer_of_operand %a_add{N}[1] : (!transform.any_op) -> !transform.any_op
+    %a_mul{N} = transform.get_producer_of_operand %a_ext{N}[0] : (!transform.any_op) -> !transform.any_op
+    transform.annotate %a_mm{N} "pv_mm{N}" : !transform.any_op
+    %a_me{N} = transform.air.fuse_multi_op_linalg %a_mul{N}, %a_ext{N} : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    %a_mea{N} = transform.air.fuse_multi_op_linalg %a_me{N}, %a_add{N} : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    %a_upd{N} = transform.air.fuse_truncf_linalg %a_op0{N}, %a_mea{N} : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.annotate %a_upd{N} "res_acc{N}" : !transform.any_op
+    %ri_m{N} = transform.air.reuse_input_as_init %m_op0{N} : (!transform.any_op) -> !transform.any_op
+    %l_upd{N} = transform.air.fuse_multi_op_linalg %l_mul{N}, %l_op0{N} : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.annotate %l_upd{N} "res_l{N}" : !transform.any_op
+    %ri_l{N} = transform.air.reuse_input_as_init %l_upd{N} : (!transform.any_op) -> !transform.any_op
+    %ri_a{N} = transform.air.reuse_input_as_init %a_upd{N} : (!transform.any_op) -> !transform.any_op
+    // @end
     transform.apply_patterns to %f { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %f : !transform.any_op
     // m crosses the loop as [R] once its packs are reshapes: carry it in
     // blocks too.
-    %kvlh = transform.structured.match ops{["scf.for"]} attributes{kv_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.sequence %kvlh : !transform.any_op failures(suppress) {
+    // @each
+    %kvlh{N} = transform.structured.match ops{["scf.for"]} attributes{kv_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.sequence %kvlh{N} : !transform.any_op failures(suppress) {
     ^bb0(%l: !transform.any_op):
-      %l2, %h2 = transform.air.hoist_loop_carried_pack %l : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+      %l2{N}, %h2{N} = transform.air.hoist_loop_carried_pack %l : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     }
+    // @end
     transform.apply_patterns to %f { transform.apply_patterns.canonicalization } : !transform.any_op
     // Elementwise chains fused once, on the whole round: each element
     // computed once.
     %fe = transform.air.fuse_elementwise_linalg %f fold_reshapes no_recompute : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %fe { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fe : !transform.any_op
-    %kvly = transform.structured.match ops{["scf.for"]} attributes{kv_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %yy = transform.structured.match ops{["scf.yield"]} in %kvly : (!transform.any_op) -> !transform.any_op
-    %py0 = transform.get_producer_of_operand %yy[0] : (!transform.any_op) -> !transform.any_op
-    %py1 = transform.get_producer_of_operand %yy[1] : (!transform.any_op) -> !transform.any_op
-    %py2 = transform.get_producer_of_operand %yy[2] : (!transform.any_op) -> !transform.any_op
-    transform.annotate %py0 "res_l" : !transform.any_op
-    transform.annotate %py1 "res_acc" : !transform.any_op
-    transform.annotate %py2 "res_m" : !transform.any_op
+    // @each
+    %sc{N}_8 = transform.structured.match ops{["scf.for"]} attributes{rounds_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %kvly{N} = transform.structured.match ops{["scf.for"]} attributes{kv_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %yy{N} = transform.structured.match ops{["scf.yield"]} in %kvly{N} : (!transform.any_op) -> !transform.any_op
+    %py0{N} = transform.get_producer_of_operand %yy{N}[0] : (!transform.any_op) -> !transform.any_op
+    %py1{N} = transform.get_producer_of_operand %yy{N}[1] : (!transform.any_op) -> !transform.any_op
+    %py2{N} = transform.get_producer_of_operand %yy{N}[2] : (!transform.any_op) -> !transform.any_op
+    transform.annotate %py0{N} "res_l{N}" : !transform.any_op
+    transform.annotate %py1{N} "res_acc{N}" : !transform.any_op
+    transform.annotate %py2{N} "res_m{N}" : !transform.any_op
     // q to L1 once a round, each core its MB blocks.
-    %qpk = transform.structured.match ops{["linalg.pack"]} filter_result_type = tensor<{R8}x{KB}x8x8xbf16> in %arg1 : (!transform.any_op) -> !transform.any_op
-    %bq, %nq = transform.structured.bufferize_to_allocation %qpk <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
-    %q_t, %q_f = transform.structured.fuse %qpk tile_sizes [{MB}, 0, 0, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.annotate %q_f "f_q" : !transform.any_op
+    %qpk{N} = transform.structured.match ops{["linalg.pack"]} filter_result_type = tensor<{QPK}x8x8xbf16> in %sc{N}_8 : (!transform.any_op) -> !transform.any_op
+    %bq{N}, %nq{N} = transform.structured.bufferize_to_allocation %qpk{N} <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+    %q_t{N}, %q_f{N} = transform.structured.fuse %qpk{N} tile_sizes [{TMB}, 0, 0, 0, 0, 0, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.annotate %q_f{N} "f_q{N}" : !transform.any_op
     // PHASE 2: the round's rows over the NQT cores, MB 8-row blocks each.
-    %m_op = transform.structured.match ops{["linalg.generic"]} attributes{res_m} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %l_op = transform.structured.match ops{["linalg.generic"]} attributes{res_l} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %a_op = transform.structured.match ops{["linalg.generic"]} attributes{res_acc} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %a_t, %a_f = transform.structured.fuse %a_op tile_sizes [{MB}, 0, 0, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %l_t, %l_f = transform.structured.fuse %l_op tile_sizes [{MB}, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %m_t, %m_f = transform.structured.fuse %m_op tile_sizes [{MB}, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.annotate %a_f "f_acc" : !transform.any_op
-    transform.annotate %l_f "f_l" : !transform.any_op
-    transform.annotate %m_f "f_m" : !transform.any_op
+    %m_op{N} = transform.structured.match ops{["linalg.generic"]} attributes{res_m{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %l_op{N} = transform.structured.match ops{["linalg.generic"]} attributes{res_l{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %a_op{N} = transform.structured.match ops{["linalg.generic"]} attributes{res_acc{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %a_t{N}, %a_f{N} = transform.structured.fuse %a_op{N} tile_sizes [{MB}, 0, 0, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %l_t{N}, %l_f{N} = transform.structured.fuse %l_op{N} tile_sizes [{MB}, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %m_t{N}, %m_f{N} = transform.structured.fuse %m_op{N} tile_sizes [{MB}, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.annotate %a_f{N} "f_acc{N}" : !transform.any_op
+    transform.annotate %l_f{N} "f_l{N}" : !transform.any_op
+    transform.annotate %m_f{N} "f_m{N}" : !transform.any_op
+    // @end
     transform.apply_patterns to %fe { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fe : !transform.any_op
-    %m3 = transform.structured.match ops{["scf.forall"]} attributes{f_m} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %l3 = transform.structured.match ops{["scf.forall"]} attributes{f_l} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %a3 = transform.structured.match ops{["scf.forall"]} attributes{f_acc} in %arg1 : (!transform.any_op) -> !transform.any_op
+    // @each
+    %m3{N} = transform.structured.match ops{["scf.forall"]} attributes{f_m{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %l3{N} = transform.structured.match ops{["scf.forall"]} attributes{f_l{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %a3{N} = transform.structured.match ops{["scf.forall"]} attributes{f_acc{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
     // V (and its reshape) into the acc loop, so the loop needs nothing
     // made after the m and l loops.
-    %vcol = transform.structured.match ops{["tensor.collapse_shape"]} filter_result_type = tensor<{MB}x{KB}x8x8xbf16> in %arg1 : (!transform.any_op) -> !transform.any_op
-    %vpk = transform.get_producer_of_operand %vcol[0] : (!transform.any_op) -> !transform.any_op
-    %vc_in, %a4 = transform.structured.fuse_into_containing_op %vcol into %a3 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %vp_in, %a5 = transform.structured.fuse_into_containing_op %vpk into %a4 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %ml = transform.loop.fuse_sibling %l3 into %m3 : (!transform.any_op, !transform.any_op) -> !transform.any_op
-    %mla = transform.loop.fuse_sibling %a5 into %ml : (!transform.any_op, !transform.any_op) -> !transform.any_op
-    %round0 = transform.air.fold_extract_slice_of_insert_slice %mla : (!transform.any_op) -> !transform.any_op
-    transform.annotate %round0 "f_round" : !transform.any_op
+    %pvm{N} = transform.structured.match ops{["linalg.generic"]} attributes{pv_mm{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %vcol{N} = transform.get_producer_of_operand %pvm{N}[1] : (!transform.any_op) -> !transform.any_op
+    %vpk{N} = transform.get_producer_of_operand %vcol{N}[0] : (!transform.any_op) -> !transform.any_op
+    %vc_in{N}, %a4{N} = transform.structured.fuse_into_containing_op %vcol{N} into %a3{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %vp_in{N}, %a5{N} = transform.structured.fuse_into_containing_op %vpk{N} into %a4{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %ml{N} = transform.loop.fuse_sibling %l3{N} into %m3{N} : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    %mla{N} = transform.loop.fuse_sibling %a5{N} into %ml{N} : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    %round0{N} = transform.air.fold_extract_slice_of_insert_slice %mla{N} : (!transform.any_op) -> !transform.any_op
+    transform.annotate %round0{N} "f_round{N}" : !transform.any_op
+    // @end
     transform.apply_patterns to %fe { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fe : !transform.any_op
     transform.apply_patterns to %fe { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fe : !transform.any_op
     // K into each core's L1 (one transfer to all of them).
-    %rnd = transform.structured.match ops{["scf.forall"]} attributes{f_round} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %qkm = transform.structured.match ops{["linalg.generic"]} attributes{qk_mm} in %rnd : (!transform.any_op) -> !transform.any_op
-    %kpk = transform.get_producer_of_operand %qkm[1] : (!transform.any_op) -> !transform.any_op
-    %kp_in, %rnd2 = transform.structured.fuse_into_containing_op %kpk into %rnd : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // @each
+    %rnd{N} = transform.structured.match ops{["scf.forall"]} attributes{f_round{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %qkm{N} = transform.structured.match ops{["linalg.generic"]} attributes{qk_mm{N}} in %rnd{N} : (!transform.any_op) -> !transform.any_op
+    %kcol{N} = transform.get_producer_of_operand %qkm{N}[1] : (!transform.any_op) -> !transform.any_op
+    %kc_in{N}, %rnd1{N} = transform.structured.fuse_into_containing_op %kcol{N} into %rnd{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %kpk{N} = transform.get_producer_of_operand %kc_in{N}[0] : (!transform.any_op) -> !transform.any_op
+    %kp_in{N}, %rnd2{N} = transform.structured.fuse_into_containing_op %kpk{N} into %rnd1{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // @end
     transform.apply_patterns to %fe { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fe : !transform.any_op
     // Before the K loop: the state's initial values, made each round, in L1,
     // each core its rows, in one loop.
-    %rl = transform.structured.match ops{["scf.for"]} attributes{rounds_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %kvp = transform.structured.match ops{["scf.for"]} attributes{kv_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %pi_l0 = transform.get_producer_of_operand %kvp[3] : (!transform.any_op) -> !transform.any_op
-    %pi_a0 = transform.get_producer_of_operand %kvp[4] : (!transform.any_op) -> !transform.any_op
-    %pi_m0 = transform.get_producer_of_operand %kvp[5] : (!transform.any_op) -> !transform.any_op
-    %pi_m, %rl1 = transform.structured.fuse_into_containing_op %pi_m0 into %rl : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %pi_l, %rl2 = transform.structured.fuse_into_containing_op %pi_l0 into %rl1 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %pi_a, %rl3 = transform.structured.fuse_into_containing_op %pi_a0 into %rl2 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %bpm, %npm = transform.structured.bufferize_to_allocation %pi_m <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
-    %bpl, %npl = transform.structured.bufferize_to_allocation %pi_l <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
-    %bpa, %npa = transform.structured.bufferize_to_allocation %pi_a <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
-    %pa_t, %pa_f = transform.structured.fuse %pi_a tile_sizes [{MB}, 0, 0, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %pl_t, %pl_f = transform.structured.fuse %pi_l tile_sizes [{MB}, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %pm_t, %pm_f = transform.structured.fuse %pi_m tile_sizes [{MB}, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %pro01 = transform.loop.fuse_sibling %pl_f into %pa_f : (!transform.any_op, !transform.any_op) -> !transform.any_op
-    %pro012 = transform.loop.fuse_sibling %pm_f into %pro01 : (!transform.any_op, !transform.any_op) -> !transform.any_op
-    transform.annotate %pro012 "f_pro" : !transform.any_op
-    // After the K loop: out = acc / l per core, unpacked by the transfer to
-    // L2, 8 rows by 32 columns at a time (three dims for the core's DMA, and
-    // little L1), each made just before it goes.
-    %stores = transform.structured.match ops{["bufferization.materialize_in_destination"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %out_up = transform.get_producer_of_operand %stores[0] : (!transform.any_op) -> !transform.any_op
-    %out_op = transform.get_producer_of_operand %out_up[0] : (!transform.any_op) -> !transform.any_op
-    %inv = transform.get_producer_of_operand %out_op[1] : (!transform.any_op) -> !transform.any_op
-    %bo, %no = transform.structured.bufferize_to_allocation %out_up <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
-    %o_t, %o_f = transform.structured.tile_using_forall %out_up tile_sizes [{LKP}, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %o1, %of1a = transform.structured.fuse_into_containing_op %out_op into %o_f : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // @each
+    %sc{N}_11 = transform.structured.match ops{["scf.for"]} attributes{rounds_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %rl{N} = transform.structured.match ops{["scf.for"]} attributes{rounds_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %kvp{N} = transform.structured.match ops{["scf.for"]} attributes{kv_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %pi_l0{N} = transform.get_producer_of_operand %kvp{N}[3] : (!transform.any_op) -> !transform.any_op
+    %pi_a0{N} = transform.get_producer_of_operand %kvp{N}[4] : (!transform.any_op) -> !transform.any_op
+    %pi_m0{N} = transform.get_producer_of_operand %kvp{N}[5] : (!transform.any_op) -> !transform.any_op
+    %pi_m{N}, %rl1{N} = transform.structured.fuse_into_containing_op %pi_m0{N} into %rl{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %pi_l{N}, %rl2{N} = transform.structured.fuse_into_containing_op %pi_l0{N} into %rl1{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %pi_a{N}, %rl3{N} = transform.structured.fuse_into_containing_op %pi_a0{N} into %rl2{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %bpm{N}, %npm{N} = transform.structured.bufferize_to_allocation %pi_m{N} <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+    %bpl{N}, %npl{N} = transform.structured.bufferize_to_allocation %pi_l{N} <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+    %bpa{N}, %npa{N} = transform.structured.bufferize_to_allocation %pi_a{N} <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+    %pa_t{N}, %pa_f{N} = transform.structured.fuse %pi_a{N} tile_sizes [{MB}, 0, 0, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %pl_t{N}, %pl_f{N} = transform.structured.fuse %pi_l{N} tile_sizes [{MB}, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %pm_t{N}, %pm_f{N} = transform.structured.fuse %pi_m{N} tile_sizes [{MB}, 0] use_forall apply_cleanup : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %pro01{N} = transform.loop.fuse_sibling %pl_f{N} into %pa_f{N} : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    %pro012{N} = transform.loop.fuse_sibling %pm_f{N} into %pro01{N} : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.annotate %pro012{N} "f_pro{N}" : !transform.any_op
+    // After the K loop: out = acc / l per core, in acc's blocks, which are
+    // also the stored layout. It goes to L2 a few blocks of a row at a time,
+    // each made just before it goes, so it needs little L1. A slice of the
+    // blocks taken through their reshape is a slice of out's.
+    %stores{N} = transform.structured.match ops{["bufferization.materialize_in_destination"]} in %sc{N}_11 : (!transform.any_op) -> !transform.any_op
+    %out_up{N} = transform.get_producer_of_operand %stores{N}[0] : (!transform.any_op) -> !transform.any_op
+    %out_ex{N} = transform.get_producer_of_operand %out_up{N}[0] : (!transform.any_op) -> !transform.any_op
+    %out_op{N} = transform.get_producer_of_operand %out_ex{N}[0] : (!transform.any_op) -> !transform.any_op
+    %inv{N} = transform.get_producer_of_operand %out_op{N}[1] : (!transform.any_op) -> !transform.any_op
+    %bo{N}, %no{N} = transform.structured.bufferize_to_allocation %out_up{N} <{memory_space = 1, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+    %o_t{N}, %o_f{N} = transform.structured.tile_using_forall %out_up{N} tile_sizes [{TMB}, 0, 0, 0, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %fo{N} = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %fo{N} {
+      transform.apply_patterns.tensor.bubble_up_extract_slice
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    %o1{N}, %of1a{N} = transform.structured.fuse_into_containing_op %out_op{N} into %o_f{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
     // The rows' reciprocals, made once in each core.
-    %inv1, %of1 = transform.structured.fuse_into_containing_op %inv into %of1a : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %binv, %ninv = transform.structured.bufferize_to_allocation %inv1 <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
-    transform.annotate %of1 "f_out" : !transform.any_op
-    %o_up = transform.structured.match ops{["linalg.unpack"]} in %of1 : (!transform.any_op) -> !transform.any_op
-    %o_upt, %o_upl0:2 = transform.structured.tile_using_for %o_up tile_sizes [8, 32] : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    %inv1{N}, %of1{N} = transform.structured.fuse_into_containing_op %inv{N} into %of1a{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %binv{N}, %ninv{N} = transform.structured.bufferize_to_allocation %inv1{N} <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+    transform.annotate %of1{N} "f_out{N}" : !transform.any_op
+    %o_up{N} = transform.structured.match ops{["linalg.unpack"]} in %of1{N} : (!transform.any_op) -> !transform.any_op
+    %o_upt{N}, %o_upl0{N}:3 = transform.structured.tile_using_for %o_up{N} tile_sizes [1, 1, 4, 0, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
     // Counting blocks, so the block's offset in acc is the loops' indices:
     // what each core reads of acc shows as its own rows.
-    %o_upl = transform.air.normalize_loop_to_unit_step %o_upl0#0 : (!transform.any_op) -> !transform.any_op
-    %o_upc = transform.air.normalize_loop_to_unit_step %o_upl0#1 : (!transform.any_op) -> !transform.any_op
-    %o2, %o_upl2 = transform.structured.fuse_into_containing_op %o1 into %o_upc : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %bo2, %no2 = transform.structured.bufferize_to_allocation %o2 <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+    %o_upl{N} = transform.air.normalize_loop_to_unit_step %o_upl0{N}#0 : (!transform.any_op) -> !transform.any_op
+    %o_upm{N} = transform.air.normalize_loop_to_unit_step %o_upl0{N}#1 : (!transform.any_op) -> !transform.any_op
+    %o_upc{N} = transform.air.normalize_loop_to_unit_step %o_upl0{N}#2 : (!transform.any_op) -> !transform.any_op
+    %fo2{N} = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %fo2{N} {
+      transform.apply_patterns.tensor.bubble_up_extract_slice
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    %o2{N}, %o_upl2{N} = transform.structured.fuse_into_containing_op %o1{N} into %o_upc{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %bo2{N}, %no2{N} = transform.structured.bufferize_to_allocation %o2{N} <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+    // @end
     transform.apply_patterns to %fe { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fe : !transform.any_op
     // The key-column index is made in each core.
-    %rndc = transform.structured.match ops{["scf.forall"]} attributes{f_round} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %colg = transform.structured.match ops{["linalg.generic"]} filter_result_type = tensor<{MB}x8xi32> in %arg1 : (!transform.any_op) -> !transform.any_op
-    %colf, %rndc2 = transform.structured.fuse_into_containing_op %colg into %rndc : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // @single
+    %colsc{N} = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    // @end
+    // @multi
+    %colsc{N} = transform.structured.match ops{["scf.for"]} attributes{rounds_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    // @end
+    // @each
+    %rndc{N} = transform.structured.match ops{["scf.forall"]} attributes{f_round{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %colg{N} = transform.structured.match ops{["linalg.generic"]} filter_result_type = tensor<{MB}x8xi32> in %colsc{N} : (!transform.any_op) -> !transform.any_op
+    %colf{N}, %rndc2{N} = transform.structured.fuse_into_containing_op %colg{N} into %rndc{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // @end
     // S two by two blocks at a time, made where the mask takes it: its f32
     // sums go straight from the contraction to the mask, never to L1.
-    %rnd5 = transform.structured.match ops{["scf.forall"]} attributes{f_round} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %qk5 = transform.structured.match ops{["linalg.generic"]} attributes{qk_mm} in %rnd5 : (!transform.any_op) -> !transform.any_op
-    %mask5 = transform.get_consumers_of_result %qk5[0] : (!transform.any_op) -> !transform.any_op
-    %mask5t, %maskl:2 = transform.structured.tile_using_for %mask5 tile_sizes [2, 2, 0, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
-    %qk6, %maskl2 = transform.structured.fuse_into_containing_op %qk5 into %maskl#1 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %qki_sl = transform.get_producer_of_operand %qk6[2] : (!transform.any_op) -> !transform.any_op
-    %qki = transform.get_producer_of_operand %qki_sl[0] : (!transform.any_op) -> !transform.any_op
-    %qki2, %maskl3 = transform.structured.fuse_into_containing_op %qki into %maskl2 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // @each
+    %rnd5{N} = transform.structured.match ops{["scf.forall"]} attributes{f_round{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %qk5{N} = transform.structured.match ops{["linalg.generic"]} attributes{qk_mm{N}} in %rnd5{N} : (!transform.any_op) -> !transform.any_op
+    %mask5{N} = transform.get_consumers_of_result %qk5{N}[0] : (!transform.any_op) -> !transform.any_op
+    %mask5t{N}, %maskl{N}:2 = transform.structured.tile_using_for %mask5{N} tile_sizes [2, 2, 0, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    %qk6{N}, %maskl2{N} = transform.structured.fuse_into_containing_op %qk5{N} into %maskl{N}#1 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %qki_sl{N} = transform.get_producer_of_operand %qk6{N}[2] : (!transform.any_op) -> !transform.any_op
+    %qki{N} = transform.get_producer_of_operand %qki_sl{N}[0] : (!transform.any_op) -> !transform.any_op
+    %qki2{N}, %maskl3{N} = transform.structured.fuse_into_containing_op %qki{N} into %maskl2{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // @end
     %fs = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %fs {
       transform.apply_patterns.tensor.fold_tensor_empty
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     // P over S: S is read for the row maxima before P is made.
-    %rnd6 = transform.structured.match ops{["scf.forall"]} attributes{f_round} in %arg1 : (!transform.any_op) -> !transform.any_op
+    // @each
+    %rnd6{N} = transform.structured.match ops{["scf.forall"]} attributes{f_round{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
     // P is the block-shaped op with an exp2; the row rescale's exp2 has no
     // input of its result's type.
-    %e6 = transform.structured.match ops{["math.exp2"]} in %rnd6 : (!transform.any_op) -> !transform.any_op
-    %p6 = transform.get_parent_op %e6 <{deduplicate, op_name = "linalg.generic"}> : (!transform.any_op) -> !transform.any_op
-    transform.foreach %p6 : !transform.any_op {
-    ^bb0(%g: !transform.any_op):
-      transform.sequence %g : !transform.any_op failures(suppress) {
-      ^bb1(%g1: !transform.any_op):
-        %gi = transform.air.reuse_input_as_init %g1 : (!transform.any_op) -> !transform.any_op
+    %e6{N} = transform.structured.match ops{["math.exp2"]} in %rnd6{N} : (!transform.any_op) -> !transform.any_op
+    %p6{N} = transform.get_parent_op %e6{N} <{deduplicate, op_name = "linalg.generic"}> : (!transform.any_op) -> !transform.any_op
+    transform.foreach %p6{N} : !transform.any_op {
+    ^bb0(%g{N}: !transform.any_op):
+      transform.sequence %g{N} : !transform.any_op failures(suppress) {
+      ^bb1(%g1{N}: !transform.any_op):
+        %gi{N} = transform.air.reuse_input_as_init %g1{N} : (!transform.any_op) -> !transform.any_op
       }
     }
+    // @end
     // Row reductions: a row block's column blocks combined elementwise into
     // a block of partials, then one transpose and reduction of that block.
-    %rnd7 = transform.structured.match ops{["scf.forall"]} attributes{f_round} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.foreach_match in %rnd7 @match_red4 -> @split_red : (!transform.any_op) -> !transform.any_op
+    // @each
+    %rnd7{N} = transform.structured.match ops{["scf.forall"]} attributes{f_round{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.foreach_match in %rnd7{N} @match_red4 -> @split_red : (!transform.any_op) -> !transform.any_op
+    // @end
     // acc in chunks of V's tiles, V brought per chunk; inside a chunk, a tile
     // of acc at a time with its P V: a block, or two by two blocks when P V's
     // K loop is long.
-    %rnd4 = transform.structured.match ops{["scf.forall"]} attributes{f_round} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %acc4 = transform.structured.match ops{["linalg.generic"]} attributes{res_acc} in %rnd4 : (!transform.any_op) -> !transform.any_op
-    %acc4z, %zl = transform.structured.tile_using_for %acc4 tile_sizes [0, {VB}, 0, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.annotate %zl "v_chunk_loop" : !transform.any_op
-    %pv4 = transform.structured.match ops{["linalg.generic"]} attributes{pv_mm} in %rnd4 : (!transform.any_op) -> !transform.any_op
-    %pvz, %zl2 = transform.structured.fuse_into_containing_op %pv4 into %zl : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %fz = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %fz2 = transform.air.bubble_slice_through_collapse %fz : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %fz2 { transform.apply_patterns.canonicalization } : !transform.any_op
-    %zl3 = transform.structured.match ops{["scf.for"]} attributes{v_chunk_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %vpk4 = transform.structured.match ops{["linalg.pack"]} filter_result_type = tensor<{MB}x{DVC}x{VB}x8x8xbf16> in %arg1 : (!transform.any_op) -> !transform.any_op
-    %vpz, %zl4 = transform.structured.fuse_into_containing_op %vpk4 into %zl3 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %pvz2 = transform.structured.match ops{["linalg.generic"]} attributes{pv_mm} in %zl4 : (!transform.any_op) -> !transform.any_op
-    %pvi_sl = transform.get_producer_of_operand %pvz2[2] : (!transform.any_op) -> !transform.any_op
-    %pvi = transform.get_producer_of_operand %pvi_sl[0] : (!transform.any_op) -> !transform.any_op
-    %pvi_z, %zl5 = transform.structured.fuse_into_containing_op %pvi into %zl4 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %acc5 = transform.structured.match ops{["linalg.generic"]} attributes{res_acc} in %zl5 : (!transform.any_op) -> !transform.any_op
-    %acc5t, %accl:2 = transform.structured.tile_using_for %acc5 tile_sizes [{AT}, {AT}, 0, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
-    transform.annotate %accl#1 "acc_block_loop" : !transform.any_op
-    %pv5 = transform.structured.match ops{["linalg.generic"]} attributes{pv_mm} in %zl5 : (!transform.any_op) -> !transform.any_op
-    %pv5f, %accl2 = transform.structured.fuse_into_containing_op %pv5 into %accl#1 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %pv_init_sl = transform.get_producer_of_operand %pv5f[2] : (!transform.any_op) -> !transform.any_op
-    %pv_init = transform.get_producer_of_operand %pv_init_sl[0] : (!transform.any_op) -> !transform.any_op
-    %pvi_f, %accl3 = transform.structured.fuse_into_containing_op %pv_init into %accl2 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // @each
+    %sc{N}_16 = transform.structured.match ops{["scf.for"]} attributes{rounds_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %rnd4{N} = transform.structured.match ops{["scf.forall"]} attributes{f_round{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %acc4{N} = transform.structured.match ops{["linalg.generic"]} attributes{res_acc{N}} in %rnd4{N} : (!transform.any_op) -> !transform.any_op
+    %acc4z{N}, %zl{N} = transform.structured.tile_using_for %acc4{N} tile_sizes [0, {VB}, 0, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.annotate %zl{N} "v_chunk_loop{N}" : !transform.any_op
+    %pv4{N} = transform.structured.match ops{["linalg.generic"]} attributes{pv_mm{N}} in %rnd4{N} : (!transform.any_op) -> !transform.any_op
+    %pvz{N}, %zl2{N} = transform.structured.fuse_into_containing_op %pv4{N} into %zl{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %fz{N} = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %fz2{N} = transform.air.bubble_slice_through_collapse %fz{N} : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %fz2{N} { transform.apply_patterns.canonicalization } : !transform.any_op
+    %zl3{N} = transform.structured.match ops{["scf.for"]} attributes{v_chunk_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %vpk4{N} = transform.structured.match ops{["linalg.pack"]} filter_result_type = tensor<{VPK}x8x8xbf16> in %sc{N}_16 : (!transform.any_op) -> !transform.any_op
+    %vpz{N}, %zl4{N} = transform.structured.fuse_into_containing_op %vpk4{N} into %zl3{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %pvz2{N} = transform.structured.match ops{["linalg.generic"]} attributes{pv_mm{N}} in %zl4{N} : (!transform.any_op) -> !transform.any_op
+    %pvi_sl{N} = transform.get_producer_of_operand %pvz2{N}[2] : (!transform.any_op) -> !transform.any_op
+    %pvi{N} = transform.get_producer_of_operand %pvi_sl{N}[0] : (!transform.any_op) -> !transform.any_op
+    %pvi_z{N}, %zl5{N} = transform.structured.fuse_into_containing_op %pvi{N} into %zl4{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %acc5{N} = transform.structured.match ops{["linalg.generic"]} attributes{res_acc{N}} in %zl5{N} : (!transform.any_op) -> !transform.any_op
+    %acc5t{N}, %accl{N}:2 = transform.structured.tile_using_for %acc5{N} tile_sizes [{AT}, {AT}, 0, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    transform.annotate %accl{N}#1 "acc_block_loop{N}" : !transform.any_op
+    %pv5{N} = transform.structured.match ops{["linalg.generic"]} attributes{pv_mm{N}} in %zl5{N} : (!transform.any_op) -> !transform.any_op
+    %pv5f{N}, %accl2{N} = transform.structured.fuse_into_containing_op %pv5{N} into %accl{N}#1 : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %pv_init_sl{N} = transform.get_producer_of_operand %pv5f{N}[2] : (!transform.any_op) -> !transform.any_op
+    %pv_init{N} = transform.get_producer_of_operand %pv_init_sl{N}[0] : (!transform.any_op) -> !transform.any_op
+    %pvi_f{N}, %accl3{N} = transform.structured.fuse_into_containing_op %pv_init{N} into %accl2{N} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // @end
     %fe4 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %fe4 { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fe4 : !transform.any_op
     // PHASE 3: K and V into L1 per core; bufferize; herds.
     %f3 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %rnd3 = transform.structured.match ops{["scf.forall"]} attributes{f_round} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %kp3 = transform.structured.match ops{["linalg.pack"]} filter_result_type = tensor<{MB}x{KB}x8x8xbf16> in %rnd3 : (!transform.any_op) -> !transform.any_op
-    %bk3, %nk3 = transform.structured.bufferize_to_allocation %kp3 <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
-    // One buffer for V's chunks, made outside the chunk loop: a core holds
-    // one chunk at a time.
-    transform.apply_patterns to %f3 { transform.apply_patterns.tensor.fold_tensor_empty } : !transform.any_op
-    %zl6 = transform.structured.match ops{["scf.for"]} attributes{v_chunk_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.apply_licm to %zl6 : !transform.any_op
-    %vp3 = transform.structured.match ops{["linalg.pack"]} filter_result_type = tensor<{MB}x1x{VB}x8x8xbf16> in %rnd3 : (!transform.any_op) -> !transform.any_op
-    %vd3 = transform.get_producer_of_operand %vp3[1] : (!transform.any_op) -> !transform.any_op
-    %vd3e = transform.cast %vd3 : !transform.any_op to !transform.op<"tensor.empty">
-    %vd3a = transform.bufferization.empty_tensor_to_alloc_tensor %vd3e : (!transform.op<"tensor.empty">) -> !transform.op<"bufferization.alloc_tensor">
+    // @each
+    %rnd3{N} = transform.structured.match ops{["scf.forall"]} attributes{f_round{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %kp3{N} = transform.structured.match ops{["linalg.pack"]} filter_result_type = tensor<{KPK}x8x8xbf16> in %rnd3{N} : (!transform.any_op) -> !transform.any_op
+    %bk3{N}, %nk3{N} = transform.structured.bufferize_to_allocation %kp3{N} <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+    // V into L1 a chunk at a time.
+    %vp3{N} = transform.structured.match ops{["linalg.pack"]} filter_result_type = tensor<{VPC}x8x8xbf16> in %rnd3{N} : (!transform.any_op) -> !transform.any_op
+    %bv3{N}, %nv3{N} = transform.structured.bufferize_to_allocation %vp3{N} <{memory_space = 2, bufferize_destination_only, emit_dealloc}> : !transform.any_op
+    // @end
     transform.apply_patterns to %f3 { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %f3 : !transform.any_op
     transform.bufferization.eliminate_empty_tensors %f3 : !transform.any_op
@@ -519,41 +619,72 @@ module attributes {transform.with_named_sequence} {
     %fb2 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %fb2 { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fb2 : !transform.any_op
-    %fa_f_q = transform.structured.match ops{["scf.forall"]} attributes{f_q} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.foreach %fa_f_q : !transform.any_op {
-    ^bb0(%fl: !transform.any_op):
-      %pl = transform.loop.forall_to_parallel %fl : (!transform.any_op) -> !transform.any_op
-      %hl = transform.air.par_to_herd %pl <{first_dim = 1}> : (!transform.any_op) -> !transform.any_op
+    // The round loops of one column run on the same cores one after the
+    // other, so they share these L1 buffers.
+    // @multi
+    %scl{N} = transform.structured.match ops{["scf.for"]} attributes{rounds_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %l1q{N} = transform.structured.match ops{["memref.alloc"]} filter_result_type = memref<{QPK}x8x8xbf16, 2> in %scl{N} : (!transform.any_op) -> !transform.any_op
+    %l1a{N} = transform.structured.match ops{["memref.alloc"]} filter_result_type = memref<{R8}x{KB}x8x8xbf16, 2> in %scl{N} : (!transform.any_op) -> !transform.any_op
+    %l1k{N} = transform.structured.match ops{["memref.alloc"]} filter_result_type = memref<{KPK}x8x8xbf16, 2> in %scl{N} : (!transform.any_op) -> !transform.any_op
+    %l1v{N} = transform.structured.match ops{["memref.alloc"]} filter_result_type = memref<{VPC}x8x8xbf16, 2> in %scl{N} : (!transform.any_op) -> !transform.any_op
+    %l1o{N} = transform.structured.match ops{["memref.alloc"]} filter_result_type = memref<1x4x8x8xbf16, 2> in %scl{N} : (!transform.any_op) -> !transform.any_op
+    // @end
+    // @shared
+    %fsa = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.air.hoist_static_alloc %fsa <{memory_space = 2 : i32}> : (!transform.any_op) -> ()
+    // @end
+    // @column
+    %shq{C} = transform.merge_handles {EACH:%l1q} : !transform.any_op
+    %shq2{C} = transform.air.share_alloc %shq{C} : (!transform.any_op) -> !transform.any_op
+    %sha{C} = transform.merge_handles {EACH:%l1a} : !transform.any_op
+    %sha2{C} = transform.air.share_alloc %sha{C} : (!transform.any_op) -> !transform.any_op
+    %shk{C} = transform.merge_handles {EACH:%l1k} : !transform.any_op
+    %shk2{C} = transform.air.share_alloc %shk{C} : (!transform.any_op) -> !transform.any_op
+    %shv{C} = transform.merge_handles {EACH:%l1v} : !transform.any_op
+    %shv2{C} = transform.air.share_alloc %shv{C} : (!transform.any_op) -> !transform.any_op
+    %sho{C} = transform.merge_handles {EACH:%l1o} : !transform.any_op
+    %sho2{C} = transform.air.share_alloc %sho{C} : (!transform.any_op) -> !transform.any_op
+    // @end
+    // @each
+    %fa_f_q{N} = transform.structured.match ops{["scf.forall"]} attributes{f_q{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.foreach %fa_f_q{N} : !transform.any_op {
+    ^bb0(%fl{N}: !transform.any_op):
+      %pl{N} = transform.loop.forall_to_parallel %fl{N} : (!transform.any_op) -> !transform.any_op
+      %hl = transform.air.par_to_herd %pl{N} <{first_dim = 1}> : (!transform.any_op) -> !transform.any_op
     }
-    %fa_f_pro_m = transform.structured.match ops{["scf.forall"]} attributes{f_pro_m} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.foreach %fa_f_pro_m : !transform.any_op {
-    ^bb0(%fl: !transform.any_op):
-      %pl = transform.loop.forall_to_parallel %fl : (!transform.any_op) -> !transform.any_op
-      %hl = transform.air.par_to_herd %pl <{first_dim = 1}> : (!transform.any_op) -> !transform.any_op
+    %fa_f_pro_m{N} = transform.structured.match ops{["scf.forall"]} attributes{f_pro_m{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.foreach %fa_f_pro_m{N} : !transform.any_op {
+    ^bb0(%fl{N}: !transform.any_op):
+      %pl{N} = transform.loop.forall_to_parallel %fl{N} : (!transform.any_op) -> !transform.any_op
+      %hl = transform.air.par_to_herd %pl{N} <{first_dim = 1}> : (!transform.any_op) -> !transform.any_op
     }
-    %fa_f_pro = transform.structured.match ops{["scf.forall"]} attributes{f_pro} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.foreach %fa_f_pro : !transform.any_op {
-    ^bb0(%fl: !transform.any_op):
-      %pl = transform.loop.forall_to_parallel %fl : (!transform.any_op) -> !transform.any_op
-      %hl = transform.air.par_to_herd %pl <{first_dim = 1}> : (!transform.any_op) -> !transform.any_op
+    %fa_f_pro{N} = transform.structured.match ops{["scf.forall"]} attributes{f_pro{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.foreach %fa_f_pro{N} : !transform.any_op {
+    ^bb0(%fl{N}: !transform.any_op):
+      %pl{N} = transform.loop.forall_to_parallel %fl{N} : (!transform.any_op) -> !transform.any_op
+      %hl = transform.air.par_to_herd %pl{N} <{first_dim = 1}> : (!transform.any_op) -> !transform.any_op
     }
-    %fa_f_round = transform.structured.match ops{["scf.forall"]} attributes{f_round} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.foreach %fa_f_round : !transform.any_op {
-    ^bb0(%fl: !transform.any_op):
-      %pl = transform.loop.forall_to_parallel %fl : (!transform.any_op) -> !transform.any_op
-      %hl = transform.air.par_to_herd %pl <{first_dim = 1}> : (!transform.any_op) -> !transform.any_op
+    %fa_f_round{N} = transform.structured.match ops{["scf.forall"]} attributes{f_round{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.foreach %fa_f_round{N} : !transform.any_op {
+    ^bb0(%fl{N}: !transform.any_op):
+      %pl{N} = transform.loop.forall_to_parallel %fl{N} : (!transform.any_op) -> !transform.any_op
+      %hl = transform.air.par_to_herd %pl{N} <{first_dim = 1}> : (!transform.any_op) -> !transform.any_op
     }
-    %fa_f_out = transform.structured.match ops{["scf.forall"]} attributes{f_out} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.foreach %fa_f_out : !transform.any_op {
-    ^bb0(%fl: !transform.any_op):
-      %pl = transform.loop.forall_to_parallel %fl : (!transform.any_op) -> !transform.any_op
-      %hl = transform.air.par_to_herd %pl <{first_dim = 1}> : (!transform.any_op) -> !transform.any_op
+    %fa_f_out{N} = transform.structured.match ops{["scf.forall"]} attributes{f_out{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.foreach %fa_f_out{N} : !transform.any_op {
+    ^bb0(%fl{N}: !transform.any_op):
+      %pl{N} = transform.loop.forall_to_parallel %fl{N} : (!transform.any_op) -> !transform.any_op
+      %hl = transform.air.par_to_herd %pl{N} <{first_dim = 1}> : (!transform.any_op) -> !transform.any_op
     }
+    // @end
     %hs = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %hs2 = transform.air.override_memref_memory_space %hs <{memory_space = 2 : i32}> : (!transform.any_op) -> !transform.any_op
-    %hs3 = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %n_attn = transform.param.constant "attn" -> !transform.any_param
-    transform.annotate %hs3 "sym_name" = %n_attn : !transform.any_op, !transform.any_param
+    // @each
+    %sch{N} = transform.structured.match ops{["scf.for"]} attributes{rounds_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %hn{N} = transform.structured.match ops{["air.herd"]} in %sch{N} : (!transform.any_op) -> !transform.any_op
+    %hname{N} = transform.param.constant "attn{C}" -> !transform.any_param
+    transform.annotate %hn{N} "sym_name" = %hname{N} : !transform.any_op, !transform.any_param
+    // @end
     %fh = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %fh { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fh : !transform.any_op
@@ -561,7 +692,10 @@ module attributes {transform.with_named_sequence} {
     %hv0 = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %hv1 = transform.air.convert_memref_copy_to_linalg_copy %hv0 : (!transform.any_op) -> !transform.any_op
     %fv0 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %fv1 = transform.foreach_match in %fv0 @match_pv_contract -> @tile_pv_contract, @match_qk_2x2 -> @tile_qk_2x2, @match_acc_upd_2x2 -> @tile_2x2_blocks, @match_acc_upd -> @keep, @match_block -> @keep, @match_2x2_blocks -> @tile_2x2_blocks, @match_row_scaled -> @tile_blocks, @match_rank4 -> @tile_rows : (!transform.any_op) -> !transform.any_op
+    // @each
+    %scv{N} = transform.structured.match ops{["scf.for"]} attributes{rounds_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %fv1{N} = transform.foreach_match in %scv{N} @match_pv_contract{G} -> @tile_pv_contract{G}, @match_qk_2x2 -> @tile_qk_2x2, @match_acc_upd_2x2 -> @tile_2x2_blocks, @match_acc_upd -> @keep, @match_block -> @keep, @match_2x2_blocks -> @tile_2x2_blocks, @match_row_scaled -> @tile_blocks, @match_rank4 -> @tile_rows : (!transform.any_op) -> !transform.any_op
+    // @end
     %fv2 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %fv2 { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fv2 : !transform.any_op
@@ -607,8 +741,10 @@ module attributes {transform.with_named_sequence} {
     transform.memref.erase_dead_alloc_and_stores %fhv2 : (!transform.any_op) -> ()
     // Several tiles of acc a trip: their P V sums are independent, so each
     // one's multiply-accumulates run in the others' latency.
-    %abl = transform.structured.match ops{["scf.for"]} attributes{acc_block_loop} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.loop.unroll %abl factor = {AU} : !transform.any_op
+    // @each
+    %abl{N} = transform.structured.match ops{["scf.for"]} attributes{acc_block_loop{N}} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.loop.unroll %abl{N} factor = {AU} : !transform.any_op
+    // @end
     // What a block's loop computes the same way each trip, out of it.
     %hl = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.foreach %hl : !transform.any_op {
@@ -617,8 +753,12 @@ module attributes {transform.with_named_sequence} {
       transform.apply_licm to %hloops : !transform.any_op
     }
     %fw = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %fw { transform.apply_patterns.canonicalization } : !transform.any_op
-    transform.apply_cse to %fw : !transform.any_op
+    // Indices as affine maps of the herd and loop indices, so that what a
+    // core addresses of a buffer shows as its own part.
+    %fw2 = transform.apply_registered_pass "affine-expand-index-ops-as-affine" to %fw : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %fw2 { transform.apply_patterns.canonicalization } : !transform.any_op
+    transform.apply_cse to %fw2 : !transform.any_op
+    transform.memref.erase_dead_alloc_and_stores %fw2 : (!transform.any_op) -> ()
     transform.yield
   }
 }

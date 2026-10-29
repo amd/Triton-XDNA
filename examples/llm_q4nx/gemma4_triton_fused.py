@@ -168,44 +168,53 @@ def _build_hostops(out, B):
 
 
 def add_attention(dev, spec, heads):
-    """Add the spec's attention ops to `dev`, from `gemma4_attention.attn`,
-    with the interface of mlir-air's device: the GEMM's buffers, then each
-    attention group's q, KV and o in config order; an attention op takes
-    (nkv, q0, k0) at run time."""
+    """Add the spec's attention ops to `dev`, both from `gemma4_attention.attn`,
+    with the interface of mlir-air's device under the manifest's
+    "attn_format" "bf16": the GEMM's buffers, then each attention group's q,
+    KV and o in config order; an attention op takes (nkv, q0, k0) at run
+    time."""
     import torch
 
     import gemma4_attention as A
     from air_examples.llms.shared.fused_prefill import build as B
     from air_examples.llms.shared.fused_prefill import device as D
 
-    for op, groups in D.attn_ops(spec.CFG).items():
-        if len(groups) != 1:
-            raise NotImplementedError(f"attention op {op} drives {groups}")
-        (grp,) = groups
-        g = spec.CFG.attn[grp]
-        rounds = heads * (D.M // (A.NQT.value * g.lkp))
-        q = torch.zeros(rounds * A.NQT.value * g.lkp, g.dh, dtype=torch.bfloat16)
-        kv = torch.zeros(2 * g.lkp * g.dh, dtype=torch.bfloat16)
+    cfg = spec.CFG
+    ops = D.attn_ops(cfg)
+    names = list(cfg.attn)
+    # each op's heads split over the same two columns, a group per column
+    if sorted(ops) != ["f", "s"] or [g for c in zip(*ops.values()) for g in c] != names:
+        raise NotImplementedError(f"attention ops {ops} over groups {names}")
+    f, s = (cfg.attn[ops[o][0]] for o in ("f", "s"))
+    hg = heads // len(ops["f"])
+    bufs = []
+    for name in names:
+        g = cfg.attn[name]
+        q = torch.zeros(hg * D.M, g.dh, dtype=torch.bfloat16)
+        bufs += [q, torch.zeros(2 * g.lkp * g.dh, dtype=torch.bfloat16), q.clone()]
+    script = A.schedule(f, s, dev.proj)
+    for op in ops:
+        rounds = {o: hg * D.attn_qr(cfg.attn[ops[o][0]]) * (o == op) for o in ops}
         dev.add(
             B.seq_name(op, (heads,)),
             A.attn,
             (1,),
             A.args(
-                g,
-                rounds,
+                f,
+                s,
+                rounds["f"],
+                rounds["s"],
                 1,
                 0,
                 0,
-                q,
-                kv,
-                torch.zeros_like(q),
+                bufs,
                 rows=D.M,
-                window=(spec.CFG.windows or {}).get(op, g.window),
+                window=(cfg.windows or {}).get("s"),
             ),
-            transform_script=str(A.schedule(g.lkp, g.dh, g.dvt, dev.proj)),
-            slot=3 + 3 * list(spec.CFG.attn).index(grp),
+            transform_script=str(script),
+            slot=3,
             runtime=("nk", "q0", "k0"),
-            key=f"attn_{grp}",
+            key="attn",
             pin_l2=True,
             # K and V come into L2 through one channel, as the records of the
             # KV buffer hold them: its memtile has no DMA channel to spare.
@@ -222,6 +231,7 @@ def build(out):
     from triton.backends.amd_triton_npu.config import config_context
 
     import airsrc
+    import gemma4_attention as A
     import gemma4_gemm as G
     from fused_device import FusedDevice
 
@@ -267,6 +277,8 @@ def build(out):
         lm="lm",
         gemm_format="bf16",
         gemm_pairs=False,
+        attn_format="bf16",
+        attn_v_chunks=A.v_chunks(spec.CFG),
         device="triton",
         max_len=getattr(spec, "max_len", None),
     )

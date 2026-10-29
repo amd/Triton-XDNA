@@ -141,18 +141,9 @@ class FusedDevice:
             h.operation.attributes["y_loc"] = IntegerAttr.get(i64, 2)
             h.operation.attributes["sym_name"] = StringAttr.get(f"{key}_{n[1:-1]}")
         if key in self.pinned:
-            if self.width[key] != 1:
-                raise ValueError(f"{key}: pin_l2 needs a one-column kernel")
-            from air.ir import MemRefType, UnitAttr
-
-            i32 = IntegerType.get_signless(32)
-            for alloc in _ops_named(module.operation, "memref.alloc"):
-                space = MemRefType(alloc.result.type).memory_space
-                if space is not None and IntegerAttr(space).value == 1:  # L2
-                    alloc.attributes["air.memtile_col"] = IntegerAttr.get(
-                        i32, self.cols[key]
-                    )
-                    alloc.attributes["air.no_split"] = UnitAttr.get()
+            if any(w != 1 for w in widths.values()):
+                raise ValueError(f"{key}: pin_l2 needs herds one column wide")
+            _pin_l2(herds)
 
     def module_text(self):
         from air.ir import (
@@ -251,6 +242,30 @@ def _entry(m):
         and len(op.regions[0].blocks)
         and "sym_visibility" not in op.attributes
     )
+
+
+def _pin_l2(herds):
+    """Keep each L2 buffer whole in the memtile of the column of the herds it
+    is passed to."""
+    from air.ir import IntegerAttr, IntegerType, MemRefType, OpResult, UnitAttr
+
+    i32 = IntegerType.get_signless(32)
+    for h in herds:
+        x = IntegerAttr(h.operation.attributes["x_loc"]).value
+        for v in h.operation.operands:
+            if not isinstance(v, OpResult) or v.owner.name != "memref.alloc":
+                continue
+            space = MemRefType(v.type).memory_space
+            if space is None or IntegerAttr(space).value != 1:  # L2
+                continue
+            attrs = v.owner.attributes
+            if (
+                "air.memtile_col" in attrs
+                and IntegerAttr(attrs["air.memtile_col"]).value != x
+            ):
+                raise ValueError("an L2 buffer is passed to herds of two columns")
+            attrs["air.memtile_col"] = IntegerAttr.get(i32, x)
+            v.owner.attributes["air.no_split"] = UnitAttr.get()
 
 
 def _drop_unused_scalars(fn):

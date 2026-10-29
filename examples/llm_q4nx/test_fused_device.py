@@ -207,8 +207,8 @@ def test_multiplexing_attribute():
         assert str(attr) == '["L2"]'
 
 
-# An op: `nbuf` buffers, one L2 buffer, one herd `cols` columns wide, at
-# column `at` if it is placed already.
+# An op: `nbuf` buffers, one L2 buffer passed to one herd `cols` columns wide,
+# at column `at` if it is placed already.
 def _op(nbuf, cols=1, at=None):
     args = ", ".join(f"%b{i}: memref<*xbf16>" for i in range(nbuf))
     loc = "" if at is None else f" attributes {{x_loc = {at} : i64, y_loc = 2 : i64}}"
@@ -220,7 +220,7 @@ func.func @k({args}) {{
       %c1s = arith.constant 1 : index
       %cw = arith.constant {cols} : index
       %l2 = memref.alloc() : memref<64xbf16, 1>
-      air.herd @h tile (%tx, %ty) in (%hx=%cw, %hy=%c1s){loc} {{
+      air.herd @h tile (%tx, %ty) in (%hx=%cw, %hy=%c1s) args(%l=%l2) : memref<64xbf16, 1>{loc} {{
       }}
       memref.dealloc %l2 : memref<64xbf16, 1>
     }}
@@ -263,7 +263,21 @@ def test_module_text_pads_pins_and_places():
 def test_pin_l2_needs_one_column():
     dev = _dev(("a", "ka", _op(2, cols=2)))
     dev.pinned.add("ka")
-    with pytest.raises(ValueError, match="one-column"):
+    with pytest.raises(ValueError, match="one column"):
+        dev.module_text()
+
+
+def test_pin_l2_buffer_of_one_column():
+    # Two herds side by side, each pinning the L2 buffer it gets to its own
+    # column: one buffer passed to both cannot be in both memtiles.
+    op = _op(1).replace(
+        "      memref.dealloc",
+        "      air.herd @g tile (%tx, %ty) in (%hx=%c1s, %hy=%c1s) args(%l=%l2)"
+        " : memref<64xbf16, 1> {\n      }\n      memref.dealloc",
+    )
+    dev = _dev(("a", "ka", op))
+    dev.pinned.add("ka")
+    with pytest.raises(ValueError, match="two columns"):
         dev.module_text()
 
 
