@@ -6,7 +6,6 @@ import numpy as np
 from functools import wraps
 import triton
 from triton.backends.amd_triton_npu.driver import NPUDriver
-from triton.backends.triton_shared.driver import CPUDriver
 
 
 def select_npu_backend():
@@ -14,7 +13,7 @@ def select_npu_backend():
 
 
 def select_cpu_backend():
-    triton.runtime.driver.set_active(CPUDriver())
+    triton.runtime.driver.set_active_to_cpu()
 
 
 def select_gpu_backend():

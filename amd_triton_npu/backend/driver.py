@@ -3142,6 +3142,10 @@ class NPUUtils(object):
             "mem_bus_width": None,
         }
 
+    @staticmethod
+    def unload_module(module):
+        """Nothing to release: load_binary keeps no module."""
+
     # Important note:
     # Since we cannot easy pass function pointers around, we pass along the
     # assembly source code so that compile_module above can recompile the
