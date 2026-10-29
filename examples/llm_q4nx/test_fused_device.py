@@ -11,6 +11,7 @@ around them. No NPU and no Triton compile: the kernel is a stand-in for its
 parameter list.
 """
 
+import contextlib
 import os
 import sys
 from types import SimpleNamespace
@@ -18,8 +19,6 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from air.ir import ArrayAttr, Context, FunctionType, Module, TypeAttr  # noqa: E402
-
-import pytest  # noqa: E402
 
 from fused_device import (  # noqa: E402
     FusedDevice,
@@ -30,6 +29,19 @@ from fused_device import (  # noqa: E402
     _set_multiplexing,
     _shift_buffers,
 )
+
+
+@contextlib.contextmanager
+def _raises(match=""):
+    """Expect a ValueError whose message has `match`. The file also runs as a
+    plain script, without pytest."""
+    try:
+        yield
+    except ValueError as e:
+        assert match in str(e), e
+    else:
+        raise AssertionError("no ValueError")
+
 
 IR = """
 func.func private @helper(%x: i32) -> i32 {
@@ -158,18 +170,11 @@ def test_shift_buffers_ahead_of_scalars():
         m.operation.verify()
 
 
-if __name__ == "__main__":
-    for name, f in list(globals().items()):
-        if name.startswith("test_"):
-            f()
-            print(f"PASS {name}")
-
-
 def test_unknown_kept_name_rejected():
     with Context():
         m = Module.parse(IR)
         kernel = _kernel("a", "n", "k", "s", "u", "pid", "out")
-        with pytest.raises(ValueError, match="nn"):
+        with _raises("nn"):
             _bind_ints(m, kernel, (None, 1, 2, 0.5, 0.25, 0, None), keep=("nn",))
 
 
@@ -195,7 +200,7 @@ def test_shift_ranked_buffers():
 def test_shift_buffers_after_scalar_rejected():
     with Context():
         m = Module.parse("func.func @k(%n: i32, %a: memref<16xbf16>) {\n  return\n}")
-        with pytest.raises(ValueError):
+        with _raises():
             _shift_buffers(m, 1)
 
 
@@ -263,7 +268,7 @@ def test_module_text_pads_pins_and_places():
 def test_pin_l2_needs_one_column():
     dev = _dev(("a", "ka", _op(2, cols=2)))
     dev.pinned.add("ka")
-    with pytest.raises(ValueError, match="one column"):
+    with _raises("one column"):
         dev.module_text()
 
 
@@ -277,11 +282,18 @@ def test_pin_l2_buffer_of_one_column():
     )
     dev = _dev(("a", "ka", op))
     dev.pinned.add("ka")
-    with pytest.raises(ValueError, match="two columns"):
+    with _raises("two columns"):
         dev.module_text()
 
 
 def test_prebuilt_op_with_other_buffers_rejected():
     dev = _dev(("a", "ka", _op(3)), ("p", None, _op(2, at=5)))
-    with pytest.raises(ValueError, match="other buffers"):
+    with _raises("other buffers"):
         dev.module_text()
+
+
+if __name__ == "__main__":
+    for name, f in list(globals().items()):
+        if name.startswith("test_"):
+            f()
+            print(f"PASS {name}")
