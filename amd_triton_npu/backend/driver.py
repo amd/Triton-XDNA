@@ -1289,29 +1289,31 @@ def _get_output_format(runtime=None):
     If not set, defaults to "elf" on npu2 and "xclbin" on npu1.
     ELF format is only supported on npu2 (AIE2P) devices.
 
-    Under the HSA runtime the artifact must be PDI + insts, since the ROCR AIE
-    dispatch path consumes a raw ``aie.pdi`` and its ``insts.bin`` sidecar. In
-    that case "pdi" is forced and an explicit ELF/xclbin request is rejected.
+    Under the HSA runtime, "pdi" is rejected: a raw ``aie.pdi`` has no
+    ``AIE_PARTITION`` section, so the hsaco packer (which needs the PDI's
+    partition/column-count metadata, not just its bytes) has nothing to read
+    it from. Unlike XRT, which can dispatch a raw PDI + insts.bin directly,
+    HSA always packs through ``aie.compiler.hsaco.pack``, which only
+    understands the xclbin and full-ELF shapes.
     """
     if runtime is None:
         runtime = npu_config.runtime
     npu_version = detect_npu_version(runtime)
     configured_format = npu_config.output_format
-    if runtime == "hsa":
-        if configured_format is not None and configured_format != "pdi":
-            raise RuntimeError(
-                f"ROCR requires the 'pdi' output format, but "
-                f"output_format={configured_format!r} was requested. Unset "
-                "AMD_TRITON_NPU_OUTPUT_FORMAT (or npu_config.output_format), or "
-                "set it to 'pdi'."
-            )
-        return "pdi"
     if configured_format is not None:
         if configured_format == "elf" and npu_version == "npu1":
             raise RuntimeError(
                 "ELF output format is not supported on npu1 (AIE2) devices. "
                 "Unset or change AMD_TRITON_NPU_OUTPUT_FORMAT, or set "
                 "npu_config.output_format to 'xclbin', 'pdi', or None."
+            )
+        if configured_format == "pdi" and runtime == "hsa":
+            raise RuntimeError(
+                "output_format='pdi' is not supported under the HSA runtime: "
+                "a raw PDI carries no partition/column-count metadata, which "
+                "the hsaco packer needs. Unset AMD_TRITON_NPU_OUTPUT_FORMAT "
+                "(or npu_config.output_format) to auto-detect xclbin/elf, or "
+                "set it to one of those explicitly."
             )
         return configured_format
     # Auto-detect: ELF for npu2, xclbin for npu1.
@@ -2504,6 +2506,102 @@ def _put_aircc_artifacts(cache, artifacts, output_format):
     return {"bin_path": bin_path, "insts_path": insts_path}
 
 
+# Inverse of NPU_AGENT_NAMES (driver.py's existing {"aie2": "npu1", "aie2p":
+# "npu2"} map): the hsaco section an npu_version packs into.
+_NPU_VERSION_TO_ARCH = {v: k for k, v in NPU_AGENT_NAMES.items()}
+
+
+def _pack_hsaco(output_format, artifacts, arch, kernel_name):
+    """Pack aircc's artifacts (see ``_aircc_compile``) into hsaco bytes.
+
+    ``kernel_name`` is the string the packed kernel is looked up by at
+    dispatch time: the instance-qualified "<kernel>:<instance>" form
+    ``_extract_elf_kernel_name`` already produces for a full ELF (the exact
+    string XRT's own ELF launcher already looks its kernel up by), or the
+    plain Triton kernel name for PDI+insts -- packing and the later
+    ``hsa_executable_get_symbol_by_name`` only have to agree with each
+    other, not with any real ELF symbol.
+
+    Returns:
+        bytes: the packed hsaco.
+
+    Raises:
+        subprocess.CalledProcessError: if the packer rejects the artifacts
+            (e.g. ``kernel_name`` is not a kernel of the full ELF), or cannot
+            find xclbinutil/llvm-objcopy; its report is echoed to stderr.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        path = os.path.join(scratch, "kernel.hsaco")
+        if output_format == "elf":
+            kernel = [
+                "--kernel-elf",
+                artifacts["elf_path"],
+                "--kernel-elf-name",
+                kernel_name,
+            ]
+        else:
+            kernel = [
+                "--kernel-name",
+                kernel_name,
+                "--kernel-xclbin",
+                artifacts["bin_path"],
+                "--kernel-insts",
+                artifacts["insts_path"],
+            ]
+        # A subprocess, like aircc: the packer imports mlir-aie's MLIR bindings
+        # to find llvm-objcopy, and this process already holds mlir-air's LLVM.
+        # Two in one process abort on a command-line option registered twice.
+        _run_compile(
+            [sys.executable, "-m", "aie.compiler.hsaco.pack", "--hsaco", path]
+            + ["--arch", arch, *kernel]
+        )
+        return Path(path).read_bytes()
+
+
+def _hsaco_kernel_name(output_format, elf_kernel_name, pdi_kernel_name):
+    """The name ``_pack_hsaco`` looks the kernel up by: the full ELF's own
+    instance-qualified name for ``output_format == "elf"``, or the caller's own
+    (arbitrary) kernel name for a PDI + instruction sequence -- packing and the
+    later ``hsa_executable_get_symbol_by_name`` only have to agree with each
+    other.
+    """
+    return elf_kernel_name if output_format == "elf" else pdi_kernel_name
+
+
+def _cached_hsaco(cache, output_format, elf_kernel_name, pdi_kernel_name):
+    """The cached hsaco's ``(path, kernel_name)``, or ``None`` if it is missing.
+
+    Callers that already resolved the format-specific aircc artifacts
+    (xclbin/insts or elf/elf_kernel_name) from the cache ask this before
+    deciding to rebuild. ``None`` means those format-specific artifacts are
+    cached but the hsaco itself is not (e.g. a cache dir from before this
+    hsaco path existed), so the caller should treat that as a cache miss for
+    the hsaco alone, not for the format-specific artifacts it already has.
+    """
+    hsaco_path = cache.get_file("kernel.hsaco")
+    if hsaco_path is None:
+        return None
+    return hsaco_path, _hsaco_kernel_name(
+        output_format, elf_kernel_name, pdi_kernel_name
+    )
+
+
+def _pack_and_cache_hsaco(
+    cache, output_format, artifacts, npu_version, elf_kernel_name, pdi_kernel_name
+):
+    """Pack aircc's artifacts into an hsaco, cache it, and return ``(hsaco_path,
+    hsaco_kernel_name)``. ``elf_kernel_name``/``pdi_kernel_name`` are as for
+    ``_hsaco_kernel_name``.
+    """
+    arch = _NPU_VERSION_TO_ARCH[npu_version]
+    hsaco_kernel_name = _hsaco_kernel_name(
+        output_format, elf_kernel_name, pdi_kernel_name
+    )
+    hsaco_bytes = _pack_hsaco(output_format, artifacts, arch, hsaco_kernel_name)
+    hsaco_path = cache.put(hsaco_bytes, "kernel.hsaco", binary=True)
+    return hsaco_path, hsaco_kernel_name
+
+
 def compile_module(
     launcher_src,
     kernel_placeholder_name,
@@ -2517,8 +2615,7 @@ def compile_module(
     ``link_profile`` selects the runtime the generated launcher links against:
 
     * ``"xrt"``  -- XRT (xclbin/ELF); links xrt_coreutil + uuid.
-    * ``"hsa"``  -- HSA AIE dispatch via ROCR; links libhsa-runtime64. Requires
-      ``output_format == "pdi"``.
+    * ``"hsa"``  -- HSA AIE dispatch via ROCR; links libhsa-runtime64.
     """
     if link_profile not in ("xrt", "hsa"):
         raise ValueError(f"link_profile must be 'xrt' or 'hsa'; got {link_profile!r}")
@@ -2669,6 +2766,15 @@ def compile_module(
         filename = f"{name}.pyd" if IS_WINDOWS else f"{name}.so"
         cache_path = cache.get_file(filename)
         cached_artifacts = _get_cached_aircc_artifacts(cache, output_format)
+        if cached_artifacts is None:
+            # A compiled __npu_dispatch.so with no aircc artifacts behind it is
+            # unusable: cache_elf_path/cache_bin_path (and, under HSA,
+            # cache_hsaco_path/hsaco_kernel_name) are only set inside the
+            # `cached_artifacts is not None` block below, so leaving cache_path
+            # as a cache hit here would reach the final dispatch with those
+            # names never assigned -- an UnboundLocalError instead of a clean
+            # rebuild. Treat a partially-evicted cache dir as a full miss.
+            cache_path = None
         if cached_artifacts is not None:
             if output_format == "elf":
                 cache_elf_path = cached_artifacts["elf_path"]
@@ -2676,6 +2782,25 @@ def compile_module(
             else:
                 cache_bin_path = cached_artifacts["bin_path"]
                 cache_insts_path = cached_artifacts["insts_path"]
+            if link_profile == "hsa":
+                elf_kernel_name = None
+                if output_format == "elf":
+                    with open(cache_elf_kernel_path) as f:
+                        elf_kernel_name = f.read().strip()
+                cached_hsaco = _cached_hsaco(
+                    cache, output_format, elf_kernel_name, kernel_name
+                )
+                if cached_hsaco is None:
+                    # Force a real rebuild: cache_path gates that branch below,
+                    # not cached_artifacts, so both have to be cleared or a
+                    # cache dir with a compiled .so but no kernel.hsaco (e.g.
+                    # left over from before this hsaco path existed) would
+                    # still take the cache-hit branch and reach the final
+                    # dispatch with no cache_hsaco_path/hsaco_kernel_name set.
+                    cached_artifacts = None
+                    cache_path = None
+                else:
+                    cache_hsaco_path, hsaco_kernel_name = cached_hsaco
 
         if cache_path is None:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -2773,6 +2898,15 @@ def compile_module(
                 else:
                     cache_bin_path = cached_artifacts["bin_path"]
                     cache_insts_path = cached_artifacts["insts_path"]
+                if link_profile == "hsa":
+                    cache_hsaco_path, hsaco_kernel_name = _pack_and_cache_hsaco(
+                        cache,
+                        output_format,
+                        artifacts,
+                        npu_version,
+                        artifacts.get("elf_kernel_name"),
+                        kernel_name,
+                    )
                 with open(so_path, "rb") as f:
                     cache_path = cache.put(f.read(), filename, binary=True)
 
@@ -2810,7 +2944,12 @@ def compile_module(
             raise RuntimeError(f"Cannot find {name} module in {cache_path}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        if output_format == "elf":
+        if link_profile == "hsa":
+            hsaco_path_str = cache_hsaco_path
+            if IS_WINDOWS and hsaco_path_str.startswith("\\\\?\\"):
+                hsaco_path_str = hsaco_path_str[4:]
+            mod.set_paths(hsaco_path_str, hsaco_kernel_name)
+        elif output_format == "elf":
             # Read the cached kernel name
             with open(cache_elf_kernel_path) as f:
                 elf_kernel_name = f.read().strip()
@@ -2863,16 +3002,20 @@ class NPULauncher(object):
     def __init__(self, src, metadata, runtime="xrt"):
         """Build the host launcher for ``src`` targeting ``runtime``.
 
-        ``runtime`` is "xrt" (xclbin/ELF via XRT) or "hsa" (PDI + insts via
-        HSA/ROCR); it is bound by ``NPUDriver`` when it constructs the launcher.
+        ``runtime`` is "xrt" (xclbin/ELF via XRT) or "hsa" (hsaco-packed
+        PDI+insts or full ELF via HSA/ROCR); it is bound by ``NPUDriver`` when
+        it constructs the launcher.
         """
         constants, signature = extract_signature_and_constants(src)
         if runtime == "hsa":
-            # HSA consumes PDI + insts and links ROCR. Import lazily so the
-            # (large) HSA codegen module is only loaded when the HSA path is used.
+            # HSA consumes a packed hsaco (xclbin/PDI+insts or full ELF) and
+            # links ROCR. Import lazily so the (large) HSA codegen module is
+            # only loaded when the HSA path is used.
             from .hsa_launcher import _generate_hsa_launcher
 
-            self.output_format = "pdi"
+            # Detect output format the same way the XRT branch does: ELF for
+            # npu2, xclbin for npu1. Both are packed into an hsaco before dispatch.
+            self.output_format = _get_output_format(runtime=runtime)
             launcher_src = _generate_hsa_launcher(
                 constants,
                 signature,
@@ -2929,11 +3072,14 @@ def get_npu_cache_dir(compiled_kernel):
 
     The NPU backend stores hardware-specific artifacts in a separate cache
     directory from Triton's main compiler cache. Depending on the selected
-    output format, the directory contains either:
+    output format and link profile, the directory contains:
 
-    * xclbin output: ``aie.xclbin``, ``insts.bin``, and
+    * xclbin output (xrt): ``aie.xclbin``, ``insts.bin``, and
       ``__npu_dispatch.so``
-    * elf output: ``aie.elf``, ``elf_kernel_name.txt``, and
+    * elf output (xrt): ``aie.elf``, ``elf_kernel_name.txt``, and
+      ``__npu_dispatch.so``
+    * hsa (either output format, packed into one hsaco): the above
+      format-specific artifacts, plus ``kernel.hsaco`` and
       ``__npu_dispatch.so``
 
     This function returns the path to that directory.
@@ -3019,7 +3165,7 @@ class NPUDriver(DriverBase):
         ``runtime`` selects how kernels are dispatched:
 
         * ``"xrt"`` -- XRT (xclbin on npu1, ELF on npu2).
-        * ``"hsa"`` -- HSA/ROCR AIE dispatch (PDI + insts).
+        * ``"hsa"`` -- HSA/ROCR AIE dispatch (hsaco-packed PDI+insts or full ELF).
 
         Defaults to ``npu_config.runtime`` (the ``AMD_TRITON_NPU_RUNTIME`` env
         var, itself defaulting to ``"xrt"``), so ``NPUDriver()`` honors the

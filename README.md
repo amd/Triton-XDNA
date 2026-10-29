@@ -134,11 +134,14 @@ By default kernels are dispatched through XRT (xclbin on npu1, ELF on npu2). An 
 | Value | Behavior |
 | --- | --- |
 | `xrt` (default) | Dispatch via XRT; artifact is `xclbin` (npu1) or `elf` (npu2). |
-| `hsa` | Dispatch via HSA; the backend produces `pdi` + `insts.bin` and launches them on the AIE agent. |
+| `hsa` | Dispatch via HSA; the backend packs the same artifact into an hsaco (HSA code object), loads it through ROCR, and dispatches it on the AIE agent by kernel object. |
 
-Under HSA the output format is `pdi`. The HSA runtime is Linux-only and requires
-an **AIE-capable ROCR** — one that provides the AIE dispatch extension header
-(`include/hsa/hsa_ext_amd_aie.h`) and `libhsa-runtime64`.
+Under HSA the output format is the same as under XRT (`xclbin` on npu1, `elf`
+on npu2); `pdi` is refused, because the packer reads the partition's column
+count from the xclbin or ELF. Packing runs mlir-aie's `aie-hsaco`
+(`aie.compiler.hsaco.pack`). The HSA runtime is Linux-only and requires an
+**AIE-capable ROCR** that loads AIE hsacos and provides the AIE dispatch
+extension header (`include/hsa/hsa_ext_amd_aie.h`) and `libhsa-runtime64`.
 
 Install the pinned one from [TheRock](https://github.com/ROCm/TheRock)'s nightly
 ROCm wheels; the backend picks it up automatically, with no environment
@@ -152,10 +155,9 @@ pip install "triton-xdna[hsa]" \
 
 `rocm-sdk-core` is the only package needed — it carries both the headers and
 `libhsa-runtime64`. The pin in `utils/rocm-requirements.txt` is a nightly with
-everything the HSA path uses, including the device-address reporting the
-full-ELF decode needs; an older one falls back to the patched-stream decode,
-and one from before 2026-07-16 aborts at dispatch. The
-older indexes no longer receive builds but still resolve under pip:
+everything the HSA path uses; an older one may fail to build the HSA runtime,
+give wrong results on repeated full-ELF dispatches, or refuse to load the
+decode. The older indexes no longer receive builds but still resolve under pip:
 `https://rocm.nightlies.amd.com/whl-multi-arch/` stopped at 2026-08-22, and the
 per-GPU-family indexes (`https://rocm.nightlies.amd.com/v2/<target>/`) install a
 runtime too old to work.
