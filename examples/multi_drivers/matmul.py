@@ -79,8 +79,10 @@ def bench_matmul(M, N, K, provider):
             BLOCK_SIZE_N=256,
             BLOCK_SIZE_K=K,
         )
-        with open("tt.shared.mlir", "w") as f:
-            f.write(str(compiled_kernel.asm["ttsharedir"]))
+        # Only the NPU backend lowers through triton-shared.
+        if "ttsharedir" in compiled_kernel.asm:
+            with open("tt.shared.mlir", "w") as f:
+                f.write(str(compiled_kernel.asm["ttsharedir"]))
         if provider == "test":
             torch.testing.assert_close(c, c_ref, atol=1e1, rtol=1e-1)
 
