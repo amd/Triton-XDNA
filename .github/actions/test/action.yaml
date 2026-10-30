@@ -246,8 +246,8 @@ runs:
         # are silent. air-opt on fixtures; no NPU, no weights.
         python3 scripts/test_fold_add_into_matmul_init.py
 
-        # Switching Triton's active driver between the NPU and the iGPU. No
-        # NPU needed; the iGPU checks run only where torch sees one.
+        # Switching Triton's active driver between the NPU, the iGPU and the
+        # CPU. No NPU needed; the iGPU checks run only where torch sees one.
         python3 scripts/test_driver_scope.py
 
         if [ "$DEVICE" = "aie2p" ]; then
