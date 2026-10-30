@@ -250,6 +250,10 @@ runs:
         # CPU. No NPU needed; the iGPU checks run only where torch sees one.
         python3 scripts/test_driver_scope.py
 
+        # The host side of the NPU prefills, as Triton kernels on triton-cpu,
+        # against numpy at Gemma4-E2B's shapes. No NPU, no weights.
+        ( cd examples/llm_q4nx && python3 test_host_kernels.py )
+
         if [ "$DEVICE" = "aie2p" ]; then
           # Which decode artifact the example asks mlir-air for. Needs no NPU,
           # no weights and no mlir-air sources, so it runs before the fetch and
