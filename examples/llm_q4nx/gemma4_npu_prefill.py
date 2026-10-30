@@ -236,10 +236,15 @@ class NpuPrefill:
 
     def prefill(self, ids):
         self.resume()
-        ids = np.ascontiguousarray(np.asarray(ids).reshape(-1), np.int32)
+        ids = np.asarray(ids).reshape(-1)
         n = len(ids)
         if n > self.max_len:
             raise ValueError(f"a {n}-token prompt exceeds max_len {self.max_len}")
+        # the embedding gathers index the tables with these unchecked
+        bad = ids[(ids < 0) | (ids >= C.VOCAB)]
+        if bad.size:
+            raise ValueError(f"token ids outside [0, {C.VOCAB}): {bad[:8].tolist()}")
+        ids = np.ascontiguousarray(ids, np.int32)
         with driver_scope("cpu"):
             return self._prefill(ids, n)
 
