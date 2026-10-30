@@ -3,7 +3,7 @@
 
 """Gemma4-E2B's fused one-device NPU prefill, every op from Triton.
 
-Every op of a 128-token chunk runs on one device: each GEMM shape from
+Every op of a chunk runs on one device: each GEMM shape from
 `gemma4_gemm.mm_g` and both attention ops from `gemma4_attention.attn`,
 linked into one module by `FusedDevice`, a runtime sequence per op. The LM
 head is `gemma4_lm_gemv.gemv_q4` on a device of its own. `gemma4_npu_prefill`
@@ -63,8 +63,8 @@ FILES = ("fused_prefill.xclbin", "fused_prefill.txn.h", "lm.xclbin", "lm.insts.b
 #: Rows of a chunk.
 M = G.M
 HEADS = C.N_Q_HEADS
-#: The attention groups: full attention (head_dim 512) and sliding (256),
-#: each op splitting its heads over columns 0 and 7, whose cores run both.
+#: The attention groups: each op, full and sliding-window attention, splits
+#: its heads over two columns, whose cores run both ops.
 GROUPS = {
     "f0": A.Attn(col=0, dh=C.DH_GLOBAL, lkp=16),
     "s0": A.Attn(col=0, dh=C.DH_SLIDING, lkp=32),

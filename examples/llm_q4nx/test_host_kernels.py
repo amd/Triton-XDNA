@@ -3,10 +3,10 @@
 
 """host_kernels against numpy, at Gemma4-E2B's shapes, on triton-cpu.
 
-f32 results are checked to a relative 1e-5 and bf16 results to one bf16 ulp
-(the kernels and numpy round the same f32 values, but the f32 values can
-differ in the last bits, and where terms cancel that is all there is). Layout bytes the kernels must leave alone are
-checked untouched. Runs as a script; needs no NPU.
+f32 results are checked to a relative 1e-5. bf16 results are checked to one
+bf16 ulp, plus a floor for values that cancel to near zero, where the last
+f32 bits are all that differ. The bytes of a layout a kernel must leave alone
+are checked untouched. Runs as a script; needs no NPU.
 """
 
 import sys
@@ -32,8 +32,8 @@ def check(ok, what):
 def close(got, ref, what, bf16=False):
     got, ref = np.asarray(got, np.float32), np.asarray(ref, np.float32)
     if bf16:
-        # one bf16 ulp of the reference, and f32 rounding of the terms where
-        # they cancel (RoPE's a * cos - b * sin can land next to zero)
+        # one bf16 ulp, and the f32 rounding of terms that cancel: RoPE's
+        # a * cos - b * sin can land next to zero
         tol = np.abs(ref) * 2.0**-7 + 1e-6 * float(np.abs(ref).max(initial=0.0))
         ok = bool(np.all(np.abs(got - ref) <= tol))
     else:

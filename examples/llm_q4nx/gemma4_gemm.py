@@ -1,14 +1,13 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Gemma4 prefill GEMM on packed weights.
+"""Gemma4 prefill GEMM, `mm_g`, on weights packed by `pack_q4` (int4) or
+`pack_bf16`.
 
-int4 (pack_q4: one 5120-byte packet per 64 columns and 128 K) or bf16
-(pack_bf16: one per 64 columns and 32 K), laid out as mlir-air's fused
-prefill GEMM herd reads them: two K loops, one of them zero-trip by `wq`, a
-K pair (256 K) per trip.
-Both stream their packets as packet pairs, which the cores take one packet at
-a time.
+A packet holds TN columns of the weights: an int4 packet TK of K, a bf16
+packet TK / 4. `mm_g` has a K loop for each format, one of them zero-trip by
+`wq`, two K steps a trip. Both stream their packets in pairs, which the cores
+take one packet at a time.
 """
 
 import triton

@@ -6,8 +6,7 @@
 Between the device's GEMMs and attention the host normalizes, rotates,
 multiplies and adds rows, and each result goes straight into the layout the
 next device op reads: a GEMM's A tiles, attention's q blocks, a layer's KV
-records. Each kernel here is one such step, so no separate reorder pass runs
-between them.
+records. Each kernel here is one such step.
 
 Arguments are numpy arrays, including views of mapped device buffers, passed
 through `Ptr`. Launch inside `driver_scope("cpu")`.

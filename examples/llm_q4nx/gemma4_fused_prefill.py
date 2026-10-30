@@ -133,7 +133,7 @@ class Gemma4FusedPrefill(Gemma4Prefill):
 
 class Gemma4TritonFusedPrefill(Gemma4FusedPrefill):
     """`Gemma4FusedPrefill` on the devices `gemma4_triton_fused` builds,
-    run by `gemma4_npu_prefill` instead of mlir-air's runtime."""
+    run by `gemma4_npu_prefill`."""
 
     ENGINE = "triton-fused"
 
