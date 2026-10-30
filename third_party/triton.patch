@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index efd8392b25..06ba410d5f 100644
+index 90321e2f7..e7dfce040 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -327,6 +327,13 @@ if(TRITON_BUILD_PYTHON_MODULE)
+@@ -330,6 +330,13 @@ if(TRITON_BUILD_PYTHON_MODULE)
      set(Python_VERSION "${Python3_VERSION}")
      set(Python_INTERPRETER_ID "${Python3_INTERPRETER_ID}")
    endif()
@@ -17,7 +17,7 @@ index efd8392b25..06ba410d5f 100644
    find_package(nanobind CONFIG REQUIRED HINTS "${Python3_SITELIB}")
    nanobind_build_library(nanobind-static)
 diff --git a/include/triton/Dialect/Triton/IR/Traits.h b/include/triton/Dialect/Triton/IR/Traits.h
-index 392436308b..21ff88021e 100644
+index 392436308..21ff88021 100644
 --- a/include/triton/Dialect/Triton/IR/Traits.h
 +++ b/include/triton/Dialect/Triton/IR/Traits.h
 @@ -21,7 +21,15 @@ namespace impl {
@@ -37,11 +37,32 @@ index 392436308b..21ff88021e 100644
  
  LogicalResult verifyTensorSize(Operation *op);
  LogicalResult verifyTensorLayouts(Operation *op);
+diff --git a/python/src/main.cc b/python/src/main.cc
+index c0b99994d..bd16cb581 100644
+--- a/python/src/main.cc
++++ b/python/src/main.cc
+@@ -9,11 +9,14 @@ namespace py = nanobind;
+ #define FOR_EACH_3(MACRO, X, ...) MACRO(X) FOR_EACH_2(MACRO, __VA_ARGS__)
+ #define FOR_EACH_4(MACRO, X, ...) MACRO(X) FOR_EACH_3(MACRO, __VA_ARGS__)
+ #define FOR_EACH_5(MACRO, X, ...) MACRO(X) FOR_EACH_4(MACRO, __VA_ARGS__)
++#define FOR_EACH_6(MACRO, X, ...) MACRO(X) FOR_EACH_5(MACRO, __VA_ARGS__)
++#define FOR_EACH_7(MACRO, X, ...) MACRO(X) FOR_EACH_6(MACRO, __VA_ARGS__)
++#define FOR_EACH_8(MACRO, X, ...) MACRO(X) FOR_EACH_7(MACRO, __VA_ARGS__)
+ 
+ #define FOR_EACH_NARG(...) FOR_EACH_NARG_(__VA_ARGS__, FOR_EACH_RSEQ_N())
+ #define FOR_EACH_NARG_(...) FOR_EACH_ARG_N(__VA_ARGS__)
+-#define FOR_EACH_ARG_N(_1, _2, _3, _4, _5, N, ...) N
+-#define FOR_EACH_RSEQ_N() 5, 4, 3, 2, 1, 0
++#define FOR_EACH_ARG_N(_1, _2, _3, _4, _5, _6, _7, _8, N, ...) N
++#define FOR_EACH_RSEQ_N() 8, 7, 6, 5, 4, 3, 2, 1, 0
+ 
+ #define CONCATENATE(x, y) CONCATENATE1(x, y)
+ #define CONCATENATE1(x, y) x##y
 diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
-index 82d1f8e2da..f3f3d57be9 100644
+index f18750b46..80796f3a9 100644
 --- a/python/triton/runtime/autotuner.py
 +++ b/python/triton/runtime/autotuner.py
-@@ -124,7 +124,7 @@ class Autotuner(KernelInterface):
+@@ -139,7 +139,7 @@ class Autotuner(KernelInterface):
              )
              return
  
@@ -50,7 +71,7 @@ index 82d1f8e2da..f3f3d57be9 100644
      def do_bench(self):
          if self._do_bench is None:
              return driver.active.get_benchmarker()
-@@ -225,6 +225,8 @@ class Autotuner(KernelInterface):
+@@ -240,6 +240,8 @@ class Autotuner(KernelInterface):
                  if hasattr(arg, "dtype"):
                      key.append(str(arg.dtype))
              key = tuple(key)

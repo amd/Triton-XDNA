@@ -14,8 +14,21 @@ index 5c256d4..9a8d96e 100644
  endif()
  
  # Add symlinks to selected pytest files in triton. The tests are imported into triton-shared’s test folder to
+diff --git a/backend/compiler.py b/backend/compiler.py
+index 1d2b3cb..bf5b841 100644
+--- a/backend/compiler.py
++++ b/backend/compiler.py
+@@ -118,7 +118,7 @@ class CPUBackend(BaseBackend):
+ 
+     @staticmethod
+     def supports_target(target: GPUTarget):
+-        return target.backend == 'cpu'
++        return target.backend == 'triton_shared_cpu'
+ 
+     def __init__(self, target: GPUTarget) -> None:
+         super().__init__(target)
 diff --git a/backend/driver.py b/backend/driver.py
-index a4ac9ef..69f50b3 100644
+index a4ac9ef..b382d69 100644
 --- a/backend/driver.py
 +++ b/backend/driver.py
 @@ -9,6 +9,7 @@ import subprocess
@@ -26,7 +39,18 @@ index a4ac9ef..69f50b3 100644
  
  from pathlib import Path
  
-@@ -461,9 +462,56 @@ class CPUDriver(DriverBase):
+@@ -432,6 +433,10 @@ class CPUUtils(object):
+           "mem_bus_width": None
+         }
+ 
++    @staticmethod
++    def unload_module(module):
++        """Nothing to release: load_binary keeps no module."""
++
+     # Important note:
+     # Since we cannot easy pass function pointers around, we pass along the
+     # obj of the kernel so that compile_module above can recompile the
+@@ -461,9 +466,56 @@ class CPUDriver(DriverBase):
      def is_active():
          return False
  
@@ -85,6 +109,15 @@ index a4ac9ef..69f50b3 100644
  
      def get_device_capability(self):
          return ("cpu", 0)
+@@ -481,7 +533,7 @@ class CPUDriver(DriverBase):
+         return
+ 
+     def get_current_target(self):
+-        return GPUTarget("cpu", 0, 0)
++        return GPUTarget("triton_shared_cpu", 0, 0)
+ 
+     def get_active_torch_device(self):
+         import torch
 diff --git a/include/triton-shared/Analysis/UseAnalysis.h b/include/triton-shared/Analysis/UseAnalysis.h
 index d4e6675..98a8034 100644
 --- a/include/triton-shared/Analysis/UseAnalysis.h
@@ -97,6 +130,32 @@ index d4e6675..98a8034 100644
    }
  
    ChangeResult meet(const AbstractSparseLattice &other) override {
+diff --git a/include/triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp b/include/triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp
+index f8e066a..3f84013 100644
+--- a/include/triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp
++++ b/include/triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp
+@@ -933,21 +933,6 @@ struct PreciseDivConverter : public OpConversionPattern<triton::PreciseDivFOp> {
+   }
+ };
+ 
+-struct CatConverter : public OpConversionPattern<triton::CatOp> {
+-  using OpConversionPattern<triton::CatOp>::OpConversionPattern;
+-
+-  LogicalResult
+-  matchAndRewrite(triton::CatOp op, OpAdaptor adaptor,
+-                  ConversionPatternRewriter &rewriter) const override {
+-    auto replacement = tensor::ConcatOp::create(
+-        rewriter, op.getLoc(), 0 /* concat dimension */, adaptor.getOperands());
+-
+-    rewriter.replaceOp(op, replacement);
+-
+-    return success();
+-  }
+-};
+-
+ struct SplitConverter : public OpConversionPattern<triton::SplitOp> {
+   using OpConversionPattern<triton::SplitOp>::OpConversionPattern;
+ 
 diff --git a/lib/Analysis/PtrAnalysis.cpp b/lib/Analysis/PtrAnalysis.cpp
 index d2e8e77..35a9d88 100644
 --- a/lib/Analysis/PtrAnalysis.cpp
@@ -110,6 +169,34 @@ index d2e8e77..35a9d88 100644
  };
  
  void PtrAnalysis::rewriteForOp(
+diff --git a/lib/Conversion/TritonArithToLinalg/TritonArithToLinalg.cpp b/lib/Conversion/TritonArithToLinalg/TritonArithToLinalg.cpp
+index 2359a27..97ea2dd 100644
+--- a/lib/Conversion/TritonArithToLinalg/TritonArithToLinalg.cpp
++++ b/lib/Conversion/TritonArithToLinalg/TritonArithToLinalg.cpp
+@@ -68,7 +68,6 @@ void mlir::triton::populateTritonArithToLinalgConversionPatterns(
+   patterns.add<MulHiUIOpConverter>(patterns.getContext());
+   patterns.add<PreciseSqrtConverter>(patterns.getContext());
+   patterns.add<PreciseDivConverter>(patterns.getContext());
+-  patterns.add<CatConverter>(patterns.getContext());
+   patterns.add<SplitConverter>(patterns.getContext());
+   patterns.add<JoinConverter>(patterns.getContext());
+   patterns.add<FpToFpConverter>(patterns.getContext());
+diff --git a/lib/Conversion/TritonToUnstructured/TritonToUnstructuredPass.cpp b/lib/Conversion/TritonToUnstructured/TritonToUnstructuredPass.cpp
+index 7941b4b..4c28596 100644
+--- a/lib/Conversion/TritonToUnstructured/TritonToUnstructuredPass.cpp
++++ b/lib/Conversion/TritonToUnstructured/TritonToUnstructuredPass.cpp
+@@ -533,11 +533,6 @@ public:
+ 
+                   return success();
+                 })
+-                .Case<triton::CatOp>([](triton::CatOp op) {
+-                  op->emitError("Do not support gather / scatter with multiple "
+-                                "bases yet");
+-                  return failure();
+-                })
+                 .Default([&](Operation *op) {
+                   op->emitError("unexpected op in ptr sequence");
+                   return failure();
 diff --git a/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt b/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt
 index 904e6a1..485cb7a 100644
 --- a/lib/Sanitizer/SanitizerAttributes/CMakeLists.txt
