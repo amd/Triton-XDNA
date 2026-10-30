@@ -1,7 +1,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""`fused_device`'s rewrite of a kernel's func before it joins the device.
+"""`fused_device`'s rewrite of a kernel's func before it joins the device,
+and how the ops' modules are linked into one.
 
 Its int arguments are bound to the op's values, and the scalars nothing reads
 any more are erased from the func and its type, so the op's runtime sequence
@@ -12,19 +13,16 @@ parameter list.
 """
 
 import contextlib
-import os
-import sys
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from air.ir import ArrayAttr, Context, FunctionType, Module, TypeAttr
 
-from air.ir import ArrayAttr, Context, FunctionType, Module, TypeAttr  # noqa: E402
-
-from fused_device import (  # noqa: E402
+from triton.backends.amd_triton_npu.fused_device import (
     FusedDevice,
     _bind_ints,
     _drop_unused_scalars,
     _entry,
+    _link,
     _ops_named,
     _set_multiplexing,
     _shift_buffers,
@@ -290,6 +288,33 @@ def test_prebuilt_op_with_other_buffers_rejected():
     dev = _dev(("a", "ka", _op(3)), ("p", None, _op(2, at=5)))
     with _raises("other buffers"):
         dev.module_text()
+
+
+LINKED = """
+func.func private @kern(memref<4xf32>)
+func.func @%NAME%(%a: memref<4xf32>) {
+  func.call @kern(%a) : (memref<4xf32>) -> ()
+  return
+}
+"""
+
+
+def test_link_keeps_shared_declarations_once():
+    text = _link([LINKED.replace("%NAME%", n) for n in ("a", "b")])
+    with Context():
+        names = [
+            str(op.attributes["sym_name"]) for op in Module.parse(text).body.operations
+        ]
+    assert names == ['"kern"', '"a"', '"b"'], names
+
+
+def test_link_rejects_conflicting_declarations():
+    other = LINKED.replace("%NAME%", "b").replace(
+        "func.func private @kern(memref<4xf32>)",
+        'func.func private @kern(memref<4xf32>) attributes {link_with = "b.o"}',
+    )
+    with _raises("differently"):
+        _link([LINKED.replace("%NAME%", "a"), other])
 
 
 if __name__ == "__main__":

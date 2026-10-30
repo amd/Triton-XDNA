@@ -1,12 +1,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Gemma4-E2B's LM head as a Triton GEMV on the buffers of mlir-air's
-`lm_gemv` device.
+"""Gemma4-E2B's LM head as a Triton GEMV on a device of its own.
 
 y[V] = W[V, K] x[K] with Q4NX weights (w = q * scale + min). W is in
-`lm_gemv.pack`'s stream order, x is bf16 [K], and y is laid out the way
-`lm_gemv.unpack_y` reads it. Each of NC x NR cores owns TILES row tiles of GN
+`pack`'s stream order, x is bf16 [K], and y is laid out the way `unpack_y`
+reads it. Each of NC x NR cores owns TILES row tiles of GN
 rows and takes a row tile's K in KC packets of GK inputs. A packet is
 
     q      [GN/8][GK/8][8 k][8 n] nibbles, two per byte, low first
@@ -20,6 +19,43 @@ over the 8 n of its k tile, and folds the 8 k when the row tile is done.
 
 import triton
 import triton.language as tl
+
+#: the logits and the model dim
+V, K = 262144, 1536
+#: columns, and cores per column
+NC, NR = 8, 4
+#: rows of a row tile and inputs of a packet
+GN, GK = 64, 256
+KC = K // GK
+ROWS = V // (NC * NR)
+TILES = ROWS // GN
+#: row tiles per output flush
+FLUSH = 16
+
+
+def pack(q, scale, mn):
+    """int4 [V, K] as (q, scale, min per 32 in) -> the weight stream, uint8
+    [NC, ...]: per column, for each row tile and K packet, its NR cores'
+    packets. Core (c, r) owns rows (c * NR + r) * ROWS + [0, ROWS)."""
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    qt = q.reshape(NC, NR, TILES, GN // 8, 8, KC, GK // 8, 8)
+    qt = qt.transpose(0, 2, 5, 1, 3, 6, 7, 4).reshape(NC, TILES, KC, NR, -1)
+    qb = (qt[..., 0::2] | (qt[..., 1::2] << 4)).astype(np.uint8)
+
+    def groups(a):
+        a = np.asarray(a, bfloat16).reshape(NC, NR, TILES, GN, KC, GK // 32)
+        a = a.transpose(0, 2, 4, 1, 5, 3).reshape(NC, TILES, KC, NR, -1)
+        return a.view(np.uint8)
+
+    return np.concatenate([qb, groups(scale), groups(mn)], axis=-1).reshape(NC, -1)
+
+
+def unpack_y(y):
+    """The output [NC, TILES / FLUSH, NR, FLUSH * GN] -> logits [V]."""
+    y = y.reshape(NC, TILES // FLUSH, NR, FLUSH * GN).transpose(0, 2, 1, 3)
+    return y.reshape(V)
 
 
 @triton.jit
@@ -133,12 +169,10 @@ def gemv_q4(
             tl.store(out, y.reshape(NC, NR, GN))
 
 
-def args(lm_gemv, w, x, y, run=2):
-    """gemv_q4's arguments for the shape of mlir-air's `lm_gemv` module: w is
-    `lm_gemv.pack`'s uint8 stream, x bf16 [K], y bf16 as `lm_gemv.unpack_y`
-    reads it. `run`: packets per x part and per load."""
+def args(w, x, y, run=2):
+    """gemv_q4's arguments: w is `pack`'s uint8 stream, x bf16 [K], y bf16 as
+    `unpack_y` reads it. `run`: packets per x part and per load."""
     import torch
 
-    L = lm_gemv
-    shape = (L.NC, L.NR, L.TILES, L.FLUSH, L.KC, L.GN, L.GK, run)
+    shape = (NC, NR, TILES, FLUSH, KC, GN, GK, run)
     return (w.view(torch.int16), x, y, *shape)

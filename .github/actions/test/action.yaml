@@ -250,6 +250,11 @@ runs:
         # CPU. No NPU needed; the iGPU checks run only where torch sees one.
         python3 scripts/test_driver_scope.py
 
+        # How a Triton kernel's func is rewritten before it joins a fused
+        # device, and how the device module is put together. No NPU, no
+        # weights.
+        python3 scripts/test_fused_device.py
+
         # The host side of the NPU prefills, as Triton kernels on triton-cpu,
         # against numpy at Gemma4-E2B's shapes. No NPU, no weights.
         ( cd examples/llm_q4nx && python3 test_host_kernels.py )
@@ -299,10 +304,6 @@ runs:
             echo "SKIP: Q4NX examples (mlir-air sources unavailable)"
           else
             q_fail=0
-            # How a Triton kernel's func is rewritten before it joins the fused
-            # prefill device, and how the device module is put together. No
-            # NPU and no weights: the fetched sources only.
-            ( cd examples/llm_q4nx && python3 test_fused_device.py ) || q_fail=1
 
             # Every prefill/decode placement of each model; see the script for
             # which models and cases each scope runs.

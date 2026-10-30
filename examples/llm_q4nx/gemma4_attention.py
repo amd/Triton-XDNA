@@ -5,11 +5,10 @@
 
 Flash attention over one chunk's queries, round by round (a round is one
 head's R = NQT * LKP q rows), against nk K blocks of the KV buffer. The
-buffers are those of mlir-air's runtime with the manifest's "attn_format"
-"bf16", all in 8x8 blocks, each row-major: Q and O [rounds * R, DH] as blocks
-[rounds * R / 8, DH / 8], and KV as records of a K tile's blocks
-[LKP / 8, DH / 8] followed by its V tile's in "attn_v_chunks" column chunks
-of DVT, each [LKP / 8, DVT / 8]. nk, q0 and k0 (the chunk's first q block and
+buffers are all in 8x8 blocks, each row-major: Q and O [rounds * R, DH] as
+blocks [rounds * R / 8, DH / 8], and KV as records of a K tile's blocks
+[LKP / 8, DH / 8] followed by its V tile's in `v_chunks` column chunks of DVT,
+each [LKP / 8, DVT / 8]. nk, q0 and k0 (the chunk's first q block and
 first K block, in LKP rows) are the op's run-time arguments.
 
 Numerics: S in bf16, the row maximum and the masks on bf16 values, the
@@ -19,12 +18,28 @@ added to P V in f32 each block.
 
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 import triton
 import triton.language as tl
 
 LOG2E = 1.4426950408889634
 NQT = tl.constexpr(4)  # cores of an attention column, LKP q rows each
+
+
+class Attn(NamedTuple):
+    """One attention group, on the cores of column `col`. `lkp` is both the K
+    block and a core's q tile. Groups on one column share its cores. With
+    kv_heads > 1 the op's heads are kv_heads groups of heads / kv_heads, and
+    each KV head's records sit max_blocks blocks apart."""
+
+    col: int
+    dh: int
+    lkp: int
+    kv_heads: int = 1
+    max_blocks: int = 0
+
+
 SCHEDULE = Path(__file__).resolve().parent / "transform_gemma4_attention_aie2p.mlir.in"
 
 
@@ -389,9 +404,9 @@ def dvt(dh):
     return dh // 4
 
 
-def v_chunks(cfg):
+def v_chunks(groups):
     """The column chunks of V in a KV record, the same for every group."""
-    (n,) = {g.dh // dvt(g.dh) for g in cfg.attn.values()}
+    (n,) = {g.dh // dvt(g.dh) for g in groups}
     return n
 
 

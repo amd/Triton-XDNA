@@ -132,7 +132,21 @@ class Gemma4FusedPrefill(Gemma4Prefill):
 
 
 class Gemma4TritonFusedPrefill(Gemma4FusedPrefill):
-    """`Gemma4FusedPrefill` on the devices whose GEMMs and LM head are
-    Triton's (`gemma4_triton_fused`)."""
+    """`Gemma4FusedPrefill` on the devices `gemma4_triton_fused` builds,
+    run by `gemma4_npu_prefill` instead of mlir-air's runtime."""
 
     ENGINE = "triton-fused"
+
+    def __init__(self, build_dir, *a, **kw):
+        from gemma4_npu_prefill import NpuPrefill
+
+        kw.setdefault("backend", "cpu")
+        Gemma4Prefill.__init__(self, *a, **kw)
+        self._rows = min(self.kv_attn_maxl, self.max_seq)
+        self._fused = NpuPrefill(
+            build_dir, max_len=self._rows, kv_store=self._store_kv_rows
+        )
+
+    def load_weights(self, model=None):
+        Gemma4Prefill.load_weights(self, model)
+        self._fused.load_weights(model or self.model)
