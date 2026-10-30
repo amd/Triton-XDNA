@@ -5,13 +5,16 @@
 # libLLVM.so.23. When a script imports torch before triton (as every example
 # does), ROCm's LLVM wins the global namespace and air's constructor binds the
 # wrong globals and segfaults (issue #102). Load air's bindings with
-# RTLD_DEEPBIND so air resolves its own LLVM regardless of torch.
+# RTLD_DEEPBIND so air resolves its own LLVM regardless of torch, and keep them
+# out of the global namespace: a ROCm libLLVM loaded after them would
+# otherwise register its options into air's LLVM and abort ("Option 'fast'
+# already exists").
 try:
     import os
     import sys
 
     _prev_flags = sys.getdlopenflags()
-    sys.setdlopenflags(os.RTLD_NOW | os.RTLD_GLOBAL | os.RTLD_DEEPBIND)
+    sys.setdlopenflags(os.RTLD_NOW | os.RTLD_DEEPBIND)
     try:
         import air._mlir_libs._mlir  # noqa: F401
     finally:
