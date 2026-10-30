@@ -417,12 +417,12 @@ def _hsa_kv_sink(dec, spec):
 def _xrt_kv_sink(dec, spec):
     """A KV slab in pages XRT and HIP share, attached to the XRT decoder.
 
-    One row per decoder layer. The prefiller drivers keep their geometry on
-    an `fd` module and keep no host mirror of the cache, so the slab is synced
-    to the device explicitly after the prefill. The others use `dec.KV` as the
-    host mirror and write it to the device on their first dispatch, so `KV`
-    must point at the slab; otherwise that first write would overwrite the
-    prefill's K/V with the decoder's own empty cache.
+    One row per decoder layer. The prefill writes the slab through the
+    host's mapping, so it is synced to the device after the prefill, for every
+    driver: the device reads the slab's pages, and without the sync it reads
+    whatever of the prefill's K/V the CPU cache has written back so far. The
+    drivers other than the prefiller ones use `dec.KV` as the host mirror of
+    the cache, so `KV` points at the slab too.
     """
     import torch
     from triton.backends.amd_triton_npu import shared
@@ -442,11 +442,12 @@ def _xrt_kv_sink(dec, spec):
     elf = getattr(dec, "_elfdec", None)
     if elf is not None:
         elf.run.set_arg(4, dec.kvc)
-    if api == "prefiller":
-        publish = lambda P: dec.kvc.sync(dec.TO)  # noqa: E731
-    else:
+    if api != "prefiller":
         dec.KV = host
-        publish = lambda P: None  # noqa: E731
+    import pyxrt
+
+    to_device = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+    publish = lambda P: slab.bo.sync(to_device)  # noqa: E731
     sink = {
         "buf": host.reshape(-1),
         "region_w": geom.REGION_W,
@@ -489,6 +490,11 @@ def generate_zero_copy(air, spec, cfg, prefill_cls, args, ids, runtime):
     prefiller.bind_kv_sink(sink)
 
     sink["buf"][:] = 0
+    if runtime == "xrt":
+        # The zeros reach memory before the prefill writes: an iGPU prefill
+        # writes the pages directly, and a dirty line of zeros left in the
+        # CPU's cache would be written back over its K/V later.
+        publish(0)
     prefiller.clear_context()
     t0 = time.time()
     logits = np.asarray(prefiller.prefill(list(ids)), np.float32)
