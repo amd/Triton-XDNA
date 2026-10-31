@@ -50,7 +50,13 @@ def _make(kind):
     if kind not in _made:
         from triton.backends import backends
 
-        _made[kind] = backends[_BACKEND[kind]].driver()
+        d = backends[_BACKEND[kind]].driver()
+        if kind == "cpu":
+            # Host kernels on a FusedProgram's buffers keep them coherent.
+            from .fused_program import host_launcher
+
+            d.launcher_cls = host_launcher(d.launcher_cls)
+        _made[kind] = d
     return _made[kind]
 
 
