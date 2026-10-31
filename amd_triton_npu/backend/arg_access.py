@@ -7,7 +7,8 @@ Read from the kernel's TTIR, where helper functions are inlined: each store
 and atomic is traced back from its address through pointer-typed values
 (`tt.addptr`'s base, `tt.splat`, `tt.broadcast`, ...) to the kernel's
 arguments. An address that cannot be traced that way, such as a pointer
-carried through a loop, makes the answer "every pointer argument".
+carried through a loop or chosen by a branch (the result of an op with
+regions), makes the answer "every pointer argument".
 """
 
 import os
@@ -61,7 +62,8 @@ def written_args(ttir, names):
                 out.add(args[v.id()])
                 continue
             op = producer.get(v.id())
-            if op is None:
+            # a loop or branch result is whatever its regions yield
+            if op is None or op.get_num_regions():
                 return None
             ptrs = [
                 op.get_operand(i)

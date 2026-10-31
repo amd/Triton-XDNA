@@ -35,8 +35,20 @@ import numpy as np
 from .arg_access import written_args
 from .npu_runner import Device, sub_bo, sync_from, sync_to
 
-#: Arguments Triton passes a launcher ahead of the kernel's own.
+#: Arguments Triton passes a launcher ahead of the kernel's own; the grid
+#: comes first.
 _LAUNCH_PREFIX = 9
+#: The host's cache line: the host and the device each write whole lines
+#: back, so who touches a buffer is tracked at this granularity.
+LINE = 64
+
+
+def _add_range(ranges, lo, hi):
+    """Record bytes [lo, hi) in `ranges`, dropping the ranges it covers."""
+    if any(a <= lo and hi <= b for a, b in ranges):
+        return
+    ranges[:] = [(a, b) for a, b in ranges if not (lo <= a and b <= hi)]
+    ranges.append((lo, hi))
 
 
 class _Storage:
@@ -45,6 +57,7 @@ class _Storage:
     def __init__(self, device, nbytes):
         self.bo = device.bo(nbytes, 0)
         self.nbytes = nbytes
+        self.size = self.bo.size()
         self.addr = np.frombuffer(self.bo.map(), np.uint8).ctypes.data
         self.subs = {}  # offset -> sub-buffer starting there
         self.host_dirty = []  # byte ranges the host wrote since the last sync
@@ -94,7 +107,9 @@ class Buffer:
         self.strides = tuple(reversed(strides))
         self.nbytes = n
         self.size = n // self.itemsize
-        self.lo, self.hi = offset, offset + n
+        # the lines the buffer's bytes lie on
+        self.lo = offset // LINE * LINE
+        self.hi = min(-(-(offset + n) // LINE) * LINE, storage.size)
         # what Triton specializes a pointer on
         self.dtype = self.np_dtype.name
         self._views = {}
@@ -139,7 +154,7 @@ class Buffer:
             self.storage.bo.map(), self.np_dtype, self.size, self.offset
         ).reshape(self.shape)
         if write:
-            self.storage.host_dirty.append((self.lo, self.hi))
+            _add_range(self.storage.host_dirty, self.lo, self.hi)
         return a
 
 
@@ -224,14 +239,11 @@ class FusedProgram:
         self.device = Device(
             d / f"{name}.xclbin", spec["nargs"], txn_h=d / f"{name}.txn.h"
         )
-        self.ops = {}  # kernel id -> {bound names: {bound values: _Op}}
+        self.ops = {}  # kernel id -> [(op, its signature)]
         for op, sig in spec["ops"].items():
-            names = tuple(sorted(sig["bound"]))
-            key = tuple(sig["bound"][n] for n in names)
-            self.ops.setdefault(sig["kernel"], {}).setdefault(names, {})[key] = _Op(
-                op, sig
-            )
+            self.ops.setdefault(sig["kernel"], []).append((_Op(op, sig), sig))
         self.driver = _driver(self)
+        self._outer = []  # the drivers active when each scope was entered
 
     def empty(self, shape, dtype):
         shape = (shape,) if isinstance(shape, int) else tuple(shape)
@@ -250,37 +262,46 @@ class FusedProgram:
         import triton
 
         cfg = triton.runtime.driver
-        self._prev = getattr(cfg, "_active", None)
+        self._outer.append(getattr(cfg, "_active", None))
         cfg.set_active(self.driver)
         return self
 
     def __exit__(self, *exc):
         import triton
 
-        triton.runtime.driver._active = self._prev
+        triton.runtime.driver._active = self._outer.pop()
 
-    def find(self, kernel, values):
-        """The op for a call of `kernel` with `values` ({name: value})."""
-        from .fused_device import canonical, kernel_id
+    def find(self, kernel, values, grid):
+        """The op for a call of `kernel` with `values` ({name: value}) on
+        `grid`: built for the same bound values, grid and pointer types."""
+        from .fused_device import canonical, dtype_name, kernel_id
 
-        table = self.ops.get(kernel_id(kernel))
-        if table is None:
+        ops = self.ops.get(kernel_id(kernel))
+        if not ops:
             raise KeyError(f"{kernel_id(kernel)}: no op of this device runs it")
-        for names, ops in table.items():
-            key = tuple(canonical(values[n]) for n in names)
-            if key in ops:
-                return ops[key]
+        for op, sig in ops:
+            if (
+                list(grid) == sig["grid"]
+                and all(canonical(values[n]) == v for n, v in sig["bound"].items())
+                and all(
+                    dtype_name(values[n].dtype) == v for n, v in sig["types"].items()
+                )
+            ):
+                return op
+        sig = ops[0][1]
         raise KeyError(
-            f"{kernel_id(kernel)}: no op of this device is built for "
-            f"{ {n: values[n] for n in next(iter(table))} }"
+            f"{kernel_id(kernel)}: no op of this device is built for grid "
+            f"{tuple(grid)}, { {n: values[n] for n in sig['bound']} }, types "
+            f"{ {n: dtype_name(values[n].dtype) for n in sig['types']} }"
         )
 
-    def plan(self, kernel, args):
+    def plan(self, kernel, args, grid):
         """How a call of `kernel` with `args` (all its parameters, in order)
-        runs: its op, then per device buffer the argument's index, the slot
-        and whether the op writes it, then the run-time arguments' indices."""
+        on `grid` runs: its op, then per device buffer the argument's index,
+        the slot and whether the op writes it, then the run-time arguments'
+        indices."""
         names = kernel.arg_names
-        op = self.find(kernel, dict(zip(names, args)))
+        op = self.find(kernel, dict(zip(names, args)), grid)
         bufs = []
         for name, slot in op.slots.items():
             i = names.index(name)
@@ -315,7 +336,7 @@ class FusedProgram:
             s = buf.storage
             s.add_run(run, writes, buf.lo, buf.hi)
             if writes:
-                s.dev_dirty.append((buf.lo, buf.hi))
+                _add_range(s.dev_dirty, buf.lo, buf.hi)
         return run
 
 
@@ -327,13 +348,14 @@ class _Launcher:
         self.plans = {}  # the call's scalars -> its plan
 
     def __call__(self, *args):
-        args = args[_LAUNCH_PREFIX:]
-        key = tuple(
-            a for a in (args[i] for i in self.plain) if not isinstance(a, Buffer)
+        grid, args = args[:3], args[_LAUNCH_PREFIX:]
+        key = (
+            grid,
+            *(a for a in (args[i] for i in self.plain) if type(a) is not Buffer),
         )
         plan = self.plans.get(key)
         if plan is None:
-            plan = self.plans[key] = self.program.plan(self.kernel, args)
+            plan = self.plans[key] = self.program.plan(self.kernel, args, grid)
         self.program.run(plan, args)
 
 
@@ -405,6 +427,6 @@ def host_launcher(inner_cls):
             self.inner(*args)
             for b, w in bufs:
                 if w:
-                    b.storage.host_dirty.append((b.lo, b.hi))
+                    _add_range(b.storage.host_dirty, b.lo, b.hi)
 
     return _HostLauncher

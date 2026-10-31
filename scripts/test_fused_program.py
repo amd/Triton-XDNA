@@ -88,7 +88,8 @@ def main():
             np.array_equal(c.host(), ref(a, b)),
             "a call reaches its op; the host reads its output",
         )
-        picked = [prog.find(vecadd, dict(tag=tag, N=n)).name for tag in TAGS]
+        ab = dict(A=a, B=b, C=c, N=n)
+        picked = [prog.find(vecadd, dict(ab, tag=tag), (1, 1, 1)).name for tag in TAGS]
         check(
             picked == ["add_1", "add_2"], f"the bound values pick between ops: {picked}"
         )
@@ -113,7 +114,7 @@ def main():
         with prog:
             for o in outs:
                 vecadd[(1,)](a, b, o, 2, n)
-        op = prog.find(vecadd, dict(tag=2, N=n))
+        op = prog.find(vecadd, dict(ab, tag=2), (1, 1, 1))
         launches = len(op.busy) + len(op.idle)
         check(launches > 1, "in-flight runs of one op take launches of their own")
         check(
@@ -166,6 +167,63 @@ def main():
         back = (want.astype(np.float32) + b.host().astype(np.float32)).astype(bfloat16)
         check(
             np.array_equal(z.host(), back), "the device reads what a host kernel wrote"
+        )
+
+        # a call on another grid or other pointer types than any op's
+        for what, call in (
+            ("grid", lambda: vecadd[(2,)](a, b, c, 1, n)),
+            (
+                "types",
+                lambda: vecadd[(1,)](*(prog.empty(n, np.float32) for _ in "abc"), 1, n),
+            ),
+        ):
+            try:
+                with prog:
+                    call()
+                check(False, f"a call on other {what} than any op's is refused")
+            except KeyError as e:
+                check(
+                    what in str(e), f"a call on other {what} than any op's is refused"
+                )
+
+        # bytes on a cache line a run writes wait for it, though disjoint
+        line = prog.empty(n + 32, bfloat16)
+        line.host(write=True)[...] = 0
+        waited.clear()
+        FP._Run.wait = spy
+        try:
+            with prog:
+                vecadd[(1,)](a, b, line[8 : 8 + n], 1, n)
+            line[0:8].host(write=True)[...] = 1
+            check(len(waited) == 1, "writing bytes on a line a run writes waits for it")
+        finally:
+            FP._Run.wait = real
+        want = ref(a, b)
+        got = line.host()
+        check(
+            np.array_equal(got[8 : 8 + n], want) and np.all(got[:8] == 1),
+            "the run's output and the host's write next to it both stand",
+        )
+
+        # host writes over the same bytes are synced once
+        a.host(write=True)
+        a.host(write=True)
+        check(len(a.storage.host_dirty) == 1, "a range written twice is recorded once")
+
+        # scopes nest
+        import triton
+
+        before = getattr(triton.runtime.driver, "_active", None)
+        with prog:
+            with prog:
+                pass
+            check(
+                triton.runtime.driver._active is prog.driver,
+                "the inner scope restores the outer",
+            )
+        check(
+            triton.runtime.driver._active is before,
+            "the outer scope restores what was active",
         )
 
     if failures:

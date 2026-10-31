@@ -318,15 +318,22 @@ def kernel_id(kernel):
     return f"{kernel.fn.__module__}.{kernel.fn.__qualname__}"
 
 
+def dtype_name(dtype):
+    """A pointer's element type as Triton specializes on it: the name of a
+    numpy or torch dtype."""
+    return str(getattr(dtype, "name", dtype)).split(".")[-1]
+
+
 def canonical(v):
     """A bound argument as it is recorded and matched: JSON's types."""
     return v if isinstance(v, (bool, int, float, str)) else str(v)
 
 
 def _signature(kernel, grid, args, constexprs, slot, runtime, kept, compiled):
-    """How a call of `kernel` reaches the op: its pointer parameters' device
-    buffers, the values bound into the op, its run-time parameters in the
-    sequence's order, and the pointers the kernel writes."""
+    """How a call of `kernel` reaches the op: its grid, its pointer
+    parameters' element types and device buffers, the values bound into the
+    op, its run-time parameters in the sequence's order, and the pointers the
+    kernel writes."""
     values = dict(zip((p.name for p in kernel.params), args))
     values.update(constexprs or {})
     plain = [p.name for p in kernel.params if not p.is_constexpr]
@@ -339,6 +346,7 @@ def _signature(kernel, grid, args, constexprs, slot, runtime, kept, compiled):
     return dict(
         kernel=kernel_id(kernel),
         grid=list(grid),
+        types={n: dtype_name(values[n].dtype) for n in pointers},
         slots={n: slot + i for i, n in enumerate(pointers)},
         bound={
             n: canonical(v)

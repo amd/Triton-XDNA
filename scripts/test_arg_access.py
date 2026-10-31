@@ -79,6 +79,16 @@ def loop_carried(X, Y, n, B: tl.constexpr):
         p += B
 
 
+@triton.jit
+def after_loop(X, Y, Z, n, B: tl.constexpr):
+    """Stores through the pointer a loop leaves, which may be Z's."""
+    i = tl.arange(0, B)
+    p = Y
+    for _ in range(n):
+        p = Z
+    tl.store(p + i, tl.load(X + i))
+
+
 def names(kernel, ck):
     ps = [p.name for p in kernel.params if not p.is_constexpr]
     w = written_args(ck.asm["ttir"], ps)
@@ -96,6 +106,7 @@ def main():
             (accumulate, (Ptr(f), Ptr(f)), ["ACC"]),
             (reads_only, (Ptr(f), 16), []),
             (loop_carried, (Ptr(f), Ptr(f), 4), None),
+            (after_loop, (Ptr(f), Ptr(f), Ptr(f), 4), None),
         ]
         for kernel, args, want in cases:
             got = names(kernel, kernel.warmup(*args, B=16, grid=(1,)))

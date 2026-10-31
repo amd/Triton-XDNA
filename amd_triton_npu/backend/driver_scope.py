@@ -39,6 +39,9 @@ def _is_kind(driver, kind):
         from .driver import NPUDriver
 
         return isinstance(driver, NPUDriver)
+    if kind == "cpu":
+        # only the CPU driver made here keeps FusedProgram buffers coherent
+        return driver is _made.get("cpu")
     return type(driver).__module__ == f"triton.backends.{_BACKEND[kind]}.driver"
 
 

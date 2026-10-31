@@ -6,7 +6,8 @@
 - the driver active on entry is restored on exit, including none at all and
   when the body raises;
 - an already-active driver of the requested kind is kept, not replaced;
-- the iGPU and CPU drivers are constructed once and reused.
+- the iGPU and CPU drivers are constructed once and reused, and the CPU one,
+  which keeps `FusedProgram` buffers coherent, replaces any other CPU driver.
 
 Needs neither an NPU nor an iGPU; the iGPU checks run only where torch sees one.
 """
@@ -71,6 +72,12 @@ def main():
         with driver_scope("cpu") as c2:
             pass
         check(c1 is c2, "the CPU driver is built once and reused")
+        bare = backends["cpu"].driver()
+        config.set_active(bare)
+        with driver_scope("cpu") as c3:
+            check(c3 is c1, "a CPU driver made elsewhere is replaced by this one")
+        check(config._active is bare, "and is active again after")
+        config._active = None
 
     try:
         import torch
