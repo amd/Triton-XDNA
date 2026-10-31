@@ -5,8 +5,9 @@
 
 A `Device` holds one hw_context on the xclbin. Each runtime sequence is
 dispatched as a `Launch`: its instruction stream, from the compiler's TXN
-builder header or a fixed insts file, and the kernel's buffer arguments. A
-sequence's run-time arguments are patched into its stream when they change.
+builder header, and the kernel's buffer arguments. A sequence's run-time
+arguments are patched into its stream when they change. `FusedProgram` is
+built on these.
 """
 
 import numpy as np
@@ -81,21 +82,17 @@ class Launch:
 
 class Device:
     """An xclbin on its own hw_context, kernel MLIR_AIE with `nargs` buffer
-    arguments. `txn_h` is the TXN builder header of its sequences;
-    `insts` maps a sequence name to a fixed instruction file instead."""
+    arguments. `txn_h` is the TXN builder header of its sequences."""
 
-    def __init__(self, xclbin, nargs, txn_h=None, insts=None):
+    def __init__(self, xclbin, nargs, txn_h):
+        from air.backend.txn_builder import TxnBuilder
+
         x = _xrt()
         self.dev = x.device(0)
         self.xb = x.xclbin(str(xclbin))
         self.dev.register_xclbin(self.xb)
         self.nargs = nargs
-        self.txn = None
-        if txn_h is not None:
-            from air.backend.txn_builder import TxnBuilder
-
-            self.txn = TxnBuilder(str(txn_h))
-        self.fixed = {k: np.fromfile(v, np.uint32) for k, v in (insts or {}).items()}
+        self.txn = TxnBuilder(str(txn_h))
         self.launches = []
         self.ctx = self.kern = None
         self.open()
@@ -123,20 +120,7 @@ class Device:
             self.kern.group_id(3 + arg),
         )
 
-    def array(self, arg, dtype, shape, zero=True):
-        """A buffer for argument `arg` and its numpy view. Zeroed through the
-        host's mapping, then synced: a dirty line left in the cache would be
-        written back over what the device writes there later."""
-        bo = self.bo(int(np.prod(shape)) * np.dtype(dtype).itemsize, arg)
-        a = view(bo, dtype, shape)
-        if zero:
-            a[...] = 0
-            sync_to(bo)
-        return bo, a
-
     def words(self, seq, *rt):
-        if seq in self.fixed:
-            return self.fixed[seq]
         return np.asarray(self.txn(f"seg_{seq}", *rt), np.uint32)
 
     def launch(self, seq, bos, rt=()):

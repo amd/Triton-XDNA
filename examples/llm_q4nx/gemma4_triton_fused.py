@@ -57,8 +57,12 @@ _SOURCES = (
     LM_SCHEDULE,
     Path(__file__),
 )
+#: Backend modules that run a build but take no part in making it.
+_RUNTIME_ONLY = ("fused_program.py", "npu_runner.py")
 #: What a complete build holds.
-FILES = ("fused_prefill.xclbin", "fused_prefill.txn.h", "lm.xclbin", "lm.insts.bin")
+FILES = tuple(
+    f"{d}.{x}" for d in ("fused_prefill", "lm") for x in ("xclbin", "txn.h", "ops.json")
+)
 
 #: Rows of a chunk.
 M = G.M
@@ -157,7 +161,11 @@ def fingerprint():
     h.update(json.dumps([AIRCC_ARGS, LM_AIRCC_ARGS, STACK_SIZE]).encode())
     h.update(json.dumps([triton.__version__, *_versions(), *_toolchain()]).encode())
     backend_dir = Path(backend.__file__).parent
-    sources = sorted(p for p in backend_dir.rglob("*") if p.suffix in (".py", ".mlir"))
+    sources = sorted(
+        p
+        for p in backend_dir.rglob("*")
+        if p.suffix in (".py", ".mlir") and p.name not in _RUNTIME_ONLY
+    )
     for p in [*_SOURCES, HERE.parent / "gemma4_e2b_q4nx" / "config.py", *sources]:
         h.update(p.read_bytes())
     return h.hexdigest()[:16]
@@ -185,40 +193,42 @@ def _toolchain_env():
 
 
 def build_lm(out):
-    """The LM head as `lm.xclbin` and `lm.insts.bin` in `out`: its buffers
-    are the weight stream (`gemma4_lm_gemv.pack`), x bf16 [K] and the
-    logits' output (`gemma4_lm_gemv.unpack_y`)."""
+    """The LM head, device `lm` in `out`: `gemma4_lm_gemv.gemv_q4` on the
+    weight stream (`gemma4_lm_gemv.pack`), x bf16 [K] and the logits' output
+    (`gemma4_lm_gemv.unpack_y`)."""
     import torch
-    from triton.backends.amd_triton_npu.config import config_context
-    from triton.backends.amd_triton_npu.driver import _aircc_compile, _ttshared_to_air
-    from triton.backends.amd_triton_npu.driver_scope import driver_scope
+    from triton.backends.amd_triton_npu.fused_device import FusedDevice
 
     w = torch.zeros(LG.NC, LG.TILES * LG.KC * LG.NR * LM_PKT, dtype=torch.uint8)
     x = torch.zeros(LG.K, dtype=torch.bfloat16)
     y = torch.zeros(LG.V, dtype=torch.bfloat16)
-    with driver_scope("npu"), config_context(compile_only=True):
-        c = LG.gemv_q4.warmup(*LG.args(w, x, y), grid=(1, 1, 1))
-    with config_context(transform_tiling_script=str(LM_SCHEDULE)):
-        m = _ttshared_to_air(c.asm["ttsharedir"], 1, 1, 1)
-    out = Path(out)
-    work = out / "work" / "lm"
-    work.mkdir(parents=True, exist_ok=True)
-    path = work / "lm.air.mlir"
-    path.write_text(str(m))
+    dev = FusedDevice("lm", str(Path(out) / "work" / "lm"))
+    dev.add("lm", LG.gemv_q4, (1,), LG.args(w, x, y), transform_script=str(LM_SCHEDULE))
     with _toolchain_env():
-        # aircc writes its project into the working directory
-        os.chdir(work)
-        art = _aircc_compile(
-            str(path),
-            "xclbin",
-            "npu2",
-            str(work),
+        dev.compile(
+            runtime_loop_tiling_sizes=(),
             bf16_emulation=False,
             extra_args=LM_AIRCC_ARGS,
-            runtime_loop_tiling_sizes=(),
         )
-    shutil.copy(art["bin_path"], out / "lm.xclbin")
-    shutil.copy(art["insts_path"], out / "lm.insts.bin")
+    dev.save(out)
+
+
+def attn_args(op, bufs, nk, q0, k0):
+    """`gemma4_attention.attn`'s arguments for attention op `op` on `bufs`,
+    each group's q, KV records and o in `GROUPS` order: the op runs only its
+    own groups' rounds, so the other groups' buffers are not touched."""
+    f, s = (GROUPS[OPS[o][0]] for o in ("f", "s"))
+    hg = HEADS // len(OPS[op])
+    rounds = {o: hg * attn_qr(GROUPS[OPS[o][0]]) * (o == op) for o in OPS}
+    return A.args(
+        f, s, rounds["f"], rounds["s"], nk, q0, k0, bufs,
+        rows=M, window=WINDOWS.get("s"),
+    )  # fmt: skip
+
+
+def call_attention(op, bufs, nk, q0, k0):
+    """Run attention op `op` (inside its `FusedProgram`)."""
+    A.attn[(1,)](*attn_args(op, bufs, nk, q0, k0))
 
 
 def add_attention(dev):
@@ -226,35 +236,20 @@ def add_attention(dev):
     drives its groups' heads, (nk, q0, k0) at run time."""
     import torch
 
-    names = list(GROUPS)
-    f, s = (GROUPS[OPS[o][0]] for o in ("f", "s"))
     hg = HEADS // len(OPS["f"])
     bufs = []
-    for name in names:
-        g = GROUPS[name]
+    for g in GROUPS.values():
         q = torch.zeros(hg * M, g.dh, dtype=torch.bfloat16)
         bufs += [q, torch.zeros(2 * g.lkp * g.dh, dtype=torch.bfloat16), q.clone()]
-    script = A.schedule(f, s, dev.proj)
+    script = A.schedule(*(GROUPS[OPS[o][0]] for o in ("f", "s")), dev.proj)
     for op in OPS:
-        rounds = {o: hg * attn_qr(GROUPS[OPS[o][0]]) * (o == op) for o in OPS}
         dev.add(
             attn_name(op),
             A.attn,
             (1,),
-            A.args(
-                f,
-                s,
-                rounds["f"],
-                rounds["s"],
-                1,
-                0,
-                0,
-                bufs,
-                rows=M,
-                window=WINDOWS.get("s"),
-            ),
+            attn_args(op, bufs, 1, 0, 0),
             transform_script=str(script),
-            slot=ATTN_SLOT[names[0]],
+            slot=ATTN_SLOT[next(iter(GROUPS))],
             runtime=("nk", "q0", "k0"),
             key="attn",
             pin_l2=True,
@@ -303,9 +298,8 @@ def build(out):
         add_attention(dev)
         for shape in gemm_shapes():
             add_gemm(dev, *shape)
-    xclbin, header = compile_device(dev)
-    shutil.copy(xclbin, out / "fused_prefill.xclbin")
-    shutil.copy(header, out / "fused_prefill.txn.h")
+    compile_device(dev)
+    dev.save(out)
     for scratch in ("proj", "work"):
         shutil.rmtree(out / scratch, ignore_errors=True)
 

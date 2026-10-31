@@ -8,8 +8,8 @@ multiplies and adds rows, and each result goes straight into the layout the
 next device op reads: a GEMM's A tiles, attention's q blocks, a layer's KV
 records. Each kernel here is one such step.
 
-Arguments are numpy arrays, including views of mapped device buffers, passed
-through `Ptr`. Launch inside `driver_scope("cpu")`.
+Arguments are numpy arrays or a `FusedProgram`'s buffers. The launchers run
+on the CPU whichever driver is active around them.
 
 Layouts:
 - A tiles: [M / TM, KS, TM, TK], element (r, k) at
@@ -20,17 +20,25 @@ Layouts:
   (r // 8 * (cols / 8) + c // 8) * 64 + r % 8 * 8 + c % 8.
 """
 
+import functools
+
 import triton
 import triton.language as tl
+from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 
 class Ptr:
-    """A numpy array (or a view of one) as a Triton pointer argument."""
+    """A numpy array (or a view of one) as a Triton pointer argument. An
+    argument that is one already (a `FusedProgram` buffer) is passed as is."""
 
     __slots__ = ("p", "dtype")
 
+    def __new__(cls, a):
+        return a if hasattr(a, "data_ptr") else super().__new__(cls)
+
     def __init__(self, a):
-        self.p, self.dtype = a.ctypes.data, a.dtype.name
+        if self is not a:
+            self.p, self.dtype = a.ctypes.data, a.dtype.name
 
     def data_ptr(self):
         return self.p
@@ -400,10 +408,22 @@ def _softcap(
 # ---- launchers -------------------------------------------------------------
 
 
+def _on_host(fn):
+    """Launch on the CPU whichever device is active around the call."""
+
+    @functools.wraps(fn)
+    def run(*a, **kw):
+        with driver_scope("cpu"):
+            return fn(*a, **kw)
+
+    return run
+
+
 def _ch(n):
     return 256 if n % 256 == 0 else 128
 
 
+@_on_host
 def rms_tile(x, w, am, t, k, eps, norm=True):
     """x [>= t, k] (f32 or bf16 rows, any row stride) -> A tiles am."""
     hr, ks, tm, tk = am.shape
@@ -414,6 +434,7 @@ def rms_tile(x, w, am, t, k, eps, norm=True):
     )  # fmt: skip
 
 
+@_on_host
 def add_rms(res, y, w, t, eps, scale=None, am=None, w2=None):
     """res[:t] = (res + rms(y) * w) [* scale, a float]; y the rows of a GEMM's
     output.
@@ -430,6 +451,7 @@ def add_rms(res, y, w, t, eps, scale=None, am=None, w2=None):
     )  # fmt: skip
 
 
+@_on_host
 def mul_tile(a, b, am, t, k):
     """a * b ([>= t, k] rows each, any row strides) -> A tiles am."""
     hr, ks, tm, tk = am.shape
@@ -439,6 +461,7 @@ def mul_tile(a, b, am, t, k):
     )  # fmt: skip
 
 
+@_on_host
 def rope_table(inv, cs, sn, r0):
     """cs, sn [M, len(inv)] f32: cos and sin of positions r0 .. r0 + M."""
     _rope_table[(cs.shape[0] // BR,)](
@@ -446,6 +469,7 @@ def rope_table(inv, cs, sn, r0):
     )  # fmt: skip
 
 
+@_on_host
 def q_post(q, w, rope, qb, t, h0, scale, eps):
     """Heads h0 .. h0 + len(qb) of q (the q GEMM's output rows) into
     qb [heads, M, dh] as 8x8 blocks; rope = (cos, sin) from rope_table."""
@@ -456,6 +480,7 @@ def q_post(q, w, rope, qb, t, h0, scale, eps):
     )  # fmt: skip
 
 
+@_on_host
 def kv_post(k, v, w, rope, kf, vf, rec, t, lkp, dvt, eps):
     """One KV head: kf, vf [t, dh] f32 and its records from rec on (the
     chunk starts a record)."""
@@ -468,6 +493,7 @@ def kv_post(k, v, w, rope, kf, vf, rec, t, lkp, dvt, eps):
     )  # fmt: skip
 
 
+@_on_host
 def o_tile(ob, am, t, h0):
     """Attention output ob [heads, M, dh] (8x8 blocks) -> columns
     h0 * dh .. of the A tiles am."""
@@ -478,6 +504,7 @@ def o_tile(ob, am, t, h0):
     )
 
 
+@_on_host
 def ple(p, w, tbl, pli, t, pscale, iscale, eps):
     """pli[:t] [t, layers, d] from the model projection p's rows and the
     per-layer token embeddings tbl [t, layers * d]."""
@@ -488,6 +515,7 @@ def ple(p, w, tbl, pli, t, pscale, iscale, eps):
     )  # fmt: skip
 
 
+@_on_host
 def embed(q, s, ids, out, scale=1.0):
     """out [len(ids), W] f32 = rows ids of int8 table q [V, W] * scales s
     [V, W / 32]."""
@@ -496,11 +524,13 @@ def embed(q, s, ids, out, scale=1.0):
     )
 
 
+@_on_host
 def rms_rows(x, w, out, eps):
     n = x.shape[-1]
     _rms_rows[(x.size // n,)](Ptr(x), Ptr(w), Ptr(out), eps, N=n, CH=_ch(n))
 
 
+@_on_host
 def softcap(y, out, cap, nr, tf, fg):
     """out [V] f32 = cap * tanh(logits / cap), the logits unpacked from y."""
     ch = 1024

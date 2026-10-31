@@ -2,7 +2,8 @@
 """Standalone check of `gemma4_gemm.mm_g` against a torch reference.
 
 Each case is an op of one device, built as `gemma4_triton_fused` builds its
-GEMMs and dispatched by `npu_runner` as the prefill dispatches a GEMM. The
+GEMMs and called as the prefill calls a GEMM, `mm_g[grid](...)` on a
+`FusedProgram`. The
 weights are packed by `gemma4_gemm.pack_q4` and `pack_bf16` and A is laid out
 in the A tiles the host kernels write, so a change on either side of that
 interface shows up here rather than as a wrong prefill. Checked: int4 weights
@@ -63,13 +64,13 @@ def gelu(acc):
     return torch.nn.functional.gelu(acc, approximate="tanh")
 
 
-def build(proj, n, cases):
-    """One device with an op per case, built as gemma4_triton_fused builds
-    its GEMMs. Returns its xclbin and TXN builder header."""
-    from triton.backends.amd_triton_npu.fused_device import FusedDevice
+def build(out, n, cases):
+    """One device with an op per case, built into `out` as
+    gemma4_triton_fused builds its GEMMs."""
     from triton.backends.amd_triton_npu.config import config_context
+    from triton.backends.amd_triton_npu.fused_device import FusedDevice
 
-    dev = FusedDevice("fused_prefill", str(proj))
+    dev = FusedDevice("fused_prefill", str(Path(out) / "proj"))
     c = torch.zeros(G.M, n, dtype=torch.bfloat16)
     with config_context(bf16_emulation=True):
         for name, (act, wq, k, a, w, _) in cases.items():
@@ -80,31 +81,26 @@ def build(proj, n, cases):
                 G.args(a, torch.from_numpy(w), c, n, k, act, wq, G.k_pad(k)),
                 transform_script=str(T.SCHEDULE),
             )
-    return T.compile_device(dev)
+    T.compile_device(dev)
+    dev.save(out)
 
 
-def run(xclbin, header, cases, n):
-    """Each case's op, dispatched as the prefill dispatches a GEMM."""
-    from triton.backends.amd_triton_npu.npu_runner import Device, sync_from, sync_to
+def run(out, cases, n):
+    """Each case's GEMM, called as the prefill calls it."""
+    from triton.backends.amd_triton_npu.fused_program import FusedProgram
 
-    dev = Device(xclbin, 3, txn_h=header)
-    out = {}
+    prog = FusedProgram(out, "fused_prefill")
+    res = {}
     for name, (act, wq, k, a, w, _) in cases.items():
         ta = a.view(torch.int16).numpy()
-        ba, am = dev.array(0, np.int16, ta.shape)
-        am[:] = ta
-        sync_to(ba)
-        bw, wm = dev.array(1, np.uint8, w.shape)
-        wm[:] = w
-        sync_to(bw)
-        bc, cm = dev.array(2, bfloat16, (G.M, n))
-        run = dev.launch(name, {0: ba, 1: bw, 2: bc})
-        run.start()
-        run.wait()
-        sync_from(bc)
-        out[name] = torch.from_numpy(cm.astype(np.float32))
-    dev.close()
-    return out
+        ab, wb = prog.empty(ta.shape, np.int16), prog.empty(w.shape, np.uint8)
+        cb = prog.empty((G.M, n), bfloat16)
+        ab.host(write=True)[...] = ta
+        wb.host(write=True)[...] = w
+        with prog:
+            G.mm_g[(1,)](*G.args(ab.view(bfloat16), wb, cb, n, k, act, wq, G.k_pad(k)))
+        res[name] = torch.from_numpy(cb.host().astype(np.float32))
+    return res
 
 
 def check(name, out, ref):
@@ -149,8 +145,8 @@ def main():
         "bf16": (0, 0, kb, tiled_a(ab), b16, accb),
     }
     with tempfile.TemporaryDirectory() as d:
-        xclbin, header = build(Path(d) / "proj", n, cases)
-        out = run(xclbin, header, cases, n)
+        build(d, n, cases)
+        out = run(d, cases, n)
     for name, case in cases.items():
         check(name, out[name], case[-1])
     print("PASS")
