@@ -3,14 +3,17 @@
 """Choose which device Triton compiles and launches for, within a scope.
 
 Triton holds one active driver per thread and every launch goes to it, so a
-program that runs kernels on both the NPU and the iGPU has to switch it
-around each group of launches:
+program that runs kernels on the NPU, the iGPU and the host CPU has to
+switch it around each group of launches:
 
     with driver_scope("npu"):
         kernel[grid](...)          # compiled and launched for the NPU
 
     with driver_scope("gpu"):
         gpu_kernel[grid](...)      # compiled and launched for the iGPU
+
+    with driver_scope("cpu"):
+        host_kernel[grid](...)     # compiled and launched by triton-cpu
 
 This module does not import `driver.py` at load time, so iGPU-only callers do
 not pull in the NPU toolchain.
@@ -19,12 +22,14 @@ not pull in the NPU toolchain.
 import contextlib
 
 # "gpu" is the AMD iGPU; Triton registers its driver as the "amd" backend.
-_KINDS = ("npu", "gpu")
+# "cpu" is the host, through triton-cpu's backend.
+_KINDS = ("npu", "gpu", "cpu")
+_BACKEND = {"gpu": "amd", "cpu": "cpu"}
 
-# The iGPU driver is built once and reused: constructing one is far more
-# expensive than switching to it. The NPU driver is built on each entry
+# The iGPU and CPU drivers are built once and reused: constructing one is far
+# more expensive than switching to it. The NPU driver is built on each entry
 # because `NPUDriver()` reads the launch runtime from the environment.
-_gpu = None
+_made = {}
 
 
 def _is_kind(driver, kind):
@@ -34,25 +39,24 @@ def _is_kind(driver, kind):
         from .driver import NPUDriver
 
         return isinstance(driver, NPUDriver)
-    return type(driver).__module__ == "triton.backends.amd.driver"
+    return type(driver).__module__ == f"triton.backends.{_BACKEND[kind]}.driver"
 
 
 def _make(kind):
-    global _gpu
     if kind == "npu":
         from .driver import NPUDriver
 
         return NPUDriver()
-    if _gpu is None:
+    if kind not in _made:
         from triton.backends import backends
 
-        _gpu = backends["amd"].driver()
-    return _gpu
+        _made[kind] = backends[_BACKEND[kind]].driver()
+    return _made[kind]
 
 
 @contextlib.contextmanager
 def driver_scope(kind):
-    """Make the `kind` driver ("npu" or "gpu") active for the duration.
+    """Make the `kind` driver ("npu", "gpu" or "cpu") active for the duration.
 
     On exit the driver that was active on entry is restored, including none
     at all. `_active` is read and assigned directly because the `.active`
@@ -61,7 +65,7 @@ def driver_scope(kind):
     whose driver is already active does nothing.
 
     Switching does not invalidate compiled kernels: Triton caches them per
-    device, and the NPU and the iGPU are different devices.
+    device, and the NPU, the iGPU and the CPU are different devices.
     """
     if kind not in _KINDS:
         raise ValueError(f"driver_scope: kind must be one of {_KINDS}, not {kind!r}")

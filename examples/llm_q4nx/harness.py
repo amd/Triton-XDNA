@@ -742,11 +742,11 @@ def fused_prefill_config(cfg, max_seq=None):
 
 
 def fused_prefill_cls(cfg, prefill_cls, config, triton=False):
-    """A `prefill_cls` that runs mlir-air's fused NPU prefill.
-
-    Builds it through `tl.extra.npu.fused_prefill`, or through
-    `gemma4_triton_fused` if `triton` (a cache hit after the first build), and
-    returns a factory with `run_prefill`'s calling convention. The prefiller's
+    """A `prefill_cls` that runs a fused NPU prefill: mlir-air's, built through
+    `tl.extra.npu.fused_prefill` and run by its runtime, or with `triton`
+    Gemma4's from Triton, built by `gemma4_triton_fused` (a cache hit after
+    the first build) and run by `gemma4_npu_prefill`. Returns a factory with
+    `run_prefill`'s calling convention. The prefiller's
     own host path runs on the CPU backend, so no Triton NPU chain is built.
     Gemma4-E2B's keeps the embedding, norms and head its decoders read; a dense
     model's (`dense_fused_prefill`) keeps nothing but the KV.
@@ -848,8 +848,9 @@ def build_parser(doc, backends=("cpu", "npu", "hetero")):
         "one-device chunked NPU prefill (tl.extra.npu.fused_prefill), handing "
         "its KV to the decode the way the Triton prefill does; --backend, "
         "--ops and --profile do not apply to it and are refused. "
-        "triton-fused (Gemma4-E2B): the same device with its GEMMs compiled "
-        "from Triton (gemma4_triton_fused). igpu: the "
+        "triton-fused (Gemma4-E2B): a one-device chunked prefill whose ops "
+        "all come from Triton (gemma4_triton_fused), run by Triton-XDNA "
+        "with its host math as Triton kernels on the CPU. igpu: the "
         "whole prefill in Triton on the iGPU, writing the KV cache in the "
         "layout both decodes read. auto "
         "(default): air-fused where mlir-air has one for the model, except "

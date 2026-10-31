@@ -2,10 +2,10 @@
 """Standalone check of `gemma4_attention.attn` against a numpy reference.
 
 Both of Gemma4-E2B's attention ops are built as `gemma4_triton_fused` builds
-them and dispatched as mlir-air's runtime dispatches an attention op under
-the manifest's "attn_format" "bf16": per group (one per column), q and o for
-its half of the heads and the KV records of the layer from the chunk's first
-K block on, all in 8x8 blocks, and (nk, q0, k0) at run time. Checked: the
+them and dispatched by `npu_runner` as the prefill dispatches them: per group
+(one per column), q and o for its half of the heads and the KV records of the
+layer from the chunk's first K block on, all in 8x8 blocks, and (nk, q0, k0)
+at run time. Checked: the
 first chunk of a prompt and later ones, for the causal op and for the
 sliding-window op past its window.
 
@@ -23,37 +23,23 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-import airsrc  # noqa: E402
+sys.path[:0] = [str(HERE), str(HERE.parent / "gemma4_e2b_q4nx")]
 import gemma4_attention as A  # noqa: E402
 import gemma4_triton_fused as T  # noqa: E402
 
-airsrc.add_air_paths("gemma4_e2b_q4nx")
-import importlib  # noqa: E402
-
-from air_examples.llms.shared.fused_prefill import build as B  # noqa: E402
-from air_examples.llms.shared.fused_prefill import device as D  # noqa: E402
-
-SPEC = importlib.import_module(T.SPEC)
-HEADS = SPEC.ATTN_POINTS["base"][0]
 #: Tokens of KV the test holds.
 MAX_LEN = 768
 
 
 def build(proj):
     """The attention ops on one device, as gemma4_triton_fused builds them."""
-    from fused_device import FusedDevice
+    from triton.backends.amd_triton_npu.fused_device import FusedDevice
     from triton.backends.amd_triton_npu.config import config_context
 
     dev = FusedDevice("fused_prefill", str(proj))
     with config_context(bf16_emulation=True):
-        T.add_attention(dev, SPEC, HEADS)
-    return dev.compile(
-        runtime_loop_tiling_sizes=(),
-        bf16_emulation=True,
-        extra_args=T.AIRCC_ARGS,
-        stack_size=T.STACK_SIZE,
-    )
+        T.add_attention(dev)
+    return T.compile_device(dev)
 
 
 def reference(q, k, v, r0, window):
@@ -95,52 +81,43 @@ def records(k, v, lkp, dvt):
 
 
 def run(xclbin, header, cases):
-    import pyxrt as xrt
-    from air.backend.txn_builder import TxnBuilder
-    from air_examples.llms.shared.fused_prefill.engine import FROM, TO, Ctx, view
+    from triton.backends.amd_triton_npu.npu_runner import Device, sync_from, sync_to
 
-    ctx = Ctx(xrt.device(0), xclbin)
-    txn = TxnBuilder(str(header))
-    names = list(SPEC.CFG.attn)
-    nargs = 3 + 3 * len(names)
+    dev = Device(xclbin, T.NARGS, txn_h=header)
     out = []
     for op, groups, q, kv, nk, q0, k0 in cases:
-        bos = [ctx.bo(4096, i) for i in range(nargs)]
-        obs = []
+        bos, obs = {}, []
         hg = q.shape[0] // len(groups)
         for c, grp in enumerate(groups):
-            slot = 3 + 3 * names.index(grp)
+            slot = T.ATTN_SLOT[grp]
             qc = blocks(q[c * hg : (c + 1) * hg])
-            qb = ctx.bo(qc.nbytes, slot)
-            view(qb, bfloat16, qc.shape)[:] = qc
-            qb.sync(TO)
-            kb = ctx.bo(kv.nbytes, slot + 1)
-            view(kb, bfloat16, kv.shape)[:] = kv
-            kb.sync(TO)
-            ob = ctx.bo(qc.nbytes, slot + 2)
-            bos[slot : slot + 3] = [qb, kb, ob]
-            obs.append((ob, qc.shape))
-        ins = np.asarray(txn(f"seg_{B.seq_name(op, (HEADS,))}", nk, q0, k0), np.uint32)
-        ib, _ = ctx.insts(ins)
-        r = ctx.run(ib, len(ins), bos)
-        r.r.start()
-        st = r.r.wait()
-        assert "COMPLETED" in str(st), (op, q0, st)
+            qb, qm = dev.array(slot, bfloat16, qc.shape)
+            qm[:] = qc
+            sync_to(qb)
+            kb, km = dev.array(slot + 1, bfloat16, kv.shape)
+            km[:] = kv
+            sync_to(kb)
+            ob, om = dev.array(slot + 2, bfloat16, qc.shape)
+            bos.update({slot: qb, slot + 1: kb, slot + 2: ob})
+            obs.append((ob, om))
+        run = dev.launch(T.attn_name(op), bos, rt=(nk, q0, k0))
+        run.start()
+        run.wait()
         got = []
-        for ob, shape in obs:
-            ob.sync(FROM)
-            got.append(unblocks(view(ob, bfloat16, shape).astype(np.float32)))
+        for ob, om in obs:
+            sync_from(ob)
+            got.append(unblocks(om.astype(np.float32)))
         out.append(np.concatenate(got))
-    ctx.close()
+    dev.close()
     return out
 
 
 def main():
     rng = np.random.default_rng(0)
     cases, refs, names = [], [], []
-    for op, groups in D.attn_ops(SPEC.CFG).items():
-        g = SPEC.CFG.attn[groups[0]]
-        window = (SPEC.CFG.windows or {}).get(op)
+    for op, groups in T.OPS.items():
+        g = T.GROUPS[groups[0]]
+        window = T.WINDOWS.get(op)
         k = rng.standard_normal((MAX_LEN, g.dh)).astype(bfloat16)
         v = rng.standard_normal((MAX_LEN, g.dh)).astype(bfloat16)
         kv = records(k, v, g.lkp, A.dvt(g.dh))
@@ -148,8 +125,8 @@ def main():
         # the first chunk and later ones: past the window, for the windowed
         # op
         for r0 in (0, 640) if window else (0, 256, 512):
-            t = D.M
-            q = rng.standard_normal((HEADS, t, g.dh)).astype(bfloat16)
+            t = T.M
+            q = rng.standard_normal((T.HEADS, t, g.dh)).astype(bfloat16)
             q0 = r0 // g.lkp
             nend = -(-(r0 + t) // g.lkp)
             k0 = max(0, q0 - window // g.lkp) if window else 0

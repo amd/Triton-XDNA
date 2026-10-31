@@ -122,15 +122,12 @@ def owns_kv(layer_idx):
 
 
 def kv_source_layer(layer_idx):
-    """Which layer's cache this one attends. Itself, below FIRST_KV_SHARED.
-
-    Taken from mlir-air rather than restated: the sharing map is not a formula
-    anyone should re-derive, and a wrong one produces fluent wrong text.
-    """
-    _add_air_paths()
-    from gemma4_e2b_q4nx_weights import kv_source_layer as _src
-
-    return int(_src(layer_idx))
+    """Which layer's cache this one attends: itself below FIRST_KV_SHARED,
+    above it the last layer of the same attention type below it."""
+    if layer_idx < FIRST_KV_SHARED:
+        return layer_idx
+    same = is_sliding(layer_idx)
+    return max(i for i in range(FIRST_KV_SHARED) if is_sliding(i) == same)
 
 
 # The Paris gate, from gemma4_e2b_q4nx_inference.py.

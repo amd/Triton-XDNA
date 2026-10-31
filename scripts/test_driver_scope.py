@@ -6,7 +6,7 @@
 - the driver active on entry is restored on exit, including none at all and
   when the body raises;
 - an already-active driver of the requested kind is kept, not replaced;
-- the iGPU driver is constructed once and reused.
+- the iGPU and CPU drivers are constructed once and reused.
 
 Needs neither an NPU nor an iGPU; the iGPU checks run only where torch sees one.
 """
@@ -53,6 +53,24 @@ def main():
     except KeyError:
         pass
     check(config._active is outer, "restored when the body raises")
+
+    from triton.backends import backends
+
+    if "cpu" not in backends:
+        print("  skip CPU checks: this Triton has no CPU backend")
+    else:
+        config._active = None
+        with driver_scope("cpu") as c1:
+            check(
+                type(c1) is type(backends["cpu"].driver()), "cpu scope is triton-cpu's"
+            )
+            with driver_scope("npu") as n:
+                check(isinstance(n, NPUDriver), "npu nested inside cpu")
+            check(config._active is c1, "cpu restored after the nested npu")
+        check(config._active is None, "cpu scope restores nothing-active")
+        with driver_scope("cpu") as c2:
+            pass
+        check(c1 is c2, "the CPU driver is built once and reused")
 
     try:
         import torch

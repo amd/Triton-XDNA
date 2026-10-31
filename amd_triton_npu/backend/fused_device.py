@@ -11,13 +11,13 @@ prebuilt modules' herds already use.
 
 import os
 
-from triton.backends.amd_triton_npu.config import config_context
-from triton.backends.amd_triton_npu.driver import (
+from .config import config_context
+from .driver import (
     _aircc_compile,
     _ttshared_to_air,
     detect_npu_version,
 )
-from triton.backends.amd_triton_npu.driver_scope import driver_scope
+from .driver_scope import driver_scope
 
 SEG = "seg"
 
@@ -397,9 +397,28 @@ def _ops_named(op, name):
 
 
 def _link(texts):
-    import airsrc
+    """Merge modules into one. A symbol several modules declare (a kernel
+    function, a shared private func) is kept once, and must be declared the
+    same way in each."""
+    from air.ir import Context, Location, Module
 
-    airsrc.register_air_examples()
-    from air_examples.llms.shared.fused_prefill.build import _link
+    with Context(), Location.unknown():
+        mods = [Module.parse(t) for t in texts]
+        base, seen = mods[0], {}
 
-    return _link(texts)
+        def key(op):
+            if "sym_name" in op.attributes:
+                return str(op.attributes["sym_name"])
+
+        for op in base.body.operations:
+            seen[key(op)] = op.get_asm(print_generic_op_form=True)
+        for m in mods[1:]:
+            for op in list(m.body.operations):
+                k, text = key(op), op.get_asm(print_generic_op_form=True)
+                if k in seen:
+                    if seen[k] != text:
+                        raise ValueError(f"modules declare {k} differently")
+                    continue
+                seen[k] = text
+                base.body.append(op)
+        return str(base)
