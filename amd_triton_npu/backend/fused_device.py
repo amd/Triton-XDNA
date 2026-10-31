@@ -9,8 +9,10 @@ header). Each kernel's herds get columns of their own, next to the columns the
 prebuilt modules' herds already use.
 """
 
+import json
 import os
 
+from .arg_access import written_args
 from .config import config_context
 from .driver import (
     _aircc_compile,
@@ -32,6 +34,7 @@ class FusedDevice:
         self.cols = {}  # kernel key -> first column
         self.width = {}  # kernel key -> columns
         self.pinned = set()  # kernel keys whose L2 buffers sit in their column
+        self.signatures = {}  # op name -> how a call of its kernel maps to it
 
     def add(
         self,
@@ -68,7 +71,10 @@ class FusedDevice:
         # The op's ints, bound in the launch: the herds take them as RTPs, so
         # every shape of a kernel has the same segment body.
         _bind_ints(m, kernel, args, keep=runtime)
-        _drop_unused_scalars(_entry(m))
+        kept = _drop_unused_scalars(_entry(m))
+        self.signatures[name] = _signature(
+            kernel, g, args, constexprs, slot, runtime, kept, c
+        )
         if slot:
             _shift_buffers(m, slot)
         if multiplex:
@@ -163,7 +169,7 @@ class FusedDevice:
             # The device's kernel takes the buffers of the op whose sequence
             # comes first, so every op's func takes all of them.
             mods = [Module.parse(air) for _, _, air in self.ops]
-            nbuf = max(_buffer_count(m) for m in mods)
+            nbuf = self.nargs = max(_buffer_count(m) for m in mods)
             for (name, key, air), m in zip(self.ops, mods):
                 if key is None:
                     if _buffer_count(m) != nbuf:
@@ -222,7 +228,20 @@ class FusedDevice:
         finally:
             os.chdir(cwd)
         header = os.path.join(self.proj, "air_project", f"npu.{self.name}.air.txn.h")
-        return out["bin_path"], header
+        self._built = out["bin_path"], header
+        return self._built
+
+    def save(self, out_dir):
+        """Put the compiled device into `out_dir` as `FusedProgram` loads it:
+        `<name>.xclbin`, `<name>.txn.h` and `<name>.ops.json`, how a call of
+        each op's kernel maps to the op."""
+        import shutil
+
+        xclbin, header = self._built
+        shutil.copy(xclbin, os.path.join(out_dir, f"{self.name}.xclbin"))
+        shutil.copy(header, os.path.join(out_dir, f"{self.name}.txn.h"))
+        with open(os.path.join(out_dir, f"{self.name}.ops.json"), "w") as f:
+            json.dump(dict(nargs=self.nargs, ops=self.signatures), f, indent=1)
 
 
 def _herd_width(h):
@@ -270,7 +289,8 @@ def _pin_l2(herds):
 
 def _drop_unused_scalars(fn):
     """Erase the func's scalar arguments nothing reads, so its runtime
-    sequence takes only buffers and the scalars it still uses."""
+    sequence takes only buffers and the scalars it still uses. Returns which
+    arguments were kept."""
     from air.ir import ArrayAttr, FunctionType, MemRefType, TypeAttr
 
     block = fn.regions[0].blocks[0]
@@ -290,6 +310,52 @@ def _drop_unused_scalars(fn):
             fn.attributes["arg_attrs"] = ArrayAttr.get(
                 [a for a, k in zip(attrs, keep) if k]
             )
+    return keep
+
+
+def kernel_id(kernel):
+    """A Triton kernel's name across processes: its module and name."""
+    return f"{kernel.fn.__module__}.{kernel.fn.__qualname__}"
+
+
+def dtype_name(dtype):
+    """A pointer's element type as Triton specializes on it: the name of a
+    numpy or torch dtype."""
+    return str(getattr(dtype, "name", dtype)).split(".")[-1]
+
+
+def canonical(v):
+    """A bound argument as it is recorded and matched: JSON's types."""
+    return v if isinstance(v, (bool, int, float, str)) else str(v)
+
+
+def _signature(kernel, grid, args, constexprs, slot, runtime, kept, compiled):
+    """How a call of `kernel` reaches the op: its grid, its pointer
+    parameters' element types and device buffers, the values bound into the
+    op, its run-time parameters in the sequence's order, and the pointers the
+    kernel writes."""
+    values = dict(zip((p.name for p in kernel.params), args))
+    values.update(constexprs or {})
+    plain = [p.name for p in kernel.params if not p.is_constexpr]
+    pointers = [n for n in plain if hasattr(values[n], "data_ptr")]
+    # the func's arguments are the kernel's non-constexpr parameters in order,
+    # then Triton's grid ints; `kept` says which survived
+    named = plain + [None] * (len(kept) - len(plain))
+    rt = [n for n, k in zip(named, kept) if k and n in runtime]
+    written = written_args(compiled.asm["ttir"], plain)
+    return dict(
+        kernel=kernel_id(kernel),
+        grid=list(grid),
+        types={n: dtype_name(values[n].dtype) for n in pointers},
+        slots={n: slot + i for i, n in enumerate(pointers)},
+        bound={
+            n: canonical(v)
+            for n, v in values.items()
+            if n not in pointers and n not in runtime
+        },
+        runtime=rt,
+        written=None if written is None else sorted(written),
+    )
 
 
 def _bind_ints(m, kernel, args, keep=()):

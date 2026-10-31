@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standalone check of the Triton LM head (`gemma4_lm_gemv`) against numpy.
 
-Builds the LM head the way `gemma4_triton_fused.build` does and runs it on
-`npu_runner` the way the prefill does: weights packed by `gemma4_lm_gemv.pack`,
+Builds the LM head the way `gemma4_triton_fused.build` does and calls it as
+the prefill does, `gemv_q4[grid](...)` on a `FusedProgram`: weights packed by `gemma4_lm_gemv.pack`,
 x bf16, logits read back by `gemma4_lm_gemv.unpack_y`. A change on either
 side of that interface shows up here rather than as wrong tokens.
 
@@ -25,7 +25,7 @@ import gemma4_triton_fused as T  # noqa: E402
 
 
 def main():
-    from triton.backends.amd_triton_npu.npu_runner import Device, sync_from, sync_to
+    from triton.backends.amd_triton_npu.fused_program import FusedProgram
 
     rng = np.random.default_rng(0)
     q = rng.integers(0, 16, (LG.V, LG.K)).astype(np.uint8)
@@ -37,23 +37,19 @@ def main():
     ref = (q.astype(np.float32) * s32 + m32) @ x.astype(np.float32)
 
     with tempfile.TemporaryDirectory() as d:
-        out = Path(d)
-        T.build_lm(out)
-        dev = Device(out / "lm.xclbin", 3, insts={"lm": out / "lm.insts.bin"})
+        T.build_lm(d)
+        prog = FusedProgram(d, "lm")
         w = LG.pack(q, sc, mn)
-        bw, wm = dev.array(0, np.uint8, w.shape)
-        wm[:] = w
-        sync_to(bw)
-        bx, xm = dev.array(1, bfloat16, (LG.K,))
-        by, ym = dev.array(2, bfloat16, (LG.V,))
-        xm[:] = x
-        sync_to(bx)
-        run = dev.launch("lm", {0: bw, 1: bx, 2: by})
-        run.start()
-        run.wait()
-        sync_from(by)
-        got = LG.unpack_y(ym.astype(np.float32))
-        dev.close()
+        wb, xb, yb = (
+            prog.empty(w.shape, np.uint8),
+            prog.empty(LG.K, bfloat16),
+            prog.empty(LG.V, bfloat16),
+        )
+        wb.host(write=True)[...] = w
+        xb.host(write=True)[...] = x
+        with prog:
+            LG.gemv_q4[(1,)](*LG.args(wb, xb, yb))
+        got = LG.unpack_y(yb.host().astype(np.float32))
 
     rel = np.linalg.norm(got - ref) / np.linalg.norm(ref)
     print(f"V={LG.V}: relerr {rel:.5f}, argmax {got.argmax()} (ref {ref.argmax()})")

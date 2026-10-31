@@ -255,6 +255,10 @@ runs:
         # weights.
         python3 scripts/test_fused_device.py
 
+        # Which pointer arguments a kernel writes, read from its TTIR: what a
+        # fused device's calls sync back. No NPU.
+        python3 scripts/test_arg_access.py
+
         # The host side of the NPU prefills, as Triton kernels on triton-cpu,
         # against numpy at Gemma4-E2B's shapes. No NPU, no weights.
         ( cd examples/llm_q4nx && python3 test_host_kernels.py )
@@ -282,6 +286,10 @@ runs:
           # That NPU waits release the GIL: MultiLaunchRunner falls back to
           # pyxrt's own wait, which holds it, without saying so.
           python3 scripts/test_npu_wait.py
+
+          # Calling a fused device's ops as Triton kernels: which op a call
+          # reaches, and that the host and the device see each other's writes.
+          python3 scripts/test_fused_program.py
 
           # One-op NPUChain re-dispatch (the LLM projection and attention chains).
           python3 scripts/test_npu_chain_single_op.py

@@ -2,7 +2,8 @@
 """Standalone check of `gemma4_attention.attn` against a numpy reference.
 
 Both of Gemma4-E2B's attention ops are built as `gemma4_triton_fused` builds
-them and dispatched by `npu_runner` as the prefill dispatches them: per group
+them and called as the prefill calls them, `attn[grid](...)` on a
+`FusedProgram`: per group
 (one per column), q and o for its half of the heads and the KV records of the
 layer from the chunk's first K block on, all in 8x8 blocks, and (nk, q0, k0)
 at run time. Checked: the
@@ -31,15 +32,17 @@ import gemma4_triton_fused as T  # noqa: E402
 MAX_LEN = 768
 
 
-def build(proj):
-    """The attention ops on one device, as gemma4_triton_fused builds them."""
-    from triton.backends.amd_triton_npu.fused_device import FusedDevice
+def build(out):
+    """The attention ops on one device, built into `out` as
+    gemma4_triton_fused builds them."""
     from triton.backends.amd_triton_npu.config import config_context
+    from triton.backends.amd_triton_npu.fused_device import FusedDevice
 
-    dev = FusedDevice("fused_prefill", str(proj))
+    dev = FusedDevice("fused_prefill", str(Path(out) / "proj"))
     with config_context(bf16_emulation=True):
         T.add_attention(dev)
-    return T.compile_device(dev)
+    T.compile_device(dev)
+    dev.save(out)
 
 
 def reference(q, k, v, r0, window):
@@ -80,36 +83,37 @@ def records(k, v, lkp, dvt):
     return np.concatenate(out)
 
 
-def run(xclbin, header, cases):
-    from triton.backends.amd_triton_npu.npu_runner import Device, sync_from, sync_to
+def run(out, cases):
+    from triton.backends.amd_triton_npu.fused_program import FusedProgram
 
-    dev = Device(xclbin, T.NARGS, txn_h=header)
-    out = []
+    prog = FusedProgram(out, "fused_prefill")
+    res = []
     for op, groups, q, kv, nk, q0, k0 in cases:
-        bos, obs = {}, []
         hg = q.shape[0] // len(groups)
-        for c, grp in enumerate(groups):
-            slot = T.ATTN_SLOT[grp]
-            qc = blocks(q[c * hg : (c + 1) * hg])
-            qb, qm = dev.array(slot, bfloat16, qc.shape)
-            qm[:] = qc
-            sync_to(qb)
-            kb, km = dev.array(slot + 1, bfloat16, kv.shape)
-            km[:] = kv
-            sync_to(kb)
-            ob, om = dev.array(slot + 2, bfloat16, qc.shape)
-            bos.update({slot: qb, slot + 1: kb, slot + 2: ob})
-            obs.append((ob, om))
-        run = dev.launch(T.attn_name(op), bos, rt=(nk, q0, k0))
-        run.start()
-        run.wait()
-        got = []
-        for ob, om in obs:
-            sync_from(ob)
-            got.append(unblocks(om.astype(np.float32)))
-        out.append(np.concatenate(got))
-    dev.close()
-    return out
+        g = T.GROUPS[groups[0]]
+        kvb = prog.empty(kv.shape, bfloat16)
+        kvb.host(write=True)[...] = kv
+        bufs, outs = [], []
+        for name in T.GROUPS:
+            if name in groups:
+                c = groups.index(name)
+                qc = blocks(q[c * hg : (c + 1) * hg])
+                qb = prog.empty(qc.shape, bfloat16)
+                qb.host(write=True)[...] = qc
+                ob = prog.empty(qc.shape, bfloat16)
+                bufs += [qb, kvb, ob]
+                outs.append(ob)
+            else:
+                # the other op's groups: the op does not touch them
+                other = T.GROUPS[name]
+                q_ = prog.empty((hg * T.M, other.dh), bfloat16)
+                bufs += [q_, prog.empty(2 * other.lkp * other.dh, bfloat16), q_]
+        with prog:
+            T.call_attention(op, bufs, nk, q0, k0)
+        res.append(
+            np.concatenate([unblocks(ob.host().astype(np.float32)) for ob in outs])
+        )
+    return res
 
 
 def main():
@@ -139,8 +143,8 @@ def main():
             refs.append(reference(q.astype(np.float32), k[:n], v[:n], r0, window))
             names.append(f"{op} r0={r0} k0={k0}")
     with tempfile.TemporaryDirectory() as d:
-        xclbin, header = build(Path(d) / "proj")
-        outs = run(xclbin, header, cases)
+        build(d)
+        outs = run(d, cases)
     # S and P are bf16, and so is the output accumulated over K blocks,
     # against an f32 reference.
     ok = True

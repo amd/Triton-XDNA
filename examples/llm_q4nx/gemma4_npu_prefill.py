@@ -1,15 +1,14 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Gemma4-E2B's prefill on the devices `gemma4_triton_fused` builds,
-dispatched by `npu_runner` on weights it reads (`gemma4_weights`) and packs
-itself.
+"""Gemma4-E2B's prefill on the devices `gemma4_triton_fused` builds, as a
+Triton program: NPU kernels called on a `FusedProgram`'s buffers, the math
+between them as host kernels (`host_kernels`, on triton-cpu), on weights read
+from the bundle (`gemma4_weights`) and packed here.
 
-A prompt runs in chunks of M rows. Each layer starts every chunk's GEMMs
-before it waits on the first, so the host work of one chunk overlaps the
-device work of the others. The math between the device's GEMMs and
-attention runs on the host as Triton kernels (`host_kernels`, on
-triton-cpu), each writing the layout the next device op reads.
+A prompt runs in chunks of M rows. Each layer calls every chunk's GEMMs before
+the host reads the first one's output, so the host work of one chunk overlaps
+the device work of the others.
 """
 
 import numpy as np
@@ -21,12 +20,9 @@ import gemma4_lm_gemv as LG
 import gemma4_triton_fused as T
 import host_kernels as H
 from gemma4_weights import Gemma4Weights
-from triton.backends.amd_triton_npu.driver_scope import driver_scope
-from triton.backends.amd_triton_npu.npu_runner import Device, sub_bo, sync_from, sync_to
+from triton.backends.amd_triton_npu.fused_program import FusedProgram
 
 HR = G.M // G.TM
-#: per attention op, its groups (q's buffer slot, group) in kernel order
-ATTN = {op: [(T.ATTN_SLOT[g], T.GROUPS[g]) for g in gs] for op, gs in T.OPS.items()}
 
 
 def inv_freq(dh, sliding, freqs):
@@ -39,29 +35,26 @@ def inv_freq(dh, sliding, freqs):
     return np.ascontiguousarray(inv, np.float32)
 
 
-# ---- the prefill -----------------------------------------------------------
+def op_of(L):
+    """Layer L's attention op."""
+    return "s" if C.is_sliding(L) else "f"
 
 
 class NpuPrefill:
-    """`build_dir` holds fused_prefill.xclbin / .txn.h and lm.xclbin /
-    lm.insts.bin. `kv_store(L, r0, k, v)` takes each owning layer's K and V
-    rows (float32 [t, dh], normed and roped)."""
+    """`build_dir` holds the `fused_prefill` and `lm` devices.
+    `kv_store(L, r0, k, v)` takes each owning layer's K and V rows (float32
+    [t, dh], normed and roped)."""
 
     def __init__(self, build_dir, max_len=2048, kv_store=None):
-        from pathlib import Path
-
-        d = Path(build_dir)
-        self.dir, self.max_len, self.kv_store = d, max_len, kv_store
-        self.fp = Device(
-            d / "fused_prefill.xclbin", T.NARGS, txn_h=d / "fused_prefill.txn.h"
-        )
-        self.lm_dev = Device(d / "lm.xclbin", 3, insts={"lm": d / "lm.insts.bin"})
+        self.max_len, self.kv_store = max_len, kv_store
+        self.fp = FusedProgram(build_dir, "fused_prefill")
+        self.lm = FusedProgram(build_dir, "lm")
         self.on_layer = None
-        self.a, self.c, self.runs, self.att = {}, {}, {}, {}
+        self.a, self.c, self.att = {}, {}, {}
         self.suspended = False
 
     def contexts(self):
-        return [self.fp, self.lm_dev]
+        return [self.fp.device, self.lm.device]
 
     def suspend(self):
         if not self.suspended:
@@ -80,10 +73,9 @@ class NpuPrefill:
     def _site(self, site, k, n, packed, wq):
         kp = packed.shape[1] * G.k_pad(k) // k
         packed = np.pad(packed, ((0, 0), (0, kp - packed.shape[1]), (0, 0)))
-        bo = self.fp.bo(packed.nbytes, 1)
-        bo.write(packed.tobytes(), 0)
-        sync_to(bo)
-        self.sites[site] = dict(k=k, n=n, npd=G.n_pad(n), wq=wq, w=bo)
+        w = self.fp.empty(packed.shape, np.uint8)
+        w.host(write=True)[...] = packed
+        self.sites[site] = dict(k=k, npd=G.n_pad(n), wq=wq, w=w)
 
     def load_weights(self, model=None):
         w = self.w = Gemma4Weights(model)
@@ -108,127 +100,102 @@ class NpuPrefill:
         self.embed_tbl, self.ple_tbl = w.embed_table(), w.ple_embed_table()
         self.kv = {}
         for L in range(C.N_LAYERS):
-            if not C.owns_kv(L):
-                continue
-            slot, g = ATTN["s" if C.is_sliding(L) else "f"][0]
-            nblk = -(-self.max_len // g.lkp) + 1
-            bo, m = self.fp.array(slot + 1, bfloat16, (nblk, 2 * g.lkp * g.dh))
-            self.kv[L] = dict(bo=bo, m=m, subs={})
+            if C.owns_kv(L):
+                g = T.GROUPS[T.OPS[op_of(L)][0]]
+                # the cores read K blocks in pairs, so one past the last
+                nblk = -(-self.max_len // g.lkp) + 1
+                self.kv[L] = self.fp.zeros((nblk, 2 * g.lkp * g.dh), bfloat16)
         lw = LG.pack(*w.lm_head(0, C.VOCAB))
-        self.lm_w = self.lm_dev.bo(lw.nbytes, 0)
-        self.lm_w.write(lw.tobytes(), 0)
-        sync_to(self.lm_w)
-        self.lm_x, self.lm_xm = self.lm_dev.array(1, bfloat16, (LG.K,))
-        self.lm_y, self.lm_ym = self.lm_dev.array(2, bfloat16, (LG.V,))
-        self.lm_run = self.lm_dev.launch(
-            "lm", {0: self.lm_w, 1: self.lm_x, 2: self.lm_y}
-        )
+        self.lm_w = self.lm.empty(lw.shape, np.uint8)
+        self.lm_w.host(write=True)[...] = lw
+        self.lm_x = self.lm.empty(LG.K, bfloat16)
+        self.lm_y = self.lm.empty(LG.V, bfloat16)
         self.logits = np.empty(LG.V, np.float32)
 
-    # ---- GEMMs
-
-    def a_buf(self, k, c):
-        key = (k, c)
-        if key not in self.a:
-            self.a[key] = self.fp.array(
-                0, bfloat16, (HR, G.k_pad(k) // G.TK, G.TM, G.TK)
-            )
-        return self.a[key]
+    # ---- device buffers, one set per chunk so the chunks can be in flight
 
     def am(self, k, c):
-        """The A tiles a kernel writes for a K-deep GEMM of chunk c."""
-        return self.a_buf(k, c)[1]
+        """The A tiles of a K-deep GEMM of chunk c."""
+        if (k, c) not in self.a:
+            shape = (HR, G.k_pad(k) // G.TK, G.TM, G.TK)
+            self.a[k, c] = self.fp.zeros(shape, bfloat16)
+        return self.a[k, c]
 
-    def a_sync(self, k, c):
-        sync_to(self.a_buf(k, c)[0])
+    def out(self, role, npd, c):
+        if (role, npd, c) not in self.c:
+            self.c[role, npd, c] = self.fp.empty((G.M, npd), bfloat16)
+        return self.c[role, npd, c]
 
-    def gemm_start(self, site, c, act=0, role=None):
+    def gemm(self, site, c, act=0):
+        """Call the GEMM of weights `site` on chunk c's A tiles; returns its
+        output rows [M, npd] bf16."""
         s = self.sites[site]
-        role = role or site.split(".")[-1]
-        name = T.gemm_name(s["k"], s["n"], act, s["wq"])
-        key = (name, role, c)
-        if key not in self.runs:
-            ck = (role, s["npd"], c)
-            if ck not in self.c:
-                self.c[ck] = self.fp.array(2, bfloat16, (G.M, s["npd"]))
-            bos = {0: self.a_buf(s["k"], c)[0], 1: s["w"], 2: self.c[ck][0]}
-            self.runs[key] = (self.fp.launch(name, bos), self.c[ck])
-        run, (cb, cm) = self.runs[key]
-        run.set_bo(1, s["w"])
-        sync_to(cb, 64, 0)
-        run.start()
-        return run, cb, cm, s
+        y = self.out(site.split(".")[-1], s["npd"], c)
+        G.mm_g[(1,)](
+            *G.args(self.am(s["k"], c), s["w"], y, s["npd"], s["k"], act, s["wq"], G.k_pad(s["k"]))
+        )  # fmt: skip
+        return y
 
-    def gemm_wait(self, pend, t):
-        """The output's rows [M, npd] bf16, valid in [:t, :n]."""
-        run, cb, cm, s = pend
-        run.wait()
-        sync_from(cb, t * s["npd"] * 2, 0)
-        return cm
+    def attn_bufs(self, op, c):
+        """Per group, in `GROUPS` order: q and o for op's groups of chunk c,
+        stand-ins for the other op's (which it does not touch); the KV slot
+        is filled per call."""
+        if (op, c) not in self.att:
+            hg = C.N_Q_HEADS // len(T.OPS[op])
+            bufs = []
+            for name, g in T.GROUPS.items():
+                if name in T.OPS[op]:
+                    q = self.fp.empty((hg, G.M, g.dh), bfloat16)
+                    o = self.fp.empty((hg, G.M, g.dh), bfloat16)
+                else:
+                    q = o = self.fp.empty((1, 2 * g.lkp * g.dh), bfloat16)
+                bufs += [q, None, o]
+            self.att[op, c] = bufs
+        return self.att[op, c]
 
-    # ---- attention
-
-    def attn_chunk(self, op, c):
-        key = (op, c)
-        if key not in self.att:
-            groups, hg = ATTN[op], C.N_Q_HEADS // len(ATTN[op])
-            bos, parts = {}, []
-            for slot, g in groups:
-                q, qm = self.fp.array(slot, bfloat16, (hg, G.M, g.dh))
-                o, om = self.fp.array(slot + 2, bfloat16, (hg, G.M, g.dh))
-                bos[slot], bos[slot + 2] = q, o
-                parts.append(dict(q=q, qm=qm, o=o, om=om, slot=slot, hg=hg))
-            run = self.fp.launch(T.attn_name(op), bos, rt=(1, 0, 0))
-            self.att[key] = dict(run=run, parts=parts)
-        return self.att[key]
-
-    def attn_start(self, op, kv, c, r0, t, q, q_norm, rope):
-        """q: the q GEMM's output rows, normed, roped and scaled here."""
-        ch = self.attn_chunk(op, c)
-        _, g = ATTN[op][0]
+    def attention(self, op, kv, c, r0, t, q, q_norm, rope):
+        """q: the q GEMM's output rows, normed, roped and scaled here.
+        Returns the op's buffers."""
+        g = T.GROUPS[T.OPS[op][0]]
         scale = float(np.sqrt(g.dh) * C.ATTN_SCALE)
         q0 = r0 // g.lkp
         nend = -(-(r0 + t) // g.lkp)
         w = T.WINDOWS.get(op)
         k0 = max(0, q0 - w // g.lkp) if w else 0
-        rec = 2 * g.lkp * g.dh * 2
-        sub = kv["subs"].get(k0)
-        if sub is None:
-            sub = kv["subs"][k0] = sub_bo(kv["bo"], k0 * rec)
-        h0 = 0
-        for p in ch["parts"]:
-            H.q_post(q, q_norm, rope, p["qm"], t, h0, scale, C.RMS_EPS)
-            sync_to(p["q"])
-            ch["run"].set_bo(p["slot"] + 1, sub)
-            sync_to(p["o"], 64, 0)
-            h0 += p["hg"]
         n = nend - k0
-        ch["run"].set_rt(n + n % 2, q0, k0)
-        ch["run"].start()
-        return ch
-
-    def attn_wait(self, ch, t, am):
-        """The output into the A tiles am of [t, heads * dh]."""
-        ch["run"].wait()
+        bufs = self.attn_bufs(op, c)
         h0 = 0
-        for p in ch["parts"]:
-            sync_from(p["o"])
-            H.o_tile(p["om"], am, t, h0)
-            h0 += p["hg"]
+        for i, name in enumerate(T.GROUPS):
+            if name in T.OPS[op]:
+                H.q_post(q, q_norm, rope, bufs[3 * i], t, h0, scale, C.RMS_EPS)
+                h0 += bufs[3 * i].shape[0]
+                # the records the chunk attends to, so writing later ones
+                # does not wait for it
+                bufs[3 * i + 1] = kv[k0 : k0 + n]
+            else:
+                bufs[3 * i + 1] = bufs[3 * i]
+        # the cores read K blocks in pairs; the one past the last is masked
+        T.call_attention(op, bufs, n + n % 2, q0, k0)
+        return bufs
+
+    def attn_out(self, op, bufs, t, am):
+        """The op's output into the A tiles am of [t, heads * dh]."""
+        h0 = 0
+        for i, name in enumerate(T.GROUPS):
+            if name in T.OPS[op]:
+                H.o_tile(bufs[3 * i + 2], am, t, h0)
+                h0 += bufs[3 * i + 2].shape[0]
 
     def kv_write(self, L, r0, t, k, v, k_norm, rope):
         """Layer L's KV head from the k and v GEMMs' output rows."""
-        _, g = ATTN["s" if C.is_sliding(L) else "f"][0]
-        kv = self.kv[L]
-        b0 = r0 // g.lkp
+        g = T.GROUPS[T.OPS[op_of(L)][0]]
+        b0, nb = r0 // g.lkp, -(-t // g.lkp)
         kf = np.empty((t, g.dh), np.float32)
         vf = np.empty((t, g.dh), np.float32)
         H.kv_post(
-            k, v, k_norm, rope, kf, vf, kv["m"][b0:], t,
+            k, v, k_norm, rope, kf, vf, self.kv[L][b0 : b0 + nb], t,
             g.lkp, g.dh // T.V_CHUNKS, C.RMS_EPS,
         )  # fmt: skip
-        nb = kv["m"].shape[1] * 2
-        sync_to(kv["bo"], -(-t // g.lkp) * nb, b0 * nb)
         if self.kv_store:
             self.kv_store(L, r0, kf, vf)
 
@@ -245,7 +212,7 @@ class NpuPrefill:
         if bad.size:
             raise ValueError(f"token ids outside [0, {C.VOCAB}): {bad[:8].tolist()}")
         ids = np.ascontiguousarray(ids, np.int32)
-        with driver_scope("cpu"):
+        with self.fp:
             return self._prefill(ids, n)
 
     def _prefill(self, ids, n):
@@ -255,15 +222,14 @@ class NpuPrefill:
         tbl = np.empty((n, C.N_LAYERS * C.PLI_D), np.float32)
         H.embed(*self.ple_tbl, ids, tbl)
         chunks = [(r0, min(G.M, n - r0)) for r0 in range(0, n, G.M)]
-        pend = []
+        proj = []
         for c, (r0, t) in enumerate(chunks):
             H.rms_tile(x[r0:], None, self.am(C.D, c), t, C.D, eps, norm=False)
-            self.a_sync(C.D, c)
-            pend.append(self.gemm_start("mp", c))
+            proj.append(self.gemm("mp", c))
         pli = np.empty((n, C.N_LAYERS, C.PLI_D), np.float32)
         for c, (r0, t) in enumerate(chunks):
             H.ple(
-                self.gemm_wait(pend[c], t), self.ple_norm, tbl[r0:], pli[r0:], t,
+                proj[c], self.ple_norm, tbl[r0:], pli[r0:], t,
                 C.PLE_MODEL_PROJ_SCALE, C.PLE_INPUT_SCALE, eps,
             )  # fmt: skip
         ropes = {}
@@ -278,14 +244,12 @@ class NpuPrefill:
             self.layer(L, x, pli, chunks, ropes)
             if self.on_layer:
                 self.on_layer(L, x, pli)
-        H.rms_rows(x[-1:], self.final_norm, self.lm_xm, eps)
-        sync_to(self.lm_x)
-        sync_to(self.lm_y, 64, 0)
-        self.lm_run.start()
-        self.lm_run.wait()
-        sync_from(self.lm_y)
-        _, tf, nr, fg = self.lm_ym.reshape(LG.NC, -1, LG.NR, LG.FLUSH * LG.GN).shape
-        H.softcap(self.lm_ym, self.logits, C.FINAL_LOGIT_SOFTCAP, nr, tf, fg)
+        H.rms_rows(x[-1:], self.final_norm, self.lm_x, eps)
+        with self.lm:
+            LG.gemv_q4[(1,)](*LG.args(self.lm_w, self.lm_x, self.lm_y))
+        y = self.lm_y.reshape(LG.NC, -1, LG.NR, LG.FLUSH * LG.GN)
+        _, tf, nr, fg = y.shape
+        H.softcap(self.lm_y, self.logits, C.FINAL_LOGIT_SOFTCAP, nr, tf, fg)
         return self.logits.copy()
 
     def layer(self, L, x, pli, chunks, ropes):
@@ -295,60 +259,43 @@ class NpuPrefill:
         dq = C.N_Q_HEADS * dh
         inter = C.mlp_inter(L)
         own = C.owns_kv(L)
-        op = "s" if C.is_sliding(L) else "f"
+        op = op_of(L)
         rows = [x[r0 : r0 + t] for r0, t in chunks]
-        pend = []
+        qkv = []
         for c, (r0, t) in enumerate(chunks):
             H.rms_tile(rows[c], nm["input"], self.am(C.D, c), t, C.D, eps)
-            self.a_sync(C.D, c)
-            ps = [self.gemm_start(f"{L}.q", c)]
-            if own:
-                ps += [self.gemm_start(f"{L}.k", c), self.gemm_start(f"{L}.v", c)]
-            pend.append(ps)
+            sites = ("q", "k", "v") if own else ("q",)
+            qkv.append([self.gemm(f"{L}.{s}", c) for s in sites])
         kv = self.kv[C.kv_source_layer(L)]
         att = []
         for c, (r0, t) in enumerate(chunks):
-            q = self.gemm_wait(pend[c][0], t)
             if own:
-                k = self.gemm_wait(pend[c][1], t)
-                v = self.gemm_wait(pend[c][2], t)
+                _, k, v = qkv[c]
                 self.kv_write(L, r0, t, k, v, nm["k_norm"], ropes[dh][c])
-            att.append(self.attn_start(op, kv, c, r0, t, q, nm["q_norm"], ropes[dh][c]))
-        pend = []
+            q = qkv[c][0]
+            att.append(self.attention(op, kv, c, r0, t, q, nm["q_norm"], ropes[dh][c]))
+        o = []
         for c, (r0, t) in enumerate(chunks):
-            self.attn_wait(att[c], t, self.am(dq, c))
-            self.a_sync(dq, c)
-            pend.append(self.gemm_start(f"{L}.o", c))
+            self.attn_out(op, att[c], t, self.am(dq, c))
+            o.append(self.gemm(f"{L}.o", c))
         gu = []
         for c, (r0, t) in enumerate(chunks):
-            o = self.gemm_wait(pend[c], t)
             H.add_rms(
-                rows[c], o, nm["post_attn"], t, eps,
+                rows[c], o[c], nm["post_attn"], t, eps,
                 am=self.am(C.D, c), w2=nm["pre_ffn"],
             )  # fmt: skip
-            self.a_sync(C.D, c)
-            gu.append(
-                (self.gemm_start(f"{L}.gate", c, 1), self.gemm_start(f"{L}.up", c))
-            )
-        pend = []
+            gu.append((self.gemm(f"{L}.gate", c, 1), self.gemm(f"{L}.up", c)))
+        down = []
         for c, (r0, t) in enumerate(chunks):
-            g = self.gemm_wait(gu[c][0], t)
-            u = self.gemm_wait(gu[c][1], t)
-            H.mul_tile(g, u, self.am(inter, c), t, inter)
-            self.a_sync(inter, c)
-            pend.append(self.gemm_start(f"{L}.down", c))
+            H.mul_tile(gu[c][0], gu[c][1], self.am(inter, c), t, inter)
+            down.append(self.gemm(f"{L}.down", c))
         pg = []
         for c, (r0, t) in enumerate(chunks):
-            d = self.gemm_wait(pend[c], t)
-            H.add_rms(rows[c], d, nm["post_ffn"], t, eps, am=self.am(C.D, c))
-            self.a_sync(C.D, c)
-            pg.append(self.gemm_start(f"{L}.ple_gate", c, 1))
-        pend = []
+            H.add_rms(rows[c], down[c], nm["post_ffn"], t, eps, am=self.am(C.D, c))
+            pg.append(self.gemm(f"{L}.ple_gate", c, 1))
+        pp = []
         for c, (r0, t) in enumerate(chunks):
-            g = self.gemm_wait(pg[c], t)
-            H.mul_tile(g, pli[r0:, L], self.am(C.PLI_D, c), t, C.PLI_D)
-            self.a_sync(C.PLI_D, c)
-            pend.append(self.gemm_start(f"{L}.ple_proj", c))
+            H.mul_tile(pg[c], pli[r0:, L], self.am(C.PLI_D, c), t, C.PLI_D)
+            pp.append(self.gemm(f"{L}.ple_proj", c))
         for c, (r0, t) in enumerate(chunks):
-            p = self.gemm_wait(pend[c], t)
-            H.add_rms(rows[c], p, nm["post_ple"], t, eps, scale=nm["out_scale"])
+            H.add_rms(rows[c], pp[c], nm["post_ple"], t, eps, scale=nm["out_scale"])
