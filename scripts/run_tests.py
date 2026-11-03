@@ -41,6 +41,11 @@ DEFAULT_SKIPPED_EXAMPLES = {
     "gemma3_4b_q4nx",
     "gemma4_e2b_q4nx",
     "gemma4_e4b_q4nx",
+    # Same, and additionally needs an image, pillow, and a decode template at
+    # least 512 long -- an image is 256 soft tokens before a word of prompt, so
+    # the 128 the text examples build is too short. Its own gate is
+    # `make vision`, which needs no hardware and no decode build.
+    "gemma4_e2b_flash",
     # Not an example: the harness the *_q4nx examples share. Its files are
     # libraries, and the two with a __main__ are build steps -- running
     # decode_build.py as a "test" lowers the whole decode.

@@ -316,6 +316,18 @@ EXAMPLES = [
             "decode."
         ),
     },
+    {
+        "kind": "model",
+        "name": "Gemma4-E2B flash (image)",
+        "path": "gemma4_e2b_flash",
+        "datatypes": "bf16 vision + prefill, q4nx decode",
+        "description": (
+            "The Gemma4-E2B checkpoint with an image in front of the prompt: "
+            "a 16-layer Triton vision tower encodes the patches into soft "
+            "tokens that replace placeholders in the text. The only model "
+            "here that takes anything but tokens as input."
+        ),
+    },
 ]
 
 # Directories under examples/ that are not examples. Keep in step with
