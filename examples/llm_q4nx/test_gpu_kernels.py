@@ -295,6 +295,89 @@ def _qkv_post(G, dev):
     return ok
 
 
+def _gqa_slab(G, dev):
+    """Gemma4-E4B's two KV heads: `qkv_post` writes each into its own slot of
+    the shared slab row, and `attn_decode` reads each query group's head back
+    out of it. Against torch, head by head."""
+    # The lane map and the slot width do not depend on the head count.
+    KVL = _e2b_kv_layout()
+    DH_A, K_REGION, V_REGION, lane_shift = (
+        KVL.DH_A,
+        KVL.K_REGION,
+        KVL.V_REGION,
+        KVL.lane_shift,
+    )
+
+    print("\nqkv_post + attn_decode  (two KV heads, shared slab)")
+    ok = True
+    n_kv, maxl, slot, T, pos0 = 2, 16, 1, 5, 3
+    row_w = n_kv * DH_A
+    group = N_Q_HEADS // n_kv
+    for dh in (256, 512):
+        qd = N_Q_HEADS * dh
+        qkv = torch.randn(T, qd + 2 * n_kv * dh, device=dev)
+        qn, kn = torch.randn(dh, device=dev), torch.randn(dh, device=dev)
+        rows = torch.randn(T, dh, device=dev)
+        stride = maxl * row_w
+        slab = torch.zeros(3, 2 * stride, dtype=torch.bfloat16, device=dev)
+        q, kd, vd = G.qkv_post(
+            qkv, qn, kn, rows, N_Q_HEADS, dh, RMS_EPS,
+            (slab, slot, pos0, stride), dense_kv=True, n_kv=n_kv,
+        )  # fmt: skip
+        k_ref, v_ref = [], []
+        for j in range(n_kv):
+            kj = qkv[:, qd + j * dh : qd + (j + 1) * dh]
+            kj = G.rmsnorm(kj, kn, RMS_EPS)
+            k_ref.append(
+                torch.cat([G.rope(kj[t : t + 1], rows[t], 1, dh) for t in range(T)])
+            )
+            vb = qd + n_kv * dh + j * dh
+            v_ref.append(G.rmsnorm(qkv[:, vb : vb + dh], None, RMS_EPS))
+        ok &= check(f"dense K dh={dh}", kd, torch.cat(k_ref, 1), tol=1e-5)
+        ok &= check(f"dense V dh={dh}", vd, torch.cat(v_ref, 1), tol=1e-5)
+
+        # Where each head's lanes land in a row, by region.
+        def lanes(j, region):
+            d = torch.arange(dh, device=dev)
+            shift = lane_shift(dh, region)
+            return j * DH_A + torch.where(d < dh // 2, d, d + shift)
+
+        kreg = slab[slot, :stride].view(maxl, row_w)
+        vreg = slab[slot, stride:].view(maxl, row_w)
+        for j in range(n_kv):
+            r = slice(pos0, pos0 + T)
+            ok &= check(
+                f"slab K head {j} dh={dh}",
+                kreg[r][:, lanes(j, K_REGION)].float(),
+                k_ref[j].to(torch.bfloat16).float(),
+                tol=1e-6,
+            )
+            ok &= check(
+                f"slab V head {j} dh={dh}",
+                vreg[r][:, lanes(j, V_REGION)].float(),
+                v_ref[j].to(torch.bfloat16).float(),
+                tol=1e-6,
+            )
+
+        # Decode attention over rows 0 .. pos0 + T, read in place.
+        S = pos0 + T
+        qt = torch.randn(1, qd, device=dev)
+        got = G.attn_decode(
+            qt, kreg[:S], vreg[:S], N_Q_HEADS, dh, 1.0,
+            k_shift=lane_shift(dh, K_REGION), v_shift=lane_shift(dh, V_REGION),
+            n_kv=n_kv, kv_w=DH_A,
+        )  # fmt: skip
+        ref = []
+        for h in range(N_Q_HEADS):
+            j = h // group
+            kh = kreg[:S][:, lanes(j, K_REGION)].float()
+            vh = vreg[:S][:, lanes(j, V_REGION)].float()
+            qh = qt[0, h * dh : (h + 1) * dh]
+            ref.append(torch.softmax(kh @ qh, -1) @ vh)
+        ok &= check(f"attn_decode S={S} dh={dh}", got, torch.cat(ref)[None], tol=1e-4)
+    return ok
+
+
 def _vision(G, dev):
     """The vision tower's kernels: clipped GEMM, q/k/v post, bidirectional MHA."""
     import gemma4_vision as V
@@ -630,6 +713,7 @@ def main():
 
     ok &= _gemv_q4nx(G, dev)
     ok &= _qkv_post(G, dev)
+    ok &= _gqa_slab(G, dev)
     ok &= _gemm_w4a8(G, dev)
     ok &= _vision(G, dev)
 

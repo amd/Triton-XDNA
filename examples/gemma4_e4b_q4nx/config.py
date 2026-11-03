@@ -148,9 +148,9 @@ def _fingerprint(src):
         return ""
 
 
-def load_q4nx(model=None):
+def load_q4nx(model=None, projections=True):
     """Host-dequantized Gemma4-E4B weights, in the layout E2B's loader returns
-    (`../gemma4_e2b_q4nx/config.py::load_q4nx`)."""
+    (`../gemma4_e2b_q4nx/config.py::load_q4nx`), `projections` included."""
     import numpy as np
 
     gw = _weights()
@@ -180,7 +180,11 @@ def load_q4nx(model=None):
                 f"says {mlp_inter(k)}"
             )
         # Transposed to [K, out], as E2B's loader does.
-        w = {nm: np.ascontiguousarray(t.T) for nm, t in qm.layer_weights(k).items()}
+        w = (
+            {nm: np.ascontiguousarray(t.T) for nm, t in qm.layer_weights(k).items()}
+            if projections
+            else {}
+        )
         ple = {nm: np.ascontiguousarray(t.T) for nm, t in qm.layer_ple(k).items()}
         nm = qm.layer_norms(k)
         layers.append(
@@ -210,6 +214,51 @@ def load_q4nx(model=None):
         rope_freqs=qm.rope_freqs(),
         fingerprint=_fingerprint(src),
     )
+
+
+def load_q4nx_packed(model=None):
+    """The Codec B projections as the bundle stores them, NOT dequantized, in
+    the layout E2B's loader returns (`../gemma4_e2b_q4nx/config.py::
+    load_q4nx_packed`): for the iGPU's W4A16 kernels, which read them in place.
+    """
+    import numpy as np
+
+    qm = _weights().Q4nxModel(model or MODEL_DEFAULT)
+
+    def raw(name, N, K):
+        nb = qm._hdr[name]["shape"][0]
+        if nb != (N // 32) * (K // 256):
+            raise RuntimeError(f"{name}: {nb} chunks is not a {N}x{K} Codec B matrix")
+        return qm._raw(name, np.int16).view(np.uint8)
+
+    layers = []
+    for k in range(N_LAYERS):
+        dq, dkv, inter = N_Q_HEADS * head_dim(k), N_KV_HEADS * head_dim(k), mlp_inter(k)
+        p = f"model.layers.{k}."
+        qkv = [raw(p + "self_attn.q_proj.weight", dq, D)]
+        if owns_kv(k):
+            qkv += [
+                raw(p + "self_attn.k_proj.weight", dkv, D),
+                raw(p + "self_attn.v_proj.weight", dkv, D),
+            ]
+        layers.append(
+            dict(
+                qkv=(np.concatenate(qkv), dq + (2 * dkv if owns_kv(k) else 0), D),
+                o=(raw(p + "self_attn.o_proj.weight", D, dq), D, dq),
+                gate_up=(
+                    np.concatenate(
+                        [
+                            raw(p + "mlp.gate_proj.weight", inter, D),
+                            raw(p + "mlp.up_proj.weight", inter, D),
+                        ]
+                    ),
+                    2 * inter,
+                    D,
+                ),
+                down=(raw(p + "mlp.down_proj.weight", D, inter), D, inter),
+            )
+        )
+    return dict(layers=layers, lm_head=(raw("lm_head.weight", VOCAB, D), VOCAB, D))
 
 
 def rope_lut(seq_len, layer_idx, rope_freqs=None, dtype=None):

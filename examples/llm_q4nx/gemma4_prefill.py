@@ -99,16 +99,21 @@ def _host_view(buf):
 
 
 def _bf16_np(t):
-    """A numpy bfloat16 view of a torch tensor, converting exactly once.
+    """A torch tensor or numpy array as numpy bfloat16, converting exactly once.
 
-    numpy has no bfloat16, so the round trip goes through int16 and is
-    reinterpreted by `ml_dtypes` on the far side. Done here rather than at each
-    assignment because the value is written twice -- once per attention CU --
-    and letting numpy convert on assignment would convert twice.
+    Done here rather than at each assignment because the value is written
+    twice -- once per attention CU -- and letting numpy convert on assignment
+    would convert twice. The conversion is `ml_dtypes`', from float32: it
+    rounds to nearest even as torch's does, bit for bit, and torch's CPU cast
+    measured 200x slower (6 ms for one layer's chunk of K, against 0.03 ms).
     """
     from ml_dtypes import bfloat16
 
-    return t.to(torch.bfloat16).contiguous().view(torch.int16).numpy().view(bfloat16)
+    if torch.is_tensor(t):
+        if t.dtype == torch.bfloat16:
+            return t.contiguous().cpu().view(torch.int16).numpy().view(bfloat16)
+        t = t.detach().to("cpu", torch.float32).numpy()
+    return np.asarray(t, np.float32).astype(bfloat16)
 
 
 class Gemma4Prefill(LlamaPrefill):
@@ -187,6 +192,12 @@ class Gemma4Prefill(LlamaPrefill):
     #: for `share_weights_from` never runs `load_weights`, and `_layer` reads
     #: this on every layer.
     _fused_mlp = None
+
+    #: Whether `load_weights` dequantizes the projections (q/k/v/o, gate/up,
+    #: down) onto the host. A prefiller whose forward runs elsewhere -- the
+    #: fused NPU prefills -- turns it off: its decoders read the projections
+    #: packed from the bundle, and on E4B the bf16 copies alone are ~25 GiB.
+    HOST_PROJECTIONS = True
 
     #: Run attention's two GEMMs on the NPU where `_attention` allows it. A
     #: prefix-reusing suffix cannot take that path, so a session that reuses
@@ -380,7 +391,7 @@ class Gemma4Prefill(LlamaPrefill):
         holds the float32 originals and keeping them alive alongside the bf16
         copies doubles the resident set.
         """
-        raw = load_q4nx(model or self.model)
+        raw = load_q4nx(model or self.model, projections=self.HOST_PROJECTIONS)
         self.fingerprint = raw["fingerprint"]
         self.embed = _as_bf16(raw.pop("embed"))
         # NOT tied on this model -- its own 262144x1536 matrix, and by a wide
@@ -410,23 +421,29 @@ class Gemma4Prefill(LlamaPrefill):
                 )
             }
             w["out_scale"] = float(L["out_scale"])
-            for nm in ("o", "down", "inp_gate", "per_layer_projection", "model_proj"):
+            for nm in ("inp_gate", "per_layer_projection", "model_proj"):
                 w[nm] = _t(L[nm], torch.bfloat16)
-            # One dispatch costs ~24 ms of fixed overhead regardless of size,
-            # so projections sharing an input are issued as one GEMM. Q|K|V
-            # only where k and v exist: on a KV-shared layer `q` goes alone.
-            q = _t(L["q"], torch.bfloat16)
-            if "k" in L:
-                w["qkv"] = torch.cat(
-                    [q, _t(L["k"], torch.bfloat16), _t(L["v"], torch.bfloat16)], dim=1
+            if self.HOST_PROJECTIONS:
+                for nm in ("o", "down"):
+                    w[nm] = _t(L[nm], torch.bfloat16)
+                # One dispatch costs ~24 ms of fixed overhead regardless of
+                # size, so projections sharing an input are issued as one GEMM.
+                # Q|K|V only where k and v exist: on a KV-shared layer `q` goes
+                # alone.
+                q = _t(L["q"], torch.bfloat16)
+                if "k" in L:
+                    w["qkv"] = torch.cat(
+                        [q, _t(L["k"], torch.bfloat16), _t(L["v"], torch.bfloat16)],
+                        dim=1,
+                    ).contiguous()
+                else:
+                    w["qkv"] = q
+                w["gate_up"] = torch.cat(
+                    [_t(L["gate"], torch.bfloat16), _t(L["up"], torch.bfloat16)], dim=1
                 ).contiguous()
-            else:
-                w["qkv"] = q
-            w["gate_up"] = torch.cat(
-                [_t(L["gate"], torch.bfloat16), _t(L["up"], torch.bfloat16)], dim=1
-            ).contiguous()
+                del q
             self._w.append(w)
-            del L, q
+            del L
 
         # bf16 cos/sin, as the device applies them. One table per layer: the
         # theta and the width both follow the attention type, so there is no
@@ -460,7 +477,9 @@ class Gemma4Prefill(LlamaPrefill):
         """
         self._fused_mlp = None
         # Built for any backend whose PLACEMENT puts both operators on the NPU.
-        if any(self._device(op) != "npu" for op in ("matmul", "geglu")):
+        if not self.HOST_PROJECTIONS or any(
+            self._device(op) != "npu" for op in ("matmul", "geglu")
+        ):
             return
         if os.environ.get("Q4NX_FUSED_MLP", "1") != "1":
             print("[gemma4] fused MLP disabled by Q4NX_FUSED_MLP=0")
@@ -1237,6 +1256,12 @@ class Gemma4GpuDecode:
             from config import load_q4nx_packed
 
             packed = load_q4nx_packed(pf.model)
+        elif not pf.HOST_PROJECTIONS:
+            raise ValueError(
+                f"Q4NX_GPU_WEIGHTS={weights} reads the prefiller's bf16 "
+                "projections, and this prefiller loads none (HOST_PROJECTIONS "
+                "is off). Use q4k or q4nx."
+            )
         fused = getattr(pf, "_fused_mlp", None) or {}
         self._mlp_w = None
         if fused and packed is None:
@@ -1531,6 +1556,7 @@ class Gemma4GpuDecode:
                     kv=(self._slab_t, self._slot[L], 0, self._region_stride),
                     dense_kv=True,
                     out_dtype=torch.float16,
+                    n_kv=N_KV_HEADS,
                 )
                 dense[L] = (kd, vd)
             else:
@@ -1553,6 +1579,7 @@ class Gemma4GpuDecode:
                 dh,
                 window=SLIDING_WINDOW if is_sliding(L) else None,
                 scale=ATTN_SCALE,
+                n_kv=N_KV_HEADS,
             )
             a = gpu_kernels.gemm_w4a8(a, w["o"])
             x, h = gpu_kernels.rmsnorm_residual(
@@ -1641,6 +1668,7 @@ class Gemma4GpuDecode:
                     if owns
                     else None
                 ),
+                n_kv=N_KV_HEADS,
             )
 
             # One query row against the cache. No causal mask -- every cached
@@ -1658,6 +1686,8 @@ class Gemma4GpuDecode:
                 ATTN_SCALE,
                 k_shift=kv_layout.lane_shift(dh, kv_layout.K_REGION),
                 v_shift=kv_layout.lane_shift(dh, kv_layout.V_REGION),
+                n_kv=N_KV_HEADS,
+                kv_w=kv_layout.DH_A,
             )
 
             a = self._mm(a, w["o"])
@@ -1735,6 +1765,9 @@ class Gemma4IgpuPrefill(Gemma4Prefill):
     """
 
     ENGINE = "igpu"
+    #: The iGPU reads its projections packed from the bundle, unless asked for
+    #: bf16 ones -- which are the host copies.
+    HOST_PROJECTIONS = os.environ.get("Q4NX_GPU_WEIGHTS", "q4k") == "bf16"
 
     def __init__(self, *a, **kw):
         kw["backend"] = "cpu"
@@ -1747,8 +1780,8 @@ class Gemma4IgpuPrefill(Gemma4Prefill):
             self._gpu_decoder = dec
         return dec
 
-    def prefill(self, ids):
-        return self.gpu_decoder().prefill(ids)
+    def prefill(self, ids, image_embeds=None, image_mask=None, ple_ids=None):
+        return self.gpu_decoder().prefill(ids, image_embeds, image_mask, ple_ids)
 
 
 # ---------------------------------------------------------------------------

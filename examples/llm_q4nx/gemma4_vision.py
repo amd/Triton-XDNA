@@ -1,10 +1,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
-"""Gemma4-E2B's vision tower: patches in, language-space soft tokens out.
+"""Gemma4's vision tower: patches in, language-space soft tokens out.
 
-This is the piece that lets `examples/gemma4_e2b_flash/` take an image at all.
-The text half of the model is already here and gated
-(`examples/gemma4_e2b_q4nx/`); nothing below touches it.
+This is the piece that lets the `gemma4_*_flash` examples take an image at
+all. E2B and E4B share the tower; only the final projection's width differs,
+and it is read off the weights. The text half of the model is already here
+and gated (`examples/gemma4_*_q4nx/`); nothing below touches it.
 
 The tower is a 16-layer ViT at hidden 768, 12 heads of 64, and it borrows the
 Gemma block the text side already implements -- the four-norm sandwich, the
@@ -61,14 +62,13 @@ import math
 import numpy as np
 import torch
 
-import gemma4_vision_weights as vw
+import gemma4_vision_q4nx as vw
 
 HIDDEN = vw.HIDDEN
 N_LAYERS = vw.N_LAYERS
 N_HEADS = vw.N_HEADS
 HEAD_DIM = vw.HEAD_DIM
 INTER = vw.INTER
-OUT_HIDDEN = vw.OUT_HIDDEN
 POOLING_K = vw.POOLING_KERNEL_SIZE
 ROPE_THETA = vw.ROPE_THETA
 RMS_EPS = vw.RMS_EPS
@@ -183,12 +183,10 @@ class Gemma4VisionTower:
         whether it has `.to`, and a numpy array answers no -- so a raw array
         reaches the torch path as a confusing "this weight is resident" error.
         """
-        from llama_prefill import _as_bf16, _t
-
         bf = torch.bfloat16
         out = dict(w)
-        out["patch_embd"] = _t(_as_bf16(np.asarray(w["patch_embd"])), bf)
-        out["embedding_proj"] = _t(_as_bf16(np.asarray(w["embedding_proj"])), bf)
+        out["patch_embd"] = vw.to_torch(vw.as_bf16(w["patch_embd"]), bf)
+        out["embedding_proj"] = vw.to_torch(vw.as_bf16(w["embedding_proj"]), bf)
         # Gathered by row, so it stays numpy: `_patch_embed` indexes it with
         # the patch positions and converts only the rows it takes.
         out["position_table"] = np.asarray(w["position_table"])
@@ -201,7 +199,7 @@ class Gemma4VisionTower:
             input clamp, and the parts land in disjoint column ranges.
             """
             t = {
-                nm: _as_bf16(np.asarray(lw[nm]))
+                nm: vw.as_bf16(np.asarray(lw[nm]))
                 for nm in ("q", "k", "v", "o", "gate", "up", "down")
             }
             for fused, parts in _FUSIONS:
@@ -212,13 +210,13 @@ class Gemma4VisionTower:
                         "fusing would apply one part's bound to another's"
                     )
                 t[fused] = np.concatenate([t.pop(n) for n in parts], axis=1)
-            return {nm: _t(t[nm], bf) for nm in RESIDENT_PROJS}
+            return {nm: vw.to_torch(t[nm], bf) for nm in RESIDENT_PROJS}
 
         out["layers"] = [
             {
                 **_projs(lw),
                 **{
-                    nm: _t(np.asarray(lw[nm], dtype=np.float32))
+                    nm: vw.to_torch(np.asarray(lw[nm], dtype=np.float32))
                     for nm in (
                         "norm1",
                         "post_attn_norm",
@@ -386,9 +384,9 @@ class Gemma4VisionTower:
             h = self._matmul(2.0 * (px - 0.5), self._w["patch_embd"])
             tbl = self._w["position_table"]
             pos = np.maximum(np.asarray(pos_ids), 0)
-            from llama_prefill import _t
-
-            pe = _t(tbl[0][pos[:, 0]]) + _t(tbl[1][pos[:, 1]])
+            pe = vw.to_torch(tbl[0][pos[:, 0]], torch.float32) + vw.to_torch(
+                tbl[1][pos[:, 1]], torch.float32
+            )
             keep = torch.as_tensor(np.asarray(valid), dtype=torch.bool)[:, None]
             return h + torch.where(keep, pe, 0.0)
 
@@ -519,7 +517,7 @@ class Gemma4VisionTower:
 
         `pixels` is `[P, 768]` (3 channels x 16 x 16, flattened) and `pos_ids`
         is `[P, 2]` with padding patches at `(-1, -1)` -- exactly what
-        `Gemma4ImageProcessor` returns. Returns `[n_soft_tokens, 1536]`, ready
+        `Gemma4ImageProcessor` returns. Returns `[n_soft_tokens, out_hidden]`, ready
         to be scattered over the image placeholders in the prompt.
 
         `trace`, if given, is a dict this fills with the intermediate of every
@@ -607,15 +605,13 @@ class Gemma4GpuVisionTower:
     }
 
     def __init__(self, weights=None, model=None, device="cuda"):
-        from llama_prefill import _as_bf16
-
         w = weights if weights is not None else vw.load_vision(model)
         self.dev = device
         self.fingerprint = w.get("fingerprint")
 
         def bf16(a):
             return (
-                torch.from_numpy(_as_bf16(np.asarray(a)).view(np.int16))
+                torch.from_numpy(vw.as_bf16(np.asarray(a)).view(np.int16))
                 .view(torch.bfloat16)
                 .to(device)
             )
@@ -625,6 +621,7 @@ class Gemma4GpuVisionTower:
 
         self.patch_embd = bf16(w["patch_embd"])
         self.embedding_proj = bf16(w["embedding_proj"])
+        self.out_hidden = self.embedding_proj.shape[1]
         self.position_table = f32(w["position_table"])  # [2, 10240, 768]
         unbounded = torch.full((HIDDEN,), float("inf"), device=device)
         self._no_clip = (-float("inf"), float("inf"), -unbounded, unbounded)
@@ -736,6 +733,6 @@ class Gemma4GpuVisionTower:
             self.embedding_proj,
             -float("inf"),
             float("inf"),
-            torch.full((OUT_HIDDEN,), -float("inf"), device=dev),
-            torch.full((OUT_HIDDEN,), float("inf"), device=dev),
+            torch.full((self.out_hidden,), -float("inf"), device=dev),
+            torch.full((self.out_hidden,), float("inf"), device=dev),
         )

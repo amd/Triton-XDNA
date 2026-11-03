@@ -1,6 +1,6 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
-"""Reader for Gemma4-E2B's vision tower weights (`vision_weight.q4nx`).
+"""Reader for Gemma4's vision tower weights (`vision_weight.q4nx`).
 
 The vision weights are **not in `model.q4nx`** -- that bundle has 709 keys and
 none of them is a vision tensor. They ship as a separate 337 MB file in the same
@@ -22,12 +22,13 @@ weight::
 
 `mm_n`/`mm_k` are `VISION_MM_TILE_N`/`VISION_MM_TILE_K` from the model's
 `vision_config`. The converter pads both dims up to `max(mm_n, mm_k)` first, but
-every vision dim here (768, 1536, 3072, 10240) is already a multiple of 256, so
+every vision dim here (768, 3072, 10240, and the language widths 1536 and 2560)
+is already a multiple of 256, so
 no padding is in the file and `unpack` does not try to strip any -- it asserts
 the shapes work out exactly instead.
 
 The rearrange is a pure reshape-and-transpose, so it inverts exactly; `unpack`
-is bitwise lossless and `test_gemma4_vision_weights.py` checks that by re-packing
+is bitwise lossless and `test_gemma4_vision_q4nx.py` checks that by re-packing
 what it reads.
 
 Returned projections are **`[K, out]`**, transposed out of the file's `[N, K]`.
@@ -44,7 +45,9 @@ from pathlib import Path
 import numpy as np
 from ml_dtypes import bfloat16
 
-#: The repo the text bundle comes from. Same repo, different file.
+#: The repo the text bundle comes from, when the caller names none. Same repo,
+#: different file. E2B and E4B ship the same tower; only the projection into
+#: the language space differs in width.
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Gemma4-E2B-IT-NPU2")
 
 #: The file inside it.
@@ -61,7 +64,6 @@ N_HEADS = 12
 HEAD_DIM = 64
 INTER = 3072
 PATCH = 16
-OUT_HIDDEN = 1536  # GEMMA4E_VISION_IMAGE_OUTPUT_SIZE, the language hidden size
 POSITION_EMBEDDING_SIZE = 10240
 POOLING_KERNEL_SIZE = 3
 ROPE_THETA = 100.0
@@ -110,6 +112,25 @@ _NORM_KEYS = {
     "q_norm": ("vision_attn.q_norm.weight", HEAD_DIM),
     "k_norm": ("vision_attn.k_norm.weight", HEAD_DIM),
 }
+
+
+def as_bf16(a):
+    """A numpy array as ml_dtypes bfloat16, without a copy when it already is."""
+    a = np.asarray(a)
+    return a if a.dtype == bfloat16 else a.astype(bfloat16)
+
+
+def to_torch(a, dtype=None):
+    """numpy -> torch. bfloat16 is reinterpreted, not converted: torch cannot
+    borrow an ml_dtypes buffer, but the two types are the same two bytes."""
+    import torch
+
+    a = np.ascontiguousarray(a)
+    if a.dtype == bfloat16:
+        t = torch.from_numpy(a.view(np.uint16)).view(torch.bfloat16)
+    else:
+        t = torch.from_numpy(a)
+    return t if dtype is None else t.to(dtype)
 
 
 def resolve_vision_weights(model=None):
@@ -192,6 +213,16 @@ class VisionWeights:
             json.dumps(self._hdr, sort_keys=True).encode()
         ).hexdigest()[:16]
 
+    @property
+    def out_hidden(self):
+        """The language model's hidden size: the projection's output width.
+
+        Read off the packed shape rather than restated, because it is the one
+        dim that differs between models (1536 on E2B, 2560 on E4B).
+        """
+        n_blk = self._hdr["model.vision.embedding_projection.weight"]["shape"][0]
+        return n_blk * MM_TILE_N
+
     def has(self, name):
         return name in self._hdr
 
@@ -241,7 +272,7 @@ class VisionWeights:
                 clip                         : {proj: (in_lo, in_hi, out_lo, out_hi)}
             patch_embd        : bfloat16 [768, 768]   (3*16^2 -> hidden)
             position_table    : bfloat16 [2, 10240, 768]
-            embedding_proj    : bfloat16 [768, 1536]  (hidden -> language hidden)
+            embedding_proj    : bfloat16 [768, out_hidden]  (-> language hidden)
             fingerprint       : str
 
         The norms come back f32 and the projections bf16, matching what the text
@@ -293,7 +324,7 @@ class VisionWeights:
             ),
             position_table=np.ascontiguousarray(table),
             embedding_proj=self.proj(
-                "model.vision.embedding_projection.weight", HIDDEN, OUT_HIDDEN
+                "model.vision.embedding_projection.weight", HIDDEN, self.out_hidden
             ),
             fingerprint=self.fingerprint(),
         )

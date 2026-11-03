@@ -60,6 +60,8 @@ class Gemma4FusedPrefill(Gemma4Prefill):
     """
 
     ENGINE = "air-fused"
+    #: The forward is the fused prefill's; see `Gemma4Prefill.HOST_PROJECTIONS`.
+    HOST_PROJECTIONS = False
 
     def __init__(self, build_dir, *a, **kw):
         kw.setdefault("backend", "cpu")
@@ -97,8 +99,8 @@ class Gemma4FusedPrefill(Gemma4Prefill):
         t = k.shape[0]
         dh = head_dim(layer_idx)
         for region, src in (
-            (kv_layout.K_REGION, _bf16_np(torch.from_numpy(np.asarray(k, np.float32)))),
-            (kv_layout.V_REGION, _bf16_np(torch.from_numpy(np.asarray(v, np.float32)))),
+            (kv_layout.K_REGION, _bf16_np(k)),
+            (kv_layout.V_REGION, _bf16_np(v)),
         ):
             kv_layout.scatter_rows(
                 self._region(layer_idx, region)[r0 : r0 + t], src, dh, region

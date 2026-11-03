@@ -1009,20 +1009,23 @@ def _qkv_post_kernel(
     REGION_W: tl.constexpr,
     HAS_KV: tl.constexpr,
     DENSE_KV: tl.constexpr,
+    NKV: tl.constexpr = 1,
+    DH_A: tl.constexpr = 0,
 ):
     """Everything between the QKV projection and attention, per token.
 
     Program `h < NQ` is query head `h`: RMSNorm with `QN`, then half-split
     RoPE against the position's table row -- the same arithmetic, in the same
-    order, as `_rmsnorm_kernel` followed by `_rope_kernel`. Program `NQ` is
-    the single KV head: `k` gets the same with `KN`, `v` the weightless norm,
-    and both are rounded to bf16 and written to row `pos` of slab `slot`, at
-    each region's padded-head lane map in `kv_layout`.
+    order, as `_rmsnorm_kernel` followed by `_rope_kernel`. Program `NQ + j`
+    is KV head `j`: `k` gets the same with `KN`, `v` the weightless norm, and
+    both are rounded to bf16 and written to row `pos` of slab `slot`, in head
+    `j`'s `DH_A`-wide slot of the row, at each region's padded-head lane map
+    in `kv_layout`.
 
     Grid axis 1 is the token, written to row `pos + t`: one token for a
     decode step, the whole prompt for a prefill. With `DENSE_KV` the roped K
-    and normed V are also stored densely as `[tokens, dh]` in the dtype of
-    `KOUT`/`VOUT`; the prefill's attention reads those instead of the slab.
+    and normed V are also stored densely as `[tokens, NKV * dh]` in the dtype
+    of `KOUT`/`VOUT`; the prefill's attention reads those instead of the slab.
     """
     h = tl.program_id(0)
     t = tl.program_id(1)
@@ -1043,7 +1046,8 @@ def _qkv_post_kernel(
         tl.store(QOUT + base + o, y1 * cos - y2 * sin)
         tl.store(QOUT + base + HALF + o, y1 * sin + y2 * cos)
     elif HAS_KV:
-        kb = NQ * 2 * HALF
+        j = h - NQ
+        kb = (NQ + j) * 2 * HALF
         x1 = tl.load(QKV + kb + o).to(tl.float32)
         x2 = tl.load(QKV + kb + HALF + o).to(tl.float32)
         inv = 1.0 / tl.sqrt((tl.sum(x1 * x1) + tl.sum(x2 * x2)) / (2 * HALF) + eps)
@@ -1051,14 +1055,14 @@ def _qkv_post_kernel(
         y2 = x2 * inv * tl.load(KN + HALF + o).to(tl.float32)
         k1 = y1 * cos - y2 * sin
         k2 = y1 * sin + y2 * cos
-        vb = kb + 2 * HALF
+        vb = kb + NKV * 2 * HALF
         v1 = tl.load(QKV + vb + o).to(tl.float32)
         v2 = tl.load(QKV + vb + HALF + o).to(tl.float32)
         inv = 1.0 / tl.sqrt((tl.sum(v1 * v1) + tl.sum(v2 * v2)) / (2 * HALF) + eps)
         v1 = v1 * inv
         v2 = v2 * inv
         if DENSE_KV:
-            d = t * 2 * HALF
+            d = (t * NKV + j) * 2 * HALF
             tl.store(KOUT + d + o, k1)
             tl.store(KOUT + d + HALF + o, k2)
             tl.store(VOUT + d + o, v1)
@@ -1067,7 +1071,7 @@ def _qkv_post_kernel(
         k2 = k2.to(tl.bfloat16)
         v1 = v1.to(tl.bfloat16)
         v2 = v2.to(tl.bfloat16)
-        lo = SLAB + slot.to(tl.int64) * layer_stride + pos * REGION_W + o
+        lo = SLAB + slot.to(tl.int64) * layer_stride + pos * REGION_W + j * DH_A + o
         tl.store(lo, k1)
         tl.store(lo + HALF + K_SHIFT, k2)
         tl.store(lo + region_stride, v1)
@@ -1085,15 +1089,16 @@ def qkv_post(
     kv=None,
     dense_kv=False,
     out_dtype=torch.float32,
+    n_kv=1,
 ):
     """Head norms, RoPE and the KV-cache append, in one launch.
 
-    `qkv` is the projection's `[T, (n_q + 2) * dh]` output, or `[T, n_q * dh]`
-    on a KV-shared layer, which has no k or v: one row for a decode step, the
-    prompt for a prefill. `lut_rows` is the RoPE table's `[T, dh]` rows for
-    those positions (a single `[dh]` row for T = 1). Returns the rotated q,
-    `[T, n_q * dh]` -- and with `dense_kv`, also the roped K and normed V
-    as `[T, dh]`.
+    `qkv` is the projection's `[T, (n_q + 2 * n_kv) * dh]` output, or
+    `[T, n_q * dh]` on a KV-shared layer, which has no k or v: one row for a
+    decode step, the prompt for a prefill. `lut_rows` is the RoPE table's
+    `[T, dh]` rows for those positions (a single `[dh]` row for T = 1).
+    Returns the rotated q, `[T, n_q * dh]` -- and with `dense_kv`, also the
+    roped K and normed V as `[T, n_kv * dh]`.
 
     `kv`, where the layer owns its cache, is `(slab, slot, pos, region_stride)`:
     the `[n_slabs, layer_elems]` bf16 slab, the layer's slab in it
@@ -1103,7 +1108,10 @@ def qkv_post(
     `out_dtype` is the dtype of q and of the dense K/V. The prefill passes
     fp16, which `attn_prefill_fa` takes; the slab is bf16 either way.
     """
-    from kv_layout import K_REGION, REGION_W, V_REGION, lane_shift
+    from kv_layout import DH_A, K_REGION, V_REGION, lane_shift
+
+    # One cache row: every KV head, DH_A apart (`kv_layout.REGION_W`).
+    region_w = n_kv * DH_A
 
     lut_rows = lut_rows.reshape(-1, dh)
     T = lut_rows.shape[0]
@@ -1113,7 +1121,11 @@ def qkv_post(
     q = torch.empty((T, n_q * dh), dtype=out_dtype, device=qkv.device)
     if dense_kv and kv is None:
         raise ValueError("dense K/V needs a layer that owns its K/V")
-    kd = torch.empty((T, dh), dtype=out_dtype, device=qkv.device) if dense_kv else q
+    kd = (
+        torch.empty((T, n_kv * dh), dtype=out_dtype, device=qkv.device)
+        if dense_kv
+        else q
+    )
     vd = torch.empty_like(kd) if dense_kv else q
     if kv is not None:
         slab, slot, pos, region_stride = kv
@@ -1122,7 +1134,7 @@ def qkv_post(
         # The kernel writes rows `pos .. pos + T - 1` by raw offset, so a row
         # past the region would land in the V region or the next layer rather
         # than fault.
-        attn_maxl = region_stride // REGION_W
+        attn_maxl = region_stride // region_w
         if not (0 <= pos and pos + T <= attn_maxl):
             raise ValueError(
                 f"KV rows {pos}..{pos + T - 1} are outside the slab's {attn_maxl} rows"
@@ -1130,7 +1142,7 @@ def qkv_post(
         args = (slab, kd, vd, slot, pos, eps, slab.stride(0), region_stride)
     else:
         args = (q, q, q, 0, 0, eps, 0, 0)
-    _qkv_post_kernel[(n_q + (kv is not None), T)](
+    _qkv_post_kernel[(n_q + n_kv * (kv is not None), T)](
         qkv,
         q_norm.contiguous(),
         k_norm.contiguous() if k_norm is not None else q_norm,
@@ -1143,9 +1155,11 @@ def qkv_post(
         HALF=dh // 2,
         K_SHIFT=lane_shift(dh, K_REGION),
         V_SHIFT=lane_shift(dh, V_REGION),
-        REGION_W=REGION_W,
+        REGION_W=region_w,
         HAS_KV=kv is not None,
         DENSE_KV=dense_kv,
+        NKV=n_kv,
+        DH_A=DH_A,
     )
     return (q, kd, vd) if dense_kv else q
 
@@ -1220,12 +1234,16 @@ def _attn_decode_kernel(
     K_SHIFT: tl.constexpr,
     V_SHIFT: tl.constexpr,
     HALF: tl.constexpr,
+    GROUP: tl.constexpr = 1 << 30,
+    KV_W: tl.constexpr = 0,
 ):
     """softmax(q . K^T * scale) . V for one token, one program per query head.
 
     No causal mask: every cached key is at or before this position by
     construction, and the window is applied by the caller as a lower bound on
-    the slice. MQA -- every query head reads the one kv head's cache.
+    the slice. GQA: query head `h` reads KV head `h // GROUP`, whose lanes
+    start `KV_W` apart in a cache row; the default is MQA, every query head
+    reading the one KV head.
 
     `BLOCK_S` is a fixed tile and `S` is a runtime argument, so one compile
     serves every context length. `S` is also exempt from Triton's integer
@@ -1252,6 +1270,8 @@ def _attn_decode_kernel(
     is fetched.
     """
     h = tl.program_id(0)
+    KC += (h // GROUP) * KV_W
+    VC += (h // GROUP) * KV_W
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < dh
     k_lane = tl.where(offs_d < HALF, offs_d, offs_d + K_SHIFT)
@@ -1290,8 +1310,14 @@ def _attn_decode_kernel(
     tl.store(OUT + h * dh + offs_d, acc / l_i, mask=mask_d)
 
 
-def attn_decode(q, kc, vc, n_heads, dh, scale, block_s=64, k_shift=0, v_shift=0):
+def attn_decode(
+    q, kc, vc, n_heads, dh, scale, block_s=64, k_shift=0, v_shift=0, n_kv=1, kv_w=None
+):
     """q: [1, n_heads*dh] against kc/vc: [S, *] -> [1, n_heads*dh].
+
+    `n_kv` KV heads sit `kv_w` lanes apart in a cache row (`dh` where the
+    cache is dense, `kv_layout.DH_A` in the shared slab); query head `h` reads
+    head `h // (n_heads // n_kv)`.
 
     `kc`/`vc` are rows of the cache, NOT necessarily `[S, dh]` and NOT required
     to be contiguous: the row stride is read off the tensor, and `k_shift` and
@@ -1329,6 +1355,8 @@ def attn_decode(q, kc, vc, n_heads, dh, scale, block_s=64, k_shift=0, v_shift=0)
         K_SHIFT=k_shift,
         V_SHIFT=v_shift,
         HALF=dh // 2,
+        GROUP=n_heads // n_kv,
+        KV_W=dh if kv_w is None else kv_w,
     )
     return out.reshape(1, n_heads * dh)
 

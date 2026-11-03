@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check `gemma4_vision_weights.unpack` against the packing it inverts.
+"""Check `gemma4_vision_q4nx.unpack` against the packing it inverts.
 
 The vision tower's weights are tile-packed for FLM's MM engine and we un-pack
 them to read them. A wrong `mm_n`/`mm_k` pair does not fail: it produces a
@@ -17,7 +17,7 @@ function produced.
 Needs the 337 MB `vision_weight.q4nx`. Exits 77 -- graded as a skip -- when it
 is not resolvable, so this runs offline without failing.
 
-    python test_gemma4_vision_weights.py [model-dir-or-repo-id]
+    python test_gemma4_vision_q4nx.py [model-dir-or-repo-id]
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import gemma4_vision_weights as vw
+import gemma4_vision_q4nx as vw
 
 SKIP_EXIT_CODE = 77
 

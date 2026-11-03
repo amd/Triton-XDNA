@@ -198,12 +198,16 @@ def _fingerprint(src):
         return ""
 
 
-def load_q4nx(model=None):
+def load_q4nx(model=None, projections=True):
     """Host-dequantized Gemma4-E2B weights.
 
     Dequantizing on the host is deliberate: prefill is compute-bound, so W4A16
     would cut memory traffic that is not the bottleneck and add unpack work to
     every GEMM tile.
+
+    `projections=False` leaves out q/k/v/o/gate/up/down -- by far the bulk of
+    the dequantized bytes -- for a prefiller whose forward runs elsewhere (the
+    fused NPU prefills) and whose decoders read their projections packed.
 
     Returns a dict with
 
@@ -272,7 +276,11 @@ def load_q4nx(model=None):
         # to happen somewhere -- doing it once, here, keeps the forward reading
         # like its siblings. A missed one is not a silent failure: the GEMM
         # shapes stop matching.
-        w = {nm: np.ascontiguousarray(t.T) for nm, t in qm.layer_weights(k).items()}
+        w = (
+            {nm: np.ascontiguousarray(t.T) for nm, t in qm.layer_weights(k).items()}
+            if projections
+            else {}
+        )
         ple = {nm: np.ascontiguousarray(t.T) for nm, t in qm.layer_ple(k).items()}
         nm = qm.layer_norms(k)
         layers.append(
