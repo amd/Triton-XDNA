@@ -22,9 +22,13 @@ from .fused_decode import (
     DecodeEngine,
     fused_decode,
 )
+from .flash_attention import AttentionConfig, AttentionConfigError, flash_attention
 from .fused_prefill import PrefillConfig, PrefillConfigError, fused_prefill
 
 __all__ = [
+    "AttentionConfig",
+    "AttentionConfigError",
+    "flash_attention",
     "ENGINES",
     "DecodeConfig",
     "DecodeConfigError",

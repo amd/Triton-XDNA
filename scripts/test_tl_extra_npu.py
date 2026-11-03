@@ -656,6 +656,106 @@ def test_prefill_rebuild_publishes_a_new_generation():
         drv.find_peano_root, m._mlir_aie_root = saved
 
 
+def test_attention_config_refuses_unsupported_shapes():
+    """Rows that do not split into whole cascade stages, other head dims and
+    odd head counts are refused rather than built."""
+    npu = importlib.import_module("triton.language.extra.npu")
+    npu.AttentionConfig(576, 12)
+    npu.AttentionConfig(2304, 12)
+    for args, kw in (
+        ((630, 12), {}),
+        ((576, 12), {"head_dim": 128}),
+        ((576, 11), {}),
+        ((576, 12), {"kv_heads": 5}),
+    ):
+        try:
+            npu.AttentionConfig(*args, **kw)
+        except npu.AttentionConfigError:
+            continue
+        raise AssertionError(f"AttentionConfig{args} {kw} was accepted")
+
+
+def test_attention_config_must_be_a_config():
+    npu = importlib.import_module("triton.language.extra.npu")
+    try:
+        npu.flash_attention({"rows": 576, "heads": 12}, "/nonexistent")
+    except npu.AttentionConfigError:
+        return
+    raise AssertionError("a plain dict was accepted as an AttentionConfig")
+
+
+def _fake_flash_attention_dir(root):
+    """The files `flash_attention.fingerprint` reads, in mlir-air's layout."""
+    from pathlib import Path
+
+    d = Path(root) / "programming_examples" / "flash_attention" / "kernel_fusion_based"
+    d.mkdir(parents=True)
+    (d / "attn_npu2_seqfirst.py").write_text(
+        "raise SystemExit('the builder must not run')\n"
+    )
+    (d / "attn_npu2.cc").write_text("// kernel\n")
+    return d
+
+
+def test_attention_fingerprint_follows_sources():
+    """Same inputs, same digest; a changed source, shape, precision or tool
+    path changes it; a missing source is an error."""
+    import tempfile
+
+    m = importlib.import_module("triton.language.extra.npu.flash_attention")
+    cfg = m.AttentionConfig(576, 12)
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _fake_flash_attention_dir(tmp)
+        a = m.fingerprint(cfg, d, "/peano", "/aie")
+        assert a == m.fingerprint(cfg, d, "/peano", "/aie"), "not deterministic"
+        assert a != m.fingerprint(cfg, d, "/other-peano", "/aie"), "ignores Peano"
+        assert a != m.fingerprint(cfg, d, "/peano", "/other-aie"), "ignores mlir-aie"
+        other = m.AttentionConfig(768, 12)
+        assert a != m.fingerprint(other, d, "/peano", "/aie"), "ignores the shape"
+        bfp = m.AttentionConfig(576, 12, bfp16=True)
+        assert a != m.fingerprint(bfp, d, "/peano", "/aie"), "ignores bfp16"
+        (d / "attn_npu2.cc").write_text("// edited\n")
+        assert a != m.fingerprint(cfg, d, "/peano", "/aie"), "ignores the microkernel"
+        (d / "attn_npu2.cc").unlink()
+        try:
+            m.fingerprint(cfg, d, "/peano", "/aie")
+        except FileNotFoundError:
+            return
+        raise AssertionError("a missing source was hashed as absent")
+
+
+def test_attention_reuses_a_complete_build():
+    """A complete build under the current fingerprint is returned as is (the
+    fake builder raises if it runs), and one without its ELF is not complete."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    import triton.backends.amd_triton_npu.driver as drv
+
+    m = importlib.import_module("triton.language.extra.npu.flash_attention")
+    cfg = m.AttentionConfig(576, 12)
+    saved = drv.find_peano_root, m._mlir_aie_root
+    drv.find_peano_root = lambda: "/peano"
+    m._mlir_aie_root = lambda: "/aie"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = _fake_flash_attention_dir(tmp)
+            cache = Path(tmp) / "cache"
+            fp = m.fingerprint(cfg, d, "/peano", "/aie")
+            out = cache / f"768x576_{fp}"
+            out.mkdir(parents=True)
+            (out / "attn.elf").write_bytes(b"")
+            (out / "kernel.json").write_text(json.dumps({"kernel": "MLIR_AIE"}))
+            r = m.flash_attention(cfg, d, cache_root=cache)
+            assert r["cached"] and r["kernel"] == "MLIR_AIE", r
+            assert r["q_rows"] == 768 and r["elf_path"].endswith("attn.elf"), r
+            (out / "attn.elf").unlink()
+            assert not m._complete(out), "a build without its ELF is complete"
+    finally:
+        drv.find_peano_root, m._mlir_aie_root = saved
+
+
 def main():
     tests = [
         ("tl.extra.npu is installed by the build", test_installed),
@@ -702,6 +802,19 @@ def main():
         (
             "Gemma4-E4B's fingerprint follows E2B's sources",
             test_prefill_fingerprint_follows_gemma4_base,
+        ),
+        (
+            "flash_attention refuses unsupported shapes",
+            test_attention_config_refuses_unsupported_shapes,
+        ),
+        ("a dict is not an AttentionConfig", test_attention_config_must_be_a_config),
+        (
+            "the flash attention fingerprint follows its inputs",
+            test_attention_fingerprint_follows_sources,
+        ),
+        (
+            "a complete flash attention build is reused",
+            test_attention_reuses_a_complete_build,
         ),
     ]
     print("tl.extra.npu:")
