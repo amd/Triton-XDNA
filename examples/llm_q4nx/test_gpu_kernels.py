@@ -295,6 +295,61 @@ def _qkv_post(G, dev):
     return ok
 
 
+def _vision(G, dev):
+    """The vision tower's kernels: clipped GEMM, q/k/v post, bidirectional MHA."""
+    import gemma4_vision as V
+
+    ok = True
+    print("\nmatmul_clip  clamp(clamp(x) @ w), and the gate|up GeGLU form")
+    M, K, N = 37, 768, 512
+    x = (torch.randn(M, K, device=dev) * 3).to(torch.bfloat16)
+    w = (torch.randn(K, 2 * N, device=dev) * 0.05).to(torch.bfloat16)
+    olo = -torch.rand(2 * N, device=dev) * 2
+    ohi = torch.rand(2 * N, device=dev) * 2
+    xc = x.float().clamp(-2.5, 2.5).to(torch.bfloat16).float()
+    y = (xc @ w.float()).clamp(olo, ohi)
+    ok &= check("plain", G.matmul_clip(x, w, -2.5, 2.5, olo, ohi), y, tol=1e-4)
+    g, u = y[:, :N], y[:, N:]
+    ref = G.geglu(g.contiguous(), u.contiguous()).view(M, N)
+    got = G.matmul_clip(x, w, -2.5, 2.5, olo, ohi, glu=True, out_dtype=torch.bfloat16)
+    ok &= check("glu, bf16 out", got.float(), ref, tol=1e-2)
+
+    print("\nvision_qkv_post  per-head norms + 2-D RoPE")
+    P, NH = 50, V.N_HEADS
+    qkv = torch.randn(P, 3 * NH * 64, device=dev)
+    qn, kn = torch.randn(64, device=dev), torch.randn(64, device=dev)
+    pos = torch.stack([torch.randint(0, 48, (P,)), torch.randint(0, 48, (P,))], 1)
+    lx, ly = (t.to(dev) for t in V.rope_tables(pos.numpy()))
+
+    def head(part, weight):
+        t = qkv[:, part * NH * 64 : (part + 1) * NH * 64].reshape(P, NH, 64)
+        t = t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + V.RMS_EPS)
+        return t if weight is None else t * weight
+
+    def rot(t, lut):
+        c, sn = lut[:, None, :16], lut[:, None, 16:]
+        a, b = t[..., :16], t[..., 16:]
+        return torch.cat([a * c - b * sn, a * sn + b * c], -1)
+
+    def rope2d(t):
+        return torch.cat([rot(t[..., :32], lx), rot(t[..., 32:], ly)], -1)
+
+    want = [rope2d(head(0, qn)), rope2d(head(1, kn)), head(2, None)]
+    got = G.vision_qkv_post(qkv, qn, kn, lx, ly, NH, V.RMS_EPS)
+    for name, g_, w_ in zip("qkv", got, want):
+        ok &= check(name, g_.float(), w_.reshape(P, -1), tol=1e-3)
+
+    print("\nattn_prefill_fa  bidirectional MHA (vision), dh=64")
+    for N in (37, 700):
+        q, k, v = (torch.randn(N, NH * 64, device=dev) for _ in range(3))
+        qh, kh, vh = (t.view(N, NH, 64).transpose(0, 1) for t in (q, k, v))
+        ref = torch.softmax(qh @ kh.transpose(1, 2), -1) @ vh
+        ref = ref.transpose(0, 1).reshape(N, NH * 64)
+        got = G.attn_prefill_fa(q, k, v, NH, 64, scale=1.0, n_kv=NH, causal=False)
+        ok &= check(f"N={N}", got, ref)
+    return ok
+
+
 def _gemm_w4a8(G, dev):
     """The prefill's W4A8 GEMM, its q8 activations, and the fused gate|up.
 
@@ -576,6 +631,7 @@ def main():
     ok &= _gemv_q4nx(G, dev)
     ok &= _qkv_post(G, dev)
     ok &= _gemm_w4a8(G, dev)
+    ok &= _vision(G, dev)
 
     # --- rmsnorm, weighted and weightless ---
     print("\nrmsnorm")

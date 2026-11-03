@@ -817,11 +817,14 @@ def _rmsnorm_kernel(
     tl.store(Y + row * N + offs, y, mask=mask)
 
 
-def rmsnorm(x, weight, eps):
-    """x: [rows, N] -> same, f32. `weight=None` is the weightless norm."""
+def rmsnorm(x, weight, eps, out_dtype=torch.float32):
+    """x: [rows, N] -> same. `weight=None` is the weightless norm.
+
+    `out_dtype` bf16 is for a norm whose only reader is a bf16 GEMM.
+    """
     x = x.contiguous()
     rows, N = x.shape
-    out = torch.empty_like(x, dtype=torch.float32)
+    out = torch.empty_like(x, dtype=out_dtype)
     _rmsnorm_kernel[(rows,)](
         x,
         weight if weight is not None else x,  # unread when HAS_W is False
@@ -878,17 +881,24 @@ def _rmsnorm_residual_kernel(
         tl.store(Y2 + row + offs, y * inv2 * w2, mask=mask)
 
 
-def rmsnorm_residual(x, weight, eps, residual, scale=1.0, next_norm=None):
+def rmsnorm_residual(
+    x, weight, eps, residual, scale=1.0, next_norm=None, next_dtype=torch.float32
+):
     """`(residual + rmsnorm(x) * weight) * scale` per row of `[rows, N]`, f32.
 
-    With `next_norm`, returns `(result, rmsnorm(result) * next_norm)`. One row
-    is the decode; the prefill passes the whole prompt.
+    With `next_norm`, returns `(result, rmsnorm(result) * next_norm)`, the
+    second in `next_dtype`. One row is the decode; the prefill passes the
+    whole prompt.
     """
     N = weight.numel()
     x = x.reshape(-1, N).contiguous()
     rows = x.shape[0]
     out = torch.empty((rows, N), dtype=torch.float32, device=x.device)
-    nxt = torch.empty_like(out) if next_norm is not None else out
+    nxt = (
+        torch.empty((rows, N), dtype=next_dtype, device=x.device)
+        if next_norm is not None
+        else out
+    )
     _rmsnorm_residual_kernel[(rows,)](
         x,
         weight.contiguous(),
@@ -1414,6 +1424,209 @@ def matmul(x, w, block_m=64, block_n=64, block_k=64):
 
 
 @triton.jit
+def _clipped_tile(
+    A, B, offs_m, mask_m, n0, K, stride_am, stride_bk, lo, hi, BM, BN, BK
+):
+    """`clamp(A, lo, hi) @ B[:, n0:n0+BN]` for one row block, f32."""
+    offs_n = n0 + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, K, BK):
+        k = k0 + tl.arange(0, BK)
+        a = tl.load(
+            A + offs_m[:, None] * stride_am + k[None, :],
+            mask=mask_m[:, None],
+            other=0.0,
+        )
+        a = tl.minimum(tl.maximum(a.to(tl.float32), lo), hi).to(tl.bfloat16)
+        b = tl.load(B + k[:, None] * stride_bk + offs_n[None, :])
+        acc += tl.dot(a, b)
+    return acc
+
+
+@triton.jit
+def _matmul_clip_kernel(
+    A,
+    B,
+    C,
+    OLO,
+    OHI,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_bk,
+    stride_cm,
+    lo,
+    hi,
+    C2,
+    KC,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GLU: tl.constexpr,
+):
+    """`clamp(clamp(A, lo, hi) @ B, OLO[n], OHI[n])`, bf16 operands.
+
+    With `GLU`, `B` holds gate and up side by side, `N` is the width of one
+    half, and a program computes the same columns of both so that it can
+    write `gelu_tanh(gate) * up` directly.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    mask_m = offs_m < M
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    acc = _clipped_tile(
+        A, B, offs_m, mask_m, pid_n * BN, K, stride_am, stride_bk, lo, hi, BM, BN, BK
+    )
+    acc = tl.minimum(
+        tl.maximum(acc, tl.load(OLO + offs_n)[None, :]), tl.load(OHI + offs_n)[None, :]
+    )
+    if GLU:
+        u = _clipped_tile(
+            A,
+            B,
+            offs_m,
+            mask_m,
+            N + pid_n * BN,
+            K,
+            stride_am,
+            stride_bk,
+            lo,
+            hi,
+            BM,
+            BN,
+            BK,
+        )
+        u = tl.minimum(
+            tl.maximum(u, tl.load(OLO + N + offs_n)[None, :]),
+            tl.load(OHI + N + offs_n)[None, :],
+        )
+        acc = acc * tl.sigmoid(C2 * (acc + KC * acc * acc * acc)) * u
+    tl.store(
+        C + offs_m[:, None] * stride_cm + offs_n[None, :], acc, mask=mask_m[:, None]
+    )
+
+
+def matmul_clip(
+    x,
+    w,
+    in_lo,
+    in_hi,
+    out_lo,
+    out_hi,
+    glu=False,
+    out_dtype=torch.float32,
+    block_m=64,
+    block_n=256,
+    block_k=64,
+    num_warps=8,
+):
+    """`Gemma4ClippableLinear`: clamp the input, project, clamp the output.
+
+    x: [M, K], w: [K, N] bf16. The input bounds are scalars; `out_lo` and
+    `out_hi` are f32 `[N]`, so a projection fused from several (q|k|v) keeps
+    each part's own output bounds. With `glu`, `w` is gate|up and the result
+    is `gelu_tanh(gate) * up`, `[M, N / 2]`. x should be bf16: an f32 x is
+    read at twice the bytes by every column block.
+    """
+    M, K = x.shape
+    N = w.shape[1] // (2 if glu else 1)
+    if K % block_k or N % block_n:
+        raise ValueError(f"K={K}, N={N} must be multiples of {block_k}, {block_n}")
+    x = x.contiguous()
+    out = torch.empty((M, N), dtype=out_dtype, device=x.device)
+    _matmul_clip_kernel[(triton.cdiv(M, block_m), N // block_n)](
+        x,
+        w,
+        out,
+        out_lo,
+        out_hi,
+        M,
+        N,
+        K,
+        x.stride(0),
+        w.stride(0),
+        out.stride(0),
+        float(in_lo),
+        float(in_hi),
+        _GELU_2C,
+        _GELU_K,
+        BM=block_m,
+        BN=block_n,
+        BK=block_k,
+        GLU=glu,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return out
+
+
+@triton.jit
+def _vision_qkv_kernel(QKV, QN, KN, LX, LY, Q, K, V, eps, NH: tl.constexpr):
+    """One patch and one head of the vision tower's q, k and v.
+
+    Each is RMS-normed over the head's 64 lanes, q and k with their learned
+    weights and v with none. q and k then get the 2-D rotary: lanes 0-31 on
+    the patch's x coordinate and lanes 32-63 on its y, each half rotating its
+    pairs `(i, i + 16)` against a `[cos16, sin16]` table row.
+    """
+    p = tl.program_id(0)
+    h = tl.program_id(1)
+    o = tl.arange(0, 16)
+    cx = tl.load(LX + p * 32 + o)
+    sx = tl.load(LX + p * 32 + 16 + o)
+    cy = tl.load(LY + p * 32 + o)
+    sy = tl.load(LY + p * 32 + 16 + o)
+    for part in tl.static_range(3):
+        src = QKV + p * (3 * NH * 64) + part * (NH * 64) + h * 64
+        x0 = tl.load(src + o).to(tl.float32)
+        x1 = tl.load(src + 16 + o).to(tl.float32)
+        x2 = tl.load(src + 32 + o).to(tl.float32)
+        x3 = tl.load(src + 48 + o).to(tl.float32)
+        ss = tl.sum(x0 * x0) + tl.sum(x1 * x1) + tl.sum(x2 * x2) + tl.sum(x3 * x3)
+        inv = 1.0 / tl.sqrt(ss / 64 + eps)
+        x0, x1, x2, x3 = x0 * inv, x1 * inv, x2 * inv, x3 * inv
+        if part < 2:
+            W = QN if part == 0 else KN
+            x0 = x0 * tl.load(W + o)
+            x1 = x1 * tl.load(W + 16 + o)
+            x2 = x2 * tl.load(W + 32 + o)
+            x3 = x3 * tl.load(W + 48 + o)
+            x0, x1 = x0 * cx - x1 * sx, x0 * sx + x1 * cx
+            x2, x3 = x2 * cy - x3 * sy, x2 * sy + x3 * cy
+        dst = (Q if part == 0 else (K if part == 1 else V)) + p * NH * 64 + h * 64
+        tl.store(dst + o, x0)
+        tl.store(dst + 16 + o, x1)
+        tl.store(dst + 32 + o, x2)
+        tl.store(dst + 48 + o, x3)
+
+
+def vision_qkv_post(qkv, q_norm, k_norm, lut_x, lut_y, n_heads, eps):
+    """q|k|v `[P, 3 * n_heads * 64]` -> normed and rotated q, k, v, each
+    `[P, n_heads * 64]` fp16, as `attn_prefill_fa` takes them. `lut_x` and
+    `lut_y` are `gemma4_vision.rope_tables`' `[P, 32]` rows."""
+    P = qkv.shape[0]
+    q, k, v = (
+        torch.empty((P, n_heads * 64), dtype=torch.float16, device=qkv.device)
+        for _ in range(3)
+    )
+    _vision_qkv_kernel[(P, n_heads)](
+        qkv.contiguous(),
+        q_norm,
+        k_norm,
+        lut_x.contiguous(),
+        lut_y.contiguous(),
+        q,
+        k,
+        v,
+        eps,
+        NH=n_heads,
+    )
+    return q, k, v
+
+
+@triton.jit
 def _rope_batch_kernel(
     X,
     LUT,
@@ -1632,19 +1845,22 @@ def _attn_prefill_fa_kernel(
     scale,
     window,
     NQ: tl.constexpr,
+    NKV: tl.constexpr,
     DH: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
     DC: tl.constexpr,
+    CAUSAL: tl.constexpr,
     HAS_WINDOW: tl.constexpr,
-    NKV: tl.constexpr = 1,
 ):
-    """Causal, optionally windowed attention for one head and `BM` query rows.
+    """Attention for one head and `BM` query rows: causal (optionally
+    windowed) for the text prefill, bidirectional for the vision tower.
 
     Laid out like llama.cpp's scalar Vulkan flash attention (`flash_attn.comp`):
 
-    * One program per (query block, head). The eight query heads share the
-      single K/V head through L2 rather than within a program.
+    * One program per (query block, head). Query heads that share a K/V head
+      (all eight of them on Gemma4's text layers) share it through L2 rather
+      than within a program.
     * The whole head dim in one program, so QK^T is computed once even for
       the 512-wide heads.
     * fp16 operands with f32 accumulation, as llama.cpp uses. bf16 operands
@@ -1656,7 +1872,7 @@ def _attn_prefill_fa_kernel(
       L2 per key block, in a loop that must stay rolled: unrolled, the
       compiler hoists every slice's loads and spills again.
 
-    Q, K and V are fp16; the output is f32. K and V are `[N, NKV * DH]`; query
+    Q, K and V are fp16; the output is f32 by default. K and V are `[N, NKV * DH]`; query
     head `h` reads KV head `h // (NQ // NKV)`, as `flash_attn.comp`'s
     `gqa_ratio` does.
     """
@@ -1675,7 +1891,9 @@ def _attn_prefill_fa_kernel(
     l_i = tl.zeros((BM,), tl.float32)
     acc = tl.zeros((BM, DH), tl.float32)
     t0 = pid_m * BM
-    hi = tl.minimum(N, t0 + BM)  # causal: no key past the block's last row
+    hi = N
+    if CAUSAL:
+        hi = tl.minimum(N, t0 + BM)  # no key past the block's last row
     lo = 0
     if HAS_WINDOW:
         lo = (tl.maximum(0, t0 - window + 1) // BN) * BN
@@ -1686,7 +1904,9 @@ def _attn_prefill_fa_kernel(
         for c0 in tl.range(0, DH, DC, loop_unroll_factor=1):
             s = _fa_qk_slice(q_row, K, j, mask_t, mask_j, c0, dc, KS, s)
         s = s * scale
-        keep = mask_j[None, :] & (j[None, :] <= t[:, None])
+        keep = mask_j[None, :]
+        if CAUSAL:
+            keep = keep & (j[None, :] <= t[:, None])
         if HAS_WINDOW:
             keep = keep & (t[:, None] - j[None, :] < window)
         s = tl.where(keep, s, float("-inf"))
@@ -1708,22 +1928,34 @@ def _attn_prefill_fa_kernel(
 
 
 #: (query rows, head-dim slice) per program, by head width, with 32-key
-#: blocks and 4 warps. Swept on gfx1103 at N = 512.
-_FA_TILE = {256: (32, 64), 512: (32, 32)}
+#: blocks and 4 warps. Swept on gfx1103: the text widths at N = 512, the
+#: vision tower's 64 at the default image size.
+_FA_TILE = {64: (128, 64), 256: (32, 64), 512: (32, 32)}
 
 
-def attn_prefill_fa(q, k, v, n_q, dh, window=None, scale=None, n_kv=1):
-    """q: [N, n_q*dh], k/v: [N, n_kv*dh] -> [N, n_q*dh], f32.
+def attn_prefill_fa(
+    q,
+    k,
+    v,
+    n_q,
+    dh,
+    window=None,
+    scale=None,
+    n_kv=1,
+    causal=True,
+    out_dtype=torch.float32,
+):
+    """q: [N, n_q*dh], k/v: [N, n_kv*dh] -> [N, n_q*dh].
 
-    Causal, windowed where `window` is given. Inputs should be fp16; others
-    are converted here at the cost of extra launches.
+    Causal, windowed where `window` is given, unless `causal=False`. Inputs
+    should be fp16; others are converted here at the cost of extra launches.
     """
     N = q.shape[0]
     if n_q % n_kv or k.shape[-1] != n_kv * dh:
         raise ValueError(f"k is {tuple(k.shape)} for {n_kv} heads of {dh}")
     scale = dh**-0.5 if scale is None else scale
     q, k, v = (x.to(torch.float16).contiguous() for x in (q, k, v))
-    out = torch.empty((N, n_q * dh), dtype=torch.float32, device=q.device)
+    out = torch.empty((N, n_q * dh), dtype=out_dtype, device=q.device)
     BM, DC = _FA_TILE.get(dh, (32, 32))
     _attn_prefill_fa_kernel[(triton.cdiv(N, BM), n_q)](
         q,
@@ -1734,12 +1966,13 @@ def attn_prefill_fa(q, k, v, n_q, dh, window=None, scale=None, n_kv=1):
         float(scale),
         window if window is not None else 0,
         NQ=n_q,
+        NKV=n_kv,
         DH=dh,
         BM=BM,
         BN=32,
         DC=DC,
+        CAUSAL=causal,
         HAS_WINDOW=window is not None,
-        NKV=n_kv,
         num_warps=4,
         num_stages=1,
     )

@@ -108,7 +108,19 @@ class Gemma4FusedPrefill(Gemma4Prefill):
             kf[r0 : r0 + t] = k
             vf[r0 : r0 + t] = v
 
-    def prefill(self, ids):
+    def prefill(
+        self, ids, image_embeds=None, image_mask=None, ple_ids=None, reuse=False
+    ):
+        """`Gemma4Prefill.prefill`'s contract, image arguments included.
+
+        The fused prefill takes an image as `ple_ids` -- the prompt with the
+        pad token at the image positions, which is what its per-layer table is
+        gathered with -- plus the soft tokens and their positions, which
+        replace the token embeddings there.
+
+        `reuse` is accepted and ignored: the fused prefill always runs the whole
+        prompt, which is what a reusing prefill is required to equal anyway.
+        """
         ids = [int(t) for t in np.asarray(ids).reshape(-1)]
         N = len(ids)
         # These bound the rows written below; checked before the slab is touched.
@@ -118,8 +130,22 @@ class Gemma4FusedPrefill(Gemma4Prefill):
                 f"holds (ATTN_MAXL={self.kv_attn_maxl}, max_seq={self.max_seq}, "
                 f"and the fused prefill build's own limit)"
             )
+        image = {}
+        run_ids = ids
+        if image_embeds is not None:
+            pos = np.flatnonzero(np.asarray(image_mask, dtype=bool))
+            if len(pos) != len(image_embeds):
+                raise ValueError(
+                    f"{len(pos)} image placeholders in the prompt but "
+                    f"{len(image_embeds)} soft tokens to fill them"
+                )
+            if ple_ids is None or len(ple_ids) != N:
+                raise ValueError("an image prompt needs ple_ids as long as ids")
+            run_ids = [int(t) for t in ple_ids]
+            soft = torch.as_tensor(image_embeds).to(torch.float32).cpu().numpy()
+            image = dict(soft_embeds=soft, soft_positions=pos)
         self._zero_slab()
-        out = run_fused(self._fused, ids)
+        out = run_fused(self._fused, run_ids, **image)
         logits = torch.from_numpy(np.asarray(out, np.float32))
         self._ids = ids
         self.current_context_length = N

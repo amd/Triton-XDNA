@@ -66,8 +66,8 @@ def release_fused_prefills():
     return bool(held)
 
 
-def run_fused(fused, ids):
-    """`fused.prefill(ids)`, leaving its hardware contexts open.
+def run_fused(fused, ids, **kw):
+    """`fused.prefill(ids, **kw)`, leaving its hardware contexts open.
 
     Reopening them reconfigures the array, so they stay open until something
     else needs the room and calls `release_fused_prefills`. The device grants
@@ -82,7 +82,7 @@ def run_fused(fused, ids):
         driver.context_releasers.append(release_fused_prefills)
     try:
         try:
-            return fused.prefill(ids)
+            return fused.prefill(ids, **kw)
         except RuntimeError as e:
             if "HWCTX" not in str(e) or not NPUChain._open:
                 raise
@@ -91,7 +91,7 @@ def run_fused(fused, ids):
             # A refused resume can leave some of its own contexts open.
             for c in fused.contexts():
                 c.close()
-            return fused.prefill(ids)
+            return fused.prefill(ids, **kw)
     finally:
         _holding.add(fused)
 

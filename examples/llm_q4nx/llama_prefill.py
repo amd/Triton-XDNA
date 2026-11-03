@@ -459,8 +459,32 @@ class LlamaPrefill:
                 [x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1
             ).reshape(N, -1)
 
-    def _attention(self, q, k, v, n_q, n_kv, dh, window=None, scale=None, backend=None):
-        """Causal GQA. q: [N, n_q*dh], k/v: [N, n_kv*dh] -> [N, n_q*dh].
+    def _attention(
+        self,
+        q,
+        k,
+        v,
+        n_q,
+        n_kv,
+        dh,
+        window=None,
+        scale=None,
+        backend=None,
+        q_offset=0,
+    ):
+        """Causal GQA. q: [Nq, n_q*dh], k/v: [Nk, n_kv*dh] -> [Nq, n_q*dh].
+
+        `q_offset` is the ABSOLUTE position of the first query row, so a
+        prefill that reuses a cached prefix can hand in the suffix's queries
+        against the whole prompt's keys: query `i` sits at `q_offset + i` and
+        attends keys `0 .. q_offset + i`. It defaults to 0, where `Nq == Nk`
+        and this is the ordinary square causal attention every model here has
+        always run.
+
+        It is the one thing that makes prefix reuse an attention question
+        rather than a bookkeeping one: get it wrong and every suffix row
+        attends the wrong span, which is a fluent-wrong-text failure, not a
+        crash.
 
         `window` bounds how far back a position may attend: with it set, j is
         visible to i only while `i - window < j <= i`. None is unbounded, which
@@ -478,12 +502,22 @@ class LlamaPrefill:
         Host or iGPU, see PLACEMENT.
         """
         with self.timer.track("attention"):
-            N = q.shape[0]
+            Nq, Nk = q.shape[0], k.shape[0]
             rep = n_q // n_kv
             scale = dh**-0.5 if scale is None else scale
             # The scores are [n_q, N, N], which is where a long prompt spends
             # its prefill.
-            if self._device("attention", backend) == "gpu":
+            #
+            # `gpu_kernels.attn_prefill` assumes a SQUARE causal problem: its
+            # grid is sized from one N and its mask comes from the block
+            # indices alone, with nowhere to put an offset. So a prefix-reusing
+            # layer takes the torch body below even under `hetero`: correct,
+            # but slower than the kernel would be with an offset.
+            if (
+                self._device("attention", backend) == "gpu"
+                and q_offset == 0
+                and Nq == Nk
+            ):
                 dev = "cuda"
                 # Flash-style, so the [n_q, N, N] score matrix the torch body
                 # below materializes never exists -- that matrix is what makes
@@ -496,27 +530,34 @@ class LlamaPrefill:
                         q.to(dev), k.to(dev), v.to(dev), n_q, n_kv, dh, window, scale
                     )
                 return out.cpu()
-            qh = q.reshape(N, n_q, dh).transpose(0, 1)  # [n_q, N, dh]
-            kh = k.reshape(N, n_kv, dh).transpose(0, 1)  # [n_kv, N, dh]
-            vh = v.reshape(N, n_kv, dh).transpose(0, 1)
+            qh = q.reshape(Nq, n_q, dh).transpose(0, 1)  # [n_q, Nq, dh]
+            kh = k.reshape(Nk, n_kv, dh).transpose(0, 1)  # [n_kv, Nk, dh]
+            vh = v.reshape(Nk, n_kv, dh).transpose(0, 1)
             kh = kh.repeat_interleave(rep, dim=0)  # GQA broadcast
             vh = vh.repeat_interleave(rep, dim=0)
-            out = torch.empty((n_q, N, dh), dtype=qh.dtype, device=qh.device)
+            out = torch.empty((n_q, Nq, dh), dtype=qh.dtype, device=qh.device)
             # A chunk of queries at a time, against only the keys its mask can
             # let through: causal stops at the chunk's LAST row, and a window
             # starts `window` back from its FIRST -- the two ends of the chunk,
-            # not one of them, or the earliest rows lose keys they can see. Everything outside that span is
-            # -inf for every row in the chunk, and -inf contributes exactly
-            # zero to both the softmax denominator and `p @ v`, so leaving it
-            # out is the same arithmetic on fewer elements rather than an
-            # approximation of it. Whole-prompt scores are `[n_q, N, N]`; this
-            # is what a long prompt used to spend its prefill on.
-            for m0 in range(0, N, self.ATTN_CHUNK):
-                m1 = min(m0 + self.ATTN_CHUNK, N)
-                lo = 0 if window is None else max(0, m0 - window + 1)
-                s = (qh[:, m0:m1] @ kh[:, lo:m1].transpose(1, 2)) * scale
-                i = torch.arange(m0, m1, device=s.device)[:, None]
-                j = torch.arange(lo, m1, device=s.device)[None, :]
+            # not one of them, or the earliest rows lose keys they can see.
+            # Everything outside that span is -inf for every row in the chunk,
+            # and -inf contributes exactly zero to both the softmax denominator
+            # and `p @ v`, so leaving it out is the same arithmetic on fewer
+            # elements rather than an approximation of it. Whole-prompt scores
+            # are `[n_q, N, N]`; this is what a long prompt used to spend its
+            # prefill on.
+            #
+            # Positions are absolute (`q_offset` added), because with an offset
+            # the band is no longer on the diagonal. The key span also stops at
+            # `Nk`: a caller may pass only the context's keys under a padded
+            # bucket of queries.
+            for m0 in range(0, Nq, self.ATTN_CHUNK):
+                m1 = min(m0 + self.ATTN_CHUNK, Nq)
+                a0, a1 = q_offset + m0, min(q_offset + m1, Nk)
+                lo = 0 if window is None else max(0, a0 - window + 1)
+                s = (qh[:, m0:m1] @ kh[:, lo:a1].transpose(1, 2)) * scale
+                i = torch.arange(a0, q_offset + m1, device=s.device)[:, None]
+                j = torch.arange(lo, a1, device=s.device)[None, :]
                 keep = j <= i
                 if window is not None:
                     # `j <= i` is the causal half and `i - j < window` the
@@ -524,8 +565,8 @@ class LlamaPrefill:
                     # both, so no row comes out fully masked.
                     keep = keep & (i - j < window)
                 s = s.masked_fill(~keep, float("-inf"))
-                out[:, m0:m1] = torch.softmax(s, dim=-1) @ vh[:, lo:m1]
-            return out.transpose(0, 1).reshape(N, n_q * dh)
+                out[:, m0:m1] = torch.softmax(s, dim=-1) @ vh[:, lo:a1]
+            return out.transpose(0, 1).reshape(Nq, n_q * dh)
 
     def _lm_head(self, x, w, backend=None):
         """x: [N, D] -> logits [N, VOCAB]. w is [VOCAB, D] (tied embed).

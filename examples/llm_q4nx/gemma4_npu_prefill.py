@@ -201,7 +201,11 @@ class NpuPrefill:
 
     # ---- the model
 
-    def prefill(self, ids):
+    def prefill(self, ids, soft_embeds=None, soft_positions=None):
+        """`soft_embeds` [k, D] (a vision tower's output) replace the token
+        embeddings at `soft_positions`, where `ids` hold the pad token: the
+        per-layer table is gathered with those ids, while the per-layer
+        projection reads the embeddings after the soft tokens are in place."""
         self.resume()
         ids = np.asarray(ids).reshape(-1)
         n = len(ids)
@@ -212,13 +216,24 @@ class NpuPrefill:
         if bad.size:
             raise ValueError(f"token ids outside [0, {C.VOCAB}): {bad[:8].tolist()}")
         ids = np.ascontiguousarray(ids, np.int32)
+        soft = None
+        if soft_embeds is not None:
+            pos = np.asarray(soft_positions, np.int64)
+            if len(pos) != len(soft_embeds):
+                raise ValueError(
+                    f"{len(pos)} soft positions for {len(soft_embeds)} soft tokens"
+                )
+            soft = (pos, np.asarray(soft_embeds, np.float32))
         with self.fp:
-            return self._prefill(ids, n)
+            return self._prefill(ids, n, soft)
 
-    def _prefill(self, ids, n):
+    def _prefill(self, ids, n, soft=None):
         eps = C.RMS_EPS
         x = np.empty((n, C.D), np.float32)
         H.embed(*self.embed_tbl, ids, x, C.EMBED_SCALE)
+        if soft is not None:
+            # Unscaled: the soft tokens are already in the scaled space.
+            x[soft[0]] = soft[1]
         tbl = np.empty((n, C.N_LAYERS * C.PLI_D), np.float32)
         H.embed(*self.ple_tbl, ids, tbl)
         chunks = [(r0, min(G.M, n - r0)) for r0 in range(0, n, G.M)]
