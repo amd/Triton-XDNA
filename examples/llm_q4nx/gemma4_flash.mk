@@ -5,7 +5,7 @@
 #   TITLE := Gemma4-E2B
 #
 # Each stage of an image turn is placed on its own:
-#   VISION=auto|air|igpu|host  ENGINE=air-fused|triton-fused|triton|igpu
+#   VISION=auto|air|triton|igpu|host  ENGINE=air-fused|triton-fused|triton|igpu
 #   DECODE=npu|gpu
 # and whatever the placement, the prefill writes its K/V into the one slab the
 # decode reads, in pages the NPU and the iGPU both map.
@@ -35,7 +35,7 @@ OPS      ?=
 MODEL    ?=
 IMAGE    ?= /tmp/shapes.png
 PROMPT   ?= Describe the shapes and their colors and positions.
-## `make vision`'s tower: host (scored per stage), air or igpu.
+## `make vision`'s tower: host (scored per stage), air, triton or igpu.
 TOWER    ?= host
 
 OPT_ARGS := $(if $(SOFT),--max-soft-tokens $(SOFT)) $(if $(MODEL),--model "$(MODEL)") \
@@ -57,7 +57,7 @@ help:
 	@echo "  make compile-decode   Build the decode at DECODE_L=$(DECODE_L) (once)"
 	@echo "  make test-image       Write the two-shape test image to $(IMAGE)"
 	@echo ""
-	@echo "  VISION=auto|air|igpu|host            (default: $(VISION))"
+	@echo "  VISION=auto|air|triton|igpu|host     (default: $(VISION))"
 	@echo "  ENGINE=air-fused|triton-fused|triton|igpu  prefill (default: $(ENGINE))"
 	@echo "  DECODE=npu|gpu                       (default: $(DECODE))"
 	@echo "  SOFT=70|140|280|560|1120             image budget (default: 280)"

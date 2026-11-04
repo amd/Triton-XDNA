@@ -10,6 +10,8 @@ the NPU or the iGPU.
 The three stages and where each can run:
 
     --vision          air      mlir-air's NPU tower (gemma4_vision_air)
+                      triton   the same tower pipeline, its GEMMs and attention
+                               Triton kernels on the NPU (gemma4_vision_device)
                       igpu     the tower as Triton kernels on the iGPU
                       host     the tower on the host, its GEMMs placed by
                                --backend/--ops like the Triton prefill's
@@ -44,7 +46,7 @@ import registry
 
 DEFAULT_TEXT = "Describe the shapes and their colors and positions."
 
-VISION = ("auto", "air", "igpu", "host")
+VISION = ("auto", "air", "triton", "igpu", "host")
 ENGINES = ("air-fused", "triton-fused", "triton", "igpu")
 
 
@@ -156,6 +158,10 @@ def _tower(args, weights):
         import gemma4_vision_air
 
         return gemma4_vision_air.AirVisionTower(weights=weights)
+    if args.vision == "triton":
+        import gemma4_vision_device
+
+        return gemma4_vision_device.tower(weights=weights)
     if args.vision == "igpu":
         return gemma4_vision.Gemma4GpuVisionTower(weights=weights)
     from gemma4_prefill import Gemma4Prefill
@@ -278,10 +284,15 @@ def main(cfg, doc=None, argv=None):
     t_dec = time.perf_counter() - t0
     eos = set(cfg.EOS_IDS)
     text_ids = [t for t in out if t not in eos]
-    n = max(len(out) - 1, 1)
+    if args.decode == "gpu":
+        n = max(len(out) - 1, 1)
+        rate = f"{n / t_dec:.2f} tok/s"
+    else:
+        # mlir-air builds its decoder inside `generate`, weights and all, and
+        # prints the decode's own rate above; this wall time includes that.
+        rate = "including the decoder's setup"
     print(
-        f"[flash] decode({args.decode}): {len(out)} tokens in {t_dec:.2f}s, "
-        f"{n / t_dec:.2f} tok/s",
+        f"[flash] decode({args.decode}): {len(out)} tokens in {t_dec:.2f}s, {rate}",
         flush=True,
     )
     text = tokenizer.decode(text_ids)

@@ -87,13 +87,15 @@ class AirVisionTower:
     NPU tower. The ELFs for an image shape are compiled on first use and
     cached under `cache_dir` (mlir-air's default: `G4_VISION_BUILD_DIR`)."""
 
-    def __init__(self, weights=None, model=None, cache_dir=None, verbose=False):
+    def __init__(self, weights=None, model=None, ops=None, verbose=False):
+        """`ops` are the encoder's device ops: mlir-air's `NpuOps` by default,
+        or `gemma4_vision_device.TritonOps`."""
         from triton.backends.amd_triton_npu import driver
 
         enc = _air_vision()
         w = weights if weights is not None else vw.load_vision(model)
         self.fingerprint = w.get("fingerprint")
-        self.ops = enc.NpuOps(cache_dir=cache_dir, verbose=verbose)
+        self.ops = ops or enc.NpuOps(verbose=verbose)
         self.enc = enc.VisionEncoder(self.ops, weights=AirWeights(w))
         # The tower holds a context per ELF (seven), and the prefill and the
         # decode need their own. A launch the device refuses asks for them back.
@@ -107,14 +109,22 @@ class AirVisionTower:
         """Close the tower's hardware contexts, keeping its buffers, so the
         weights are not uploaded again. The next encode reopens them. True if
         any were open."""
-        cache = self.ops.cache
-        loaded = list(cache._loaded.items())
-        for name, backend in loaded:
-            backend.unload()
-            type(cache)._contexts.pop((cache._uid, name), None)
-        cache._loaded.clear()
-        return bool(loaded)
+        return _release(self.ops)
 
     def timings(self):
         """Per-op device seconds from the last encodes, mlir-air's own split."""
         return self.ops.timings()
+
+
+def _release(ops):
+    """Close `ops`' hardware contexts, keeping its buffers: an `NpuOps`'
+    kernel cache, or whatever else it holds (`ops.release`)."""
+    if hasattr(ops, "release"):
+        return ops.release()
+    cache = ops.cache
+    loaded = list(cache._loaded.items())
+    for name, backend in loaded:
+        backend.unload()
+        type(cache)._contexts.pop((cache._uid, name), None)
+    cache._loaded.clear()
+    return bool(loaded)
