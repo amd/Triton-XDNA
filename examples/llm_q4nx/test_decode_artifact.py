@@ -261,6 +261,34 @@ def test_xrt_elf_checks_its_own_model_stamp():
             raise AssertionError("an unstamped ELF accepted")
 
 
+def test_a_template_build_for_another_model_clears_its_templates():
+    import tempfile
+    import types
+
+    import decode_build
+
+    def touch(d, name):
+        open(os.path.join(d, name), "w").close()
+
+    gemma = types.SimpleNamespace(name="gemma4-e2b", engine="fused_decode")
+    with tempfile.TemporaryDirectory() as d:
+        # Another model's L=512 pair, and an ELF with its own stamp.
+        for n in ("decode_L512.xclbin", "decode_L512.insts.bin"):
+            touch(d, n)
+        touch(d, decode_build.ELF_NAME)
+        with open(os.path.join(d, decode_build.STAMP), "w") as f:
+            f.write("llama-3.2-1b\n")
+        decode_build._claim(d, gemma)
+        left = sorted(os.listdir(d))
+        assert left == sorted([decode_build.ELF_NAME, decode_build.STAMP]), left
+        # The same model's templates stay.
+        touch(d, "decode_L2048.xclbin")
+        with open(os.path.join(d, decode_build.STAMP), "w") as f:
+            f.write("gemma4-e2b\n")
+        decode_build._claim(d, gemma)
+        assert "decode_L2048.xclbin" in os.listdir(d)
+
+
 def main():
     failures = 0
     for name, fn in sorted(globals().items()):

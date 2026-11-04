@@ -31,6 +31,7 @@ scopes that environment to a single build, so it no longer has to.
 """
 
 import argparse
+import glob
 import os
 import shutil
 import sys
@@ -81,7 +82,9 @@ ELF_MODEL = "decode_scratchpad.model"
 #: mlir-air's loader resolves the decode directory as a fixed path, so every
 #: model's `decode_L2048.xclbin` lands on the same name. Loading one model's
 #: artifacts under another does not fail -- it decodes to fluent nonsense --
-#: so the stamp is what turns that into an error. See `check_stamp`.
+#: so the stamp is what turns that into an error. See `check_stamp`. It speaks
+#: for every template in the directory, so a build for another model first
+#: removes the templates already there (`_claim`).
 STAMP = "decode_model.txt"
 
 
@@ -126,6 +129,18 @@ def check_elf_stamp(model, out_dir=None):
             f"the full ELF in {out_dir} {what}, not {model.name!r}; rebuild it:\n"
             f"  make compile-decode MODEL={model.name} DECODE_ELF=1"
         )
+
+
+def _claim(out_dir, model):
+    """Make `out_dir`'s templates `model`'s to stamp: remove those another
+    model, or an unstamped build, left there. Otherwise a context length this
+    build does not cover keeps the other model's template under this model's
+    stamp. The ELF has its own stamp and stays."""
+    if read_stamp(out_dir) == model.name:
+        return
+    for ext in ("xclbin", "pdi", "insts.bin"):
+        for path in glob.glob(os.path.join(out_dir, f"decode_L*.{ext}")):
+            os.remove(path)
 
 
 def lower_template(L, out_dir=None, output_format="xclbin", model=None):
@@ -190,6 +205,7 @@ def lower_template(L, out_dir=None, output_format="xclbin", model=None):
     ext = "pdi" if output_format == "pdi" else "xclbin"
     dst_x = os.path.join(out_dir, f"decode_L{L}.{ext}")
     dst_i = os.path.join(out_dir, f"decode_L{L}.insts.bin")
+    _claim(out_dir, model)
     shutil.copyfile(art["bin_path"], dst_x)
     shutil.copyfile(art["insts_path"], dst_i)
     with open(os.path.join(out_dir, STAMP), "w") as f:
@@ -232,6 +248,7 @@ def _copy_elf(art, out_dir, model):
         f.write(f"{art['attn_maxl']}\n")
     with open(os.path.join(out_dir, ELF_MODEL), "w") as f:
         f.write(model.name + "\n")
+    _claim(out_dir, model)
     with open(os.path.join(out_dir, STAMP), "w") as f:
         f.write(model.name + "\n")
     print(f"[decode-build] -> {dst_e} + {ELF_PARAMS}", flush=True)
