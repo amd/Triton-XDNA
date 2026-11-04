@@ -32,6 +32,11 @@ def _load_text_config():
 
 text = _load_text_config()
 
+# The text example's own modules (gemma4_weights, which the triton-fused
+# prefill reads its weights with), after this directory, whose `config` wins.
+if _TEXT_DIR not in sys.path:
+    sys.path.append(_TEXT_DIR)
+
 # Underscore names included: the shared harness reads `_SHARED` and the
 # loaders off this module by name.
 globals().update({k: v for k, v in vars(text).items() if not k.startswith("__")})
