@@ -1,20 +1,19 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""``tl.extra.npu.flash_attention`` -- mlir-air's flash attention for one shape.
+"""``tl.extra.npu.flash_attention``: mlir-air's flash attention for one shape.
 
-mlir-air's `flash_attention/kernel_fusion_based/attn_npu2_seqfirst` builds an
-attention whose dataflow (Q/K/V tiling, the K/V cascade across core rows, the
-online softmax) is written with mlir-air's Python builder, and whose per-core
-math is a C++ microkernel, `attn_npu2.cc`. This op builds that design for one
-`AttentionConfig` and hands back the ELF.
+mlir-air's `flash_attention/kernel_fusion_based/attn_npu2_seqfirst` writes the
+dataflow (Q/K/V tiling, the K/V cascade across core rows, the online softmax)
+with mlir-air's Python builder; the per-core math is the C++ microkernel
+`attn_npu2.cc`. This op builds that design for one `AttentionConfig` and
+returns the ELF.
 
-It is the same arrangement as `fused_decode`: the module comes from mlir-air's
-builder, from outside the Triton compiler, and is lowered by this backend's
-`_aircc_compile` through `FusedDecodeOp`. The microkernel is compiled with
-mlir-air's own helper, against the Peano and mlir-aie this backend resolves.
-As in `fused_prefill`, each build is kept under a content fingerprint and
-published only once complete, so a later call returns it without building.
+As with `fused_decode`, the module comes from mlir-air's builder and is
+lowered by this backend's `_aircc_compile` through `FusedDecodeOp`. The
+microkernel is compiled with mlir-air's helper against the Peano and mlir-aie
+this backend resolves. As in `fused_prefill`, each build is stored under a
+content fingerprint and published only once complete.
 
 Q, K and V are row-major `[rows, heads * head_dim]` bf16, and so is the output.
 The kernel scales the scores by `1/sqrt(head_dim)` itself; a caller that wants
@@ -43,8 +42,8 @@ KV_STAGE_ROWS = 64
 #: The builder and the microkernel, relative to `flash_attention_dir`.
 SOURCES = ("attn_npu2_seqfirst.py", "attn_npu2.cc")
 
-#: aircc options mlir-air's own callers build this design with (SmolVLA's
-#: `_attn_backend`): no ping-pong transform, and runtime loops tiled 1x1.
+#: aircc options mlir-air's own callers build this design with: no ping-pong
+#: transform, and runtime loops tiled 1x1.
 AIRCC_ARGS = ("--omit-ping-pong-transform=all",)
 RUNTIME_LOOP_TILING = (1, 1)
 
@@ -68,10 +67,9 @@ class AttentionConfig:
         kv_heads: key/value heads; `heads` must be a multiple. Defaults to
             `heads` (multi-head attention).
         head_dim: 64, the kernel's K/V tile.
-        bfp16: build the microkernel's matmuls in block-float mode. About 3x
-            faster; mlir-air records a systematic bias from it on SmolVLA's
-            vision encoder, so a caller turns it on only where its own model
-            gate holds.
+        bfp16: build the microkernel's matmuls in block-float mode. Faster
+            but less accurate; enable it only where the caller's accuracy
+            check passes with it.
     """
 
     def __init__(self, rows, heads, kv_heads=None, head_dim=64, bfp16=False):
@@ -125,8 +123,8 @@ class AttentionConfig:
             fused_qkv=False,
             n_images=1,
             # The q loop inside the segment needs fewer waves, but past four q
-            # tiles its runtime sequence holds more buffer descriptors at once
-            # than a shim tile has (16), and aircc refuses it.
+            # tiles the runtime sequence needs more buffer descriptors at once
+            # than a shim tile has (16).
             q_in_segment=self.q_rows <= Q_TILES * Q_TILE,
         )
 
@@ -262,7 +260,8 @@ def flash_attention(config, flash_attention_dir, cache_root=None, rebuild=False)
         raise RuntimeError("no Peano (llvm-aie) install found for the microkernel")
     aie_root = _mlir_aie_root()
     fp = fingerprint(config, d, peano, aie_root)
-    root = Path(cache_root or default_cache_root())
+    # Absolute: the build runs from inside the generation directory.
+    root = Path(cache_root or default_cache_root()).resolve()
     root.mkdir(parents=True, exist_ok=True)
     # `current` names the published generation, as in `fused_prefill`: a
     # generation is never modified once published, and publishing a new one

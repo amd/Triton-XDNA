@@ -2,39 +2,32 @@
 # SPDX-License-Identifier: MIT
 """Reader for Gemma4's vision tower weights (`vision_weight.q4nx`).
 
-The vision weights are **not in `model.q4nx`** -- that bundle has 709 keys and
-none of them is a vision tensor. They ship as a separate 337 MB file in the same
-repo, `vision_weight.q4nx`, and this module is the only thing here that reads
-it.
+The vision weights are not in `model.q4nx`; they ship as a separate file,
+`vision_weight.q4nx`, in the same repo.
 
-Two things make it unlike the text bundle's reader:
+Unlike the text bundle:
 
-* **Nothing is quantized.** Every tensor is BF16, projections included. There is
-  no Codec A or Codec B here, so no dequantization step and no group scales.
-* **Everything is tile-packed** for FLM's vision MM engine. A projection stored
-  as `[12, 3, 16384]` is a `[768, 768]` matrix rearranged, not a 3-D tensor.
+* Nothing is quantized. Every tensor is BF16, projections included, so there
+  is no dequantization and there are no group scales.
+* Projections are tile-packed for FLM's vision MM engine. A projection stored
+  as `[12, 3, 16384]` is a rearranged `[768, 768]` matrix, not a 3-D tensor.
 
-The packing is FLM's own, from `FLM_Q4NX_Converter/q4nx/model_converter.py:702`
-(`_multi_modal_mm_weight_rearrange`), applied to an `[out, in]` = `[N, K]` HF
-weight::
+The packing is FLM's converter (`_multi_modal_mm_weight_rearrange`), applied
+to an `[out, in]` = `[N, K]` HF weight::
 
     rearrange(W, "(N mm_n) (K mm_k) -> N K (mm_n mm_k)", mm_n=64, mm_k=256)
 
 `mm_n`/`mm_k` are `VISION_MM_TILE_N`/`VISION_MM_TILE_K` from the model's
-`vision_config`. The converter pads both dims up to `max(mm_n, mm_k)` first, but
-every vision dim here (768, 3072, 10240, and the language widths 1536 and 2560)
-is already a multiple of 256, so
-no padding is in the file and `unpack` does not try to strip any -- it asserts
-the shapes work out exactly instead.
+`vision_config`. The converter pads both dims up to `max(mm_n, mm_k)`, but
+every vision dim (and the language widths) is a multiple of 256, so the file
+has no padding; `unpack` asserts the shapes instead of stripping any.
 
-The rearrange is a pure reshape-and-transpose, so it inverts exactly; `unpack`
-is bitwise lossless and `test_gemma4_vision_q4nx.py` checks that by re-packing
-what it reads.
+The rearrange is a reshape and transpose, so `unpack` is bitwise lossless;
+`test_gemma4_vision_q4nx.py` checks this by re-packing what it reads.
 
-Returned projections are **`[K, out]`**, transposed out of the file's `[N, K]`.
-That is what every forward in `llm_q4nx/` takes (`y = x @ W`), and matches the
-note in `gemma4_e2b_q4nx/config.py::load_q4nx` -- doing the transpose once, in
-the reader, keeps the tower reading like its text sibling.
+Projections are returned as `[K, out]`, transposed from the file's `[N, K]`,
+since every forward in `llm_q4nx/` computes `y = x @ W`, as with the text
+weights from `gemma4_e2b_q4nx/config.py::load_q4nx`.
 """
 
 import json
@@ -45,19 +38,17 @@ from pathlib import Path
 import numpy as np
 from ml_dtypes import bfloat16
 
-#: The repo the text bundle comes from, when the caller names none. Same repo,
-#: different file. E2B and E4B ship the same tower; only the projection into
-#: the language space differs in width.
+#: Default repo (the text bundle's). E2B and E4B ship the same tower; only the
+#: projection into the language space differs in width.
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Gemma4-E2B-IT-NPU2")
 
 #: The file inside it.
 VISION_FILE = "vision_weight.q4nx"
 
 # ---------------------------------------------------------------- dims
-# Mirrors config.json's `vision_config`. Restated rather than parsed because the
-# shape assertions below need them before any model directory is resolved, and a
-# silent disagreement with the checkpoint is exactly what those assertions are
-# for.
+# Mirrors config.json's `vision_config`. Restated rather than parsed so the
+# shape checks below have them before any model directory is resolved and can
+# catch a checkpoint that disagrees.
 HIDDEN = 768
 N_LAYERS = 16
 N_HEADS = 12
@@ -69,9 +60,8 @@ POOLING_KERNEL_SIZE = 3
 ROPE_THETA = 100.0
 RMS_EPS = 1e-6
 
-#: The MM tile the converter packed against. Not a free parameter: a wrong pair
-#: reshapes into a same-sized matrix of nonsense, which is why `unpack` checks
-#: the resulting dims against what the caller expects rather than trusting them.
+#: The MM tile the converter packed against. A wrong pair still reshapes into a
+#: same-sized (wrong) matrix, so `unpack` checks dims against the caller's.
 MM_TILE_N = 64
 MM_TILE_K = 256
 
@@ -136,10 +126,8 @@ def to_torch(a, dtype=None):
 def resolve_vision_weights(model=None):
     """Resolve `model` to a local `vision_weight.q4nx` path.
 
-    The same three cases `gemma4_e2b_q4nx_weights.resolve_q4nx_model` accepts --
-    a direct file, a directory holding the file, or an HF repo id -- so a caller
-    that passes nothing downloads the file rather than reading whatever happens
-    to be in someone's home directory.
+    Accepts a direct file, a directory holding the file, or an HF repo id.
+    With no `model`, the default repo is downloaded.
     """
     model = model or MODEL_DEFAULT
     if os.path.isfile(model):
@@ -178,8 +166,8 @@ def unpack(t, K, out, mm_n=MM_TILE_N, mm_k=MM_TILE_K):
 def pack(w, mm_n=MM_TILE_N, mm_k=MM_TILE_K):
     """`[K, out]` -> the file's tile-packed layout. Inverse of `unpack`.
 
-    Only the round-trip test needs this, but it lives next to `unpack` so the
-    two cannot drift.
+    Used by the round-trip test; kept next to `unpack` so the two stay in
+    sync.
     """
     n, k = w.shape[1], w.shape[0]
     t = np.ascontiguousarray(w.T).reshape(n // mm_n, mm_n, k // mm_k, mm_k)
@@ -190,7 +178,7 @@ class VisionWeights:
     """Reader for `vision_weight.q4nx`.
 
     Opens the safetensors header once and reads tensors on demand; `load()`
-    pulls the whole tower, which is 337 MB and comfortably fits in host memory.
+    reads the whole tower.
     """
 
     def __init__(self, path=None):
@@ -204,8 +192,7 @@ class VisionWeights:
     def fingerprint(self):
         """Short digest of the header, as the text configs do it.
 
-        Of the header alone, never the payload: this is printed next to a
-        result, and hashing 337 MB to label one would be out of proportion.
+        Hashes the header only, not the payload, to keep it cheap.
         """
         import hashlib
 
@@ -217,8 +204,7 @@ class VisionWeights:
     def out_hidden(self):
         """The language model's hidden size: the projection's output width.
 
-        Read off the packed shape rather than restated, because it is the one
-        dim that differs between models (1536 on E2B, 2560 on E4B).
+        Read from the packed shape because it differs between models.
         """
         n_blk = self._hdr["model.vision.embedding_projection.weight"]["shape"][0]
         return n_blk * MM_TILE_N
@@ -246,9 +232,8 @@ class VisionWeights:
     def scalar(self, name):
         """A `[1]` clip bound as a float.
 
-        `+/-inf` survives the BF16 round trip, so a projection the exporter
-        chose not to clip comes back as an unbounded clamp rather than as a
-        special case anyone has to test for.
+        `+/-inf` survives BF16, so an unclipped projection comes back as an
+        unbounded clamp.
         """
         v = self.f32(name)
         if v.size != 1:
@@ -301,12 +286,10 @@ class VisionWeights:
             }
             layers.append(w)
 
-        # The position table is the one tensor stored per-dimension: [2, ...],
-        # x first then y. The converter packs `weights[k].T`, i.e. it calls the
-        # hidden size N and the table length K -- so `unpack`, which returns
-        # [K, out], hands back [10240, 768], the HF layout, with no transpose
-        # here. Passing (HIDDEN, POSITION_EMBEDDING_SIZE) instead would trip the
-        # shape check rather than silently transpose.
+        # The position table is stored per axis as [2, ...], x then y. The
+        # converter packs `weights[k].T`, treating the hidden size as N and the
+        # table length as K, so `unpack` returns the HF layout [10240, 768]
+        # with no extra transpose.
         tbl = self.raw("model.vision.patch_embedder.position_embedding_table")
         if tbl.shape[0] != 2:
             raise ValueError(f"position table is {tbl.shape}, expected a leading 2")
@@ -316,9 +299,7 @@ class VisionWeights:
 
         return dict(
             layers=layers,
-            # 3 channels x 16x16 pixels = 768, which coincides with the hidden
-            # size here. They are not the same number twice by design; the
-            # assertion names both.
+            # 3 channels x 16x16 pixels; equal to HIDDEN only by coincidence.
             patch_embd=self.proj(
                 "model.vision.patch_embd.weight", 3 * PATCH * PATCH, HIDDEN
             ),

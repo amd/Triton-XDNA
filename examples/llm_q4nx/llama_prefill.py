@@ -474,17 +474,11 @@ class LlamaPrefill:
     ):
         """Causal GQA. q: [Nq, n_q*dh], k/v: [Nk, n_kv*dh] -> [Nq, n_q*dh].
 
-        `q_offset` is the ABSOLUTE position of the first query row, so a
-        prefill that reuses a cached prefix can hand in the suffix's queries
+        `q_offset` is the absolute position of the first query row, so a
+        prefill that reuses a cached prefix can pass the suffix's queries
         against the whole prompt's keys: query `i` sits at `q_offset + i` and
-        attends keys `0 .. q_offset + i`. It defaults to 0, where `Nq == Nk`
-        and this is the ordinary square causal attention every model here has
-        always run.
-
-        It is the one thing that makes prefix reuse an attention question
-        rather than a bookkeeping one: get it wrong and every suffix row
-        attends the wrong span, which is a fluent-wrong-text failure, not a
-        crash.
+        attends keys `0 .. q_offset + i`. A caller may also pass fewer keys
+        than queries, the context's under a padded bucket of queries.
 
         `window` bounds how far back a position may attend: with it set, j is
         visible to i only while `i - window < j <= i`. None is unbounded, which
@@ -508,17 +502,20 @@ class LlamaPrefill:
             # The scores are [n_q, N, N], which is where a long prompt spends
             # its prefill.
             #
-            # `gpu_kernels.attn_prefill` assumes a SQUARE causal problem: its
-            # grid is sized from one N and its mask comes from the block
-            # indices alone, with nowhere to put an offset. So a prefix-reusing
-            # layer takes the torch body below even under `hetero`: correct,
-            # but slower than the kernel would be with an offset.
+            # `gpu_kernels.attn_prefill` takes a square causal problem with no
+            # query offset, so a prefix-reusing call runs the torch body below.
+            # Fewer keys than queries (only the context's under a padded bucket)
+            # are zero-padded: those keys come after every real query, and the
+            # causal mask keeps them out of its row.
             if (
                 self._device("attention", backend) == "gpu"
                 and q_offset == 0
-                and Nq == Nk
+                and Nk <= Nq
             ):
                 dev = "cuda"
+                if Nk < Nq:
+                    k = torch.nn.functional.pad(k, (0, 0, 0, Nq - Nk))
+                    v = torch.nn.functional.pad(v, (0, 0, 0, Nq - Nk))
                 # Flash-style, so the [n_q, N, N] score matrix the torch body
                 # below materializes never exists -- that matrix is what makes
                 # a long prompt expensive here. See `_rope` for why it is a
@@ -537,20 +534,15 @@ class LlamaPrefill:
             vh = vh.repeat_interleave(rep, dim=0)
             out = torch.empty((n_q, Nq, dh), dtype=qh.dtype, device=qh.device)
             # A chunk of queries at a time, against only the keys its mask can
-            # let through: causal stops at the chunk's LAST row, and a window
-            # starts `window` back from its FIRST -- the two ends of the chunk,
-            # not one of them, or the earliest rows lose keys they can see.
-            # Everything outside that span is -inf for every row in the chunk,
-            # and -inf contributes exactly zero to both the softmax denominator
-            # and `p @ v`, so leaving it out is the same arithmetic on fewer
-            # elements rather than an approximation of it. Whole-prompt scores
-            # are `[n_q, N, N]`; this is what a long prompt used to spend its
-            # prefill on.
+            # let through: causal stops at the chunk's last row, and a window
+            # starts `window` back from its first row (using one end for both
+            # would drop keys the earliest rows can see). Keys outside that
+            # span are -inf for every row in the chunk and contribute zero to
+            # the softmax and `p @ v`, so skipping them is exact. Whole-prompt
+            # scores would be `[n_q, N, N]`.
             #
-            # Positions are absolute (`q_offset` added), because with an offset
-            # the band is no longer on the diagonal. The key span also stops at
-            # `Nk`: a caller may pass only the context's keys under a padded
-            # bucket of queries.
+            # Positions are absolute (`q_offset` added), and the key span stops
+            # at `Nk`.
             for m0 in range(0, Nq, self.ATTN_CHUNK):
                 m1 = min(m0 + self.ATTN_CHUNK, Nq)
                 a0, a1 = q_offset + m0, min(q_offset + m1, Nk)

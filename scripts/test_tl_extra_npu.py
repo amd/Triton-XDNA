@@ -756,6 +756,43 @@ def test_attention_reuses_a_complete_build():
         drv.find_peano_root, m._mlir_aie_root = saved
 
 
+def test_attention_relative_cache_root():
+    """A relative cache root still builds: `_build` runs from inside the
+    generation directory, so the paths it is given must be absolute. (Before
+    Python 3.12, `tempfile.mkdtemp` keeps a relative `dir` relative.)"""
+    import os
+    import tempfile
+
+    import triton.backends.amd_triton_npu.driver as drv
+
+    m = importlib.import_module("triton.language.extra.npu.flash_attention")
+    cfg = m.AttentionConfig(576, 12)
+    seen = []
+
+    def fake_build(config, d, gen, peano, aie_root):
+        seen.append(gen)
+        assert gen.is_absolute(), gen
+        (gen / "attn.elf").write_bytes(b"")
+        return "MLIR_AIE"
+
+    saved = drv.find_peano_root, m._mlir_aie_root, m._build
+    drv.find_peano_root = lambda: "/peano"
+    m._mlir_aie_root = lambda: "/aie"
+    m._build = fake_build
+    prev = os.getcwd()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = _fake_flash_attention_dir(tmp)
+            os.chdir(tmp)
+            r = m.flash_attention(cfg, d, cache_root="cache")
+            assert seen and not r["cached"], r
+            assert os.path.isabs(r["elf_path"]), r
+            assert os.path.isfile(r["elf_path"]), r
+    finally:
+        os.chdir(prev)
+        drv.find_peano_root, m._mlir_aie_root, m._build = saved
+
+
 def main():
     tests = [
         ("tl.extra.npu is installed by the build", test_installed),
@@ -815,6 +852,10 @@ def main():
         (
             "a complete flash attention build is reused",
             test_attention_reuses_a_complete_build,
+        ),
+        (
+            "flash attention builds under a relative cache root",
+            test_attention_relative_cache_root,
         ),
     ]
     print("tl.extra.npu:")

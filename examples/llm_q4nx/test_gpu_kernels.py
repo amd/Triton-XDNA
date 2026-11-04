@@ -660,6 +660,56 @@ def _dense_glu_and_norm(G, dev):
     return ok
 
 
+def _padded_key_attention(dev):
+    """`LlamaPrefill._attention` placed on the iGPU, given fewer keys than
+    queries (the context's keys under a padded bucket of queries), against
+    the same call on the host. Only the first `Nk` rows are real."""
+    print("\nLlamaPrefill._attention  (iGPU, fewer keys than queries)")
+    from contextlib import nullcontext
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(os.path.dirname(here), "gemma4_e2b_q4nx"))
+    import llama_prefill
+
+    class _Stub:
+        ATTN_CHUNK = llama_prefill.LlamaPrefill.ATTN_CHUNK
+
+        def __init__(self, dev):
+            self.dev = dev
+            self.timer = type("T", (), {"track": lambda self, op: nullcontext()})()
+
+        def _device(self, op, backend=None):
+            return self.dev
+
+    import gpu_kernels
+
+    calls = []
+    kernel = gpu_kernels.attn_prefill
+    gpu_kernels.attn_prefill = lambda *a, **kw: calls.append(1) or kernel(*a, **kw)
+    attn = llama_prefill.LlamaPrefill._attention
+    ok = True
+    try:
+        for nq, nk, dh, win in (
+            (384, 276, DH_SLIDING, 512),
+            (128, 15, DH_GLOBAL, None),
+        ):
+            q = torch.randn(nq, N_Q_HEADS * dh)
+            k = torch.randn(nk, dh)
+            v = torch.randn(nk, dh)
+            args = (q, k, v, N_Q_HEADS, 1, dh, win, 1.0)
+            n = len(calls)
+            got = attn(_Stub("gpu"), *args)[:nk]
+            if len(calls) == n:
+                print(f"  Nq={nq} Nk={nk}: ran on the host, not the iGPU  FAIL")
+                ok = False
+                continue
+            want = attn(_Stub("cpu"), *args)[:nk]
+            ok &= check(f"Nq={nq} Nk={nk} dh={dh} win={win}", got, want)
+    finally:
+        gpu_kernels.attn_prefill = kernel
+    return ok
+
+
 def main():
     if not torch.cuda.is_available():
         print("SKIP: no ROCm device visible to torch")
@@ -923,6 +973,7 @@ def main():
     ok &= _dense_qkv_post(G, dev)
     ok &= _dense_attn_decode(G, dev)
     ok &= _dense_attn_prefill(G, dev)
+    ok &= _padded_key_attention(dev)
 
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

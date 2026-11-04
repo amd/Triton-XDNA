@@ -99,13 +99,12 @@ def _host_view(buf):
 
 
 def _bf16_np(t):
-    """A torch tensor or numpy array as numpy bfloat16, converting exactly once.
+    """A torch tensor or numpy array as numpy bfloat16, converting once.
 
-    Done here rather than at each assignment because the value is written
-    twice -- once per attention CU -- and letting numpy convert on assignment
-    would convert twice. The conversion is `ml_dtypes`', from float32: it
-    rounds to nearest even as torch's does, bit for bit, and torch's CPU cast
-    measured 200x slower (6 ms for one layer's chunk of K, against 0.03 ms).
+    Converted here rather than on assignment because the value is written
+    twice, once per attention CU. Float32 goes through `ml_dtypes`, which
+    rounds to nearest even like torch's cast and is much faster than torch's
+    CPU cast.
     """
     from ml_dtypes import bfloat16
 
@@ -194,15 +193,13 @@ class Gemma4Prefill(LlamaPrefill):
     _fused_mlp = None
 
     #: Whether `load_weights` dequantizes the projections (q/k/v/o, gate/up,
-    #: down) onto the host. A prefiller whose forward runs elsewhere -- the
-    #: fused NPU prefills -- turns it off: its decoders read the projections
-    #: packed from the bundle, and on E4B the bf16 copies alone are ~25 GiB.
+    #: down) onto the host. Prefillers whose forward runs elsewhere (the fused
+    #: NPU prefills) turn it off: their decoders read the projections packed
+    #: from the bundle, and the bf16 copies dominate host memory.
     HOST_PROJECTIONS = True
 
-    #: Run attention's two GEMMs on the NPU where `_attention` allows it. A
-    #: prefix-reusing suffix cannot take that path, so a session that reuses
-    #: turns it off: its full and reusing passes then run the same arithmetic
-    #: and stay bit-identical.
+    #: Run attention's two GEMMs on the NPU where `_attention` allows it.
+    #: Prefix reuse needs it off (see `prefill`).
     npu_attention = True
 
     def __init__(self, *a, **kw):
@@ -235,20 +232,11 @@ class Gemma4Prefill(LlamaPrefill):
         self._kv_slabs, _, self._kv_slot = kv_layout.kv_slots(kv_src)
         self._kv_slab = self._alloc_kv()
         self._kv_host = _host_view(self._kv_slab)
-        # Dense f32 K/V for EVERY layer that owns a cache, not only the ones
-        # some other layer reads back.
-        #
-        # It used to be only the source layers (13 and 14 here), because only
-        # they were read a second time. Prefix reuse makes every owning layer
-        # read its own cache a second time: a suffix-only pass has queries for
-        # rows `p0..N` but needs keys for rows `0..N`, and the prefix rows are
-        # not in hand -- they were computed on an earlier call. Reading them
-        # back out of the bf16 slab would work and would make a reused prefill
-        # differ from a full one by the slab's rounding, which is exactly the
-        # difference `prefill(..., reuse=True)` promises not to make.
-        #
-        # 15 layers x 2 x max_seq x dh x 4B: ~31 MB at max_seq=512, against a
-        # 5 GB model. Cheap enough not to make conditional.
+        # Dense f32 K/V for every layer that owns a cache. A prefix-reusing
+        # pass has queries for rows `p0..N` but needs keys for rows `0..N`;
+        # reading the prefix back from the bf16 slab would make it differ from
+        # a full prefill by the slab's rounding. The size is small next to the
+        # weights.
         self._kv_src = {
             src: (
                 np.zeros((self.max_seq, N_KV_HEADS * head_dim(src)), np.float32),
@@ -426,10 +414,9 @@ class Gemma4Prefill(LlamaPrefill):
             if self.HOST_PROJECTIONS:
                 for nm in ("o", "down"):
                     w[nm] = _t(L[nm], torch.bfloat16)
-                # One dispatch costs ~24 ms of fixed overhead regardless of
-                # size, so projections sharing an input are issued as one GEMM.
-                # Q|K|V only where k and v exist: on a KV-shared layer `q` goes
-                # alone.
+                # Each dispatch has a fixed overhead regardless of size, so
+                # projections sharing an input are issued as one GEMM. Q|K|V
+                # only where k and v exist: on a KV-shared layer `q` goes alone.
                 q = _t(L["q"], torch.bfloat16)
                 if "k" in L:
                     w["qkv"] = torch.cat(
@@ -639,7 +626,7 @@ class Gemma4Prefill(LlamaPrefill):
         softmax on the host, over pages both sides address directly. Taken
         only where it applies -- one KV head, which is every Gemma4 layer --
         where `PLACEMENT` puts attention on the NPU, and with no query offset,
-        which its mask has no place for. Otherwise the base class's, on the
+        which its mask does not support. Otherwise the base class's, on the
         host or the iGPU.
         """
         if (
@@ -676,6 +663,11 @@ class Gemma4Prefill(LlamaPrefill):
                 v = torch.nn.functional.pad(v, (0, 0, 0, pad))
             return att(q, k, v, scale=dh**-0.5 if scale is None else scale)
 
+    def _host_attention(self):
+        """Whether a full pass runs the host attention a reusing pass must."""
+        dev = self._device("attention")
+        return dev == "cpu" or (dev == "npu" and not self.npu_attention)
+
     def _gpu_scope(self):
         """The iGPU driver scope for the head norms through the attention, or
         a no-op if neither RoPE nor attention runs on the iGPU."""
@@ -693,10 +685,9 @@ class Gemma4Prefill(LlamaPrefill):
 
         `p0` is the absolute position of this block's first row. Zero on a
         full prefill, where `x` is the whole prompt. On a prefix-reusing one
-        `x` holds only rows `p0..` and three things follow from it: the RoPE
-        table is sliced from `p0`, the KV is written from row `p0`, and the
-        attention runs rectangular -- `N` queries against `p0 + N` keys. Every
-        other operator here is row-wise and does not care.
+        `x` holds only rows `p0..`, so the RoPE table is sliced from `p0`, the
+        KV is written from row `p0`, and attention runs `N` queries against
+        `p0 + N` keys. The other operators are row-wise.
         """
         keep = N if keep is None else keep
         w = self._w[L]
@@ -745,25 +736,11 @@ class Gemma4Prefill(LlamaPrefill):
                 # The decode's handoff: roped K, normalized V, written straight
                 # into the layout both decoders read. No rearrangement follows.
                 self._store_kv(L, k, v, keep, row0=p0)
-            # The keys are the whole context and nothing more, read back out of
-            # the dense f32 cache the store above just appended to -- for an
-            # owning layer its own, for a KV-shared one its source's.
-            #
-            # Two things fall out of using it even when `p0 == 0`, where the
-            # freshly computed `k`/`v` are already in hand:
-            #
-            # * it TRIMS. `k`/`v` are `N` rows, bucketed, and the rows past
-            #   `keep` are padding whose keys are zero. They are masked out of
-            #   every real query, so dropping them changes no result -- but it
-            #   shortens the score matrix from `[n_q, N, N]` to `[n_q, N,
-            #   context]`, which at a 15-token prompt in a 128-row bucket is
-            #   most of the attention.
-            # * it makes reuse EXACT. A reusing pass necessarily reduces over
-            #   `context` keys; if a full pass reduced over `N` instead, the
-            #   two would differ by f32 reassociation alone -- measured at
-            #   9.5e-07 per layer, which the bf16 rounding in `_matmul`
-            #   amplifies to ~1e-3 in the KV and ~1% in the logits over 35
-            #   layers. Same reduction length on both paths, no difference.
+            # The keys are the context's rows of the dense f32 cache (this
+            # layer's, or its KV source's), even when `p0 == 0` and fresh
+            # `k`/`v` are in hand. That drops the bucket's padding rows, which
+            # no real query sees, and it gives a full pass and a reusing pass
+            # the same keys to reduce over, which keeps reuse bit-exact.
             k, v = self._source_kv(L if src is None else src, p0 + keep)
 
             a = self._attention(
@@ -809,33 +786,22 @@ class Gemma4Prefill(LlamaPrefill):
         # slightly too large, and it compounds over 35 layers.
         return x * w["out_scale"]
 
-    #: The prompt whose KV the slab currently holds, or None. Only `prefill`
-    #: sets it and only `clear_context` clears it; `_reusable_prefix` is the
-    #: single reader. Declared on the class so a fresh instance has it.
+    #: The prompt whose KV the slab holds, or None if unknown. Declared on the
+    #: class so a fresh instance has it.
     _cached_ids = None
-    #: The image soft tokens and placeholder mask that went with `_cached_ids`.
-    #: Read only by `_image_safe_prefix`, which is where their purpose is.
+    #: The image soft tokens and placeholder mask that went with `_cached_ids`,
+    #: for `_image_safe_prefix`.
     _cached_soft = None
     _cached_mask = None
 
     def _image_safe_prefix(self, p0, image_mask, image_embeds):
-        """Cut `p0` back to where the IDS still determine the embeddings.
+        """Cut `p0` back to where the ids still determine the embeddings.
 
-        Prefix matching compares token ids, and for text that is enough: a row's
-        embedding is a pure function of its id. **An image row is not.** Every
-        soft token carries the same placeholder id (258880), so two turns
-        holding two different pictures have identical ids over the whole image
-        run -- and an id-only match will happily reuse the first picture's KV
-        for the second one. Nothing raises; the model describes the wrong
-        image, fluently.
-
-        Found by `gemma4_e2b_flash/bench_prefix_reuse.py`, which puts a
-        different picture in each turn and reported 130 reusable rows where the
-        system prefix is 61.
-
-        So the image run is reusable only when the soft tokens are the same
-        tensor values as last time. Otherwise the prefix stops at the first
-        placeholder.
+        A text row's embedding is a function of its id, but every image soft
+        token has the same placeholder id, so prompts with different images
+        match over the whole image run. The image run is reusable only if the
+        soft tokens and mask equal the cached ones; otherwise the prefix stops
+        at the first placeholder.
         """
         if not p0 or image_mask is None:
             return p0
@@ -854,18 +820,13 @@ class Gemma4Prefill(LlamaPrefill):
         return p0 if same else first
 
     def _reusable_prefix(self, ids):
-        """How many leading rows of `ids` the cache already holds, correctly.
+        """How many leading rows of `ids` the cache already holds.
 
-        The longest common prefix with the last prefill, capped one short of
-        the prompt so there is always a row to compute -- a pass with nothing
-        to do has no last hidden state to take logits from.
-
-        Capped at the cached length too: rows the last prompt never reached
-        hold whatever `_zero_slab` left, not this prompt's KV.
-
-        A row's KV depends on every row before it, so the first differing
-        token invalidates the rest. That makes this a prefix match and not a
-        longest-common-subsequence; anything cleverer would be wrong.
+        The longest common prefix with the last prefill. Capped one short of
+        the prompt, so at least one row is computed to take logits from, and
+        at the cached length, since rows past it hold no KV of this prompt.
+        A row's KV depends on every row before it, so only a prefix can be
+        reused.
         """
         old = self._cached_ids
         if not old:
@@ -890,52 +851,35 @@ class Gemma4Prefill(LlamaPrefill):
         The base class's, with the PLE pass inserted before the layer loop and
         the logit softcap after the head.
 
-        The three optional arguments are the image path, and every one of them
-        defaults to leaving the text path exactly as it was:
+        The optional image arguments leave the text path unchanged when
+        omitted:
 
-        * `image_embeds` -- `[n_soft_tokens, D]` from
+        * `image_embeds`: `[n_soft_tokens, D]` from
           `gemma4_vision.Gemma4VisionTower.encode`, already in language space.
-        * `image_mask` -- bool `[N]`, True at the placeholder positions those
-          rows replace. Taken rather than derived so this file needs no notion
-          of which token id is an image; `examples/gemma4_e2b_flash/` owns that.
-        * `ple_ids` -- the ids the **per-layer embedding table** is gathered
-          with, which on an image prompt are NOT `ids`. Upstream substitutes
-          the pad token at every image position
-          (`modeling_gemma4.py::Gemma4Model.forward`, `llm_input_ids[...] =
-          pad_token_id`), so the placeholder's own row -- which is a vocabulary
-          entry that never appears in text and was never trained as one -- is
-          not what feeds the layers. The projection half of the PLE still runs
-          on the merged embeddings, image features included; only this lookup
-          changes. Quiet when wrong: every shape is identical and the text
-          degrades with depth.
+        * `image_mask`: bool `[N]`, True at the placeholder positions those
+          rows replace. Passed in so this file needs no notion of which token
+          id is an image.
+        * `ple_ids`: the ids the per-layer embedding table is gathered with.
+          On an image prompt these differ from `ids`: upstream substitutes the
+          pad token at every image position
+          (`modeling_gemma4.py::Gemma4Model.forward`), so the placeholder's
+          own, untrained row does not feed the layers. The projection half of
+          the PLE still runs on the merged embeddings. A wrong table raises
+          nothing; output quality degrades with depth.
 
-        Attention stays causal. The larger Gemma4 sizes make image tokens
-        attend each other bidirectionally, but E2B's `use_bidirectional_attention`
-        is null, so upstream takes its ordinary-causal branch here and so do we.
-        Written down because the absence otherwise reads like an omission.
+        Attention stays causal. Larger Gemma4 sizes make image tokens attend
+        each other bidirectionally, but E2B's `use_bidirectional_attention` is
+        null, so upstream takes the causal branch.
 
-        `reuse=True` keeps whatever leading rows this prompt shares with the
-        last one and recomputes only the suffix -- the system-prompt caching a
-        production hybrid does, where a 135-token prompt behind a 61-token
-        system prefix computes 74 rows instead of 135.
-
-        It is **bit-identical** to a full prefill, and that is measured rather
-        than argued: `test_prefix_reuse.py` compares logits and KV and requires
-        exact equality. Every operator in a block is row-wise except the
-        attention, and the attention is handed the whole context's keys out of
-        a dense f32 cache.
-
-        Exactness is not free, though, and the thing that buys it is `_layer`
-        trimming the keys to the real context on BOTH paths. Left untrimmed,
-        a full pass reduced over the padded bucket and a reusing pass over the
-        context, and f32 reassociation alone -- 9.5e-07 per layer -- came out
-        as ~1e-3 in the KV and ~1% in the logits after 35 layers. The argmax
-        survived, which is exactly why this is gated on equality and not on a
-        first token.
-
-        It saves PREFILL work only. The KV the decode receives is the full
-        context either way, so this does not shrink the handoff.
-
+        `reuse=True` keeps the leading rows this prompt shares with the last
+        one and recomputes the rest. The result is bit-identical to a full
+        prefill (`test_prefix_reuse.py` checks logits and KV): every operator
+        but attention is row-wise, and both passes give attention the
+        context's keys from the dense f32 cache in the same order. The NPU and
+        iGPU attention kernels take no query offset, so reuse needs the host
+        attention; where a full pass would run a kernel, nothing is reused.
+        Reuse saves prefill work only; the decode receives the whole context
+        either way.
         """
         assert self._w is not None, "call load_weights() first"
         N = len(ids)
@@ -949,18 +893,14 @@ class Gemma4Prefill(LlamaPrefill):
                 f"template on disk is ATTN_MAXL={self.kv_attn_maxl}. Rebuild "
                 f"it larger: make compile-decode DECODE_L=<n>."
             )
-        # How much of this prompt the cache already holds. Only the leading
-        # rows can be reused -- a row's KV depends on every row before it, so
-        # the first token that differs invalidates everything from there on.
-        p0 = self._reusable_prefix(ids) if reuse else 0
+        # Rows of this prompt the cache already holds.
+        p0 = self._reusable_prefix(ids) if reuse and self._host_attention() else 0
         p0 = self._image_safe_prefix(p0, image_mask, image_embeds)
         Ns = N - p0
 
         # Pad to a bucket. Safe under causal masking: the padded rows sit after
         # every real one, so no real position attends to them, and their own
-        # outputs are discarded. On a reusing pass it is the SUFFIX that is
-        # bucketed, which is the whole saving: a 135-token prompt with a
-        # 61-token prefix computes 74 rows padded to 128, not 135 padded to 256.
+        # outputs are discarded. On a reusing pass only the suffix is bucketed.
         Nb = min(
             self.max_seq - p0,
             ((Ns + self.SEQ_BUCKET - 1) // self.SEQ_BUCKET) * self.SEQ_BUCKET,
@@ -975,35 +915,29 @@ class Gemma4Prefill(LlamaPrefill):
                     f"{int(rows.sum())} image placeholders in the prompt but "
                     f"{len(image_embeds)} soft tokens to fill them"
                 )
-            # Inserted UNSCALED. Gemma scales its embedding table by
-            # `sqrt(hidden_size)` and this bundle has that already folded in
-            # (`config.EMBED_SCALE`), which is the same relationship upstream
-            # has when it scatters raw image features into a scaled table.
+            # Inserted unscaled: the bundle's embedding table already carries
+            # Gemma's sqrt(hidden_size) (`config.EMBED_SCALE`), and upstream
+            # scatters raw image features into the scaled table the same way.
             #
-            # Indexed into `x` directly rather than into `x[:Ns]`: the slice is
-            # a view and a masked write through it does reach `x`, but that is
-            # a fact about torch views rather than something this line should
-            # depend on.
+            # Under reuse `x` starts at absolute row `p0`, so the mask and the
+            # soft tokens are cut to the suffix; an image wholly inside the
+            # reused prefix is already in the cache.
             #
-            # Under reuse, `x` starts at absolute row `p0`, so both the mask and
-            # the soft tokens are sliced to the suffix. An image that fell
-            # entirely inside the reused prefix contributes nothing here and its
-            # rows are already in the cache.
+            # The tower may have run on the iGPU while `x` is on the host.
             rows = rows[p0:]
             keep_soft = int(torch.as_tensor(np.asarray(image_mask))[:p0].sum())
             x[torch.nonzero(rows, as_tuple=True)[0]] = image_embeds[keep_soft:].to(
-                torch.float32
+                x.device, torch.float32
             )
 
         # Before any layer writes: the padded lanes inside a written row, and
         # the rows past the prompt, both have to be zero for the decode to read
         # them. `_store_kv` writes only the real lanes, by design.
         #
-        # On a reusing pass only the tail is zeroed -- zeroing rows below `p0`
-        # would erase the very thing being reused. The tail still has to go:
-        # the decode's attention bound grows with generation in 16-row blocks,
-        # so rows past the context are read and must be zero (see `_zero_slab`),
-        # and a previous, longer turn may have left values there.
+        # On a reusing pass only rows from `N` on are zeroed, keeping the
+        # reused prefix. Those still must be: the decode's attention bound
+        # grows in 16-row blocks, so rows past the context are read (see
+        # `_zero_slab`), and a longer previous prompt may have left values.
         if p0:
             self._zero_slab_from(N)
         else:
@@ -1012,9 +946,9 @@ class Gemma4Prefill(LlamaPrefill):
         ple_all = list(ids if ple_ids is None else ple_ids)
         if len(ple_all) != N:
             raise ValueError(f"ple_ids is {len(ple_all)} long, the prompt is {N}")
-        # The PLE is row-wise, so the suffix's rows are all that is needed --
-        # and `per_layer_inputs` reads `_ple_ids` for the table gather, which
-        # has to line up with the `x` it is handed.
+        # The PLE is row-wise, so only the suffix's ids are needed.
+        # `per_layer_inputs` gathers with `_ple_ids`, which must line up with
+        # `x`.
         self._ple_ids = ple_all[p0:]
         pli_all = self.per_layer_inputs(x, Nb)
         for L in range(self.n_layers):
@@ -1062,9 +996,7 @@ class Gemma4Prefill(LlamaPrefill):
 
     def clear_context(self):
         self.current_context_length = 0
-        # The cache is gone, so nothing may be reused from it. Without this a
-        # `reuse=True` prefill after a clear would match a prefix against rows
-        # that have just been zeroed.
+        # Nothing may be reused from a cleared cache.
         self._cached_ids = None
         self._cached_soft = self._cached_mask = None
         self._zero_slab()
@@ -1765,8 +1697,8 @@ class Gemma4IgpuPrefill(Gemma4Prefill):
     """
 
     ENGINE = "igpu"
-    #: The iGPU reads its projections packed from the bundle, unless asked for
-    #: bf16 ones -- which are the host copies.
+    #: The iGPU reads its projections packed from the bundle, unless
+    #: Q4NX_GPU_WEIGHTS=bf16 asks for the host's bf16 copies.
     HOST_PROJECTIONS = os.environ.get("Q4NX_GPU_WEIGHTS", "q4k") == "bf16"
 
     def __init__(self, *a, **kw):

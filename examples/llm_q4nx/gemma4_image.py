@@ -5,18 +5,17 @@
 Both Gemma4 sizes share the tower and the tokenizer's image tokens, so nothing
 here depends on which model the turn is for.
 
-`load_image` wraps transformers' own Gemma4 image processor, with the PIL
-backend (its torchvision one imports `torchvision`, which is not a dependency
-here). What comes back, for a 448x448 input at the default budget:
+`load_image` wraps transformers' Gemma4 image processor with the PIL backend
+(the torchvision backend needs `torchvision`, which is not a dependency). For a
+448x448 input at the default budget it returns:
 
-* `pixels` `[2520, 768]` -- each row one 16x16 RGB patch, flattened as
-  `(channel, row, col)`. The image is first resized, preserving its aspect
-  ratio, to the largest size that fits the patch budget and divides
-  `pooling * patch`: 768x768 = 48x48 = 2304 patches; the other 216 rows are
-  padding.
-* `pos_ids` `[2520, 2]` -- each patch's `(x, y)` grid coordinate, `(-1, -1)` on
-  the padding rows. The position embedding and the pooler both key off it.
-* `n_soft` -- 256 here, the pooled tokens the prompt must hold placeholders for.
+* `pixels` `[2520, 768]`: each row one 16x16 RGB patch, flattened as
+  `(channel, row, col)`. The image is resized, keeping its aspect ratio, to
+  the largest size that fits the patch budget and divides `pooling * patch`:
+  768x768 = 48x48 = 2304 patches; the other 216 rows are padding.
+* `pos_ids` `[2520, 2]`: each patch's `(x, y)` grid coordinate, `(-1, -1)` on
+  padding rows.
+* `n_soft`: 256, the number of image placeholders the prompt needs.
 """
 
 import numpy as np
@@ -26,17 +25,16 @@ import gemma4_vision_q4nx as vw
 #: The checkpoint's `default_output_length`.
 MAX_SOFT_TOKENS = 280
 
-#: The budgets the processor accepts. FastFlowLM ships 70.
+#: The budgets the processor accepts.
 SOFT_TOKEN_BUDGETS = (70, 140, 280, 560, 1120)
 
 
 def processor(max_soft_tokens=None):
     """Gemma4's image processor, PIL backend.
 
-    `max_soft_tokens` is the resolution budget, and the biggest lever on how
-    much work everything downstream does. The image is resized to the largest
-    size that fits it, so the tokens produced are the largest tier at or below
-    it. On a 448x448 input:
+    `max_soft_tokens` is the resolution budget, which sets how much work
+    everything downstream does. The image is resized to the largest size that
+    fits it. On a 448x448 input:
 
         budget   patches   soft tokens   prompt
             70       630            64       84
@@ -44,8 +42,7 @@ def processor(max_soft_tokens=None):
            280      2520           256      276
            560      5040           529      549
 
-    The tower's attention is quadratic in patches, so 70 -> 280 is 4x the
-    patches and ~16x the attention. Compare against FastFlowLM at 70.
+    The tower's attention is quadratic in the patch count.
     """
     from transformers.models.gemma4.image_processing_pil_gemma4 import (
         Gemma4ImageProcessorPil,
@@ -99,8 +96,8 @@ def build_prompt(tokenizer, text, n_soft, system=None):
     holds the pad token at the image positions: upstream gathers the
     per-layer embedding table with those, not with the placeholder's id.
 
-    `system`, when given, is a system turn ahead of the image turn -- the
-    prefix a reusing prefill caches across turns.
+    `system`, when given, is a system turn before the image turn, which a
+    prefix-reusing prefill can cache across turns.
     """
     msg = []
     if system:
@@ -151,7 +148,7 @@ def shapes_image(path, size=448):
 
 
 #: Each group must appear in the shapes image's description. Positions are one
-#: group because the model phrases them freely. mlir-air's gate, verbatim.
+#: group because the model phrases them freely. Matches mlir-air's gate.
 SHAPES_TERMS = [
     ("red", ("red",)),
     ("square", ("square", "rectangle")),

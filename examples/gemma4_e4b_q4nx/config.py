@@ -217,9 +217,10 @@ def load_q4nx(model=None, projections=True):
 
 
 def load_q4nx_packed(model=None):
-    """The Codec B projections as the bundle stores them, NOT dequantized, in
-    the layout E2B's loader returns (`../gemma4_e2b_q4nx/config.py::
-    load_q4nx_packed`): for the iGPU's W4A16 kernels, which read them in place.
+    """The Codec B projections as the bundle stores them (not dequantized), in
+       the layout E2B's loader returns
+    (`../gemma4_e2b_q4nx/config.py::
+       load_q4nx_packed`): for the iGPU's W4A16 kernels, which read them in place.
     """
     import numpy as np
 

@@ -8,31 +8,29 @@
 
 `--tower`:
 
-* `host` -- `gemma4_vision.Gemma4VisionTower`, its operators placed by
-  `--backend`/`--ops` as the text prefill's are. Scored **stage by stage**, so
-  a failure names the stage that broke.
-* `air` -- mlir-air's NPU tower (`gemma4_vision_air`). Scored on its soft
-  tokens; mlir-air's own gate is the same comparison.
-* `triton` -- mlir-air's tower pipeline with its GEMMs on this repository's
+* `host`: `gemma4_vision.Gemma4VisionTower`, its operators placed by
+  `--backend`/`--ops` as for the text prefill. Scored stage by stage, so a
+  failure names the stage that broke.
+* `air`: mlir-air's NPU tower (`gemma4_vision_air`). Scored on its soft tokens.
+* `triton`: mlir-air's tower pipeline with its GEMMs on this repository's
   Triton device (`gemma4_vision_device`). Scored on its soft tokens.
-* `igpu` -- `gemma4_vision.Gemma4GpuVisionTower`, every stage a Triton kernel
+* `igpu`: `gemma4_vision.Gemma4GpuVisionTower`, every stage a Triton kernel
   on the iGPU. Scored on its soft tokens.
 
 Per-patch stages are scored on the real patches only. The padding rows are
-undefined on both sides -- upstream masks them out of attention on both axes,
-the towers here only on the key axis -- and are zeroed before the pooler reads
-anything, so they cannot reach an output.
+undefined on both sides (upstream masks them on both attention axes, the
+towers here only on the key axis) and are zeroed before the pooler, so they
+cannot reach an output.
 
-`--model` takes the text bundle's repo or directory: the vision weights ship
-beside it, so `FastFlowLM/Gemma4-E4B-IT-NPU2` gates E4B's tower (the same
-tower, at E4B's projection width).
+`--model` takes the text bundle's repo or directory; the vision weights ship
+beside it.
 
-The host tower in f32 sits at cosine ~0.99999 per stage; the device towers
-add their bf16 GEMMs and land at ~0.9995 on the soft tokens. The floors below
-are cliff detectors: a real error is 0.9 or 0.3, not 0.999.
+The floors are set well below what a correct tower reaches, so they catch
+real errors without flagging bf16 rounding.
 """
 
 import argparse
+import math
 import os
 import statistics
 import sys
@@ -47,17 +45,20 @@ import gemma4_vision  # noqa: E402
 import gemma4_vision_hf  # noqa: E402
 import gemma4_vision_q4nx as vw  # noqa: E402
 
-#: Per stage, for the host tower.
+#: Per-stage floor for the host tower.
 STAGE_COS_MIN = 0.999
-#: On the soft tokens, for the device towers -- mlir-air's own floor.
+#: Soft-token floor for the device towers; matches mlir-air's own gate.
 SOFT_COS_MIN = 0.99
 
 
 def _cos(a, b):
+    """Cosine similarity; -inf for a zero or non-finite input, which no floor
+    lets pass (a NaN would fail no `<` comparison)."""
     a = a.reshape(-1).to(torch.float64)
     b = b.reshape(-1).to(torch.float64)
     n = a.norm() * b.norm()
-    return float(a.dot(b) / n) if n > 0 else float("nan")
+    c = float(a.dot(b) / n) if n > 0 else float("nan")
+    return c if math.isfinite(c) else float("-inf")
 
 
 def make_tower(kind, weights, backend="cpu", ops=None):
@@ -65,9 +66,8 @@ def make_tower(kind, weights, backend="cpu", ops=None):
     if kind == "host":
         from gemma4_prefill import Gemma4Prefill
 
-        # The tower borrows its operators from a Gemma4Prefill, so that
-        # `--backend`/`--ops` mean the same thing as on the text side. Its
-        # language weights are never loaded.
+        # Borrow operators from a Gemma4Prefill so `--backend`/`--ops` mean
+        # the same as on the text side. Its language weights are not loaded.
         host = Gemma4Prefill(backend=backend, ops=ops, n_layers=1, max_seq=64)
         return gemma4_vision.Gemma4VisionTower(host, weights=weights)
     if kind == "air":

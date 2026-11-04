@@ -1097,8 +1097,8 @@ def qkv_post(
     `[T, n_q * dh]` on a KV-shared layer, which has no k or v: one row for a
     decode step, the prompt for a prefill. `lut_rows` is the RoPE table's
     `[T, dh]` rows for those positions (a single `[dh]` row for T = 1).
-    Returns the rotated q, `[T, n_q * dh]` -- and with `dense_kv`, also the
-    roped K and normed V as `[T, n_kv * dh]`.
+    Returns the rotated q, `[T, n_q * dh]`; with `dense_kv`, also the roped
+    K and normed V as `[T, n_kv * dh]`.
 
     `kv`, where the layer owns its cache, is `(slab, slot, pos, region_stride)`:
     the `[n_slabs, layer_elems]` bf16 slab, the layer's slab in it
@@ -1110,7 +1110,7 @@ def qkv_post(
     """
     from kv_layout import DH_A, K_REGION, V_REGION, lane_shift
 
-    # One cache row: every KV head, DH_A apart (`kv_layout.REGION_W`).
+    # A cache row holds every KV head, DH_A apart (`kv_layout.REGION_W`).
     region_w = n_kv * DH_A
 
     lut_rows = lut_rows.reshape(-1, dh)
@@ -1887,8 +1887,7 @@ def _attn_prefill_fa_kernel(
     Laid out like llama.cpp's scalar Vulkan flash attention (`flash_attn.comp`):
 
     * One program per (query block, head). Query heads that share a K/V head
-      (all eight of them on Gemma4's text layers) share it through L2 rather
-      than within a program.
+      share it through L2 rather than within a program.
     * The whole head dim in one program, so QK^T is computed once even for
       the 512-wide heads.
     * fp16 operands with f32 accumulation, as llama.cpp uses. bf16 operands
@@ -1900,9 +1899,9 @@ def _attn_prefill_fa_kernel(
       L2 per key block, in a loop that must stay rolled: unrolled, the
       compiler hoists every slice's loads and spills again.
 
-    Q, K and V are fp16; the output is f32 by default. K and V are `[N, NKV * DH]`; query
-    head `h` reads KV head `h // (NQ // NKV)`, as `flash_attn.comp`'s
-    `gqa_ratio` does.
+    Q, K and V are fp16; the output is f32 by default. K and V are
+    `[N, NKV * DH]`; query head `h` reads KV head `h // (NQ // NKV)`, as
+    `flash_attn.comp`'s `gqa_ratio` does.
     """
     pid_m = tl.program_id(0)
     h = tl.program_id(1)
@@ -1956,8 +1955,7 @@ def _attn_prefill_fa_kernel(
 
 
 #: (query rows, head-dim slice) per program, by head width, with 32-key
-#: blocks and 4 warps. Swept on gfx1103: the text widths at N = 512, the
-#: vision tower's 64 at the default image size.
+#: blocks and 4 warps. Tuned on gfx1103.
 _FA_TILE = {64: (128, 64), 256: (32, 64), 512: (32, 32)}
 
 

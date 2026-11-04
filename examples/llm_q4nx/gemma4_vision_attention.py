@@ -4,9 +4,9 @@
 """Gemma4's vision attention for the vision device: bidirectional flash
 attention over an image's patches, every head its own K and V.
 
-`gemma4_attention`'s round loop with one change, the mask: a query sees every
-key that is a real patch -- the first `nvalid` -- whatever its position, where
-the text's sees the keys at or before it. The buffers are that module's: q and
+`gemma4_attention`'s round loop with a different mask: a query sees every
+real patch (the first `nvalid` keys) regardless of position, instead of only
+the keys at or before it. The buffers are that module's: q and
 o as 8x8 blocks [rounds * R / 8, DH / 8], each head's KV as records of a K
 tile's blocks [LKP / 8, DH / 8] then its V tile's in DH / DVT column chunks
 [LKP / 8, DVT / 8], one head's records SPAN elements after the previous
@@ -84,11 +84,9 @@ def _rounds_bidir(
     voff = tl.arange(0, DVC)[:, None, None, None, None, None] * (
         MB * VB * 64
     ) + A._offsets(MB * VB // (S * VBM), S, VBM).expand_dims(0)
-    # Minus each key's column within its block, on every q row, so that a
-    # block's mask compares it with how many of its keys are real. Spelled as
-    # the q row minus the key column, minus the q row again: the schedule
-    # stages a mask of that shape, [R, LKP] from the two ranges, and not a
-    # [1, LKP] one broadcast over the rows.
+    # Negated key column within the block, on every q row. Written as
+    # (row - col) - row so the mask is [R, LKP] built from both ranges, the
+    # shape the schedule stages, rather than a [1, LKP] broadcast.
     dkey = (orr[:, None] - oi[None, :]) - orr[:, None]
     for r in range(nr):
         q = tl.reshape(tl.load(Q + r * R * DH + qoff), (R8, KB, 8, 8))
@@ -248,15 +246,15 @@ def records(k, v):
     return rec.reshape(*lead, nb * REC).astype(bfloat16)
 
 
-# ---- a device of its own, for the test
+# ---- the attention device
 
 
 def build(out):
-    """`vattn` alone, as device `vattn` in `out`: MAX_BLOCKS K blocks a head
-    at most and the rounds of ROWS q rows, nk and nvalid at run time. The
-    round count is built in: a run-time one keeps the round loop rolled,
-    where every transfer it frees without waiting gives its buffer
-    descriptor back while the transfer may still be queued."""
+    """`vattn` alone, as device `vattn` in `out`: at most MAX_BLOCKS K blocks
+    a head, ROWS q rows, nk and nvalid at run time. The round count is a
+    compile-time constant because a run-time count keeps the round loop
+    rolled, and the rolled loop can release a buffer descriptor while its
+    transfer is still queued."""
     import torch
     from triton.backends.amd_triton_npu.config import config_context
     from triton.backends.amd_triton_npu.fused_device import FusedDevice
@@ -289,9 +287,8 @@ def build(out):
     dev.save(out)
 
 
-#: What aircc builds the device with, beyond the defaults: the vision
-#: device's. Without `--fuse-sequential-loops` a core's input channel is fed
-#: from two memtile channels.
+#: aircc options, as for the vision GEMM device. `--fuse-sequential-loops`
+#: keeps each core's input channel fed from a single memtile channel.
 AIRCC_ARGS = (
     "--air-channel-multiplexing=L1",
     "--omit-ping-pong-transform=L1",
@@ -355,7 +352,7 @@ class Attention:
         if lk % LKP or lq % 8:
             raise ValueError(f"{lk} keys or {lq} queries: not whole blocks")
         nb = lk // LKP
-        # Straight into the device buffers' blocked views: one copy each way.
+        # Write into the device buffers' blocked views: one copy each way.
         kv = self.kv.host(write=True).reshape(heads, MAX_BLOCKS, REC)
         kv[:, nb:nk] = 0
         kv = kv[:, :nb]

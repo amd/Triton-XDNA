@@ -2,17 +2,16 @@
 # SPDX-License-Identifier: MIT
 """mlir-air's NPU vision tower (`llms/gemma4_e2b_vision`) on FastFlowLM's weights.
 
-mlir-air's tower runs its six GEMMs and the attention as AIR ELFs, one per
-image shape, and the elementwise work between them on the host
-(`hostops.c`). It is the reference this repository's own NPU tower is held to.
+mlir-air's tower runs its GEMMs and the attention as AIR ELFs, built per image
+shape, and the elementwise work between them on the host (`hostops.c`). It
+serves as the reference for this repository's NPU tower.
 
-It reads the HF bf16 checkpoint; here it reads `vision_weight.q4nx` instead,
-the file the text bundle ships beside it (`gemma4_vision_q4nx`). The two hold
-the same bf16 tensors, so `AirWeights` only renames: mlir-air's
-`VisionWeights` interface over our loader's dict.
+mlir-air reads the HF bf16 checkpoint; here it reads `vision_weight.q4nx`
+(`gemma4_vision_q4nx`), which holds the same bf16 tensors, so `AirWeights` only
+adapts names to mlir-air's `VisionWeights` interface.
 
-E2B and E4B share the tower. `GEMMA4_VARIANT`, which the E4B config sets, is
-what mlir-air's modules read; the projection width comes from the weights.
+E2B and E4B share the tower. mlir-air's modules read `GEMMA4_VARIANT`, which
+the E4B config sets; the projection width comes from the weights.
 """
 
 import sys
@@ -97,8 +96,8 @@ class AirVisionTower:
         self.fingerprint = w.get("fingerprint")
         self.ops = ops or enc.NpuOps(verbose=verbose)
         self.enc = enc.VisionEncoder(self.ops, weights=AirWeights(w))
-        # The tower holds a context per ELF (seven), and the prefill and the
-        # decode need their own. A launch the device refuses asks for them back.
+        # The tower holds a hardware context per ELF, and the prefill and
+        # decode need theirs. Registered so a refused launch can reclaim them.
         driver.context_releasers.append(self.release)
 
     def encode(self, pixels, pos_ids):

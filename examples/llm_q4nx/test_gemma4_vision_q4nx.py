@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """Check `gemma4_vision_q4nx.unpack` against the packing it inverts.
 
-The vision tower's weights are tile-packed for FLM's MM engine and we un-pack
-them to read them. A wrong `mm_n`/`mm_k` pair does not fail: it produces a
-matrix of exactly the right shape holding the right numbers in the wrong places,
-and the tower built on it yields plausible-looking soft tokens and a confidently
-wrong caption. So the check is that a re-pack of what we read is **bitwise**
-equal to the bytes in the file, not a tolerance on anything downstream.
+A wrong `mm_n`/`mm_k` pair does not fail on its own: it yields a matrix of
+the right shape with values in the wrong places. So the check is that
+re-packing what was read is bitwise equal to the bytes in the file.
 
-Re-packing with our own `pack` rather than with the converter's `einops`
-rearrange is deliberate: `pack` is written as the literal inverse of `unpack`,
-so agreement between them proves only that the pair is self-consistent. What
-makes this a real test is the third party -- the file, whose bytes neither
-function produced.
+`pack` is the inverse of `unpack`, so their agreement alone only shows the
+pair is self-consistent; comparing against the file's bytes makes it a real
+check.
 
-Needs the 337 MB `vision_weight.q4nx`. Exits 77 -- graded as a skip -- when it
-is not resolvable, so this runs offline without failing.
+Needs `vision_weight.q4nx`. Exits 77 (graded as a skip) when it cannot be
+resolved.
 
     python test_gemma4_vision_q4nx.py [model-dir-or-repo-id]
 """
@@ -33,9 +28,8 @@ import gemma4_vision_q4nx as vw
 
 SKIP_EXIT_CODE = 77
 
-#: (key, K, out) for one tensor of every distinct packed geometry in the file:
-#: square, wide (K < out), tall (K > out), and the non-square output projection.
-#: Checking all 659 would take minutes and prove nothing the four do not.
+#: (key, K, out) for one tensor of each distinct packed geometry: square,
+#: wide (K < out), tall (K > out), and the output projection.
 _CASES = [
     ("model.vision.0.vision_attn.q_proj.weight", 768, 768),
     ("model.vision.0.ffn.gate_proj.weight", 768, 3072),
@@ -58,8 +52,7 @@ def main(argv=None):
     for key, K, out in _CASES:
         stored = r.raw(key)
         back = vw.pack(r.proj(key, K, out))
-        # int16 rather than bfloat16: a bitwise check should not route through
-        # a float comparison that could call two NaN encodings equal.
+        # Compare as int16 so the check is bitwise, not a float comparison.
         ok = np.array_equal(stored.view(np.int16), back.view(np.int16))
         bad += not ok
         print(
@@ -67,10 +60,8 @@ def main(argv=None):
             f"[{K}, {out}]  {key}"
         )
 
-    # The position table is the one tensor packed per-dimension, and the one
-    # where the converter feeds a transpose -- so it is the one most likely to
-    # come back with its axes swapped, which is invisible in the shape (both
-    # axes would still be 10240 and 768, just the other way round).
+    # The position table is packed per axis from a transposed input, so a
+    # swapped-axes bug would not show in the shape.
     key = "model.vision.patch_embedder.position_embedding_table"
     stored = r.raw(key)
     un = [
@@ -84,8 +75,8 @@ def main(argv=None):
         f"  {'ok  ' if ok else 'FAIL'} {tuple(stored.shape)} -> 2x[10240, 768]  {key}"
     )
 
-    # A swapped mm_n/mm_k has to be rejected, not merely un-chosen. Without
-    # this, the checks above pass for any self-consistent pair.
+    # The round trips above pass for any self-consistent tile pair, so also
+    # check that a swapped mm_n/mm_k is rejected.
     key, K, out = _CASES[0]
     try:
         vw.unpack(r.raw(key), K, out, mm_n=vw.MM_TILE_K, mm_k=vw.MM_TILE_N)

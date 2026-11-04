@@ -115,13 +115,13 @@ class Gemma4FusedPrefill(Gemma4Prefill):
     ):
         """`Gemma4Prefill.prefill`'s contract, image arguments included.
 
-        The fused prefill takes an image as `ple_ids` -- the prompt with the
-        pad token at the image positions, which is what its per-layer table is
-        gathered with -- plus the soft tokens and their positions, which
-        replace the token embeddings there.
+        The fused prefill takes an image as `ple_ids` (the prompt with the pad
+        token at the image positions, used to gather the per-layer table) plus
+        the soft tokens and their positions, which replace the token
+        embeddings there.
 
-        `reuse` is accepted and ignored: the fused prefill always runs the whole
-        prompt, which is what a reusing prefill is required to equal anyway.
+        `reuse` is accepted and ignored: the fused prefill always runs the
+        whole prompt, which a reusing prefill must match anyway.
         """
         ids = [int(t) for t in np.asarray(ids).reshape(-1)]
         N = len(ids)

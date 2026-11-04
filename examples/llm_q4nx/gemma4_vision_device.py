@@ -3,18 +3,17 @@
 
 """Gemma4's vision tower GEMMs as one NPU device of Triton kernels.
 
-One `gemma4_gemm.mm_g` op per GEMM shape of the tower -- q|k|v, o, gate (GELU
-in its drain), up, down, the patch embedding and the projection into the
-language space -- linked into one device by `FusedDevice` and called on a
-`FusedProgram`, a 128-row chunk at a time. The weights are bf16, as the
+One `gemma4_gemm.mm_g` op per GEMM shape of the tower (q|k|v, o, gate with
+GELU in its drain, up, down, the patch embedding and the projection into the
+language space), linked into one device by `FusedDevice` and called on a
+`FusedProgram` one 128-row chunk at a time. The weights are bf16, as the
 checkpoint ships them.
 
-`TritonOps` is the device-ops interface of mlir-air's `VisionEncoder`
-(`gemma4_vision_air`): build, gemm, attention, timings. With it the tower's
-host pipeline is mlir-air's, its attention `gemma4_vision_attention`'s Triton
-kernel on a device of its own -- or, with `attention="air"`, mlir-air's
-FlashAttention ELF, so a comparison against mlir-air's own `NpuOps` measures
-the GEMMs alone.
+`TritonOps` implements the device-ops interface of mlir-air's `VisionEncoder`
+(`gemma4_vision_air`): build, gemm, attention, timings. The host pipeline is
+mlir-air's. Attention runs `gemma4_vision_attention`'s Triton kernel on its
+own device, or with `attention="air"` mlir-air's FlashAttention ELF, which
+isolates the GEMMs when comparing against mlir-air's `NpuOps`.
 
 E2B and E4B share every shape but the projection's, so the device carries
 both widths and serves either model.

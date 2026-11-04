@@ -24,10 +24,10 @@ The three stages and where each can run:
                       gpu      the decode as Triton kernels on the iGPU
 
 The soft tokens the tower produces replace the image placeholders' embeddings
-in the prompt. Whatever the prefill, it writes its K/V straight into ONE slab
-in the layout both decoders read (`kv_layout`), in pages the NPU (an XRT BO)
-and the iGPU (a HIP mapping of the same pages) both address: the decode reads
-the cache where the prefill left it, with no copy in between.
+in the prompt. Every prefill writes K/V into a single slab in the layout both
+decoders read (`kv_layout`), in pages the NPU (an XRT BO) and the iGPU (a HIP
+mapping of the same pages) both address, so the decode reads the cache in
+place without a copy.
 
 A model is this module plus its `config` (`examples/gemma4_*_flash/`).
 """
@@ -265,13 +265,13 @@ def main(cfg, doc=None, argv=None):
     if args.prefill_only:
         return 0
 
-    # The tower's NPU contexts are the decode's to use now.
+    # Free the tower's NPU contexts for the decode.
     if hasattr(tower, "release"):
         tower.release()
 
     # `--max-tokens` counts the prefill's first token. Both decodes return it
-    # first; the iGPU's returns `max_tokens` in all, mlir-air's `max_tokens`
-    # more, so the latter is asked for one fewer.
+    # first; the iGPU's returns `max_tokens` in total, mlir-air's returns
+    # `max_tokens` more, so mlir-air's is asked for one fewer.
     want = args.max_tokens
     t0 = time.perf_counter()
     if args.decode == "gpu":

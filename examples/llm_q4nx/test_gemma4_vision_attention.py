@@ -12,8 +12,7 @@ largest the device holds, its q rows over several dispatches.
 
     python test_gemma4_vision_attention.py
 
-Not an example: `scripts/run_tests.py` runs every *.py directly under an
-example directory, and `llm_q4nx` is excluded from the sweep as a library.
+Not run by `scripts/run_tests.py`, which skips `llm_q4nx` as a library.
 """
 
 import sys
@@ -32,9 +31,9 @@ BIG = 1.0e4
 
 
 def widened(rng, rows, nvalid=None):
-    """[rows, H 2DH] bf16: each head's DH columns, then its mask columns --
-    1 in every row of q (nvalid None), else 0 below nvalid and -BIG from
-    there -- and zeros."""
+    """[rows, H 2DH] bf16: each head's DH columns, then its mask column
+    (1 in every row for q, i.e. nvalid None; for k, 0 below nvalid and -BIG
+    from there), then zeros."""
     x = np.zeros((rows, H, 2 * DH), np.float32)
     x[:, :, :DH] = rng.standard_normal((rows, H, DH))
     if nvalid is None:
@@ -61,8 +60,8 @@ def main():
     from triton.backends.amd_triton_npu.fused_program import FusedProgram
 
     rng = np.random.default_rng(0)
-    # (q rows, K rows, real keys), as the encoder's shapes come: K rows are
-    # the real ones rounded up to a K block.
+    # (q rows, K rows, real keys). K rows are the real ones rounded up to a
+    # K block, as in the encoder.
     cases = [(256, 256, 256), (1536, 704, 700), (2560, 2560, 2520)]
     ok = True
     with tempfile.TemporaryDirectory() as d:
@@ -75,8 +74,8 @@ def main():
             got = attn.attention(q, k, v, VA.SCALE).astype(np.float32)
             ref = reference(q, k, v, nvalid)
             err = float(np.linalg.norm(got - ref) / np.linalg.norm(ref))
-            # S, P and the accumulator are bf16, against an f32 reference:
-            # gemma4_attention's numerics and test_gemma4_attention's bound.
+            # S, P and the accumulator are bf16 against an f32 reference; same
+            # bound as test_gemma4_attention.
             good = err < 6e-2
             ok &= good
             print(

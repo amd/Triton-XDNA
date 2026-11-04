@@ -1,33 +1,24 @@
 #!/usr/bin/env python3
 """Gate `Gemma4Prefill.prefill(..., reuse=True)` against a full prefill.
 
-    python test_prefix_reuse.py            # cpu, ~2 min including the load
+    python test_prefix_reuse.py
     python test_prefix_reuse.py --backend npu
 
-Prefix reuse recomputes only the rows a prompt does not share with the previous
-one. The claim it makes is **exactness**, not approximation: every operator in a
-block is row-wise except the attention, and the attention is handed the whole
-prompt's keys out of the dense f32 cache, so the rows it does compute should
-come out bit-for-bit as a full prefill would have computed them.
+Prefix reuse recomputes only the rows a prompt does not share with the
+previous one. Every operator in a block is row-wise except attention, which
+reads the whole prompt's keys from the dense f32 cache, so the recomputed
+rows should match a full prefill bit for bit.
 
-That claim is what this checks, and it is worth checking rather than reasoning
-about, because all three ways it can break are silent:
+Failures this catches (none of them raise):
 
-* a RoPE table sliced from 0 instead of from `p0` -- every suffix row rotated
-  as if it were at the start of the prompt;
-* an attention mask still anchored on the diagonal -- suffix rows attending the
-  wrong span;
-* KV written at row 0 instead of row `p0` -- the cache overwritten with the
-  suffix and the prefix lost.
+* the RoPE table sliced from 0 instead of `p0`;
+* the attention mask anchored on the diagonal instead of offset by `p0`;
+* KV written at row 0 instead of row `p0`.
 
-None raises. All three produce fluent, wrong text.
+The check is exact equality of the logits and the KV cache. Prefix rows are
+not recomputed by reuse, so they are compared straight from the cache.
 
-So the test is equality of the logits and of the KV cache, not a tolerance on
-either. The two paths run the same arithmetic in the same order on the rows
-they share; the only licensed difference is that reuse never recomputed the
-prefix rows, and those are compared straight out of the cache.
-
-Exits 77 -- graded as a skip -- when the weights cannot be loaded.
+Exits 77 (graded as a skip) when the weights cannot be loaded.
 """
 
 from __future__ import annotations
@@ -43,13 +34,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 SKIP_EXIT_CODE = 77
 
-#: A prompt with an obvious seam: a shared leading run, then a divergence.
-#: `PREFIX` stands in for the system prompt a production hybrid caches.
+#: A shared leading run (standing in for a cached system prompt), then two
+#: diverging tails.
 PREFIX = [2, 818, 5279, 529, 7001, 563, 9079, 236761, 818, 5279]
-#: The tails must DIVERGE AT THEIR FIRST TOKEN. When this test was written both
-#: began with 529, so the real common prefix was 11 rather than 10 and the
-#: expected-prefix check failed for a reason that had nothing to do with the
-#: code under test. The implementation was right and the constants were wrong.
+#: The tails must differ at their first token, or the common prefix is longer
+#: than `PREFIX` and the expected-prefix check fails.
 TAIL_A = [7001, 563]
 TAIL_B = [12811, 563, 1018, 84750]
 
@@ -66,8 +55,7 @@ def main(argv=None):
     ap.add_argument("--max-seq", type=int, default=256)
     args = ap.parse_args(argv)
 
-    # After argv: importing `config` needs an example directory on sys.path,
-    # and this file lives in the shared harness rather than in one of them.
+    # `config` lives in the model's example directory, not the shared harness.
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(os.path.dirname(here), "gemma4_e2b_q4nx"))
     import config  # noqa: E402
@@ -92,6 +80,19 @@ def main(argv=None):
         print(f"[skip] cannot load the q4nx weights: {type(e).__name__}: {e}")
         return SKIP_EXIT_CODE
 
+    # Reuse runs only where a full pass runs the same host attention as a
+    # reusing one; with the NPU attention on, it must be refused.
+    if m._device("attention") == "npu":
+        m.npu_attention = True
+        refused = not m._host_attention()
+        m.npu_attention = False
+        if not refused:
+            print("[reuse] FAIL -- reuse allowed with the NPU attention on")
+            return 1
+    if not m._host_attention():
+        print("[reuse] FAIL -- reuse refused with the host attention")
+        return 1
+
     prompt_a = PREFIX + TAIL_A
     prompt_b = PREFIX + TAIL_B
     print(
@@ -99,12 +100,12 @@ def main(argv=None):
         f"B={len(prompt_b)} tokens, shared prefix {len(PREFIX)}"
     )
 
-    # --- the reference: B computed from nothing ---
+    # Reference: B prefilled from an empty context.
     m.clear_context()
     full = m.prefill(prompt_b)
     full_kv = [tuple(np.array(t, copy=True) for t in m.kv_view(L)) for L in range(6)]
 
-    # --- the path under test: A, then B reusing what it can ---
+    # Under test: A, then B with reuse.
     m.clear_context()
     m.prefill(prompt_a)
     p0 = m._reusable_prefix(prompt_b)
@@ -116,9 +117,8 @@ def main(argv=None):
     )
     bad = []
     if p0 != len(PREFIX):
-        # Not a tolerance question: the two prompts share exactly PREFIX, so
-        # anything else means the prefix search is wrong and the rest of the
-        # comparison would be measuring the wrong thing.
+        # The prompts share exactly PREFIX; anything else is a prefix-search
+        # bug.
         bad.append(f"prefix {p0}, expected {len(PREFIX)}")
 
     d = _max_abs(full, reused)

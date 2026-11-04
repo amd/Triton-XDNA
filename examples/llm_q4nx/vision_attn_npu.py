@@ -4,19 +4,17 @@
 """Gemma4 vision attention on the NPU, through `tl.extra.npu.flash_attention`.
 
 The vision tower's attention is multi-head (12 heads, head dim 64), runs over
-every real patch with no mask, and is quadratic in the patch count: at the
-256-token image budget it was two thirds of the encoder on the CPU. The op
+every real patch with no mask, and is quadratic in the patch count. The op
 builds mlir-air's non-causal flash attention for the patch count; this wraps
 it for the tower:
 
 * Scale. The kernel scales scores by 1/sqrt(head_dim) and Gemma4's vision
   attention uses 1.0, so Q is multiplied by `scale * sqrt(head_dim)`, which for
   head dim 64 is an exact power of two in bf16.
-* Precision. The microkernel is built in block-float mode (`bfp16`), about 3x
-  the bf16 build at 2304 rows. The vision gate (`gemma4_e2b_flash/vision.py
-  --backend npu`) holds with it at both image budgets.
+* Precision. The microkernel is built in block-float mode (`bfp16`), which is
+  faster than bf16 and within the vision accuracy gate.
 * Dispatch. Through Triton-XDNA's `MultiLaunchRunner`, not mlir-air's
-  `KernelCache`, which takes `/tmp/npu.lock` around every dispatch and so would
+  `KernelCache`, which takes `/tmp/npu.lock` around every dispatch and would
   deadlock under a caller that already holds it.
 """
 

@@ -47,8 +47,8 @@ SPARSE_PATHS = (
     # The vision tower's GEMMs (`llms/shared/builders/gemm_builder.py`).
     "programming_examples/matrix_multiplication/bf16_in_bf16_out",
     "programming_examples/flash_attention/kernel_fusion_based",
-    # The rest of what `llms/shared/infra/external_kernels.py` compiles before
-    # any of its ELF builds, the vision tower's included.
+    # The other kernels `llms/shared/infra/external_kernels.py` compiles before
+    # any ELF build, including the vision tower's.
     "programming_examples/silu_and_mul",
     "programming_examples/gelu_and_mul",
     "programming_examples/rope_halfsplit",

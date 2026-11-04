@@ -205,9 +205,9 @@ def load_q4nx(model=None, projections=True):
     would cut memory traffic that is not the bottleneck and add unpack work to
     every GEMM tile.
 
-    `projections=False` leaves out q/k/v/o/gate/up/down -- by far the bulk of
-    the dequantized bytes -- for a prefiller whose forward runs elsewhere (the
-    fused NPU prefills) and whose decoders read their projections packed.
+    `projections=False` skips q/k/v/o/gate/up/down, the bulk of the
+    dequantized bytes, for prefills that run the projections elsewhere and
+    decoders that read them packed.
 
     Returns a dict with
 

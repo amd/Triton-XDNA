@@ -7,8 +7,8 @@
 # Each stage of an image turn is placed on its own:
 #   VISION=auto|air|triton|igpu|host  ENGINE=air-fused|triton-fused|triton|igpu
 #   DECODE=npu|gpu
-# and whatever the placement, the prefill writes its K/V into the one slab the
-# decode reads, in pages the NPU and the iGPU both map.
+# Whatever the placement, the prefill writes K/V into the slab the decode
+# reads, in pages both the NPU and the iGPU map.
 
 PYTHON  ?= python3
 srcdir  := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -78,9 +78,12 @@ import gemma4_image; print('wrote', gemma4_image.shapes_image('$(IMAGE)'))"
 $(IMAGE):
 	@$(MAKE) --no-print-directory test-image
 
+# Without MODEL, the gate is given this example's default model rather than
+# the loader's.
 vision: preflight $(IMAGE)
 	@cd $(srcdir) && $(PYTHON) $(shared)/gemma4_vision_gate.py --image $(IMAGE) \
-		--tower $(TOWER) --repeat $(REPEAT) $(OPT_ARGS)
+		--tower $(TOWER) --repeat $(REPEAT) $(OPT_ARGS) \
+		$(if $(MODEL),,--model "$$($(PYTHON) -c 'import config; print(config.MODEL_DEFAULT)')")
 
 prefill: preflight $(IMAGE)
 	@cd $(srcdir) && $(PYTHON) $(DRIVER) --prefill-only $(RUN_ARGS)

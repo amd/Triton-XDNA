@@ -41,10 +41,10 @@ DEFAULT_SKIPPED_EXAMPLES = {
     "gemma3_4b_q4nx",
     "gemma4_e2b_q4nx",
     "gemma4_e4b_q4nx",
-    # Same, and additionally needs an image, pillow, and a decode template at
-    # least 512 long -- an image is 256 soft tokens before a word of prompt, so
-    # the 128 the text examples build is too short. Its own gate is
-    # `make vision`, which needs no hardware and no decode build.
+    # Same, and they also need an image, pillow, and a decode template of at
+    # least 512: an image alone is 256 soft tokens, more than the 128 the text
+    # examples build. Their own gate is `make vision`, which needs no hardware
+    # or decode build.
     "gemma4_e2b_flash",
     "gemma4_e4b_flash",
     # Not an example: the harness the *_q4nx examples share. Its files are

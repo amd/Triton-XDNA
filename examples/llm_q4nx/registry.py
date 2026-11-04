@@ -689,7 +689,7 @@ QWEN2_5_3B = ModelSpec(
 #: (`GEMMA4_VARIANT=e4b`, set by its `gemma4_e4b_q4nx` wrappers), so this is
 #: E2B's spec with E4B's names, layer count and LM-head chunking. Its PLE
 #: decode holds the two KV heads one per attention CU, unreplicated
-#: (`kv_layout`). The HSA path is E2B-only for now.
+#: (`kv_layout`). The HSA path is E2B-only.
 GEMMA4_E4B = ModelSpec(
     name="gemma4-e4b",
     decode_env=dict(
@@ -713,9 +713,8 @@ GEMMA4_E4B = ModelSpec(
     # The iGPU prefill and decode read the bundle's packed weights; their KV
     # kernels take E4B's two heads.
     supports_igpu=True,
-    # Measured: peak RSS of the Triton prefill's `--prefill-only` is 26.9 GiB.
-    # The fused NPU and iGPU prefills load no host projections and need far
-    # less.
+    # Sized for the Triton prefill's `--prefill-only` peak RSS. The fused NPU
+    # and iGPU prefills load no host projections and need much less.
     min_host_gib=29.0,
 )
 

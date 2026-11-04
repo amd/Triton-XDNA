@@ -706,11 +706,10 @@ def triton_matmul(
     The address is only stable if `w` is: pass the same tensor every call, not
     one rebuilt per call, or each call stages a fresh copy.
 
-    `epilogue`, if given, is applied to the `[M, N]` result where it lies and
-    returns what the caller gets; it must return new tensors. On the chain
-    path the result sits in a page the next call reuses and is otherwise
-    copied out, so an elementwise epilogue such as a clamp does that copy's
-    work instead of a second pass over it.
+    `epilogue`, if given, replaces the copy-out of the `[M, N]` result and
+    returns what the caller gets. It must return new tensors, since the result
+    can sit in a buffer the next call reuses. An elementwise epilogue such as
+    a clamp then costs no extra pass.
     """
     out = epilogue or (lambda r: r.clone())
     M, K = x.shape
@@ -954,9 +953,9 @@ def triton_geglu(gate, up, block=SWIGLU_BLOCK, whole=False):
     The SwiGLU wrapper's chunking and padding, unchanged -- only the activation
     differs -- so see `glu_chunk` for how the dispatch is sized.
 
-    `whole` covers the range in one dispatch instead. Its grid follows the
-    row count, so it suits a caller whose row count is fixed: each count
-    compiles once, and every chunk it saves is a dispatch and its staging.
+    `whole=True` runs the range in one dispatch. Its grid follows the row
+    count, so use it when the row count is fixed: each count compiles once,
+    and it saves a dispatch and its staging per chunk.
     """
     shape = gate.shape
     n = gate.numel()

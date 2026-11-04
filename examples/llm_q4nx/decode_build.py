@@ -82,9 +82,9 @@ ELF_MODEL = "decode_scratchpad.model"
 #: mlir-air's loader resolves the decode directory as a fixed path, so every
 #: model's `decode_L2048.xclbin` lands on the same name. Loading one model's
 #: artifacts under another does not fail -- it decodes to fluent nonsense --
-#: so the stamp is what turns that into an error. See `check_stamp`. It speaks
-#: for every template in the directory, so a build for another model first
-#: removes the templates already there (`_claim`).
+#: so the stamp is what turns that into an error. See `check_stamp`. It covers
+#: every template in the directory, so a build for a different model first
+#: removes the existing templates (`_claim`).
 STAMP = "decode_model.txt"
 
 
@@ -132,10 +132,10 @@ def check_elf_stamp(model, out_dir=None):
 
 
 def _claim(out_dir, model):
-    """Make `out_dir`'s templates `model`'s to stamp: remove those another
-    model, or an unstamped build, left there. Otherwise a context length this
-    build does not cover keeps the other model's template under this model's
-    stamp. The ELF has its own stamp and stays."""
+    """Remove `out_dir`'s decode templates unless they are stamped as
+    `model`'s. Otherwise a context length this build does not cover would keep
+    another model's template under this model's stamp. The ELF has its own
+    stamp and is kept."""
     if read_stamp(out_dir) == model.name:
         return
     for ext in ("xclbin", "pdi", "insts.bin"):

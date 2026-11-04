@@ -2,23 +2,15 @@
 # SPDX-License-Identifier: MIT
 """`transformers`' own Gemma4 vision tower, on our de-tiled weights.
 
-This is the oracle `gemma4_vision_gate.py` diffs against. It is worth being
-precise about what it does and does not prove.
-
-It runs **the same weights** through **a different implementation**. So it
-catches everything about the forward: a wrong RoPE split, a transposed
-projection, a dropped clip, a pooler keyed off the wrong axis. It cannot catch
-a de-tile that is wrong in a way both sides would share, because there is only
-one de-tile -- that is `llm_q4nx/test_gemma4_vision_q4nx.py`'s job, and it
-checks against the bytes in the file rather than against any forward.
-
-The two together cover it: the bytes are read correctly, and the forward built
-on them agrees with upstream's.
+The reference `gemma4_vision_gate.py` diffs against. It runs the same weights
+through an independent forward, so it checks the forward but not the de-tile,
+which both sides share; `test_gemma4_vision_q4nx.py` checks the de-tile against
+the file's bytes.
 
 `Gemma4MultimodalEmbedder` (the weightless norm and the projection into the
-language-width space) lives on `Gemma4Model`, not on `Gemma4VisionModel`,
-so it is constructed separately here and applied after -- which is also the
-order `Gemma4Model.get_image_features` applies it in.
+language hidden size) lives on `Gemma4Model`, not `Gemma4VisionModel`, so it
+is built separately and applied after, as `Gemma4Model.get_image_features`
+does.
 """
 
 import numpy as np
@@ -67,9 +59,8 @@ def _f32(a):
 def _load_clipped(mod, w, clip):
     """One `Gemma4ClippableLinear`: the matrix plus its four bounds.
 
-    Our weights are `[K, out]` and `nn.Linear` wants `[out, K]`, so every
-    assignment here transposes. That single `.T` is the whole of the layout
-    difference between this repository and upstream.
+    Our weights are `[K, out]` and `nn.Linear` wants `[out, K]`, hence the
+    transpose.
     """
     mod.linear.weight.data.copy_(_f32(w).T)
     lo_i, hi_i, lo_o, hi_o = clip
@@ -109,18 +100,15 @@ def build(weights=None, model=None):
         _load_clipped(blk.mlp.down_proj, lw["down"], c["down"])
         blk.self_attn.q_norm.weight.data.copy_(_f32(lw["q_norm"]))
         blk.self_attn.k_norm.weight.data.copy_(_f32(lw["k_norm"]))
-        # The four norms, in upstream's names. The mapping is the one place a
-        # silent swap is plausible -- `norm2` is the PRE-feedforward norm and
-        # `post_attn_norm` the post-attention one, and both are [768] -- so it
-        # is written as four explicit lines rather than a loop over a dict.
+        # The four layer norms, mapped to upstream's names. `norm2` is the
+        # pre-feedforward norm; all four are [768], so a swap would not error.
         blk.input_layernorm.weight.data.copy_(_f32(lw["norm1"]))
         blk.post_attention_layernorm.weight.data.copy_(_f32(lw["post_attn_norm"]))
         blk.pre_feedforward_layernorm.weight.data.copy_(_f32(lw["norm2"]))
         blk.post_feedforward_layernorm.weight.data.copy_(_f32(lw["ffn_post_norm"]))
 
-    # Not part of the vision model upstream either: it belongs to the
-    # multimodal wrapper, and `output_proj_dims` is absent from a vision config
-    # so the embedder reads `hidden_size` for its input width.
+    # The embedder belongs to the multimodal wrapper. A vision config has no
+    # `output_proj_dims`, so the embedder takes `hidden_size` as its input width.
     from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 
     ev = Gemma4MultimodalEmbedder(
@@ -135,11 +123,9 @@ def build(weights=None, model=None):
 def encode(pixels, pos_ids, weights=None, model=None, built=None, trace=None):
     """The reference soft tokens, `[n_soft_tokens, out_hidden]`.
 
-    `trace`, when given, is filled with the same stage keys
-    `gemma4_vision.Gemma4VisionTower.encode` fills, so the two can be zipped.
-    The per-layer states are captured with forward hooks rather than by
-    re-implementing the loop -- the point of an oracle is that none of its
-    forward is ours.
+    `trace`, when given, is filled with the same stage keys as
+    `gemma4_vision.Gemma4VisionTower.encode`. Stages are captured with forward
+    hooks so the forward stays entirely upstream's.
     """
     vm, ev = built if built is not None else build(weights, model)
     px = torch.as_tensor(np.asarray(pixels), dtype=torch.float32)[None]
@@ -173,9 +159,8 @@ def encode(pixels, pos_ids, weights=None, model=None, built=None, trace=None):
         for h in handles:
             h.remove()
 
-    # `last_hidden_state` is already stripped of the slots no patch reached, so
-    # this and `trace["pool"]` differ in row count by design -- the pool stage
-    # is compared before the strip, the projection after.
+    # `last_hidden_state` is already stripped of the slots no patch reached,
+    # so it has fewer rows than `trace["pool"]`.
     soft = ev(inputs_embeds=out.last_hidden_state)
     if trace is not None:
         trace["embed_vision"] = soft.clone()

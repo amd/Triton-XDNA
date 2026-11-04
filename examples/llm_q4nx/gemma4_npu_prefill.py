@@ -203,9 +203,9 @@ class NpuPrefill:
 
     def prefill(self, ids, soft_embeds=None, soft_positions=None):
         """`soft_embeds` [k, D] (a vision tower's output) replace the token
-        embeddings at `soft_positions`, where `ids` hold the pad token: the
-        per-layer table is gathered with those ids, while the per-layer
-        projection reads the embeddings after the soft tokens are in place."""
+        embeddings at `soft_positions`, where `ids` hold the pad token. The
+        per-layer table is gathered with those ids; the per-layer projection
+        reads the embeddings with the soft tokens in place."""
         self.resume()
         ids = np.asarray(ids).reshape(-1)
         n = len(ids)
