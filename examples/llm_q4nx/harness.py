@@ -21,6 +21,11 @@ import sys
 import tempfile
 import time
 
+# libgomp reads this once, when it loads (with torch). Idle OpenMP threads
+# that spin between the host kernels' parallel regions take the CPU from the
+# threads that start NPU work and wait for it.
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import airsrc  # noqa: E402
@@ -848,7 +853,7 @@ def build_parser(doc, backends=("cpu", "npu", "hetero")):
         "one-device chunked NPU prefill (tl.extra.npu.fused_prefill), handing "
         "its KV to the decode the way the Triton prefill does; --backend, "
         "--ops and --profile do not apply to it and are refused. "
-        "triton-fused (Gemma4-E2B): a one-device chunked prefill whose ops "
+        "triton-fused (Gemma4): a one-device chunked prefill whose ops "
         "all come from Triton (gemma4_triton_fused), run by Triton-XDNA "
         "with its host math as Triton kernels on the CPU. igpu: the "
         "whole prefill in Triton on the iGPU, writing the KV cache in the "
@@ -992,7 +997,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             )
         if args.prefill_engine == "triton-fused" and fused.dense:
             raise SystemExit(
-                "--prefill-engine triton-fused is built for gemma4-e2b only."
+                "--prefill-engine triton-fused is built for Gemma4 models only."
             )
         if getattr(args, "interactive", False):
             raise SystemExit(
@@ -1040,10 +1045,10 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             f"Use --max-tokens for a single turn."
         )
 
-    # Sized for the Triton prefill's bf16 weights. The dense fused and iGPU
-    # prefills keep them packed and load no host copy; Gemma4's still do.
+    # Sized for the Triton prefill's bf16 weights. The fused prefills, and a
+    # dense model's iGPU prefill, keep them packed and load no host copy.
     dense = not is_gemma4(cfg)
-    if not ((one_device and fused.dense) or (igpu and dense)):
+    if not (one_device or (igpu and dense)):
         check_host_memory(spec)
 
     # mlir-air's driver and its built decode are the NPU decode's; an iGPU

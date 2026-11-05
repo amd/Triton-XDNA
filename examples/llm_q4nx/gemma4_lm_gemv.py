@@ -1,7 +1,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Gemma4-E2B's LM head as a Triton GEMV on a device of its own.
+"""Gemma4's LM head as a Triton GEMV on a device of its own, K deep: a wider
+model's runs on slices of its K (`gemma4_npu_prefill`).
 
 y[V] = W[V, K] x[K] with Q4NX weights (w = q * scale + min). W is in
 `pack`'s stream order, x is bf16 [K], and y is laid out the way `unpack_y`

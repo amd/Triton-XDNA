@@ -306,21 +306,23 @@ def _kv_post(
     REC,
     t,
     rows,
+    col0,
     eps,
     DH: tl.constexpr,
     LKP: tl.constexpr,
     DVT: tl.constexpr,
     BR: tl.constexpr,
 ):
-    """The KV head of a chunk: k normed by W and roped, v normed. Rows < t go
-    to KF and VF (f32 [t, DH]); rows < `rows` (t rounded up to whole records)
-    to the records at REC, zero past t."""
+    """A KV head of a chunk, columns col0 .. col0 + DH of K and V: k normed by
+    W and roped, v normed. Rows < t go to KF and VF (f32 [t, DH]); rows <
+    `rows` (t rounded up to whole records) to the records at REC, zero past
+    t."""
     r = tl.program_id(0) * BR + tl.arange(0, BR)
     live = (r < t)[:, None]
     keep = (r < rows)[:, None]
     h = tl.arange(0, DH // 2)
-    ka, kb = _norm_rope(K, ld, 0, W, CS, SN, r, live, eps, DH, True)
-    va, vb = _norm_rope(V, ld, 0, None, CS, SN, r, live, eps, DH, False)
+    ka, kb = _norm_rope(K, ld, col0, W, CS, SN, r, live, eps, DH, True)
+    va, vb = _norm_rope(V, ld, col0, None, CS, SN, r, live, eps, DH, False)
     lo, hi = h[None, :], DH // 2 + h[None, :]
     tl.store(KF + r[:, None] * DH + lo, ka, mask=live)
     tl.store(KF + r[:, None] * DH + hi, kb, mask=live)
@@ -481,14 +483,14 @@ def q_post(q, w, rope, qb, t, h0, scale, eps):
 
 
 @_on_host
-def kv_post(k, v, w, rope, kf, vf, rec, t, lkp, dvt, eps):
-    """One KV head: kf, vf [t, dh] f32 and its records from rec on (the
-    chunk starts a record)."""
+def kv_post(k, v, w, rope, kf, vf, rec, t, lkp, dvt, eps, col0=0):
+    """The KV head at columns col0 .. of k and v: kf, vf [t, dh] f32 and its
+    records from rec on (the chunk starts a record)."""
     dh = kf.shape[1]
     rows = -(-t // lkp) * lkp
     _kv_post[(triton.cdiv(rows, BR),)](
         Ptr(k), Ptr(v), k.strides[0] // k.itemsize, Ptr(w), Ptr(rope[0]),
-        Ptr(rope[1]), Ptr(kf), Ptr(vf), Ptr(rec), t, rows, eps,
+        Ptr(rope[1]), Ptr(kf), Ptr(vf), Ptr(rec), t, rows, col0, eps,
         DH=dh, LKP=lkp, DVT=dvt, BR=BR,
     )  # fmt: skip
 

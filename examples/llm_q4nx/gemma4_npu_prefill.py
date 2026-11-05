@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Gemma4-E2B's prefill on the devices `gemma4_triton_fused` builds, as a
+"""A Gemma4 model's prefill on the devices `gemma4_triton_fused` builds, as a
 Triton program: NPU kernels called on a `FusedProgram`'s buffers, the math
 between them as host kernels (`host_kernels`, on triton-cpu), on weights read
 from the bundle (`gemma4_weights`) and packed here.
@@ -98,18 +98,35 @@ class NpuPrefill:
             C.DH_GLOBAL: inv_freq(C.DH_GLOBAL, False, freqs),
         }
         self.embed_tbl, self.ple_tbl = w.embed_table(), w.ple_embed_table()
+        # Per owning layer, each KV head's records.
         self.kv = {}
         for L in range(C.N_LAYERS):
             if C.owns_kv(L):
                 g = T.GROUPS[T.OPS[op_of(L)][0]]
                 # the cores read K blocks in pairs, so one past the last
                 nblk = -(-self.max_len // g.lkp) + 1
-                self.kv[L] = self.fp.zeros((nblk, 2 * g.lkp * g.dh), bfloat16)
-        lw = LG.pack(*w.lm_head(0, C.VOCAB))
-        self.lm_w = self.lm.empty(lw.shape, np.uint8)
-        self.lm_w.host(write=True)[...] = lw
-        self.lm_x = self.lm.empty(LG.K, bfloat16)
-        self.lm_y = self.lm.empty(LG.V, bfloat16)
+                self.kv[L] = [
+                    self.fp.zeros((nblk, 2 * g.lkp * g.dh), bfloat16)
+                    for _ in range(C.N_KV_HEADS)
+                ]
+        # The LM head device is LG.K deep; a wider model runs it on slices of
+        # its K, the last zero-padded, and adds their outputs.
+        self.lm_k = [(k0, min(k0 + LG.K, C.D)) for k0 in range(0, C.D, LG.K)]
+        q, sc, mn = w.lm_head(0, C.VOCAB)
+        self.lm_w, self.lm_x, self.lm_y = [], [], []
+        for k0, k1 in self.lm_k:
+            parts = [q, sc, mn] if C.D == LG.K else []
+            for a, g in ((q, 1), (sc, 32), (mn, 32))[len(parts) :]:
+                part = np.zeros((a.shape[0], LG.K // g), a.dtype)
+                part[:, : (k1 - k0) // g] = a[:, k0 // g : k1 // g]
+                parts.append(part)
+            lw = LG.pack(*parts)
+            del parts
+            self.lm_w.append(self.lm.empty(lw.shape, np.uint8))
+            self.lm_w[-1].host(write=True)[...] = lw
+            self.lm_x.append(self.lm.zeros(LG.K, bfloat16))
+            self.lm_y.append(self.lm.empty(LG.V, bfloat16))
+        del q, sc, mn
         self.logits = np.empty(LG.V, np.float32)
 
     # ---- device buffers, one set per chunk so the chunks can be in flight
@@ -168,10 +185,13 @@ class NpuPrefill:
         for i, name in enumerate(T.GROUPS):
             if name in T.OPS[op]:
                 H.q_post(q, q_norm, rope, bufs[3 * i], t, h0, scale, C.RMS_EPS)
+                # The op's j-th group takes q heads h0.., KV head j's, or the
+                # one KV head.
+                j = T.OPS[op].index(name)
                 h0 += bufs[3 * i].shape[0]
                 # the records the chunk attends to, so writing later ones
                 # does not wait for it
-                bufs[3 * i + 1] = kv[k0 : k0 + n]
+                bufs[3 * i + 1] = kv[min(j, len(kv) - 1)][k0 : k0 + n]
             else:
                 bufs[3 * i + 1] = bufs[3 * i]
         # the cores read K blocks in pairs; the one past the last is masked
@@ -187,17 +207,24 @@ class NpuPrefill:
                 h0 += bufs[3 * i + 2].shape[0]
 
     def kv_write(self, L, r0, t, k, v, k_norm, rope):
-        """Layer L's KV head from the k and v GEMMs' output rows."""
+        """Layer L's KV heads from the k and v GEMMs' output rows; `kv_store`
+        gets them as [t, heads * dh]."""
         g = T.GROUPS[T.OPS[op_of(L)][0]]
         b0, nb = r0 // g.lkp, -(-t // g.lkp)
-        kf = np.empty((t, g.dh), np.float32)
-        vf = np.empty((t, g.dh), np.float32)
-        H.kv_post(
-            k, v, k_norm, rope, kf, vf, self.kv[L][b0 : b0 + nb], t,
-            g.lkp, g.dh // T.V_CHUNKS, C.RMS_EPS,
-        )  # fmt: skip
+        kf = np.empty((C.N_KV_HEADS, t, g.dh), np.float32)
+        vf = np.empty((C.N_KV_HEADS, t, g.dh), np.float32)
+        for h, rec in enumerate(self.kv[L]):
+            H.kv_post(
+                k, v, k_norm, rope, kf[h], vf[h], rec[b0 : b0 + nb], t,
+                g.lkp, g.dh // T.V_CHUNKS, C.RMS_EPS, col0=h * g.dh,
+            )  # fmt: skip
         if self.kv_store:
-            self.kv_store(L, r0, kf, vf)
+            self.kv_store(
+                L,
+                r0,
+                kf.transpose(1, 0, 2).reshape(t, -1),
+                vf.transpose(1, 0, 2).reshape(t, -1),
+            )
 
     # ---- the model
 
@@ -259,12 +286,21 @@ class NpuPrefill:
             self.layer(L, x, pli, chunks, ropes)
             if self.on_layer:
                 self.on_layer(L, x, pli)
-        H.rms_rows(x[-1:], self.final_norm, self.lm_x, eps)
+        if len(self.lm_k) == 1:
+            H.rms_rows(x[-1:], self.final_norm, self.lm_x[0], eps)
+        else:
+            xn = np.empty(C.D, bfloat16)
+            H.rms_rows(x[-1:], self.final_norm, xn, eps)
+            for (k0, k1), xb in zip(self.lm_k, self.lm_x):
+                xb.host(write=True)[: k1 - k0] = xn[k0:k1]
         with self.lm:
-            LG.gemv_q4[(1,)](*LG.args(self.lm_w, self.lm_x, self.lm_y))
-        y = self.lm_y.reshape(LG.NC, -1, LG.NR, LG.FLUSH * LG.GN)
-        _, tf, nr, fg = y.shape
-        H.softcap(self.lm_y, self.logits, C.FINAL_LOGIT_SOFTCAP, nr, tf, fg)
+            for wb, xb, yb in zip(self.lm_w, self.lm_x, self.lm_y):
+                LG.gemv_q4[(1,)](*LG.args(wb, xb, yb))
+        y = self.lm_y[0]
+        if len(self.lm_y) > 1:
+            y = sum(np.asarray(yb.host(), np.float32) for yb in self.lm_y)
+        tf = LG.TILES // LG.FLUSH
+        H.softcap(y, self.logits, C.FINAL_LOGIT_SOFTCAP, LG.NR, tf, LG.FLUSH * LG.GN)
         return self.logits.copy()
 
     def layer(self, L, x, pli, chunks, ropes):

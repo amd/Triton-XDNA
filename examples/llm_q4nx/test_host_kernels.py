@@ -207,9 +207,14 @@ def test_q_post():
 
 
 def test_kv_post():
-    for t, r0, dh, lkp in ((128, 0, 256, 32), (45, 256, 512, 16)):
+    # The last case is a second KV head: its columns start at dh.
+    for t, r0, dh, lkp, c0 in (
+        (128, 0, 256, 32, 0),
+        (45, 256, 512, 16, 0),
+        (100, 128, 256, 32, 256),
+    ):
         dvt = dh // 4
-        npd = dh + 384
+        npd = c0 + dh + 384
         k = bf(rng.standard_normal((M, npd)) * 4)
         v = bf(rng.standard_normal((M, npd)) * 4)
         w = bf(rng.standard_normal(dh))
@@ -220,15 +225,15 @@ def test_kv_post():
         rec = np.full((nb + 2, 2 * lkp * dh), 7, bfloat16)
         rp = (np.empty((M, dh // 2), np.float32), np.empty((M, dh // 2), np.float32))
         H.rope_table(inv, *rp, r0)
-        H.kv_post(k, v, w, rp, kf, vf, rec, t, lkp, dvt, EPS)
+        H.kv_post(k, v, w, rp, kf, vf, rec, t, lkp, dvt, EPS, col0=c0)
         kr = rope(
-            rms(np.asarray(k[:t, :dh], np.float32)[:, None], w),
+            rms(np.asarray(k[:t, c0 : c0 + dh], np.float32)[:, None], w),
             np.arange(r0, r0 + t),
             inv,
         )[:, 0]
-        vr = rms(np.asarray(v[:t, :dh], np.float32), None)
-        close(kf[:t], kr, f"kv_post k t={t} dh={dh}")
-        close(vf[:t], vr, f"kv_post v t={t} dh={dh}")
+        vr = rms(np.asarray(v[:t, c0 : c0 + dh], np.float32), None)
+        close(kf[:t], kr, f"kv_post k t={t} dh={dh} col0={c0}")
+        close(vf[:t], vr, f"kv_post v t={t} dh={dh} col0={c0}")
         close(
             rec[:nb],
             records(kr, vr, lkp, dvt),

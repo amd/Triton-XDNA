@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Gemma4-E2B's fused one-device NPU prefill, every op from Triton.
+"""A Gemma4 model's fused one-device NPU prefill, every op from Triton.
 
 Every op of a chunk runs on one device: each GEMM shape from
 `gemma4_gemm.mm_g` and both attention ops from `gemma4_attention.attn`,
@@ -86,9 +86,10 @@ V_CHUNKS = A.v_chunks(GROUPS.values())
 #: Bytes of one LM head weight packet.
 LM_PKT = LG.GN * LG.GK // 2 + 2 * 2 * (LG.GK // 32) * LG.GN
 
-if C.N_KV_HEADS != 1:
-    # More KV heads per column need their records max_blocks apart, so a
-    # build fixes the longest prompt; not done here.
+if C.N_KV_HEADS not in (1, len(OPS["f"])):
+    # Each column takes one KV head and that head's q heads, so a group reads
+    # one head's records. More KV heads per column would need their records
+    # max_blocks apart, fixing the longest prompt at build time.
     raise NotImplementedError(f"{C.N_KV_HEADS} KV heads")
 
 
@@ -114,7 +115,7 @@ def gemm_shapes():
     for dh in (C.DH_SLIDING, C.DH_GLOBAL):
         dq = C.N_Q_HEADS * dh
         s |= {(d, dq, 0, 1), (d, dh * C.N_KV_HEADS, 0, 1), (dq, d, 0, 1)}
-    for inter in (C.INTER, C.INTER_WIDE):
+    for inter in {C.mlp_inter(L) for L in range(C.N_LAYERS)}:
         s |= {(d, inter, 1, 1), (d, inter, 0, 1), (inter, d, 0, 1)}
     s |= {(d, C.PLI_D, 1, 0), (C.PLI_D, d, 0, 0), (d, C.N_LAYERS * C.PLI_D, 0, 0)}
     return sorted((k, G.n_pad(n), act, wq) for k, n, act, wq in s)
@@ -150,15 +151,28 @@ def _versions():
     return out
 
 
+def _model():
+    """The model dimensions the devices are built for."""
+    return dict(
+        name=C.MODEL_NAME,
+        d=C.D,
+        heads=[C.N_Q_HEADS, C.N_KV_HEADS, C.DH_SLIDING, C.DH_GLOBAL],
+        inter=[C.mlp_inter(L) for L in range(C.N_LAYERS)],
+        pli=C.PLI_D,
+        vocab=C.VOCAB,
+        window=C.SLIDING_WINDOW,
+    )
+
+
 def fingerprint():
-    """Digest of what the devices are made from: the files here, the NPU
-    backend and Triton that compile them, and the compiler stack (its
-    versions and where it is installed)."""
+    """Digest of what the devices are made from: the model's dimensions, the
+    files here, the NPU backend and Triton that compile them, and the
+    compiler stack (its versions and where it is installed)."""
     import triton
     import triton.backends.amd_triton_npu as backend
 
     h = hashlib.sha256()
-    h.update(json.dumps([AIRCC_ARGS, LM_AIRCC_ARGS, STACK_SIZE]).encode())
+    h.update(json.dumps([_model(), AIRCC_ARGS, LM_AIRCC_ARGS, STACK_SIZE]).encode())
     h.update(json.dumps([triton.__version__, *_versions(), *_toolchain()]).encode())
     backend_dir = Path(backend.__file__).parent
     sources = sorted(
@@ -166,7 +180,7 @@ def fingerprint():
         for p in backend_dir.rglob("*")
         if p.suffix in (".py", ".mlir") and p.name not in _RUNTIME_ONLY
     )
-    for p in [*_SOURCES, HERE.parent / "gemma4_e2b_q4nx" / "config.py", *sources]:
+    for p in [*_SOURCES, *sources]:
         h.update(p.read_bytes())
     return h.hexdigest()[:16]
 
@@ -316,7 +330,7 @@ def triton_fused_prefill(cache_root=None):
 
     root = Path(cache_root or default_cache_root())
     root.mkdir(parents=True, exist_ok=True)
-    current = root / f"gemma4-e2b-triton_{fingerprint()}"
+    current = root / f"{C.MODEL_NAME}-triton_{fingerprint()}"
     with open(root / f".{current.name}.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if current.is_dir() and complete(current):
