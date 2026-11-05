@@ -38,11 +38,14 @@ import statistics
 import sys
 import time
 
-import torch
+# Before torch loads libgomp; see harness.
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 
-import gemma4_image
-import harness
-import registry
+import torch  # noqa: E402
+
+import gemma4_image  # noqa: E402
+import harness  # noqa: E402
+import registry  # noqa: E402
 
 DEFAULT_TEXT = "Describe the shapes and their colors and positions."
 

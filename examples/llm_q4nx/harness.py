@@ -21,6 +21,11 @@ import sys
 import tempfile
 import time
 
+# libgomp reads this once, when it loads (with torch). Idle OpenMP threads
+# that spin between the host kernels' parallel regions take the CPU from the
+# threads that start NPU work and wait for it.
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import airsrc  # noqa: E402
