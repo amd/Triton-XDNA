@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Gemma4-E2B's tensors in FastFlowLM's model.q4nx bundle, by layer.
+"""A Gemma4 model's tensors in FastFlowLM's model.q4nx bundle, by layer.
 
 The int4 projections come back as stored, (q, scale, min) with w = q *
 scale + min; the norms, PLE matrices and tables as float32.
@@ -12,12 +12,10 @@ import numpy as np
 import config as C
 from q4nx_bundle import Bundle, resolve
 
-REPO = "FastFlowLM/Gemma4-E2B-IT-NPU2"
-
 
 class Gemma4Weights:
     def __init__(self, model=None):
-        self.bundle = Bundle(resolve(model, REPO))
+        self.bundle = Bundle(resolve(model, C.MODEL_DEFAULT))
         b = self.bundle
         for L in range(C.N_LAYERS):
             got = b.int4_rows(f"model.layers.{L}.mlp.gate_proj.weight", C.D)

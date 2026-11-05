@@ -17,7 +17,7 @@ The three stages and where each can run:
                                --backend/--ops like the Triton prefill's
                       auto     igpu where there is one, else air
     --prefill-engine  air-fused     mlir-air's fused NPU prefill
-                      triton-fused  the same device, its ops from Triton (E2B)
+                      triton-fused  the same device, its ops from Triton
                       triton        this repository's prefill, per --backend
                       igpu          the prefill as Triton kernels on the iGPU
     --decode          npu      mlir-air's fused PLE decode
@@ -125,8 +125,6 @@ def _check(args, cfg):
         )
     if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa":
         raise SystemExit("the Gemma4 decode runs under XRT only; unset RUNTIME=hsa")
-    if args.prefill_engine == "triton-fused" and cfg.N_KV_HEADS != 1:
-        raise SystemExit("--prefill-engine triton-fused is built for gemma4-e2b only")
     triton_only = args.prefill_engine != "triton" and args.vision != "host"
     if triton_only and (args.backend or args.ops):
         raise SystemExit(
