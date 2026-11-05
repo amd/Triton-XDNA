@@ -86,16 +86,18 @@ class AirVisionTower:
     NPU tower. The ELFs for an image shape are compiled on first use and
     cached under `cache_dir` (mlir-air's default: `G4_VISION_BUILD_DIR`)."""
 
-    def __init__(self, weights=None, model=None, ops=None, verbose=False):
+    def __init__(self, weights=None, model=None, ops=None, verbose=False, encoder=None):
         """`ops` are the encoder's device ops: mlir-air's `NpuOps` by default,
-        or `gemma4_vision_device.TritonOps`."""
+        or `gemma4_vision_device.TritonOps`. `encoder` makes the encoder class
+        from mlir-air's encoder module; its own `VisionEncoder` by default."""
         from triton.backends.amd_triton_npu import driver
 
         enc = _air_vision()
         w = weights if weights is not None else vw.load_vision(model)
         self.fingerprint = w.get("fingerprint")
         self.ops = ops or enc.NpuOps(verbose=verbose)
-        self.enc = enc.VisionEncoder(self.ops, weights=AirWeights(w))
+        cls = encoder(enc) if encoder is not None else enc.VisionEncoder
+        self.enc = cls(self.ops, weights=AirWeights(w))
         # The tower holds a hardware context per ELF, and the prefill and
         # decode need theirs. Registered so a refused launch can reclaim them.
         driver.context_releasers.append(self.release)

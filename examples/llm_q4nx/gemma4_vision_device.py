@@ -118,6 +118,7 @@ class TritonOps:
         built = vision_device() if build_dir is None else dict(build_dir=build_dir)
         self.prog = FusedProgram(built["build_dir"], NAME)
         self.sites, self.a, self.c = {}, {}, {}
+        self.ra, self.rc = {}, {}
         self.op_t = {}
 
     def build(self, shape, m_soft, out_dim):
@@ -157,6 +158,44 @@ class TritonOps:
         if (npd, c) not in self.c:
             self.c[npd, c] = self.prog.empty((G.M, npd), bfloat16)
         return self.c[npd, c]
+
+    # ---- one 128-row chunk at a time, for `pipelined_encoder`. Each role
+    # (the GEMM input or output it holds) has buffers of its own, so a chunk
+    # of one never waits on a chunk of another.
+
+    def put(self, role, rows, c):
+        """Row-major `rows` [M, k] as chunk `c` of `role`'s input tiles."""
+        k = rows.shape[1]
+        key = (role, c)
+        if key not in self.ra:
+            shape = (G.M // G.TM, G.k_pad(k) // G.TK, G.TM, G.TK)
+            self.ra[key] = self.prog.zeros(shape, bfloat16)
+        tiles = rows.reshape(G.M // G.TM, G.TM, k // G.TK, G.TK)
+        self.ra[key].host(write=True)[:, : k // G.TK] = tiles.transpose(0, 2, 1, 3)
+
+    def start(self, op, src, dst, w, site, c):
+        """Start chunk `c` of `src`'s input @ `w` into `dst`'s output."""
+        k, n = w.shape
+        npd = G.n_pad(n)
+        if (dst, c) not in self.rc:
+            self.rc[dst, c] = self.prog.empty((G.M, npd), bfloat16)
+        G.mm_g[(1,)](
+            *G.args(
+                self.ra[src, c],
+                self._weights(site, w),
+                self.rc[dst, c],
+                npd,
+                k,
+                int(op == "gate"),
+                0,
+                G.k_pad(k),
+            )
+        )
+
+    def out(self, role, n, c):
+        """Chunk `c` of `role`'s output, [M, n] bf16, once its GEMM is done.
+        A view of the device buffer: read it before the next start into it."""
+        return self.rc[role, c].host()[:, :n]
 
     # ---- the interface
 
@@ -249,10 +288,133 @@ def _attention_ops(enc):
     return AttentionOps
 
 
-def tower(weights=None, model=None, build_dir=None, verbose=False, attention="triton"):
-    """mlir-air's tower pipeline on `TritonOps`: `encode(pixels, pos_ids)`."""
+def pipelined_encoder(E):
+    """mlir-air's `VisionEncoder` (module `E`) with its layers run 128 rows at
+    a time: while the NPU works on one chunk's GEMM, the host runs the norms,
+    clips and GLU of a chunk whose GEMM is done and starts its next GEMM.
+    Every host op is row-wise; only the attention needs every row at once.
+    The next layer's q|k|v GEMMs start as soon as a chunk leaves this layer."""
+    H = E.H
+
+    class PipelinedEncoder(E.VisionEncoder):
+        def _layer(self, sh, i, h, cos, sin, b):
+            ops, P = self.ops, self.layers[i]
+            c, nm = P["clamp"], P["norms"]
+            eps, valid = E.RMS_EPS, sh.L_valid
+            d, inter, nqkv = h.shape[1], P["up"].shape[1], P["qkv"].shape[1]
+            chunks = list(enumerate(range(0, sh.L_pad, G.M)))
+
+            def live(r0, n):
+                return min(max(n - r0, 0), G.M)
+
+            def to_qkv(j, r0, li):
+                L, x = self.layers[li], b["x"][r0 : r0 + G.M]
+                H.rms_clip_bf16(
+                    h[r0 : r0 + G.M],
+                    live(r0, valid),
+                    L["norms"]["input_ln"],
+                    eps,
+                    *L["clamp"]["q"][0],
+                    x,
+                )
+                ops.put("x", x, j)
+                ops.start("qkv", "x", "qkv", L["qkv"], f"qkv{li}", j)
+
+            # The Triton attention takes its Q and K/V a chunk at a time, while
+            # the q|k|v GEMMs of later chunks run; any other is given them whole.
+            att = getattr(ops._attn, "attn", None)
+            if att is not None:
+                att.prepare(sh.L_pad, sh.kv_rows, valid)
+            qscale = float(E.ATTN_SCALE * np.sqrt(E.DK_AUG))
+            with ops.prog:
+                if i == 0:
+                    for j, r0 in chunks:
+                        to_qkv(j, r0, 0)
+                for j, r0 in chunks:
+                    kv = live(r0, sh.kv_rows)
+                    H.qkv_prep(
+                        ops.out("qkv", nqkv, j),
+                        live(r0, valid),
+                        E.N_HEADS,
+                        E.DH,
+                        E.DK_AUG,
+                        nm["q_norm"],
+                        nm["k_norm"],
+                        eps,
+                        cos[r0 : r0 + G.M],
+                        sin[r0 : r0 + G.M],
+                        P["qkv_bounds"],
+                        qscale,
+                        E._BIG,
+                        b["q"][r0 : r0 + G.M],
+                        b["k"][r0 : r0 + kv],
+                        b["v"][r0 : r0 + kv],
+                    )
+                    if att is not None:
+                        att.put_q(b["q"][r0 : r0 + G.M], r0)
+                        if kv:
+                            att.put_kv(b["k"][r0 : r0 + kv], b["v"][r0 : r0 + kv], r0)
+            if att is not None:
+                t0 = time.perf_counter()
+                att.run()
+                attn = att.result()
+                ops._attn.t += time.perf_counter() - t0
+            else:
+                attn = ops.attention(b["q"], b["k"], b["v"], 1.0 / np.sqrt(E.DK_AUG))
+                attn = np.ascontiguousarray(attn, bfloat16)
+            with ops.prog:
+                for j, r0 in chunks:
+                    a = attn[r0 : r0 + G.M]
+                    H.clip_bf16(a, *c["o"][0])
+                    ops.put("attn", a, j)
+                    ops.start("o", "attn", "o", P["o"], f"o{i}", j)
+                for j, r0 in chunks:
+                    rows, x = h[r0 : r0 + G.M], b["x"][r0 : r0 + G.M]
+                    n = live(r0, valid)
+                    o = ops.out("o", d, j)
+                    H.add_rms_clip(rows, o, n, nm["post_attn_ln"], eps, *c["o"][1])
+                    H.rms_clip_bf16(rows, n, nm["pre_ffn_ln"], eps, *c["gate"][0], x)
+                    ops.put("x", x, j)
+                    ops.start("gate", "x", "gate", P["gate"], f"gate{i}", j)
+                    ops.start("up", "x", "up", P["up"], f"up{i}", j)
+                for j, r0 in chunks:
+                    f = b["f"][r0 : r0 + G.M]
+                    g, u = ops.out("gate", inter, j), ops.out("up", inter, j)
+                    H.glu_clip(g, u, P["gate_hi"], *c["up"][1], *c["down"][0], f)
+                    ops.put("f", f, j)
+                    ops.start("down", "f", "down", P["down"], f"down{i}", j)
+                last = i + 1 == self.n_layers
+                for j, r0 in chunks:
+                    y = ops.out("down", d, j)
+                    H.add_rms_clip(
+                        h[r0 : r0 + G.M],
+                        y,
+                        live(r0, valid),
+                        nm["post_ffn_ln"],
+                        eps,
+                        *c["down"][1],
+                    )
+                    if not last:
+                        to_qkv(j, r0, i + 1)
+
+    return PipelinedEncoder
+
+
+def tower(
+    weights=None,
+    model=None,
+    build_dir=None,
+    verbose=False,
+    attention="triton",
+    pipelined=True,
+):
+    """mlir-air's tower pipeline on `TritonOps`: `encode(pixels, pos_ids)`.
+    `pipelined` runs the layers 128 rows at a time (`pipelined_encoder`)."""
     import gemma4_vision_air
 
     return gemma4_vision_air.AirVisionTower(
-        weights, model, ops=TritonOps(build_dir, verbose=verbose, attention=attention)
+        weights,
+        model,
+        ops=TritonOps(build_dir, verbose=verbose, attention=attention),
+        encoder=pipelined_encoder if pipelined else None,
     )

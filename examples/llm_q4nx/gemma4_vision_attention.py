@@ -328,9 +328,8 @@ class Attention:
 
     def __init__(self, prog):
         self.prog = prog
-        self.q = prog.empty(HEADS * ROWS * DH, bfloat16)
         self.kv = prog.empty(HEADS * MAX_BLOCKS * REC, bfloat16)
-        self.o = prog.empty(HEADS * ROWS * DH, bfloat16)
+        self.qs, self.os = [], []  # one Q and one O buffer per dispatch
 
     def attention(self, q, k, v, scale):
         heads = HEADS
@@ -338,11 +337,19 @@ class Attention:
             raise ValueError(f"the device scales scores by {SCALE}, not {scale}")
         lq, lk = q.shape[0], k.shape[0]
         wide = q.shape[1] // heads
-        q = np.asarray(q, bfloat16).reshape(lq, heads, wide)[:, :, :DH]
-        k = np.asarray(k, bfloat16).reshape(lk, heads, wide)
-        nvalid = int(np.count_nonzero(k[:, 0, DH] == 0))
-        k = k[:, :, :DH]
-        v = np.asarray(v, bfloat16).reshape(lk, heads, DH)
+        nvalid = int(np.count_nonzero(np.asarray(k, bfloat16)[:, DH] == 0))
+        self.prepare(lq, lk, nvalid)
+        self.put_kv(k, v, 0)
+        self.put_q(q, 0)
+        self.run()
+        return self.result()
+
+    # ---- in pieces, so that the host's share can overlap the device's:
+    # `prepare`, then `put_kv` and `put_q` row block by row block as the
+    # rows are ready, `run`, then `result` (or `rows`).
+
+    def prepare(self, lq, lk, nvalid):
+        """For `lq` queries against `lk` keys, the first `nvalid` real."""
         # Whole K blocks, in pairs: the cores take them two at a time, and the
         # extra one is masked.
         nk = -(-lk // LKP)
@@ -351,11 +358,27 @@ class Attention:
             raise ValueError(f"{lk} keys; the device holds {MAX_BLOCKS * LKP}")
         if lk % LKP or lq % 8:
             raise ValueError(f"{lk} keys or {lq} queries: not whole blocks")
-        nb = lk // LKP
-        # Write into the device buffers' blocked views: one copy each way.
-        kv = self.kv.host(write=True).reshape(heads, MAX_BLOCKS, REC)
-        kv[:, nb:nk] = 0
-        kv = kv[:, :nb]
+        self.lq, self.nk, self.nvalid = lq, nk, nvalid
+        kv = self.kv.host(write=True).reshape(HEADS, MAX_BLOCKS, REC)
+        kv[:, lk // LKP : nk] = 0
+        n = -(-lq // ROWS)
+        while len(self.qs) < n:
+            self.qs.append(self.prog.zeros(HEADS * ROWS * DH, bfloat16))
+            self.os.append(self.prog.empty(HEADS * ROWS * DH, bfloat16))
+        if lq % ROWS:
+            last = self.qs[n - 1].host(write=True)
+            last.reshape(HEADS, ROWS // 8, -1)[:, lq % ROWS // 8 :] = 0
+
+    def put_kv(self, k, v, r0):
+        """Key rows `r0..` (a whole number of K blocks): k [n, H wide] with the
+        mask columns, v [n, H DH]."""
+        heads, n = HEADS, k.shape[0]
+        if r0 % LKP or n % LKP:
+            raise ValueError(f"keys {r0}..{r0 + n}: not whole blocks")
+        k = np.asarray(k, bfloat16).reshape(n, heads, -1)[:, :, :DH]
+        v = np.asarray(v, bfloat16).reshape(n, heads, DH)
+        b0, nb = r0 // LKP, n // LKP
+        kv = self.kv.host(write=True).reshape(heads, MAX_BLOCKS, REC)[:, b0 : b0 + nb]
         mb, kb, vb, dvc = LKP // 8, DH // 8, DVT // 8, DH // DVT
         # K [nb LKP, H, DH] -> [H, nb, MB, KB, 8, 8]
         kv[..., : LKP * DH].reshape(heads, nb, mb, kb, 8, 8)[...] = k.reshape(
@@ -365,23 +388,40 @@ class Attention:
         kv[..., LKP * DH :].reshape(heads, nb, dvc, mb, vb, 8, 8)[...] = v.reshape(
             nb, mb, 8, heads, dvc, vb, 8
         ).transpose(3, 0, 4, 1, 5, 2, 6)
-        out = np.empty((lq, heads, DH), bfloat16)
-        r8 = ROWS // 8
-        for r0 in range(0, lq, ROWS):
-            rows = min(ROWS, lq - r0)
-            # q [rows, H, DH] -> [H, ROWS / 8, KB, 8, 8], the rows past the
-            # image zero
-            qv = self.q.host(write=True).reshape(heads, r8, kb, 8, 8)
-            qv[:, rows // 8 :] = 0
-            qv[:, : rows // 8] = (
-                q[r0 : r0 + rows]
-                .reshape(rows // 8, 8, heads, kb, 8)
-                .transpose(2, 0, 3, 1, 4)
+
+    def put_q(self, q, r0):
+        """Query rows `r0..`, q [n, H wide]; `r0` and n multiples of 8. The
+        rows past `lq` in the last dispatch stay zero."""
+        heads, kb = HEADS, DH // 8
+        q = np.asarray(q, bfloat16).reshape(q.shape[0], heads, -1)[:, :, :DH]
+        while len(q):
+            d, off = divmod(r0, ROWS)
+            n = min(len(q), ROWS - off)
+            # [n, H, DH] -> [H, ROWS / 8, KB, 8, 8] at row block off / 8
+            qv = self.qs[d].host(write=True).reshape(heads, ROWS // 8, kb, 8, 8)
+            qv[:, off // 8 : (off + n) // 8] = (
+                q[:n].reshape(n // 8, 8, heads, kb, 8).transpose(2, 0, 3, 1, 4)
             )
-            with self.prog:
-                vattn[(1,)](*args(self.q, self.kv, self.o, nk, nvalid, NR))
-            ov = self.o.host().reshape(heads, r8, kb, 8, 8)[:, : rows // 8]
-            out[r0 : r0 + rows].reshape(rows // 8, 8, heads, kb, 8)[...] = ov.transpose(
-                1, 3, 0, 2, 4
-            )
-        return out.reshape(lq, heads * DH)
+            q, r0 = q[n:], r0 + n
+
+    def run(self):
+        """Start every dispatch."""
+        n = -(-self.lq // ROWS)
+        with self.prog:
+            for qb, ob in zip(self.qs[:n], self.os[:n]):
+                vattn[(1,)](*args(qb, self.kv, ob, self.nk, self.nvalid, NR))
+
+    def rows(self, d):
+        """Dispatch `d`'s output rows, [rows, H DH], once it is done."""
+        heads, kb = HEADS, DH // 8
+        n = min(ROWS, self.lq - d * ROWS)
+        ov = self.os[d].host().reshape(heads, ROWS // 8, kb, 8, 8)[:, : n // 8]
+        return ov.transpose(1, 3, 0, 2, 4).reshape(n, heads * DH)
+
+    def result(self):
+        """The whole output, [lq, H DH]: each dispatch's rows taken while the
+        later ones run."""
+        out = np.empty((self.lq, HEADS * DH), bfloat16)
+        for d in range(-(-self.lq // ROWS)):
+            out[d * ROWS : d * ROWS + ROWS] = self.rows(d)
+        return out
