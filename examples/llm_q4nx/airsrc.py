@@ -66,6 +66,11 @@ def fused_decode_dir(engine="fused_decode"):
     return str(air_llms_root().parent / ENGINES[engine].directory)
 
 
+def flash_attention_dir():
+    """mlir-air's flash attention builder and microkernel."""
+    return str(air_llms_root().parent / "flash_attention" / "kernel_fusion_based")
+
+
 def fused_prefill_dir(model_dir="gemma4_e2b_q4nx"):
     """mlir-air's fused prefill builder for a model, beside its driver."""
     return str(air_llms_root() / model_dir / "fused_prefill")

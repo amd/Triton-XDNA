@@ -44,7 +44,17 @@ SPARSE_PATHS = (
     # The AIE kernels the fused prefill compiles beside its own
     # (`llms/shared/fused_prefill/build.py`, which `llms` above carries).
     "programming_examples/matrix_multiplication/bf16_in_fp32_out",
+    # The vision tower's GEMMs (`llms/shared/builders/gemm_builder.py`).
+    "programming_examples/matrix_multiplication/bf16_in_bf16_out",
     "programming_examples/flash_attention/kernel_fusion_based",
+    # The other kernels `llms/shared/infra/external_kernels.py` compiles before
+    # any ELF build, including the vision tower's.
+    "programming_examples/silu_and_mul",
+    "programming_examples/gelu_and_mul",
+    "programming_examples/rope_halfsplit",
+    "programming_examples/layer_norm",
+    "programming_examples/matrix_vector_multiplication",
+    "programming_examples/attention_decode",
 )
 
 

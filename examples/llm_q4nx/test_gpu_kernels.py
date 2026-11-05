@@ -295,6 +295,144 @@ def _qkv_post(G, dev):
     return ok
 
 
+def _gqa_slab(G, dev):
+    """Gemma4-E4B's two KV heads: `qkv_post` writes each into its own slot of
+    the shared slab row, and `attn_decode` reads each query group's head back
+    out of it. Against torch, head by head."""
+    # The lane map and the slot width do not depend on the head count.
+    KVL = _e2b_kv_layout()
+    DH_A, K_REGION, V_REGION, lane_shift = (
+        KVL.DH_A,
+        KVL.K_REGION,
+        KVL.V_REGION,
+        KVL.lane_shift,
+    )
+
+    print("\nqkv_post + attn_decode  (two KV heads, shared slab)")
+    ok = True
+    n_kv, maxl, slot, T, pos0 = 2, 16, 1, 5, 3
+    row_w = n_kv * DH_A
+    group = N_Q_HEADS // n_kv
+    for dh in (256, 512):
+        qd = N_Q_HEADS * dh
+        qkv = torch.randn(T, qd + 2 * n_kv * dh, device=dev)
+        qn, kn = torch.randn(dh, device=dev), torch.randn(dh, device=dev)
+        rows = torch.randn(T, dh, device=dev)
+        stride = maxl * row_w
+        slab = torch.zeros(3, 2 * stride, dtype=torch.bfloat16, device=dev)
+        q, kd, vd = G.qkv_post(
+            qkv, qn, kn, rows, N_Q_HEADS, dh, RMS_EPS,
+            (slab, slot, pos0, stride), dense_kv=True, n_kv=n_kv,
+        )  # fmt: skip
+        k_ref, v_ref = [], []
+        for j in range(n_kv):
+            kj = qkv[:, qd + j * dh : qd + (j + 1) * dh]
+            kj = G.rmsnorm(kj, kn, RMS_EPS)
+            k_ref.append(
+                torch.cat([G.rope(kj[t : t + 1], rows[t], 1, dh) for t in range(T)])
+            )
+            vb = qd + n_kv * dh + j * dh
+            v_ref.append(G.rmsnorm(qkv[:, vb : vb + dh], None, RMS_EPS))
+        ok &= check(f"dense K dh={dh}", kd, torch.cat(k_ref, 1), tol=1e-5)
+        ok &= check(f"dense V dh={dh}", vd, torch.cat(v_ref, 1), tol=1e-5)
+
+        # Where each head's lanes land in a row, by region.
+        def lanes(j, region):
+            d = torch.arange(dh, device=dev)
+            shift = lane_shift(dh, region)
+            return j * DH_A + torch.where(d < dh // 2, d, d + shift)
+
+        kreg = slab[slot, :stride].view(maxl, row_w)
+        vreg = slab[slot, stride:].view(maxl, row_w)
+        for j in range(n_kv):
+            r = slice(pos0, pos0 + T)
+            ok &= check(
+                f"slab K head {j} dh={dh}",
+                kreg[r][:, lanes(j, K_REGION)].float(),
+                k_ref[j].to(torch.bfloat16).float(),
+                tol=1e-6,
+            )
+            ok &= check(
+                f"slab V head {j} dh={dh}",
+                vreg[r][:, lanes(j, V_REGION)].float(),
+                v_ref[j].to(torch.bfloat16).float(),
+                tol=1e-6,
+            )
+
+        # Decode attention over rows 0 .. pos0 + T, read in place.
+        S = pos0 + T
+        qt = torch.randn(1, qd, device=dev)
+        got = G.attn_decode(
+            qt, kreg[:S], vreg[:S], N_Q_HEADS, dh, 1.0,
+            k_shift=lane_shift(dh, K_REGION), v_shift=lane_shift(dh, V_REGION),
+            n_kv=n_kv, kv_w=DH_A,
+        )  # fmt: skip
+        ref = []
+        for h in range(N_Q_HEADS):
+            j = h // group
+            kh = kreg[:S][:, lanes(j, K_REGION)].float()
+            vh = vreg[:S][:, lanes(j, V_REGION)].float()
+            qh = qt[0, h * dh : (h + 1) * dh]
+            ref.append(torch.softmax(kh @ qh, -1) @ vh)
+        ok &= check(f"attn_decode S={S} dh={dh}", got, torch.cat(ref)[None], tol=1e-4)
+    return ok
+
+
+def _vision(G, dev):
+    """The vision tower's kernels: clipped GEMM, q/k/v post, bidirectional MHA."""
+    import gemma4_vision as V
+
+    ok = True
+    print("\nmatmul_clip  clamp(clamp(x) @ w), and the gate|up GeGLU form")
+    M, K, N = 37, 768, 512
+    x = (torch.randn(M, K, device=dev) * 3).to(torch.bfloat16)
+    w = (torch.randn(K, 2 * N, device=dev) * 0.05).to(torch.bfloat16)
+    olo = -torch.rand(2 * N, device=dev) * 2
+    ohi = torch.rand(2 * N, device=dev) * 2
+    xc = x.float().clamp(-2.5, 2.5).to(torch.bfloat16).float()
+    y = (xc @ w.float()).clamp(olo, ohi)
+    ok &= check("plain", G.matmul_clip(x, w, -2.5, 2.5, olo, ohi), y, tol=1e-4)
+    g, u = y[:, :N], y[:, N:]
+    ref = G.geglu(g.contiguous(), u.contiguous()).view(M, N)
+    got = G.matmul_clip(x, w, -2.5, 2.5, olo, ohi, glu=True, out_dtype=torch.bfloat16)
+    ok &= check("glu, bf16 out", got.float(), ref, tol=1e-2)
+
+    print("\nvision_qkv_post  per-head norms + 2-D RoPE")
+    P, NH = 50, V.N_HEADS
+    qkv = torch.randn(P, 3 * NH * 64, device=dev)
+    qn, kn = torch.randn(64, device=dev), torch.randn(64, device=dev)
+    pos = torch.stack([torch.randint(0, 48, (P,)), torch.randint(0, 48, (P,))], 1)
+    lx, ly = (t.to(dev) for t in V.rope_tables(pos.numpy()))
+
+    def head(part, weight):
+        t = qkv[:, part * NH * 64 : (part + 1) * NH * 64].reshape(P, NH, 64)
+        t = t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + V.RMS_EPS)
+        return t if weight is None else t * weight
+
+    def rot(t, lut):
+        c, sn = lut[:, None, :16], lut[:, None, 16:]
+        a, b = t[..., :16], t[..., 16:]
+        return torch.cat([a * c - b * sn, a * sn + b * c], -1)
+
+    def rope2d(t):
+        return torch.cat([rot(t[..., :32], lx), rot(t[..., 32:], ly)], -1)
+
+    want = [rope2d(head(0, qn)), rope2d(head(1, kn)), head(2, None)]
+    got = G.vision_qkv_post(qkv, qn, kn, lx, ly, NH, V.RMS_EPS)
+    for name, g_, w_ in zip("qkv", got, want):
+        ok &= check(name, g_.float(), w_.reshape(P, -1), tol=1e-3)
+
+    print("\nattn_prefill_fa  bidirectional MHA (vision), dh=64")
+    for N in (37, 700):
+        q, k, v = (torch.randn(N, NH * 64, device=dev) for _ in range(3))
+        qh, kh, vh = (t.view(N, NH, 64).transpose(0, 1) for t in (q, k, v))
+        ref = torch.softmax(qh @ kh.transpose(1, 2), -1) @ vh
+        ref = ref.transpose(0, 1).reshape(N, NH * 64)
+        got = G.attn_prefill_fa(q, k, v, NH, 64, scale=1.0, n_kv=NH, causal=False)
+        ok &= check(f"N={N}", got, ref)
+    return ok
+
+
 def _gemm_w4a8(G, dev):
     """The prefill's W4A8 GEMM, its q8 activations, and the fused gate|up.
 
@@ -522,6 +660,56 @@ def _dense_glu_and_norm(G, dev):
     return ok
 
 
+def _padded_key_attention(dev):
+    """`LlamaPrefill._attention` placed on the iGPU, given fewer keys than
+    queries (the context's keys under a padded bucket of queries), against
+    the same call on the host. Only the first `Nk` rows are real."""
+    print("\nLlamaPrefill._attention  (iGPU, fewer keys than queries)")
+    from contextlib import nullcontext
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(os.path.dirname(here), "gemma4_e2b_q4nx"))
+    import llama_prefill
+
+    class _Stub:
+        ATTN_CHUNK = llama_prefill.LlamaPrefill.ATTN_CHUNK
+
+        def __init__(self, dev):
+            self.dev = dev
+            self.timer = type("T", (), {"track": lambda self, op: nullcontext()})()
+
+        def _device(self, op, backend=None):
+            return self.dev
+
+    import gpu_kernels
+
+    calls = []
+    kernel = gpu_kernels.attn_prefill
+    gpu_kernels.attn_prefill = lambda *a, **kw: calls.append(1) or kernel(*a, **kw)
+    attn = llama_prefill.LlamaPrefill._attention
+    ok = True
+    try:
+        for nq, nk, dh, win in (
+            (384, 276, DH_SLIDING, 512),
+            (128, 15, DH_GLOBAL, None),
+        ):
+            q = torch.randn(nq, N_Q_HEADS * dh)
+            k = torch.randn(nk, dh)
+            v = torch.randn(nk, dh)
+            args = (q, k, v, N_Q_HEADS, 1, dh, win, 1.0)
+            n = len(calls)
+            got = attn(_Stub("gpu"), *args)[:nk]
+            if len(calls) == n:
+                print(f"  Nq={nq} Nk={nk}: ran on the host, not the iGPU  FAIL")
+                ok = False
+                continue
+            want = attn(_Stub("cpu"), *args)[:nk]
+            ok &= check(f"Nq={nq} Nk={nk} dh={dh} win={win}", got, want)
+    finally:
+        gpu_kernels.attn_prefill = kernel
+    return ok
+
+
 def main():
     if not torch.cuda.is_available():
         print("SKIP: no ROCm device visible to torch")
@@ -575,7 +763,9 @@ def main():
 
     ok &= _gemv_q4nx(G, dev)
     ok &= _qkv_post(G, dev)
+    ok &= _gqa_slab(G, dev)
     ok &= _gemm_w4a8(G, dev)
+    ok &= _vision(G, dev)
 
     # --- rmsnorm, weighted and weightless ---
     print("\nrmsnorm")
@@ -783,6 +973,7 @@ def main():
     ok &= _dense_qkv_post(G, dev)
     ok &= _dense_attn_decode(G, dev)
     ok &= _dense_attn_prefill(G, dev)
+    ok &= _padded_key_attention(dev)
 
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

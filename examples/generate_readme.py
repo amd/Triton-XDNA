@@ -316,6 +316,28 @@ EXAMPLES = [
             "decode."
         ),
     },
+    {
+        "kind": "model",
+        "name": "Gemma4-E2B flash (image)",
+        "path": "gemma4_e2b_flash",
+        "datatypes": "bf16 vision + prefill, q4nx decode",
+        "description": (
+            "An image turn on Gemma4-E2B: the vision tower encodes the "
+            "image's patches into soft tokens that take the place of the "
+            "image placeholders in the prompt. The tower, the prefill and "
+            "the decode each run on the NPU or the iGPU."
+        ),
+    },
+    {
+        "kind": "model",
+        "name": "Gemma4-E4B flash (image)",
+        "path": "gemma4_e4b_flash",
+        "datatypes": "bf16 vision + prefill, q4nx decode",
+        "description": (
+            "Gemma4-E2B flash's image turn on the Gemma4-E4B checkpoint, "
+            "whose soft tokens are projected to D 2560."
+        ),
+    },
 ]
 
 # Directories under examples/ that are not examples. Keep in step with

@@ -16,11 +16,17 @@
 // instruction: G_FTANH").
 
 // Matcher: succeeds on ops that must be cast to bf16 on AIE2P.
+//
+// Min/max is listed in all four spellings. `tl.maximum` against an f32 literal
+// arrives as `arith.maxnumf`, and a clamp can arrive as either the `num` or the
+// plain form depending on its `propagate_nan`. AIE2P has no f32 vector min/max
+// in any of them, so all four get the same cast.
 transform.named_sequence @match_bf16_only_op(
     %op: !transform.any_op {transform.readonly}) -> !transform.any_op {
   transform.match.operation_name %op
       ["math.exp", "math.tanh", "arith.addf", "arith.subf", "arith.mulf",
-       "arith.maxnumf", "vector.multi_reduction"] : !transform.any_op
+       "arith.maxnumf", "arith.minnumf", "arith.maximumf", "arith.minimumf",
+       "vector.multi_reduction"] : !transform.any_op
   transform.yield %op : !transform.any_op
 }
 

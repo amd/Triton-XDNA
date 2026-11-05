@@ -673,7 +673,13 @@ def _proj_chain(block_m, block_n, Mp, Np, Kp, a_stride, transform_script):
 
 
 def triton_matmul(
-    x, w, block_m=None, block_n=None, transform_script=BY_BLOCK, stage_key=None
+    x,
+    w,
+    block_m=None,
+    block_n=None,
+    transform_script=BY_BLOCK,
+    stage_key=None,
+    epilogue=None,
 ):
     """x: [M, K] float32/bf16, w: [K, N] bf16 -> [M, N] float32, on the NPU.
 
@@ -699,7 +705,13 @@ def triton_matmul(
     address, so two models of one shape in a process cannot share a weight.
     The address is only stable if `w` is: pass the same tensor every call, not
     one rebuilt per call, or each call stages a fresh copy.
+
+    `epilogue`, if given, replaces the copy-out of the `[M, N]` result and
+    returns what the caller gets. It must return new tensors, since the result
+    can sit in a buffer the next call reuses. An elementwise epilogue such as
+    a clamp then costs no extra pass.
     """
+    out = epilogue or (lambda r: r.clone())
     M, K = x.shape
     Kw, N = w.shape
     assert K == Kw, (x.shape, w.shape)
@@ -788,10 +800,10 @@ def triton_matmul(
             # shape, so a view into it would be overwritten under them. That
             # trades a device->host copy of the whole padded buffer for a
             # host->host copy of just the part asked for.
-            return c.reshape(Mp, Np)[:M, :N].clone()
+            return out(c.reshape(Mp, Np)[:M, :N])
         # Unbound, `got[2]` is a view of the runner's own BO for this key, which
         # the next dispatch under it overwrites -- the same lifetime as above.
-        return torch.from_numpy(np.asarray(got[2])).reshape(Mp, Np)[:M, :N].clone()
+        return out(torch.from_numpy(np.asarray(got[2])).reshape(Mp, Np)[:M, :N])
     # One block_m-row tile per dispatch: the grid is (1, N/block_n), which
     # depends on the weight alone and never on the prompt length.
     for m0 in range(0, Mp, block_m):
@@ -812,7 +824,7 @@ def triton_matmul(
             BLOCK_N=block_n,
             BLOCK_K=L2_K,
         )
-    return c[:M, :N]
+    return c[:M, :N] if epilogue is None else epilogue(c[:M, :N])
 
 
 # ---------------------------------------------------------------------------
@@ -935,15 +947,22 @@ def _geglu_kernel(G, U, Y, C2: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexp
     tl.store(Y + offs[:], gelu_gate * up)
 
 
-def triton_geglu(gate, up, block=SWIGLU_BLOCK):
+def triton_geglu(gate, up, block=SWIGLU_BLOCK, whole=False):
     """gelu_tanh(gate) * up over matching [M, N] tensors -> [M, N] float32.
 
     The SwiGLU wrapper's chunking and padding, unchanged -- only the activation
     differs -- so see `glu_chunk` for how the dispatch is sized.
+
+    `whole=True` runs the range in one dispatch. Its grid follows the row
+    count, so use it when the row count is fixed: each count compiles once,
+    and it saves a dispatch and its staging per chunk.
     """
     shape = gate.shape
     n = gate.numel()
-    chunk = glu_chunk(n, shape[-1] if gate.ndim > 1 else block, block)
+    if whole:
+        chunk = math.ceil(n / block) * block
+    else:
+        chunk = glu_chunk(n, shape[-1] if gate.ndim > 1 else block, block)
     npad = math.ceil(n / chunk) * chunk
     g = torch.nn.functional.pad(gate.reshape(-1).to(torch.bfloat16), (0, npad - n))
     u = torch.nn.functional.pad(up.reshape(-1).to(torch.bfloat16), (0, npad - n))
