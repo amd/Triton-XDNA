@@ -218,7 +218,9 @@ def load_q4nx(model=None, projections=True):
             q, o, gate, up, down          : bfloat16 [K, out]  (y = x @ W)
             k, v                          : bfloat16, ONLY where owns_kv(L)
             inp_gate, per_layer_projection, model_proj : bfloat16, the PLE trio
-        embed, per_layer_embed, final_norm, ple_proj_norm, lm_head, rope_freqs
+        embed_rows, ple_rows : ids -> those rows of the embedding tables
+        lm_head : () -> the dequantized LM head
+        final_norm, ple_proj_norm, rope_freqs
 
     Three things differ from every sibling loader and each is load-bearing:
 
@@ -300,7 +302,11 @@ def load_q4nx(model=None, projections=True):
 
     return dict(
         layers=layers,
-        embed=qm.embed_rows("model.embed_tokens.weight", np.arange(VOCAB)),
+        # Rows of the embedding table, gathered from the bundle, rather than
+        # the table: a turn reads a few hundred of its 262144 rows.
+        embed_rows=lambda ids: qm.embed_rows(
+            "model.embed_tokens.weight", np.asarray(ids)
+        ),
         # The per-layer embedding table is [VOCAB, 35, 256] -- 2.3 billion
         # entries, which is why it is a gather rather than a tensor. Returned
         # as a callable so the prompt's rows can be fetched at prefill time
@@ -310,7 +316,8 @@ def load_q4nx(model=None, projections=True):
         ).reshape(len(ids), N_LAYERS, PLI_D),
         final_norm=g["final_norm"].astype(np.float32),
         ple_proj_norm=g["ple_proj_norm"].astype(np.float32),
-        lm_head=qm.lm_head_rows(0, VOCAB),
+        # Called, not held: only a host forward or bf16 weights read it.
+        lm_head=lambda: qm.lm_head_rows(0, VOCAB),
         rope_freqs=qm.rope_freqs(),
         fingerprint=_fingerprint(src),
     )

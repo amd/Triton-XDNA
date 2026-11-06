@@ -77,6 +77,7 @@ from config import (
     PLI_D,
     RMS_EPS,
     SLIDING_WINDOW,
+    VOCAB,
     head_dim,
     is_sliding,
     kv_source_layer,
@@ -185,7 +186,47 @@ class Gemma4Prefill(LlamaPrefill):
     #: `load_weights`. The PLE trio and the two extra globals join it so a
     #: second instance built for `--compare-cpu` shares them rather than
     #: reloading a multi-GB bundle.
-    WEIGHT_ATTRS = LlamaPrefill.WEIGHT_ATTRS + ("ple_proj_norm", "_ple_rows")
+    WEIGHT_ATTRS = tuple(
+        a for a in LlamaPrefill.WEIGHT_ATTRS if a not in ("embed", "lm_head")
+    ) + ("ple_proj_norm", "_ple_rows", "_embed_rows", "_lm_head_rows", "_lm_head_t")
+    _lm_head_t = None
+
+    @property
+    def lm_head(self):
+        """The LM head, bf16 `[VOCAB, D]`, dequantized on first use.
+
+        1.25 GiB on E4B, and only a host forward or `Q4NX_GPU_WEIGHTS=bf16`
+        reads it: the NPU prefills and the packed iGPU weights have their own.
+        """
+        if self._lm_head_t is None:
+            self._lm_head_t = _t(_as_bf16(self._lm_head_rows()), torch.bfloat16)
+        return self._lm_head_t
+
+    @lm_head.setter
+    def lm_head(self, v):
+        self._lm_head_t = v
+
+    _embed_t = None
+
+    @property
+    def embed(self):
+        """The whole embedding table, bf16 numpy -- for code written against
+        `LlamaPrefill`'s. Gemma4's own paths read `embed_rows` instead."""
+        if self._embed_t is None:
+            self._embed_t = self.embed_rows(np.arange(VOCAB))
+        return self._embed_t
+
+    @embed.setter
+    def embed(self, v):
+        self._embed_t = v
+
+    def embed_rows(self, ids):
+        """The embeddings of `ids`, bf16 numpy `[len(ids), D]`.
+
+        Gathered from the bundle per call rather than held as a table: the
+        table is 1.25 GiB on E4B in bf16, and a turn reads a few hundred rows.
+        """
+        return _as_bf16(self._embed_rows(np.asarray(ids)))
 
     #: The per-layer fused MLP chains, or None for the torch path. Declared on
     #: the class, not just assigned in `_build_fused_mlp`: an instance built
@@ -382,10 +423,10 @@ class Gemma4Prefill(LlamaPrefill):
         """
         raw = load_q4nx(model or self.model, projections=self.HOST_PROJECTIONS)
         self.fingerprint = raw["fingerprint"]
-        self.embed = _as_bf16(raw.pop("embed"))
-        # NOT tied on this model -- its own 262144x1536 matrix, and by a wide
-        # margin the largest tensor here.
-        self.lm_head = _t(_as_bf16(raw.pop("lm_head")), torch.bfloat16)
+        self._embed_rows = raw.pop("embed_rows")
+        # NOT tied on this model -- its own 262144 x D matrix, and by a wide
+        # margin the largest tensor here; see `lm_head`.
+        self._lm_head_rows = raw.pop("lm_head")
         self.final_norm = _t(raw["final_norm"])
         self.ple_proj_norm = _t(raw["ple_proj_norm"])
         self._ple_rows = raw["ple_rows"]
@@ -907,7 +948,7 @@ class Gemma4Prefill(LlamaPrefill):
             ((Ns + self.SEQ_BUCKET - 1) // self.SEQ_BUCKET) * self.SEQ_BUCKET,
         )
         x = torch.zeros((Nb, D), dtype=torch.float32)
-        x[:Ns] = _t(self.embed[np.asarray(ids[p0:])])
+        x[:Ns] = _t(self.embed_rows(ids[p0:]))
 
         if image_embeds is not None:
             rows = torch.as_tensor(np.asarray(image_mask), dtype=torch.bool)
@@ -1227,7 +1268,6 @@ class Gemma4GpuDecode:
                     for k, v in w.items()
                 }
             )
-        self.embed = _t(pf.embed, torch.bfloat16).to(device)
         # `[K, N]`, the orientation `_mm` takes. The bf16 head is reached as a
         # transposed view of `[VOCAB, D]` -- see `gpu_kernels.gemv` for why it
         # is not made contiguous.
@@ -1370,6 +1410,16 @@ class Gemma4GpuDecode:
         y = gpu_kernels.geglu(self._mm(hp, Bg), self._mm(hp, Bu))
         return self._mm(y, Bd)[:, : self.pf._w[L]["post_ffn_norm"].shape[-1]]
 
+    def _embed(self, ids):
+        """The embeddings of `ids`, f32 `[len(ids), D]` on the device.
+
+        Gathered from the bundle on the host and copied over, rather than
+        indexed in a device-resident table: that table was 1.25 GiB of iGPU
+        memory on E4B for the one row a step reads.
+        """
+        rows = _t(self.pf.embed_rows(ids), torch.bfloat16)
+        return rows.to(self.dev).to(torch.float32)
+
     def _ple(self, x):
         """This token's per-layer vectors, [n_layers, PLI_D].
 
@@ -1457,7 +1507,7 @@ class Gemma4GpuDecode:
         # zero -- the reason `Gemma4Prefill._zero_slab` zeroes all of it.
         self._slab_t.zero_()
         tok = torch.tensor(ids, device=dev)
-        x = self.embed[tok].to(torch.float32)  # [N, D]
+        x = self._embed(ids)  # [N, D]
         if image_embeds is not None:
             rows = torch.as_tensor(np.asarray(image_mask, dtype=bool), device=dev)
             x[rows] = image_embeds.to(dev, torch.float32)
@@ -1654,9 +1704,7 @@ class Gemma4GpuDecode:
         """
         self._tok = int(token)
         dev = self.dev
-        # `self.embed` is already a torch tensor on the device -- staged once
-        # in __init__ -- so this is a row gather, not another conversion.
-        x = self.embed[self._tok : self._tok + 1].to(torch.float32)  # [1, D]
+        x = self._embed([self._tok])  # [1, D]
         pli = self._ple(x)
         n = self.pf.n_layers
         # Every later pre-norm comes out of the launch before it; see
