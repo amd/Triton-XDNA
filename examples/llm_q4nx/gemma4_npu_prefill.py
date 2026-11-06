@@ -50,6 +50,11 @@ class NpuPrefill:
         self.fp = FusedProgram(build_dir, "fused_prefill")
         self.lm = FusedProgram(build_dir, "lm")
         self.on_layer = None
+        #: `tail(x, pli, n, L0)`: given, the layers from `L0` on -- those that
+        #: write no cache -- and the head are left to it, for the last row
+        #: alone: `x` [1, D] f32 entering layer `L0`, `pli` that row's per-layer
+        #: inputs [N_LAYERS, PLI_D]. Returns the logits.
+        self.tail = None
         self.a, self.c, self.att = {}, {}, {}
         self.suspended = False
 
@@ -282,8 +287,29 @@ class NpuPrefill:
                 sn = np.empty((G.M, dh // 2), np.float32)
                 H.rope_table(inv, cs, sn, r0)
                 ropes[dh].append((cs, sn))
+        # From the first layer after which none writes the cache, only the
+        # last position's row reaches anything -- the logits -- so those layers
+        # run its chunk alone. It still attends every earlier key, and the NPU
+        # GEMMs take whole chunks, so this is one chunk a layer instead of all
+        # of them.
+        shared_from = next(
+            L
+            for L in range(C.N_LAYERS + 1)
+            if not any(map(C.owns_kv, range(L, C.N_LAYERS)))
+        )
+        if self.tail is not None:
+            for L in range(shared_from):
+                self.layer(L, x, pli, chunks, ropes)
+                if self.on_layer:
+                    self.on_layer(L, x, pli)
+            return self.tail(x[-1:], pli[-1], n, shared_from)
         for L in range(C.N_LAYERS):
-            self.layer(L, x, pli, chunks, ropes)
+            if L < shared_from:
+                self.layer(L, x, pli, chunks, ropes)
+            else:
+                self.layer(
+                    L, x, pli, chunks[-1:], {dh: r[-1:] for dh, r in ropes.items()}
+                )
             if self.on_layer:
                 self.on_layer(L, x, pli)
         if len(self.lm_k) == 1:

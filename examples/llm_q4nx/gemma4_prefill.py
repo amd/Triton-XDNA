@@ -81,6 +81,7 @@ from config import (
     is_sliding,
     kv_source_layer,
     load_q4nx,
+    owns_kv,
     mlp_inter,
     rope_lut,
 )
@@ -1139,15 +1140,20 @@ class Gemma4GpuDecode:
     #: What the projections are read as. `q4nx` streams the bundle's Codec B
     #: chunks and dequantizes in the GEMV (W4A16); `bf16` streams the host's
     #: dequantized copies. The decode is weight-bandwidth bound, so this is
-    #: the difference between 1.48 and 4.56 GB read per token. `q4k` is
-    #: `q4nx` re-encoded at load to `gpu_kernels`' Codec K -- Q4_K-style 6-bit
-    #: scales and mins, 4.5 bits a weight -- trading a small, measured loss
-    #: of accuracy for 10% fewer projection bytes. The default: on the real
-    #: model it is 6% faster than `q4nx` in the decode, passes the
-    #: decode-vs-prefill gate token for token, and moves perplexity on a text
-    #: passage within noise (85.5 -> 83.7; KL 2.3e-3 against `q4nx`).
-    #: `Q4NX_GPU_WEIGHTS=q4nx` is the bundle-exact path.
-    WEIGHTS = ("q4k", "q4nx", "bf16")
+    #: the difference between 1.48 and 4.56 GB read per token. `q4r`, the
+    #: default, is `q4nx` re-laid out at load inside each chunk as
+    #: `gpu_kernels`' Codec R -- the same values and bytes, by row -- which the
+    #: iGPU's GEMV and GEMM read faster: on Gemma4-E4B on a Radeon 860M, 14.3
+    #: -> 24.7 tok/s decode against `q4k`, with the kernel changes that came
+    #: with it. `q4k` is `q4nx` re-encoded to Codec K -- Q4_K-style 6-bit
+    #: scales and mins, 4.5 bits a weight -- 10% fewer bytes for a small,
+    #: measured loss (perplexity 85.5 -> 83.7 on a text passage; KL 2.3e-3
+    #: against `q4nx`), and slower here than `q4r`.
+    WEIGHTS = ("q4r", "q4k", "q4nx", "bf16")
+
+    #: The prefill runs the KV-sharing layers for the last position only; see
+    #: `_last_row_layer`. False runs them over every position, for comparison.
+    PRUNE_SHARED = True
 
     def __init__(self, pf, max_L, device="cuda", weights=None):
         if not torch.cuda.is_available():
@@ -1156,7 +1162,7 @@ class Gemma4GpuDecode:
                 "of a hybrid run; use the NPU decode instead, or install a "
                 "ROCm build of torch."
             )
-        weights = weights or os.environ.get("Q4NX_GPU_WEIGHTS", "q4k")
+        weights = weights or os.environ.get("Q4NX_GPU_WEIGHTS", "q4r")
         if weights not in self.WEIGHTS:
             raise ValueError(f"weights={weights!r}; expected one of {self.WEIGHTS}")
         self.weights = weights
@@ -1184,7 +1190,7 @@ class Gemma4GpuDecode:
         # the bundle instead, the bf16 copies of them never reach the device,
         # and the MLP runs unfused against its own packed gate|up and down.
         packed = None
-        if weights in ("q4nx", "q4k"):
+        if weights in ("q4nx", "q4k", "q4r"):
             from config import load_q4nx_packed
 
             packed = load_q4nx_packed(pf.model)
@@ -1192,7 +1198,7 @@ class Gemma4GpuDecode:
             raise ValueError(
                 f"Q4NX_GPU_WEIGHTS={weights} reads the prefiller's bf16 "
                 "projections, and this prefiller loads none (HOST_PROJECTIONS "
-                "is off). Use q4k or q4nx."
+                "is off). Use q4k, q4nx or q4r."
             )
         fused = getattr(pf, "_fused_mlp", None) or {}
         self._mlp_w = None
@@ -1291,7 +1297,9 @@ class Gemma4GpuDecode:
         where the same runs with Codec B and a host-side encode are clean.
         """
         w = gpu_kernels.Q4NXWeight(torch.from_numpy(data), N, K)
-        return w.to_codec_k() if self.weights == "q4k" else w
+        if self.weights == "q4k":
+            return w.to_codec_k()
+        return w.to_codec_r() if self.weights == "q4r" else w
 
     def _mm(self, x, w):
         """One activation row against a projection. bf16 in, f32 accumulation.
@@ -1408,7 +1416,7 @@ class Gemma4GpuDecode:
         gathered with `ple_ids`.
         """
         if not isinstance(self.w[0]["qkv"], gpu_kernels.Q4NXWeight):
-            raise ValueError("the iGPU prefill reads packed weights: q4k or q4nx")
+            raise ValueError("the iGPU prefill reads packed weights: q4k, q4nx or q4r")
         pf = self.pf
         N = len(ids)
         if N > self.attn_maxl:
@@ -1474,6 +1482,14 @@ class Gemma4GpuDecode:
         for L in range(n):
             w = self.w[L]
             dh = head_dim(L)
+            if L >= FIRST_KV_SHARED and self.PRUNE_SHARED:
+                # From here on no layer writes the cache, so only the last
+                # position -- the one the logits come from -- is needed. llama.cpp
+                # prunes the same way.
+                if L == FIRST_KV_SHARED:
+                    x, h = x[N - 1 :].contiguous(), h[N - 1 :].contiguous()
+                x, h = self._last_row_layer(L, w, x, h, N, pli[L][N - 1 :])
+                continue
             residual = x
             qkv = gpu_kernels.gemm_w4a8(h, w["qkv"])
             if L < FIRST_KV_SHARED:
@@ -1538,10 +1554,81 @@ class Gemma4GpuDecode:
             )
 
         # Only the last position's logits: the head is a GEMV, as in a step.
-        logits = self._mm(h[N - 1 : N], self.lm_head)[0]
+        logits = self._mm(h[-1:], self.lm_head)[0]
         if FINAL_LOGIT_SOFTCAP:
             logits = gpu_kernels.logit_softcap(logits, FINAL_LOGIT_SOFTCAP)
         return logits
+
+    def finish_prefill(self, x, pli, N, L0):
+        """The rest of a prefill another device ran up to layer `L0`: layers
+        `L0..` for the last row and the head. Returns the logits, [VOCAB] f32.
+
+        `x` is that row entering `L0`, [1, D]; `pli` its per-layer inputs,
+        [n_layers, PLI_D]. Only for layers that write no cache, which is what
+        lets one row stand in for the prompt: the cache rows they attend are
+        the other device's, in the shared slab.
+        """
+        if not self._slab_shared:
+            raise RuntimeError("finishing a prefill reads the slab in place")
+        if any(map(owns_kv, range(L0, self.pf.n_layers))):
+            raise ValueError(f"a layer from {L0} on writes the cache")
+        with driver_scope("gpu"):
+            x = torch.as_tensor(x, dtype=torch.float32).to(self.dev).reshape(1, -1)
+            pli = torch.as_tensor(pli, dtype=torch.float32).to(self.dev)
+            h = self._norm(x, self.w[L0]["attn_norm"])
+            for L in range(L0, self.pf.n_layers):
+                x, h = self._last_row_layer(L, self.w[L], x, h, N, pli[L : L + 1])
+            logits = self._mm(h, self.lm_head)[0]
+            if FINAL_LOGIT_SOFTCAP:
+                logits = gpu_kernels.logit_softcap(logits, FINAL_LOGIT_SOFTCAP)
+            return logits
+
+    def _last_row_layer(self, L, w, x, h, N, pli):
+        """A KV-sharing layer of the prefill, for its last position only.
+
+        Exactly a decode step's layer at position `N - 1`: the owning layers
+        have already written the slab rows it attends.
+        """
+        dh = head_dim(L)
+        src = kv_source_layer(L)
+        residual = x
+        q = gpu_kernels.qkv_post(
+            self._mm(h, w["qkv"]),
+            w["q_norm"],
+            None,
+            self.lut[L][N - 1],
+            N_Q_HEADS,
+            dh,
+            RMS_EPS,
+            n_kv=N_KV_HEADS,
+        )
+        lo = max(0, N - SLIDING_WINDOW) if is_sliding(L) else 0
+        a = gpu_kernels.attn_decode(
+            q,
+            self.k[src][lo:N],
+            self.v[src][lo:N],
+            N_Q_HEADS,
+            dh,
+            ATTN_SCALE,
+            k_shift=kv_layout.lane_shift(dh, kv_layout.K_REGION),
+            v_shift=kv_layout.lane_shift(dh, kv_layout.V_REGION),
+            n_kv=N_KV_HEADS,
+            kv_w=kv_layout.DH_A,
+        )
+        a = self._mm(a, w["o"])
+        x, h = self._norm_residual(
+            a, w["post_attn_norm"], residual, next_norm=w["ffn_norm"]
+        )
+        residual = x
+        x = self._norm_residual(self._ffn(h, L, w), w["post_ffn_norm"], residual)
+        residual = x
+        gate = gpu_kernels.gemv(x, w["inp_gate"], split_k=4)
+        pr = gpu_kernels.gemv(gate, w["per_layer_projection"], glu_up=pli)
+        n = self.pf.n_layers
+        nxt = self.w[L + 1]["attn_norm"] if L + 1 < n else self.final_norm
+        return self._norm_residual(
+            pr, w["post_ple_norm"], residual, scale=w["out_scale"], next_norm=nxt
+        )
 
     def step(self, token, pos):
         """One token through all 35 layers. Returns its logits, [VOCAB].
@@ -1699,7 +1786,7 @@ class Gemma4IgpuPrefill(Gemma4Prefill):
     ENGINE = "igpu"
     #: The iGPU reads its projections packed from the bundle, unless
     #: Q4NX_GPU_WEIGHTS=bf16 asks for the host's bf16 copies.
-    HOST_PROJECTIONS = os.environ.get("Q4NX_GPU_WEIGHTS", "q4k") == "bf16"
+    HOST_PROJECTIONS = os.environ.get("Q4NX_GPU_WEIGHTS", "q4r") == "bf16"
 
     def __init__(self, *a, **kw):
         kw["backend"] = "cpu"

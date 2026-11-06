@@ -66,6 +66,13 @@ def build_parser(doc):
     ap.add_argument("--prefill-engine", choices=ENGINES, default="air-fused")
     ap.add_argument("--decode", choices=("npu", "gpu"), default="npu")
     ap.add_argument(
+        "--prefill-tail",
+        choices=("npu", "igpu"),
+        default="npu",
+        help="--prefill-engine triton-fused: where the layers that write no KV "
+        "cache, and the head, run for the prompt's last row",
+    )
+    ap.add_argument(
         "--backend",
         choices=("cpu", "npu", "hetero"),
         default=None,
@@ -115,10 +122,13 @@ def _resolve_vision(kind):
 
 def _check(args, cfg):
     """Refuse the combinations that cannot run, before minutes of loading."""
+    if args.prefill_tail == "igpu" and args.prefill_engine != "triton-fused":
+        raise SystemExit("--prefill-tail igpu finishes a triton-fused prefill")
     gpu = (
         args.vision == "igpu"
         or args.prefill_engine == "igpu"
         or args.decode == "gpu"
+        or args.prefill_tail == "igpu"
         or args.backend == "hetero"
     )
     if gpu and not torch.cuda.is_available():
@@ -234,10 +244,16 @@ def main(cfg, doc=None, argv=None):
         args.model,
         npu_resident=args.decode != "gpu",
     )
+    if args.prefill_tail == "igpu":
+        from gemma4_prefill import Gemma4GpuDecode
+
+        # The decoder `generate_on_gpu` reuses, so a GPU decode shares it.
+        m._gpu_decoder = Gemma4GpuDecode(m, max_L=m.max_seq)
+        m.finish_on_gpu(m._gpu_decoder)
     tower = _tower(args, vw.load_vision(model))
     print(
         f"[flash] loaded in {time.time() - t0:.1f}s: vision={args.vision} "
-        f"prefill={args.prefill_engine} decode={args.decode}",
+        f"prefill={args.prefill_engine} (tail {args.prefill_tail}) decode={args.decode}",
         flush=True,
     )
 

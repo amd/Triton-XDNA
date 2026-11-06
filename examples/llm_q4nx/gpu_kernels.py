@@ -209,6 +209,23 @@ Q4NX_CHUNK_BYTES = 5120
 #: a plane per field took eight. Lossy; see `Q4NXWeight.to_codec_k` for how
 #: much and why this encoding.
 Q4K_CHUNK_BYTES = 4608
+#: Codec R: Codec B's chunk -- same 32 x 256 geometry, same 5120 bytes, same
+#: chunk order -- laid out by row inside, for the iGPU (`to_codec_r`):
+#:
+#:     [0, 512)      scales, bf16 [32 rows][8 groups]
+#:     [512, 1024)   mins, the same
+#:     [1024, 5120)  nibbles, [32 rows][128 bytes]; byte i of a row holds
+#:                   columns 2i (low) and 2i + 1 (high)
+#:
+#: Codec B packs two rows into a byte and 16 rows per column, which is what
+#: the NPU's 32-lane MAC wants. On the iGPU it spreads a thread's codes over
+#: rows, so the K reduction crosses lanes and every weight is scaled on its
+#: own. By row, a thread's codes run along K: a group's 32 products are
+#: summed in registers and scaled once, and a GEMM tile decodes without
+#: moving codes between lanes. Keeping the chunks, rather than whole rows,
+#: keeps each program's reads contiguous: a flat row-major matrix had a
+#: program reading 32 rows K/2 bytes apart and ran 25% slower.
+Q4NX_R = "r"
 #: Where the endpoint bytes' log2 scales start: scales from 2^-16, ratios 2^-8.
 _Q4K_S_OFF = 16.0
 _Q4K_R_OFF = 8.0
@@ -227,7 +244,9 @@ class Q4NXWeight:
     def __init__(self, data, N, K, codec="b"):
         if N % Q4NX_ROWS or K % Q4NX_COLS:
             raise ValueError(f"Codec B needs N % 32 == K % 256 == 0, got {N}x{K}")
-        chunk = {"b": Q4NX_CHUNK_BYTES, "k": Q4K_CHUNK_BYTES}[codec]
+        chunk = {"b": Q4NX_CHUNK_BYTES, "k": Q4K_CHUNK_BYTES, "r": Q4NX_CHUNK_BYTES}[
+            codec
+        ]
         nb = (N // Q4NX_ROWS) * (K // Q4NX_COLS)
         if data.numel() != nb * chunk or data.dtype != torch.uint8:
             raise ValueError(
@@ -248,6 +267,11 @@ class Q4NXWeight:
     def _scales_mins(self):
         """Per-chunk scale and min as float32 `[nb, 8 groups, 32 rows]`."""
         c = self.data.view(-1, self.chunk_bytes)
+        if self.codec == "r":  # [row][grp] in the chunk: back to [grp][row]
+            sm = (
+                c[:, :1024].contiguous().view(torch.bfloat16).float().view(-1, 2, 32, 8)
+            )
+            return sm[:, 0].transpose(1, 2), sm[:, 1].transpose(1, 2)
         if self.codec == "b":
             sc = c[:, :512].contiguous().view(torch.bfloat16).float()
             mn = c[:, 512:1024].contiguous().view(torch.bfloat16).float()
@@ -317,6 +341,26 @@ class Q4NXWeight:
             1,
         )
         return Q4NXWeight(out.reshape(-1), self.N, self.K, "k")
+
+    def to_codec_r(self):
+        """This Codec B weight as Codec R: the same values, row-major in the chunk.
+
+        Lossless, and the same bytes in the same chunk order; only the inside
+        of each chunk moves. See `Q4NX_R` for the layout and why.
+        """
+        if self.codec != "b":
+            raise ValueError(f"Codec R comes from codec 'b', this is {self.codec!r}")
+        c = self.data.view(-1, Q4NX_CHUNK_BYTES)
+        nb = c.shape[0]
+        # scales and mins: [grp][g][r] -> [g][r][grp], i.e. [row][grp]
+        sm = c[:, :1024].view(nb, 2, 8, 2, 16, 2).permute(0, 1, 3, 4, 2, 5)
+        # byte (g, col, k) holds rows 16g + 2k (low) and 16g + 2k + 1 (high)
+        b = c[:, 1024:].view(nb, 2, 256, 8)
+        q = torch.stack([b & 0xF, b >> 4], -1).view(nb, 2, 256, 16)
+        q = q.permute(0, 1, 3, 2).reshape(nb, 32, 256)
+        nib = q[..., 0::2] | (q[..., 1::2] << 4)
+        out = torch.cat([sm.reshape(nb, 1024), nib.reshape(nb, 4096)], 1)
+        return Q4NXWeight(out.reshape(-1), self.N, self.K, "r")
 
 
 @triton.jit
@@ -462,6 +506,8 @@ def gemv_q4nx(x, w, glu_in=False, act="gelu_tanh"):
     x = x.reshape(-1).contiguous()
     if x.numel() != w.K * (2 if glu_in else 1):
         raise ValueError(f"activation is {x.numel()} wide, weight K is {w.K}")
+    if w.codec == "r":
+        return _gemv_q4r(x, w, glu_in, act)
     nbj = w.K // Q4NX_COLS
     split = _q4nx_split(nbj)
     alloc = torch.zeros if split > 1 else torch.empty
@@ -709,6 +755,8 @@ def gemm_w4a8(x, w):
     GEMM on the dequantized weights. `x` may also be an already quantized
     `(xq, dx, xs)`, which is what `gemm_w4a8_glu_q8` returns.
     """
+    if w.codec == "r":
+        return _gemm_q4r(x, w)
     xq, dx, xs = x if isinstance(x, tuple) else quant_q8(x)
     if xq.shape[1] != w.K:
         raise ValueError(f"activation is {tuple(xq.shape)}, weight K is {w.K}")
@@ -738,7 +786,12 @@ def gemm_w4a8(x, w):
 def gemm_w4a8_glu_q8(x, w, act="gelu_tanh"):
     """`quant_q8(act(gate) * up)` for x: [M, K] against a stacked gate|up
     `Q4NXWeight` `[2 * inter, K]`, as `(xq, dx, xs)` ready for the down GEMM.
-    The f32 gate|up is never written to memory. `act` is a key of `_ACT`."""
+    The f32 gate|up is never written to memory. `act` is a key of `_ACT`.
+
+    For Codec R the result is `act(gate) * up` itself, bf16 `[M,
+    inter]`: its GEMM takes bf16, so there is no q8 input to produce."""
+    if w.codec == "r":
+        return _gemm_q4r(x, w, glu=True, act=act)
     xq, dx, xs = quant_q8(x)
     if xq.shape[1] != w.K:
         raise ValueError(f"activation is {tuple(xq.shape)}, weight K is {w.K}")
@@ -772,9 +825,178 @@ def gemm_w4a8_glu_q8(x, w, act="gelu_tanh"):
     return oq, odx, oxs
 
 
+# ---------------------------------------------------------------------------
+# Codec R: the decode's GEMV and the prefill's GEMM
+# ---------------------------------------------------------------------------
+@triton.jit
+def _gemv_q4r_kernel(X, W, C, NBJ, J, SPLIT: tl.constexpr):
+    """One 32-row block of `[1, K] @ Codec R [N, K]^T` over `J` of its chunks.
+
+    The low and high nibbles are a row's even and odd columns, so the
+    activation is loaded as its even and odd halves rather than the codes
+    interleaved; each group's 32 products are summed in registers and take
+    the scale once, and the min multiplies the group's activation sum.
+    `SPLIT` > 1 sums the partial rows into a zeroed `C` with atomics.
+    """
+    blk = tl.program_id(0)
+    j0 = tl.program_id(1) * J
+    r = tl.arange(0, 32)[:, None, None]
+    grp = tl.arange(0, 8)[None, :, None]
+    i = tl.arange(0, 16)[None, None, :]
+    so = tl.arange(0, 32)[:, None] * 8 + tl.arange(0, 8)[None, :]  # [row][grp]
+    acc = tl.zeros((32, 8), tl.float32)
+    for j in range(j0, j0 + J):
+        kk = j * 256 + grp * 32 + 2 * i  # [1, 8, 16]
+        xe = tl.load(X + kk).to(tl.bfloat16).to(tl.float32)
+        xo = tl.load(X + kk + 1).to(tl.bfloat16).to(tl.float32)
+        base = W + (blk * NBJ + j).to(tl.int64) * 5120
+        b = tl.load(base + 1024 + r * 128 + grp * 16 + i)  # [32, 8, 16]
+        dot = tl.sum(xe * (b & 0xF).to(tl.float32) + xo * (b >> 4).to(tl.float32), 2)
+        sp = base.to(tl.pointer_type(tl.bfloat16))
+        s = tl.load(sp + so).to(tl.float32)
+        m = tl.load(sp + 256 + so).to(tl.float32)
+        acc += s * dot + m * tl.sum(xe + xo, 2)
+    rows = blk * 32 + tl.arange(0, 32)
+    if SPLIT == 1:
+        tl.store(C + rows, tl.sum(acc, 1))
+    else:
+        tl.atomic_add(C + rows, tl.sum(acc, 1), sem="relaxed")
+
+
+def _gemv_q4r(x, w, glu_in, act):
+    if glu_in:
+        # Its own launch, unlike Codec B's: computed in the GEMV's load, every
+        # program recomputes the whole activation, and `down` -- the one GEMV
+        # that takes it -- ran at 49 GB/s against 75 without.
+        x = x.reshape(-1)
+        n = x.numel() // 2
+        a = torch.empty(n, dtype=torch.float32, device=x.device)
+        _geglu_kernel[(triton.cdiv(n, 1024),)](
+            x[:n], x[n:], a, n, *_ACT[act], BLOCK=1024
+        )
+        x = a
+    nblk, nbj = w.N // Q4NX_ROWS, w.K // Q4NX_COLS
+    # Split K where a deep matrix has few row blocks: `down`'s 80 programs
+    # each streaming 40 chunks left DRAM idle between their reads (66 GB/s
+    # over a token's 42 distinct layers; 89 at 10 ways). Shallow ones gained
+    # nothing. Swept on gfx1152 (Radeon 860M).
+    split = 1
+    if nbj >= 24:
+        split = max(d for d in range(1, nbj + 1) if nbj % d == 0 and d * nblk <= 1024)
+    out = (torch.zeros if split > 1 else torch.empty)(
+        w.N, dtype=torch.float32, device=x.device
+    )
+    # Two warps a program: more programs resident per CU, so more reads in
+    # flight. Over a token's 42 distinct layers, gate|up 69 -> 99 GB/s and the
+    # head 75 -> 102 against four; one warp was no better. Timed in HIP graphs:
+    # launched from Python, the small GEMVs time the launch, not the GPU.
+    _gemv_q4r_kernel[(nblk, split)](
+        x, w.data, out, nbj, nbj // split, SPLIT=split, num_warps=2
+    )
+    return out.reshape(1, w.N)
+
+
+@triton.jit
+def _q4r_tile(W, n, k0, NBJ, BK: tl.constexpr):
+    """Rows `n` x columns `[k0, k0 + BK)` of a Codec R weight, as bf16.
+
+    Each byte is loaded twice, once per column it holds, and shifted by the
+    column's parity: joining the low and high nibbles instead moves codes
+    between lanes, and cost a fifth of the GEMM.
+    """
+    kk = (k0 % 256) + tl.arange(0, BK)[None, :]
+    rr = (n % 32)[:, None]
+    base = W + ((n // 32)[:, None] * NBJ + k0 // 256).to(tl.int64) * 5120
+    b = tl.load(base + 1024 + rr * 128 + kk // 2)
+    q = ((b >> ((kk % 2) * 4)) & 0xF).to(tl.float32)
+    sp = base.to(tl.pointer_type(tl.bfloat16)) + rr * 8 + kk // 32
+    s = tl.load(sp).to(tl.float32)
+    return (q * s + tl.load(sp + 256).to(tl.float32)).to(tl.bfloat16)
+
+
+# `M` is the prompt length: it must not specialize.
+@triton.jit(do_not_specialize=["M"])
+def _gemm_q4r_kernel(
+    X,
+    W,
+    C,
+    M,
+    N,
+    NBJ,
+    C2,
+    KC,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GLU: tl.constexpr,
+):
+    """bf16 `X [M, K] @ W^T` with each weight tile decoded to bf16 once per
+    `BM` rows and multiplied by bf16 `tl.dot`, f32 accumulation.
+
+    Under `GLU` the weight is a stacked gate|up `[2 * N, K]`: a program takes
+    the same `BN` columns of both halves and writes `act(gate) * up`, bf16.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    mask_m = offs_m < M
+    n = pid_n * BN + tl.arange(0, BN)
+    xk = tl.arange(0, BK)
+    K = NBJ * 256
+    acc = tl.zeros((BM, BN), tl.float32)
+    if GLU:
+        acc_u = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, K, BK):
+        x = tl.load(
+            X + offs_m[:, None] * K + k0 + xk[None, :], mask=mask_m[:, None], other=0.0
+        )
+        acc = tl.dot(x, tl.trans(_q4r_tile(W, n, k0, NBJ, BK)), acc)
+        if GLU:
+            up = _q4r_tile(W, N + n, k0, NBJ, BK)
+            acc_u = tl.dot(x, tl.trans(up), acc_u)
+    if GLU:
+        acc = acc * tl.sigmoid(C2 * (acc + KC * acc * acc * acc)) * acc_u
+    tl.store(
+        C + offs_m[:, None] * N + n[None, :],
+        acc.to(C.dtype.element_ty),
+        mask=mask_m[:, None],
+    )
+
+
+def _gemm_q4r(x, w, glu=False, act="gelu_tanh"):
+    # bf16 once here: converting an f32 tile on every K step of every column
+    # tile made the GEMM 2-3x slower.
+    x = x.reshape(x.shape[0], -1).to(torch.bfloat16).contiguous()
+    if x.shape[1] != w.K:
+        raise ValueError(f"activation is {tuple(x.shape)}, weight K is {w.K}")
+    M = x.shape[0]
+    N = w.N // 2 if glu else w.N
+    # Swept on gfx1152 at M = 276. A wide BM decodes each weight tile for more
+    # rows; the GLU's two accumulators want twice the warps.
+    BM = min(128, max(16, _pow2(M)))
+    BN = 128 if N % 128 == 0 else (64 if N % 64 == 0 else 32)
+    out = torch.empty(
+        (M, N), dtype=torch.bfloat16 if glu else torch.float32, device=x.device
+    )
+    _gemm_q4r_kernel[(triton.cdiv(M, BM), N // BN)](
+        x, w.data, out, M, N, w.K // Q4NX_COLS, *_ACT[act],
+        BM=BM, BN=BN, BK=32, GLU=glu, num_warps=8 if glu else 4, num_stages=1,
+    )  # fmt: skip
+    return out
+
+
 def dequant_q4nx(w):
     """A `Q4NXWeight` as float32 `[K, N]`, in torch -- the reference for tests."""
     N, K = w.N, w.K
+    nbi, nbj = N // Q4NX_ROWS, K // Q4NX_COLS
+    if w.codec == "r":
+        c = w.data.view(nbi, nbj, Q4NX_CHUNK_BYTES)
+        sm = c[..., :1024].contiguous().view(torch.bfloat16).float()
+        sm = sm.view(nbi, nbj, 2, 32, 8).repeat_interleave(32, 4)  # [.., row, col]
+        nib = c[..., 1024:].reshape(nbi, nbj, 32, 128)
+        q = torch.stack([nib & 0xF, nib >> 4], -1).view(nbi, nbj, 32, 256).float()
+        wt = q * sm[:, :, 0] + sm[:, :, 1]
+        return wt.permute(0, 2, 1, 3).reshape(N, K).T
     nbi, nbj = N // Q4NX_ROWS, K // Q4NX_COLS
     c = w.data.view(nbi * nbj, w.chunk_bytes)
     sc, mn = w._scales_mins()
@@ -1236,8 +1458,16 @@ def _attn_decode_kernel(
     HALF: tl.constexpr,
     GROUP: tl.constexpr = 1 << 30,
     KV_W: tl.constexpr = 0,
+    CHUNK=1 << 30,
+    P=None,
+    ML=None,
+    DIRECT: tl.constexpr = True,
 ):
-    """softmax(q . K^T * scale) . V for one token, one program per query head.
+    """softmax(q . K^T * scale) . V for one token, one program per query head
+    and `CHUNK` keys.
+
+    Unless `DIRECT`, a program writes its unnormalized partial to `P` and its
+    `(max, sum)` to `ML` for `_attn_decode_reduce_kernel` to combine.
 
     No causal mask: every cached key is at or before this position by
     construction, and the window is applied by the caller as a lower bound on
@@ -1270,6 +1500,7 @@ def _attn_decode_kernel(
     is fetched.
     """
     h = tl.program_id(0)
+    sp = tl.program_id(1)
     KC += (h // GROUP) * KV_W
     VC += (h // GROUP) * KV_W
     offs_d = tl.arange(0, BLOCK_D)
@@ -1282,9 +1513,10 @@ def _attn_decode_kernel(
     m_i = float("-inf")
     l_i = 0.0
 
-    for j0 in range(0, S, BLOCK_S):
+    s1 = tl.minimum(S, sp * CHUNK + CHUNK)
+    for j0 in range(sp * CHUNK, s1, BLOCK_S):
         offs_s = j0 + tl.arange(0, BLOCK_S)
-        mask_s = offs_s < S
+        mask_s = offs_s < s1
         k = tl.load(
             KC + offs_s[:, None] * stride_s + k_lane[None, :],
             mask=mask_s[:, None] & mask_d[None, :],
@@ -1307,7 +1539,13 @@ def _attn_decode_kernel(
         acc += tl.sum(p[:, None] * v, axis=0)
         m_i = m_new
 
-    tl.store(OUT + h * dh + offs_d, acc / l_i, mask=mask_d)
+    if DIRECT:
+        tl.store(OUT + h * dh + offs_d, acc / l_i, mask=mask_d)
+    else:
+        nsp = tl.num_programs(1)
+        tl.store(P + (h * nsp + sp) * BLOCK_D + offs_d, acc)
+        tl.store(ML + (h * nsp + sp) * 2, m_i)
+        tl.store(ML + (h * nsp + sp) * 2 + 1, l_i)
 
 
 def attn_decode(
@@ -1341,7 +1579,20 @@ def attn_decode(
         )
     q = q.reshape(-1).contiguous()
     out = torch.empty(n_heads * dh, dtype=torch.float32, device=q.device)
-    _attn_decode_kernel[(n_heads,)](
+    # Split the keys so there are more programs than heads: one per head left
+    # most of the iGPU idle (Gemma4-E4B's 8 heads; 3.4 ms a token over 42
+    # layers). Splits of at least `block_s` keys, at most 8 of them.
+    nsp = max(1, min(8, triton.cdiv(S, block_s)))
+    chunk = triton.cdiv(triton.cdiv(S, nsp), block_s) * block_s
+    nsp = triton.cdiv(S, chunk)
+    bd = _pow2(dh)
+    if bd != dh:  # the reduce takes whole power-of-two rows
+        nsp, chunk = 1, S
+    part = ml = None
+    if nsp > 1:
+        part = torch.empty(n_heads * nsp * bd, dtype=torch.float32, device=q.device)
+        ml = torch.empty(n_heads * nsp * 2, dtype=torch.float32, device=q.device)
+    _attn_decode_kernel[(n_heads, nsp)](
         q,
         kc,
         vc,
@@ -1357,7 +1608,15 @@ def attn_decode(
         HALF=dh // 2,
         GROUP=n_heads // n_kv,
         KV_W=dh if kv_w is None else kv_w,
+        CHUNK=chunk,
+        P=part,
+        ML=ml,
+        DIRECT=nsp == 1,
     )
+    if nsp > 1:
+        _attn_decode_reduce_kernel[(n_heads,)](
+            part, ml, out, nsp, DH=dh, BSP=_pow2(nsp)
+        )
     return out.reshape(1, n_heads * dh)
 
 

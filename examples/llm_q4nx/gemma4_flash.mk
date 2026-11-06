@@ -7,6 +7,8 @@
 # Each stage of an image turn is placed on its own:
 #   VISION=auto|air|triton|igpu|host  ENGINE=air-fused|triton-fused|triton|igpu
 #   DECODE=npu|gpu
+#   TAIL=npu|igpu  (ENGINE=triton-fused: the layers that write no KV cache, and
+#                   the head, for the prompt's last row)
 # Whatever the placement, the prefill writes K/V into the slab the decode
 # reads, in pages both the NPU and the iGPU map.
 
@@ -25,6 +27,7 @@ MAX_SEQ  ?= $(DECODE_L)
 VISION   ?= auto
 ENGINE   ?= air-fused
 DECODE   ?= npu
+TAIL     ?= npu
 ## The image resolution budget (70, 140, 280, 560, 1120); empty = 280.
 SOFT     ?=
 N_TOKENS ?= 100
@@ -41,7 +44,8 @@ TOWER    ?= host
 OPT_ARGS := $(if $(SOFT),--max-soft-tokens $(SOFT)) $(if $(MODEL),--model "$(MODEL)") \
             $(if $(BACKEND),--backend $(BACKEND)) $(if $(OPS),--ops $(OPS))
 RUN_ARGS := --image $(IMAGE) --text "$(PROMPT)" --vision $(VISION) \
-            --prefill-engine $(ENGINE) --decode $(DECODE) --max-seq $(MAX_SEQ) \
+            --prefill-engine $(ENGINE) --prefill-tail $(TAIL) --decode $(DECODE) \
+            --max-seq $(MAX_SEQ) \
             --repeat $(REPEAT) $(OPT_ARGS)
 
 .PHONY: help preflight test-image vision prefill run verify compile-decode \
@@ -60,6 +64,7 @@ help:
 	@echo "  VISION=auto|air|triton|igpu|host     (default: $(VISION))"
 	@echo "  ENGINE=air-fused|triton-fused|triton|igpu  prefill (default: $(ENGINE))"
 	@echo "  DECODE=npu|gpu                       (default: $(DECODE))"
+	@echo "  TAIL=npu|igpu                        triton-fused prefill tail (default: $(TAIL))"
 	@echo "  SOFT=70|140|280|560|1120             image budget (default: 280)"
 	@echo "  REPEAT=n                             median TTFT over n turns"
 	@echo "  IMAGE=path PROMPT=\"...\""
