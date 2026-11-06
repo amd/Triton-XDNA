@@ -90,7 +90,7 @@ from config import (
 import gpu_kernels
 import kv_layout
 
-from llama_prefill import LlamaPrefill, _as_bf16, _t
+from llama_prefill import LlamaPrefill, _as_bf16, _t, release_freed_heap
 
 
 def _host_view(buf):
@@ -1252,8 +1252,10 @@ class Gemma4GpuDecode:
         for L, w in enumerate(pf._w):
             w = dict(w)
             if packed is not None:
-                for nm, (data, N, K) in packed["layers"][L].items():
-                    w[nm] = self._packed(data, N, K)
+                # One matrix at a time onto the device: reading them all first
+                # held the whole model on the host besides the device copy.
+                for nm, (read, N, K) in packed["layers"][L].items():
+                    w[nm] = self._packed(read(), N, K).to(device)
             elif self._mlp_w is None and "gate_up" not in w and L in fused:
                 w["gate_up"], w["down"] = fused[L].logical_weights(L)
             elif self._mlp_w is not None:
@@ -1272,8 +1274,8 @@ class Gemma4GpuDecode:
         # transposed view of `[VOCAB, D]` -- see `gpu_kernels.gemv` for why it
         # is not made contiguous.
         if packed is not None:
-            data, N, K = packed["lm_head"]
-            self.lm_head = self._packed(data, N, K).to(device)
+            read, N, K = packed["lm_head"]
+            self.lm_head = self._packed(read(), N, K).to(device)
         else:
             self.lm_head = pf.lm_head.to(device).T
         self.final_norm = pf.final_norm.to(device)
@@ -1286,6 +1288,7 @@ class Gemma4GpuDecode:
         for w in self.w:
             del w["model_proj"]
         self.lut = [t.to(device) for t in pf._lut]
+        release_freed_heap()  # the host side of loading the weights
 
         # The cache: region views of the prefill's slab, in the layout the NPU
         # decode also reads. Where the slab is in shared pages, `torch()` gives

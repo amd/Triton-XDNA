@@ -30,6 +30,7 @@ import kv_layout
 from config import AIR_PACKAGES, head_dim
 from dense_fused_prefill import engine_on_launch_runtime, run_fused
 from gemma4_prefill import Gemma4Prefill, _bf16_np
+from llama_prefill import release_freed_heap
 
 #: The model's mlir-air package. E4B's runs E2B's code at its own dims, so
 #: everything is reached through it rather than through E2B's directly.
@@ -86,6 +87,7 @@ class Gemma4FusedPrefill(Gemma4Prefill):
     def load_weights(self, model=None):
         super().load_weights(model)
         self._fused.load_weights(_weights().Q4nxModel(model or self.model))
+        release_freed_heap()
 
     def make_npu_resident(self):
         """Nothing to convert: the projections run in the fused prefill.
@@ -178,6 +180,7 @@ class Gemma4TritonFusedPrefill(Gemma4FusedPrefill):
     def load_weights(self, model=None):
         Gemma4Prefill.load_weights(self, model)
         self._fused.load_weights(model or self.model)
+        release_freed_heap()
 
     def finish_on_gpu(self, dec):
         """Run the layers that write no cache, and the head, on the iGPU.

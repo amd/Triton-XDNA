@@ -237,34 +237,36 @@ def load_q4nx_packed(model=None):
             raise RuntimeError(f"{name}: {nb} chunks is not a {N}x{K} Codec B matrix")
         return qm._raw(name, np.int16).view(np.uint8)
 
+    def cat(*parts):
+        return lambda: np.concatenate([raw(*a) for a in parts])
+
     layers = []
     for k in range(N_LAYERS):
         dq, dkv, inter = N_Q_HEADS * head_dim(k), N_KV_HEADS * head_dim(k), mlp_inter(k)
         p = f"model.layers.{k}."
-        qkv = [raw(p + "self_attn.q_proj.weight", dq, D)]
+        qkv = [(p + "self_attn.q_proj.weight", dq, D)]
         if owns_kv(k):
             qkv += [
-                raw(p + "self_attn.k_proj.weight", dkv, D),
-                raw(p + "self_attn.v_proj.weight", dkv, D),
+                (p + "self_attn.k_proj.weight", dkv, D),
+                (p + "self_attn.v_proj.weight", dkv, D),
             ]
         layers.append(
             dict(
-                qkv=(np.concatenate(qkv), dq + (2 * dkv if owns_kv(k) else 0), D),
-                o=(raw(p + "self_attn.o_proj.weight", D, dq), D, dq),
+                qkv=(cat(*qkv), dq + (2 * dkv if owns_kv(k) else 0), D),
+                o=(cat((p + "self_attn.o_proj.weight", D, dq)), D, dq),
                 gate_up=(
-                    np.concatenate(
-                        [
-                            raw(p + "mlp.gate_proj.weight", inter, D),
-                            raw(p + "mlp.up_proj.weight", inter, D),
-                        ]
+                    cat(
+                        (p + "mlp.gate_proj.weight", inter, D),
+                        (p + "mlp.up_proj.weight", inter, D),
                     ),
                     2 * inter,
                     D,
                 ),
-                down=(raw(p + "mlp.down_proj.weight", D, inter), D, inter),
+                down=(cat((p + "mlp.down_proj.weight", D, inter)), D, inter),
             )
         )
-    return dict(layers=layers, lm_head=(raw("lm_head.weight", VOCAB, D), VOCAB, D))
+    head = cat(("lm_head.weight", VOCAB, D))
+    return dict(layers=layers, lm_head=(head, VOCAB, D))
 
 
 def rope_lut(seq_len, layer_idx, rope_freqs=None, dtype=None):
