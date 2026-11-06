@@ -427,6 +427,8 @@ class Gemma4Prefill(LlamaPrefill):
         # NOT tied on this model -- its own 262144 x D matrix, and by a wide
         # margin the largest tensor here; see `lm_head`.
         self._lm_head_rows = raw.pop("lm_head")
+        # Tables a previous load filled in are that model's.
+        self._lm_head_t = self._embed_t = None
         self.final_norm = _t(raw["final_norm"])
         self.ple_proj_norm = _t(raw["ple_proj_norm"])
         self._ple_rows = raw["ple_rows"]
