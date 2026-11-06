@@ -150,9 +150,12 @@ class Gemma4FusedPrefill(Gemma4Prefill):
             image = dict(soft_embeds=soft, soft_positions=pos)
         self._zero_slab()
         out = run_fused(self._fused, run_ids, **image)
-        logits = torch.from_numpy(np.asarray(out, np.float32))
         self._ids = ids
         self.current_context_length = N
+        if out is None:  # cache only: the caller's decoder takes it from here
+            self.last_first_token = None
+            return None
+        logits = torch.from_numpy(np.asarray(out, np.float32))
         self.last_first_token = int(logits.argmax())
         return logits.reshape(-1)
 
@@ -167,14 +170,22 @@ class Gemma4TritonFusedPrefill(Gemma4FusedPrefill):
 
     ENGINE = "triton-fused"
 
-    def __init__(self, build_dir, *a, **kw):
+    def __init__(self, build_dir, *a, cache_only=False, **kw):
+        """`cache_only`: only the layers that write the KV cache are loaded,
+        and `prefill` returns no logits unless `finish_on_gpu` finishes the
+        last row -- see `NpuPrefill`. Without that, for a caller whose NPU
+        decoder runs the prompt's last token: prefill all but that token, seed
+        the decoder, and its first step gives the first token."""
         from gemma4_npu_prefill import NpuPrefill
 
         kw.setdefault("backend", "cpu")
         Gemma4Prefill.__init__(self, *a, **kw)
         self._rows = min(self.kv_attn_maxl, self.max_seq)
         self._fused = NpuPrefill(
-            build_dir, max_len=self._rows, kv_store=self._store_kv_rows
+            build_dir,
+            max_len=self._rows,
+            kv_store=self._store_kv_rows,
+            cache_only=cache_only,
         )
 
     def load_weights(self, model=None):
