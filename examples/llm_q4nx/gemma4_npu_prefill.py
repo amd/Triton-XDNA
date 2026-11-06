@@ -282,8 +282,23 @@ class NpuPrefill:
                 sn = np.empty((G.M, dh // 2), np.float32)
                 H.rope_table(inv, cs, sn, r0)
                 ropes[dh].append((cs, sn))
+        # From the first layer after which none writes the cache, only the
+        # last position's row reaches anything -- the logits -- so those layers
+        # run its chunk alone. It still attends every earlier key, and the NPU
+        # GEMMs take whole chunks, so this is one chunk a layer instead of all
+        # of them.
+        shared_from = next(
+            L
+            for L in range(C.N_LAYERS + 1)
+            if not any(map(C.owns_kv, range(L, C.N_LAYERS)))
+        )
         for L in range(C.N_LAYERS):
-            self.layer(L, x, pli, chunks, ropes)
+            if L < shared_from:
+                self.layer(L, x, pli, chunks, ropes)
+            else:
+                self.layer(
+                    L, x, pli, chunks[-1:], {dh: r[-1:] for dh, r in ropes.items()}
+                )
             if self.on_layer:
                 self.on_layer(L, x, pli)
         if len(self.lm_k) == 1:

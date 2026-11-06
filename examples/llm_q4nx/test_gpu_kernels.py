@@ -501,6 +501,69 @@ def _gemm_w4a8(G, dev):
     return ok
 
 
+def _codec_r(G, dev):
+    """Codec R: the same values as the Codec B it came from, and its GEMV and
+    GEMM against torch on those values.
+
+    The re-layout is checked against `dequant_q4nx` of the Codec B weight, so
+    a nibble or scale put in the wrong row shows up there and not just as a
+    kernel disagreeing with a reference that shares its mistake. The GEMM is
+    a bf16 product, so it is held to the bf16 GEMM on the dequantized weights.
+    """
+    print("\nCodec R  Codec B by row inside the chunk: gemv_q4nx, gemm_w4a8")
+    ok = True
+    for K, N in (
+        (D, N_Q_HEADS * DH_GLOBAL + 2 * DH_GLOBAL),  # qkv, full layer
+        (N_Q_HEADS * DH_GLOBAL, D),  # o, full layer
+        (12288, D),  # down, wide
+        (6400, D),  # 25 chunks a row block
+        (D, 262144),  # lm_head
+    ):
+        wb = _random_q4nx(G, N, K, "cpu")
+        wr = wb.to_codec_r()
+        # Compared on a row prefix for the head; see `_gemv_q4nx`.
+        n = min(N, 4096)
+        nb = n // 32 * (K // 256) * 5120
+        head_b = G.Q4NXWeight(wb.data[:nb], n, K)
+        head_r = G.Q4NXWeight(wr.data[:nb], n, K, "r")
+        same = torch.equal(G.dequant_q4nx(head_b), G.dequant_q4nx(head_r))
+        print(f"  {f'K={K} N={N} values':<34} {'equal' if same else 'differ  FAIL'}")
+        ok &= same
+        w = wr.to(dev)
+        x = torch.randn(1, K, device=dev)
+        ref = x.to(torch.bfloat16).float() @ G.dequant_q4nx(head_r).to(dev)
+        ok &= check(f"gemv K={K} N={N}", G.gemv_q4nx(x, w)[:, :n], ref, tol=1e-4)
+    for inter in (6144, 12288):
+        gu = torch.randn(1, 2 * inter, device=dev)
+        down = _random_q4nx(G, D, inter, "cpu").to_codec_r().to(dev)
+        ref = G.gemv_q4nx(G.geglu(gu[:, :inter], gu[:, inter:]), down)
+        got = G.gemv_q4nx(gu, down, glu_in=True)
+        ok &= check(f"geglu -> down K={inter} fused", got, ref, tol=1e-4)
+
+    for K, N in (
+        (D, N_Q_HEADS * DH_SLIDING + 2 * DH_SLIDING),  # qkv, sliding layer
+        (N_Q_HEADS * DH_GLOBAL, D),  # o, full layer
+        (6144, D),  # down, narrow
+        (D, 96),  # N not a multiple of the 128-wide tile
+    ):
+        w = _random_q4nx(G, N, K, "cpu").to_codec_r().to(dev)
+        wf = G.dequant_q4nx(w).to(torch.bfloat16).float()
+        for M in (1, 37, 128, 276):
+            x = torch.randn(M, K, device=dev)
+            ref = x.to(torch.bfloat16).float() @ wf
+            ok &= check(f"gemm K={K} N={N} M={M}", G.gemm_w4a8(x, w), ref, tol=1e-4)
+    for inter in (2048, 6144):
+        w = _random_q4nx(G, 2 * inter, D, "cpu").to_codec_r().to(dev)
+        for M in (1, 37, 276):
+            x = torch.randn(M, D, device=dev)
+            gu = G.gemm_w4a8(x, w)
+            want = G.geglu(gu[:, :inter], gu[:, inter:]).view(M, inter)
+            got = G.gemm_w4a8_glu_q8(x, w)
+            # `got` is bf16; `want` the f32 product's GeGLU.
+            ok &= check(f"glu inter={inter} M={M}", got, want, tol=1e-2)
+    return ok
+
+
 #: (name, n_q, n_kv, dh, KV groups, RoPE lanes, head norm, bias): each dense
 #: model's attention, with the KV groups `dense_kv_layout.for_model` gives it.
 DENSE = [
@@ -765,6 +828,7 @@ def main():
     ok &= _qkv_post(G, dev)
     ok &= _gqa_slab(G, dev)
     ok &= _gemm_w4a8(G, dev)
+    ok &= _codec_r(G, dev)
     ok &= _vision(G, dev)
 
     # --- rmsnorm, weighted and weightless ---
