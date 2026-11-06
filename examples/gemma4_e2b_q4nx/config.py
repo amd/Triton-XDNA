@@ -218,7 +218,9 @@ def load_q4nx(model=None, projections=True):
             q, o, gate, up, down          : bfloat16 [K, out]  (y = x @ W)
             k, v                          : bfloat16, ONLY where owns_kv(L)
             inp_gate, per_layer_projection, model_proj : bfloat16, the PLE trio
-        embed, per_layer_embed, final_norm, ple_proj_norm, lm_head, rope_freqs
+        embed_rows, ple_rows : ids -> those rows of the embedding tables
+        lm_head : () -> the dequantized LM head
+        final_norm, ple_proj_norm, rope_freqs
 
     Three things differ from every sibling loader and each is load-bearing:
 
@@ -300,7 +302,11 @@ def load_q4nx(model=None, projections=True):
 
     return dict(
         layers=layers,
-        embed=qm.embed_rows("model.embed_tokens.weight", np.arange(VOCAB)),
+        # Rows of the embedding table, gathered from the bundle, rather than
+        # the table: a turn reads a few hundred of its 262144 rows.
+        embed_rows=lambda ids: qm.embed_rows(
+            "model.embed_tokens.weight", np.asarray(ids)
+        ),
         # The per-layer embedding table is [VOCAB, 35, 256] -- 2.3 billion
         # entries, which is why it is a gather rather than a tensor. Returned
         # as a callable so the prompt's rows can be fetched at prefill time
@@ -310,7 +316,8 @@ def load_q4nx(model=None, projections=True):
         ).reshape(len(ids), N_LAYERS, PLI_D),
         final_norm=g["final_norm"].astype(np.float32),
         ple_proj_norm=g["ple_proj_norm"].astype(np.float32),
-        lm_head=qm.lm_head_rows(0, VOCAB),
+        # Called, not held: only a host forward or bf16 weights read it.
+        lm_head=lambda: qm.lm_head_rows(0, VOCAB),
         rope_freqs=qm.rope_freqs(),
         fingerprint=_fingerprint(src),
     )
@@ -321,10 +328,13 @@ def load_q4nx_packed(model=None):
 
     For the iGPU decode's W4A16 GEMV, which reads them in place. Returns
 
-        layers: list of 35 dicts of (uint8 array, N, K), y = W x with W [N, K]:
+        layers: list of 35 dicts of (read, N, K), y = W x with W [N, K], where
+                `read()` reads that matrix's uint8 chunks from the bundle --
+                on demand, so a caller can move one to the device before
+                reading the next rather than hold the whole model on the host:
             qkv     -- q|k|v where the layer owns its k/v, q alone otherwise
             o, gate_up, down
-        lm_head: (uint8 array, VOCAB, D)
+        lm_head: (read, VOCAB, D)
 
     The fusions match `Gemma4Prefill.load_weights` -- same members, same order
     -- so a decode can swap these in for its bf16 weights key for key. They
@@ -347,34 +357,36 @@ def load_q4nx_packed(model=None):
             raise RuntimeError(f"{name}: {nb} chunks is not a {N}x{K} Codec B matrix")
         return qm._raw(name, np.int16).view(np.uint8)
 
+    def cat(*parts):
+        return lambda: np.concatenate([raw(*a) for a in parts])
+
     layers = []
     for k in range(N_LAYERS):
         dq, dkv, inter = N_Q_HEADS * head_dim(k), N_KV_HEADS * head_dim(k), mlp_inter(k)
         p = f"model.layers.{k}."
-        qkv = [raw(p + "self_attn.q_proj.weight", dq, D)]
+        qkv = [(p + "self_attn.q_proj.weight", dq, D)]
         if owns_kv(k):
             qkv += [
-                raw(p + "self_attn.k_proj.weight", dkv, D),
-                raw(p + "self_attn.v_proj.weight", dkv, D),
+                (p + "self_attn.k_proj.weight", dkv, D),
+                (p + "self_attn.v_proj.weight", dkv, D),
             ]
         layers.append(
             dict(
-                qkv=(np.concatenate(qkv), dq + (2 * dkv if owns_kv(k) else 0), D),
-                o=(raw(p + "self_attn.o_proj.weight", D, dq), D, dq),
+                qkv=(cat(*qkv), dq + (2 * dkv if owns_kv(k) else 0), D),
+                o=(cat((p + "self_attn.o_proj.weight", D, dq)), D, dq),
                 gate_up=(
-                    np.concatenate(
-                        [
-                            raw(p + "mlp.gate_proj.weight", inter, D),
-                            raw(p + "mlp.up_proj.weight", inter, D),
-                        ]
+                    cat(
+                        (p + "mlp.gate_proj.weight", inter, D),
+                        (p + "mlp.up_proj.weight", inter, D),
                     ),
                     2 * inter,
                     D,
                 ),
-                down=(raw(p + "mlp.down_proj.weight", D, inter), D, inter),
+                down=(cat((p + "mlp.down_proj.weight", D, inter)), D, inter),
             )
         )
-    return dict(layers=layers, lm_head=(raw("lm_head.weight", VOCAB, D), VOCAB, D))
+    head = cat(("lm_head.weight", VOCAB, D))
+    return dict(layers=layers, lm_head=(head, VOCAB, D))
 
 
 def rope_lut(seq_len, layer_idx, rope_freqs=None, dtype=None):

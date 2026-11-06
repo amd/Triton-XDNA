@@ -40,15 +40,35 @@ def op_of(L):
     return "s" if C.is_sliding(L) else "f"
 
 
+def cache_layers():
+    """The layers that write the KV cache come first; this is how many.
+
+    From here on only the last position's row reaches anything -- the logits.
+    """
+    return next(
+        L
+        for L in range(C.N_LAYERS + 1)
+        if not any(map(C.owns_kv, range(L, C.N_LAYERS)))
+    )
+
+
 class NpuPrefill:
     """`build_dir` holds the `fused_prefill` and `lm` devices.
     `kv_store(L, r0, k, v)` takes each owning layer's K and V rows (float32
-    [t, dh], normed and roped)."""
+    [t, dh], normed and roped).
 
-    def __init__(self, build_dir, max_len=2048, kv_store=None):
+    `cache_only`: only fill the KV cache -- the layers before `cache_layers()`,
+    for every row -- and return no logits (unless a `tail` finishes the row),
+    for a caller whose NPU decoder runs the prompt's last token instead.
+    Neither the other layers' weights nor the head are loaded: on
+    Gemma4-E4B, 3.11 -> 1.57 GiB of NPU buffers.
+    """
+
+    def __init__(self, build_dir, max_len=2048, kv_store=None, cache_only=False):
         self.max_len, self.kv_store = max_len, kv_store
+        self.cache_only = cache_only
         self.fp = FusedProgram(build_dir, "fused_prefill")
-        self.lm = FusedProgram(build_dir, "lm")
+        self.lm = None if cache_only else FusedProgram(build_dir, "lm")
         self.on_layer = None
         #: `tail(x, pli, n, L0)`: given, the layers from `L0` on -- those that
         #: write no cache -- and the head are left to it, for the last row
@@ -59,7 +79,7 @@ class NpuPrefill:
         self.suspended = False
 
     def contexts(self):
-        return [self.fp.device, self.lm.device]
+        return [self.fp.device] + ([self.lm.device] if self.lm else [])
 
     def suspend(self):
         if not self.suspended:
@@ -85,7 +105,8 @@ class NpuPrefill:
     def load_weights(self, model=None):
         w = self.w = Gemma4Weights(model)
         self.sites = {}
-        for L in range(C.N_LAYERS):
+        n_layers = cache_layers() if self.cache_only else C.N_LAYERS
+        for L in range(n_layers):
             for name, (q, s, mn) in w.projections(L).items():
                 self._site(
                     f"{L}.{name}", q.shape[1], q.shape[0], G.pack_q4(q, s, mn), 1
@@ -114,25 +135,26 @@ class NpuPrefill:
                     self.fp.zeros((nblk, 2 * g.lkp * g.dh), bfloat16)
                     for _ in range(C.N_KV_HEADS)
                 ]
-        # The LM head device is LG.K deep; a wider model runs it on slices of
-        # its K, the last zero-padded, and adds their outputs.
-        self.lm_k = [(k0, min(k0 + LG.K, C.D)) for k0 in range(0, C.D, LG.K)]
-        q, sc, mn = w.lm_head(0, C.VOCAB)
-        self.lm_w, self.lm_x, self.lm_y = [], [], []
-        for k0, k1 in self.lm_k:
-            parts = [q, sc, mn] if C.D == LG.K else []
-            for a, g in ((q, 1), (sc, 32), (mn, 32))[len(parts) :]:
-                part = np.zeros((a.shape[0], LG.K // g), a.dtype)
-                part[:, : (k1 - k0) // g] = a[:, k0 // g : k1 // g]
-                parts.append(part)
-            lw = LG.pack(*parts)
-            del parts
-            self.lm_w.append(self.lm.empty(lw.shape, np.uint8))
-            self.lm_w[-1].host(write=True)[...] = lw
-            self.lm_x.append(self.lm.zeros(LG.K, bfloat16))
-            self.lm_y.append(self.lm.empty(LG.V, bfloat16))
-        del q, sc, mn
-        self.logits = np.empty(LG.V, np.float32)
+        if not self.cache_only:
+            # The LM head device is LG.K deep; a wider model runs it on slices of
+            # its K, the last zero-padded, and adds their outputs.
+            self.lm_k = [(k0, min(k0 + LG.K, C.D)) for k0 in range(0, C.D, LG.K)]
+            q, sc, mn = w.lm_head(0, C.VOCAB)
+            self.lm_w, self.lm_x, self.lm_y = [], [], []
+            for k0, k1 in self.lm_k:
+                parts = [q, sc, mn] if C.D == LG.K else []
+                for a, g in ((q, 1), (sc, 32), (mn, 32))[len(parts) :]:
+                    part = np.zeros((a.shape[0], LG.K // g), a.dtype)
+                    part[:, : (k1 - k0) // g] = a[:, k0 // g : k1 // g]
+                    parts.append(part)
+                lw = LG.pack(*parts)
+                del parts
+                self.lm_w.append(self.lm.empty(lw.shape, np.uint8))
+                self.lm_w[-1].host(write=True)[...] = lw
+                self.lm_x.append(self.lm.zeros(LG.K, bfloat16))
+                self.lm_y.append(self.lm.empty(LG.V, bfloat16))
+            del q, sc, mn
+            self.logits = np.empty(LG.V, np.float32)
 
     # ---- device buffers, one set per chunk so the chunks can be in flight
 
@@ -287,29 +309,23 @@ class NpuPrefill:
                 sn = np.empty((G.M, dh // 2), np.float32)
                 H.rope_table(inv, cs, sn, r0)
                 ropes[dh].append((cs, sn))
-        # From the first layer after which none writes the cache, only the
-        # last position's row reaches anything -- the logits -- so those layers
-        # run its chunk alone. It still attends every earlier key, and the NPU
-        # GEMMs take whole chunks, so this is one chunk a layer instead of all
-        # of them.
-        shared_from = next(
-            L
-            for L in range(C.N_LAYERS + 1)
-            if not any(map(C.owns_kv, range(L, C.N_LAYERS)))
-        )
+        # Every row through the layers that write the cache. After them, only
+        # the last position's row reaches anything -- the logits -- so the rest
+        # run its chunk alone (it still attends every earlier key; the NPU
+        # GEMMs take whole chunks, so one chunk a layer instead of all), or a
+        # `tail` runs them, or nothing does under `cache_only`.
+        shared_from = cache_layers()
+        for L in range(shared_from):
+            self.layer(L, x, pli, chunks, ropes)
+            if self.on_layer:
+                self.on_layer(L, x, pli)
         if self.tail is not None:
-            for L in range(shared_from):
-                self.layer(L, x, pli, chunks, ropes)
-                if self.on_layer:
-                    self.on_layer(L, x, pli)
             return self.tail(x[-1:], pli[-1], n, shared_from)
-        for L in range(C.N_LAYERS):
-            if L < shared_from:
-                self.layer(L, x, pli, chunks, ropes)
-            else:
-                self.layer(
-                    L, x, pli, chunks[-1:], {dh: r[-1:] for dh, r in ropes.items()}
-                )
+        if self.cache_only:
+            return None
+        last = {dh: r[-1:] for dh, r in ropes.items()}
+        for L in range(shared_from, C.N_LAYERS):
+            self.layer(L, x, pli, chunks[-1:], last)
             if self.on_layer:
                 self.on_layer(L, x, pli)
         if len(self.lm_k) == 1:

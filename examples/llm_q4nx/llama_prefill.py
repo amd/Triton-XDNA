@@ -134,6 +134,22 @@ def _keep_freed_blocks_in_heap():
         print("[prefill] mallopt refused the heap thresholds", flush=True)
 
 
+def release_freed_heap():
+    """Hand the heap's freed pages back to the OS, once, after loading.
+
+    `_keep_freed_blocks_in_heap` stops glibc doing it on its own, which is
+    right for the activations a forward allocates again on every call and
+    wrong for what loading weights frees: on Gemma4-E4B that stayed resident,
+    1-2 GiB of it.
+    """
+    import ctypes
+
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 class OpTimer:
     """Per-op wall-clock timer. Zero overhead when disabled.
 

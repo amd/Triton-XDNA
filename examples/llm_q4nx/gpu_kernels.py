@@ -231,6 +231,19 @@ _Q4K_S_OFF = 16.0
 _Q4K_R_OFF = 8.0
 
 
+def _chunks_to_r(c):
+    """Codec B chunks `[nb, 5120]` uint8 -> the same chunks in Codec R."""
+    nb = c.shape[0]
+    # scales and mins: [grp][g][r] -> [g][r][grp], i.e. [row][grp]
+    sm = c[:, :1024].reshape(nb, 2, 8, 2, 16, 2).permute(0, 1, 3, 4, 2, 5)
+    # byte (g, col, k) holds rows 16g + 2k (low) and 16g + 2k + 1 (high)
+    b = c[:, 1024:].reshape(nb, 2, 256, 8)
+    q = torch.stack([b & 0xF, b >> 4], -1).view(nb, 2, 256, 16)
+    q = q.permute(0, 1, 3, 2).reshape(nb, 32, 256)
+    nib = q[..., 0::2] | (q[..., 1::2] << 4)
+    return torch.cat([sm.reshape(nb, 1024), nib.reshape(nb, 4096)], 1)
+
+
 class Q4NXWeight:
     """A Codec B projection `[N, K]` (y = W x), kept packed on the device.
 
@@ -351,15 +364,14 @@ class Q4NXWeight:
         if self.codec != "b":
             raise ValueError(f"Codec R comes from codec 'b', this is {self.codec!r}")
         c = self.data.view(-1, Q4NX_CHUNK_BYTES)
-        nb = c.shape[0]
-        # scales and mins: [grp][g][r] -> [g][r][grp], i.e. [row][grp]
-        sm = c[:, :1024].view(nb, 2, 8, 2, 16, 2).permute(0, 1, 3, 4, 2, 5)
-        # byte (g, col, k) holds rows 16g + 2k (low) and 16g + 2k + 1 (high)
-        b = c[:, 1024:].view(nb, 2, 256, 8)
-        q = torch.stack([b & 0xF, b >> 4], -1).view(nb, 2, 256, 16)
-        q = q.permute(0, 1, 3, 2).reshape(nb, 32, 256)
-        nib = q[..., 0::2] | (q[..., 1::2] << 4)
-        out = torch.cat([sm.reshape(nb, 1024), nib.reshape(nb, 4096)], 1)
+        out = torch.empty_like(c)
+        # A slice of chunks at a time: the nibbles widen to a byte each on the
+        # way, which for the LM head at once was ~2 GB of temporaries. 16384
+        # chunks, 80 MB: past glibc's 32 MB mmap threshold, so the temporaries
+        # go back to the OS when freed rather than staying on the heap.
+        n = 16384
+        for i in range(0, c.shape[0], n):
+            out[i : i + n] = _chunks_to_r(c[i : i + n])
         return Q4NXWeight(out.reshape(-1), self.N, self.K, "r")
 
 
