@@ -50,6 +50,11 @@ class NpuPrefill:
         self.fp = FusedProgram(build_dir, "fused_prefill")
         self.lm = FusedProgram(build_dir, "lm")
         self.on_layer = None
+        #: `tail(x, pli, n, L0)`: given, the layers from `L0` on -- those that
+        #: write no cache -- and the head are left to it, for the last row
+        #: alone: `x` [1, D] f32 entering layer `L0`, `pli` that row's per-layer
+        #: inputs [N_LAYERS, PLI_D]. Returns the logits.
+        self.tail = None
         self.a, self.c, self.att = {}, {}, {}
         self.suspended = False
 
@@ -292,6 +297,12 @@ class NpuPrefill:
             for L in range(C.N_LAYERS + 1)
             if not any(map(C.owns_kv, range(L, C.N_LAYERS)))
         )
+        if self.tail is not None:
+            for L in range(shared_from):
+                self.layer(L, x, pli, chunks, ropes)
+                if self.on_layer:
+                    self.on_layer(L, x, pli)
+            return self.tail(x[-1:], pli[-1], n, shared_from)
         for L in range(C.N_LAYERS):
             if L < shared_from:
                 self.layer(L, x, pli, chunks, ropes)

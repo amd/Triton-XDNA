@@ -178,3 +178,20 @@ class Gemma4TritonFusedPrefill(Gemma4FusedPrefill):
     def load_weights(self, model=None):
         Gemma4Prefill.load_weights(self, model)
         self._fused.load_weights(model or self.model)
+
+    def finish_on_gpu(self, dec):
+        """Run the layers that write no cache, and the head, on the iGPU.
+
+        On the NPU they cost a whole chunk each for the one row the logits
+        need; `dec` (a `Gemma4GpuDecode` on this prefiller's slab) runs them as
+        decode steps. Gemma4-E4B, 86-token prompt: 207 -> 140 ms. `None` puts
+        them back on the NPU.
+        """
+        if dec is None:
+            self._fused.tail = None
+            return
+
+        def tail(x, pli, n, L0):
+            return dec.finish_prefill(x, pli, n, L0).float().cpu().numpy()
+
+        self._fused.tail = tail

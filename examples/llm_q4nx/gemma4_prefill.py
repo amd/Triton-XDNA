@@ -81,6 +81,7 @@ from config import (
     is_sliding,
     kv_source_layer,
     load_q4nx,
+    owns_kv,
     mlp_inter,
     rope_lut,
 )
@@ -1557,6 +1558,30 @@ class Gemma4GpuDecode:
         if FINAL_LOGIT_SOFTCAP:
             logits = gpu_kernels.logit_softcap(logits, FINAL_LOGIT_SOFTCAP)
         return logits
+
+    def finish_prefill(self, x, pli, N, L0):
+        """The rest of a prefill another device ran up to layer `L0`: layers
+        `L0..` for the last row and the head. Returns the logits, [VOCAB] f32.
+
+        `x` is that row entering `L0`, [1, D]; `pli` its per-layer inputs,
+        [n_layers, PLI_D]. Only for layers that write no cache, which is what
+        lets one row stand in for the prompt: the cache rows they attend are
+        the other device's, in the shared slab.
+        """
+        if not self._slab_shared:
+            raise RuntimeError("finishing a prefill reads the slab in place")
+        if any(map(owns_kv, range(L0, self.pf.n_layers))):
+            raise ValueError(f"a layer from {L0} on writes the cache")
+        with driver_scope("gpu"):
+            x = torch.as_tensor(x, dtype=torch.float32).to(self.dev).reshape(1, -1)
+            pli = torch.as_tensor(pli, dtype=torch.float32).to(self.dev)
+            h = self._norm(x, self.w[L0]["attn_norm"])
+            for L in range(L0, self.pf.n_layers):
+                x, h = self._last_row_layer(L, self.w[L], x, h, N, pli[L : L + 1])
+            logits = self._mm(h, self.lm_head)[0]
+            if FINAL_LOGIT_SOFTCAP:
+                logits = gpu_kernels.logit_softcap(logits, FINAL_LOGIT_SOFTCAP)
+            return logits
 
     def _last_row_layer(self, L, w, x, h, N, pli):
         """A KV-sharing layer of the prefill, for its last position only.
