@@ -15,6 +15,7 @@ import triton.language as tl
 
 C2 = 2 * (2 / 3.141592653589793) ** 0.5
 KG = 0.044715
+LOG2E = tl.constexpr(1.4426950408889634)
 
 #: rows per chunk, the core tile TM x TN and K step TK, and the mmul block
 M, TM, TN, TK, MM = 128, 32, 64, 128, 8
@@ -98,6 +99,7 @@ def mm_g(
     NT: tl.constexpr,
     C2: tl.constexpr,
     KG: tl.constexpr,
+    SILU: tl.constexpr,
 ):
     start = tl.program_id(0)
     num_tiles = N // TILE_N
@@ -214,9 +216,25 @@ def mm_g(
                 .to(tl.bfloat16, bitcast=True)
             )
             acc = tl.dot(a, b, acc)
-        y = (C2 * 0.5) * (acc + KG * acc * acc * acc)
-        y = tl.where(y > 10.0, 10.0, tl.where(y < -10.0, -10.0, y))
-        g = 0.5 * acc * (1.0 + tl.extra.cuda.libdevice.tanh(y))
+        if SILU:
+            # x sigmoid(x), as mlir-air's f32_to_bf16_silu_mn: 0.5 (1 +
+            # tanh(x / 2)) cancels for x << 0, so for a = |x| sigmoid(a) is
+            # taken that way and sigmoid(-a) as e^-a sigmoid(a). The cores'
+            # exp2 gives 2^n (1 + f) for 2^(n + f); a quadratic in the
+            # mantissa 1 + f scales it to 2^n 2^f.
+            neg = acc < 0.0
+            ax = tl.where(neg, -acc, acc)
+            h = 0.5 * ax
+            sp = 0.5 * (1.0 + tl.extra.cuda.libdevice.tanh(tl.where(h > 10.0, 10.0, h)))
+            e = tl.exp2(ax * -LOG2E).to(tl.bfloat16)
+            mb = (e.to(tl.int16, bitcast=True) & 0x7F) | 0x3F80
+            mf = mb.to(tl.bfloat16, bitcast=True).to(tl.float32)
+            corr = (0.225742 * mf - 0.666678) * mf + 1.434497
+            g = acc * tl.where(neg, e.to(tl.float32) * corr * sp, sp)
+        else:
+            y = (C2 * 0.5) * (acc + KG * acc * acc * acc)
+            y = tl.where(y > 10.0, 10.0, tl.where(y < -10.0, -10.0, y))
+            g = 0.5 * acc * (1.0 + tl.extra.cuda.libdevice.tanh(y))
         out = tl.where(act != 0.0, g, acc)
         tl.store(
             C + om[:, None] * stride_cm + on[None, :],
@@ -225,11 +243,11 @@ def mm_g(
         )
 
 
-def args(a, w, c, n, k, act, wq, k_pad=None):
+def args(a, w, c, n, k, act, wq, k_pad=None, silu=False):
     """w: uint8 packets, pack_q4's [N / 64, K / 128, 5120] if wq else
     pack_bf16's [N / 64, K / 32, 5120]; a: A tiled [M / 32, K / 128, 32, 128].
     Both may be padded with zeros to depth `k_pad`; only the first k of K is
-    read."""
+    read. With `silu` the activation is SiLU instead of GELU."""
     import torch
 
     k_pad = k_pad or k
@@ -255,4 +273,5 @@ def args(a, w, c, n, k, act, wq, k_pad=None):
         8,
         C2,
         KG,
+        bool(silu),
     )
