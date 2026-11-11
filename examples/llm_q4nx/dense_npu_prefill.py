@@ -227,10 +227,15 @@ class NpuPrefill:
         for c, (r0, t) in enumerate(chunks):
             H.rms_tile(rows[c], nm["input"], self.am(s.d, c), t, s.d, eps)
             qkv.append(self.gemm(f"{L}.qkv", c))
+        # every chunk's records before any chunk's attention: a chunk's
+        # records are written while no attention reads the buffer (a view of
+        # it spans all heads' blocks), so the host does not wait for the
+        # previous chunk's attention, and the attentions run back to back
+        for c, (r0, t) in enumerate(chunks):
+            self.kv_write(L, r0, t, qkv[c], nm.get("k_norm"), self._rope(op, r0))
         att = []
         for c, (r0, t) in enumerate(chunks):
             rope = self._rope(op, r0)
-            self.kv_write(L, r0, t, qkv[c], nm.get("k_norm"), rope)
             att.append(self.attention(L, op, c, r0, t, qkv[c], nm.get("q_norm"), rope))
         o = []
         for c, (r0, t) in enumerate(chunks):
@@ -286,8 +291,7 @@ class NpuPrefill:
         hg = s.heads // 2
         for i in (0, 1):
             DH.q_post(qkv, q_norm, rope, bufs[3 * i], t, i * hg, 1.0, self.eps)
-            # the records the chunk attends to on, so writing later ones
-            # does not wait for it
+            # the records the chunk attends to on
             bufs[3 * i + 1] = self.kvb[L][i][k0:]
         # the cores read K blocks in pairs; the one past the last is masked
         T.call_attention(s, op if s.window else "a", bufs, n + n % 2, q0, k0)
