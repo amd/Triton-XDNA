@@ -476,11 +476,16 @@ def _link(texts):
             if "sym_name" in op.attributes:
                 return str(op.attributes["sym_name"])
 
+        # each op numbered on its own: the same declaration prints the same
+        # whatever else its module holds
+        def asm(op):
+            return op.get_asm(print_generic_op_form=True, use_local_scope=True)
+
         for op in base.body.operations:
-            seen[key(op)] = op.get_asm(print_generic_op_form=True)
+            seen[key(op)] = asm(op)
         for m in mods[1:]:
             for op in list(m.body.operations):
-                k, text = key(op), op.get_asm(print_generic_op_form=True)
+                k, text = key(op), asm(op)
                 if k in seen:
                     if seen[k] != text:
                         raise ValueError(f"modules declare {k} differently")
