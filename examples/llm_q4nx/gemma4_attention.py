@@ -328,10 +328,11 @@ def _fill(text, keys):
     return text
 
 
-def render(nests):
+def render(nests, template=None):
     """The transform script for a kernel of several round loops, in program
     order: `nests` holds each loop's (suffix, group suffix, column suffix,
-    lkp, dh, dvt, transfers as `_keys` takes them).
+    lkp, dh, dvt, transfers as `_keys` takes them). `template` defaults to
+    SCHEDULE.
 
     The template's blocks, each closed by `// @end`: `// @each` is repeated
     for each loop, `// @single` and `// @multi` likewise but only for one loop
@@ -374,7 +375,8 @@ def render(nests):
         ]
 
     out, block, kind = [], [], None
-    for line in SCHEDULE.read_text().split("\n"):
+    template = Path(template or SCHEDULE)
+    for line in template.read_text().split("\n"):
         tag = line.strip()
         if tag.startswith("// @") and tag != "// @end":
             kind, block = tag[4:], []
@@ -395,7 +397,7 @@ def render(nests):
     text = "\n".join(out)
     left = re.search(r"\{(N|G|C|EACH:[^}]*|[A-Z0-9]+)\}", text)
     if left:
-        raise ValueError(f"unfilled {left.group(0)} in {SCHEDULE.name}")
+        raise ValueError(f"unfilled {left.group(0)} in {template.name}")
     return text
 
 

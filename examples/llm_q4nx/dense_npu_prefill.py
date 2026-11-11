@@ -17,6 +17,7 @@ the others.
 import numpy as np
 from ml_dtypes import bfloat16
 
+import dense_attention as DA
 import dense_host_kernels as DH
 import dense_triton_fused as T
 import gemma4_attention as A
@@ -261,11 +262,14 @@ class NpuPrefill:
         b0 = r0 // g.lkp
         kf, vf = (a[r0 : r0 + t] for a in self.kv[L])
         span = g.max_blocks * 2 * g.lkp * g.dh
+        # gemma4_attention's records for a model with windows, else
+        # dense_attention's (V whole)
+        dvt = A.dvt(s.dh) if s.window else DA.dvt(s.dh)
         for col in (0, 1):
             h = col * g.kv_heads
             DH.kv_post(
                 qkv, dq + h * s.dh, dq + dk + h * s.dh, k_norm, rope, kf, vf,
-                self.kvb[L][col][b0:], span, g.kv_heads, t, g.lkp, A.dvt(s.dh),
+                self.kvb[L][col][b0:], span, g.kv_heads, t, g.lkp, dvt,
                 self.eps, h * s.dh, s.dh,
             )  # fmt: skip
 

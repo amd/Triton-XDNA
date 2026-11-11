@@ -92,7 +92,7 @@ def main(dhs):
         hg, gq = heads // 2, heads // kvh
         k = rng.standard_normal((kvh, MAX_LEN, dh)).astype(bfloat16)
         v = rng.standard_normal((kvh, MAX_LEN, dh)).astype(bfloat16)
-        dvt = A.dvt(dh)
+        dvt = DA.dvt(dh)
         with tempfile.TemporaryDirectory() as d:
             nr = build(d, g, heads)
             prog = FusedProgram(d, "fused_prefill")
