@@ -941,16 +941,23 @@ def _gemm_q4r_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     GLU: tl.constexpr,
+    BT: tl.constexpr = 0,
 ):
     """bf16 `X [M, K] @ W^T` with each weight tile decoded to bf16 once per
-    `BM` rows and multiplied by bf16 `tl.dot`, f32 accumulation.
+    `BM + BT` rows and multiplied by bf16 `tl.dot`, f32 accumulation.
+
+    A program takes `BM` rows and, with `BT`, the `BT` rows after them as a
+    second, smaller block that reuses the decoded tile: 267 rows as 256 + 16
+    rather than 3 x 128 pads 5 rows instead of 117 and decodes each weight
+    tile once instead of three times.
 
     Under `GLU` the weight is a stacked gate|up `[2 * N, K]`: a program takes
     the same `BN` columns of both halves and writes `act(gate) * up`, bf16.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    offs_m = pid_m * BM + tl.arange(0, BM)
+    m0 = pid_m * (BM + BT)
+    offs_m = m0 + tl.arange(0, BM)
     mask_m = offs_m < M
     n = pid_n * BN + tl.arange(0, BN)
     xk = tl.arange(0, BK)
@@ -958,14 +965,30 @@ def _gemm_q4r_kernel(
     acc = tl.zeros((BM, BN), tl.float32)
     if GLU:
         acc_u = tl.zeros((BM, BN), tl.float32)
+    if BT:
+        offs_t = m0 + BM + tl.arange(0, BT)
+        mask_t = offs_t < M
+        acc_t = tl.zeros((BT, BN), tl.float32)
+        if GLU:
+            acc_tu = tl.zeros((BT, BN), tl.float32)
     for k0 in range(0, K, BK):
         x = tl.load(
             X + offs_m[:, None] * K + k0 + xk[None, :], mask=mask_m[:, None], other=0.0
         )
-        acc = tl.dot(x, tl.trans(_q4r_tile(W, n, k0, NBJ, BK)), acc)
+        w = tl.trans(_q4r_tile(W, n, k0, NBJ, BK))
+        acc = tl.dot(x, w, acc)
         if GLU:
-            up = _q4r_tile(W, N + n, k0, NBJ, BK)
-            acc_u = tl.dot(x, tl.trans(up), acc_u)
+            up = tl.trans(_q4r_tile(W, N + n, k0, NBJ, BK))
+            acc_u = tl.dot(x, up, acc_u)
+        if BT:
+            xt = tl.load(
+                X + offs_t[:, None] * K + k0 + xk[None, :],
+                mask=mask_t[:, None],
+                other=0.0,
+            )
+            acc_t = tl.dot(xt, w, acc_t)
+            if GLU:
+                acc_tu = tl.dot(xt, up, acc_tu)
     if GLU:
         acc = acc * tl.sigmoid(C2 * (acc + KC * acc * acc * acc)) * acc_u
     tl.store(
@@ -973,9 +996,48 @@ def _gemm_q4r_kernel(
         acc.to(C.dtype.element_ty),
         mask=mask_m[:, None],
     )
+    if BT:
+        if GLU:
+            acc_t = (
+                acc_t * tl.sigmoid(C2 * (acc_t + KC * acc_t * acc_t * acc_t)) * acc_tu
+            )
+        tl.store(
+            C + offs_t[:, None] * N + n[None, :],
+            acc_t.to(C.dtype.element_ty),
+            mask=mask_t[:, None],
+        )
 
 
-def _gemm_q4r(x, w, glu=False, act="gelu_tanh"):
+def _gemm_q4r_tiles(M, N, glu):
+    """`(BM, BT, BN, BK, num_warps)` for `_gemm_q4r_kernel`."""
+    # A tail block where it means decoding each weight tile fewer times: on
+    # gfx1152 a prefill's GEMMs at M = 267 took 385 ms as 3 x 128 rows and
+    # 290 as 256 + 16 (256 + 32 for the GLU). Elsewhere the tail cost more
+    # than it saved, outside the GLU once a program could not take all M
+    # rows. The GLU with a 16-row tail fell off a cliff (50-140 ms against
+    # 7), so it only gets 32.
+    groups = triton.cdiv(M, 128)
+    tails = (
+        ((128, 32), (256, 32)) if glu else ((128, 16), (128, 32), (256, 16), (256, 32))
+    )
+    fits = [
+        b
+        for b in tails
+        if triton.cdiv(M, sum(b)) < groups
+        and triton.cdiv(M, sum(b)) * sum(b) <= groups * 128
+        and (glu or sum(b) >= M)
+    ]
+    if fits:
+        BM, BT = min(fits, key=lambda b: triton.cdiv(M, sum(b)) * sum(b))
+        return BM, BT, 64 if N % 64 == 0 and not glu else 32, 32, 4
+    # Swept on gfx1152 at M = 276. A wide BM decodes each weight tile for more
+    # rows; the GLU's two accumulators want twice the warps.
+    BM = min(128, max(16, _pow2(M)))
+    BN = 128 if N % 128 == 0 else (64 if N % 64 == 0 else 32)
+    return BM, 0, BN, 32, 8 if glu else 4
+
+
+def _gemm_q4r(x, w, glu=False, act="gelu_tanh", tiles=None):
     # bf16 once here: converting an f32 tile on every K step of every column
     # tile made the GEMM 2-3x slower.
     x = x.reshape(x.shape[0], -1).to(torch.bfloat16).contiguous()
@@ -983,16 +1045,13 @@ def _gemm_q4r(x, w, glu=False, act="gelu_tanh"):
         raise ValueError(f"activation is {tuple(x.shape)}, weight K is {w.K}")
     M = x.shape[0]
     N = w.N // 2 if glu else w.N
-    # Swept on gfx1152 at M = 276. A wide BM decodes each weight tile for more
-    # rows; the GLU's two accumulators want twice the warps.
-    BM = min(128, max(16, _pow2(M)))
-    BN = 128 if N % 128 == 0 else (64 if N % 64 == 0 else 32)
+    BM, BT, BN, BK, warps = tiles or _gemm_q4r_tiles(M, N, glu)
     out = torch.empty(
         (M, N), dtype=torch.bfloat16 if glu else torch.float32, device=x.device
     )
-    _gemm_q4r_kernel[(triton.cdiv(M, BM), N // BN)](
+    _gemm_q4r_kernel[(triton.cdiv(M, BM + BT), N // BN)](
         x, w.data, out, M, N, w.K // Q4NX_COLS, *_ACT[act],
-        BM=BM, BN=BN, BK=32, GLU=glu, num_warps=8 if glu else 4, num_stages=1,
+        BM=BM, BN=BN, BK=BK, GLU=glu, BT=BT, num_warps=warps, num_stages=1,
     )  # fmt: skip
     return out
 
@@ -1723,26 +1782,6 @@ def matmul(x, w, block_m=64, block_n=64, block_k=64):
 
 
 @triton.jit
-def _clipped_tile(
-    A, B, offs_m, mask_m, n0, K, stride_am, stride_bk, lo, hi, BM, BN, BK
-):
-    """`clamp(A, lo, hi) @ B[:, n0:n0+BN]` for one row block, f32."""
-    offs_n = n0 + tl.arange(0, BN)
-    acc = tl.zeros((BM, BN), tl.float32)
-    for k0 in range(0, K, BK):
-        k = k0 + tl.arange(0, BK)
-        a = tl.load(
-            A + offs_m[:, None] * stride_am + k[None, :],
-            mask=mask_m[:, None],
-            other=0.0,
-        )
-        a = tl.minimum(tl.maximum(a.to(tl.float32), lo), hi).to(tl.bfloat16)
-        b = tl.load(B + k[:, None] * stride_bk + offs_n[None, :])
-        acc += tl.dot(a, b)
-    return acc
-
-
-@triton.jit
 def _matmul_clip_kernel(
     A,
     B,
@@ -1775,28 +1814,28 @@ def _matmul_clip_kernel(
     offs_m = pid_m * BM + tl.arange(0, BM)
     mask_m = offs_m < M
     offs_n = pid_n * BN + tl.arange(0, BN)
-    acc = _clipped_tile(
-        A, B, offs_m, mask_m, pid_n * BN, K, stride_am, stride_bk, lo, hi, BM, BN, BK
-    )
+    acc = tl.zeros((BM, BN), tl.float32)
+    if GLU:
+        u = tl.zeros((BM, BN), tl.float32)
+    # One loop for both halves, so the A tile is loaded and clamped once: a
+    # loop per half took 8.3 ms against 6.2 for the vision GLU at 2520
+    # patches on gfx1152.
+    for k0 in range(0, K, BK):
+        k = k0 + tl.arange(0, BK)
+        a = tl.load(
+            A + offs_m[:, None] * stride_am + k[None, :],
+            mask=mask_m[:, None],
+            other=0.0,
+        )
+        a = tl.minimum(tl.maximum(a.to(tl.float32), lo), hi).to(tl.bfloat16)
+        b = B + k[:, None] * stride_bk + offs_n[None, :]
+        acc = tl.dot(a, tl.load(b), acc)
+        if GLU:
+            u = tl.dot(a, tl.load(b + N), u)
     acc = tl.minimum(
         tl.maximum(acc, tl.load(OLO + offs_n)[None, :]), tl.load(OHI + offs_n)[None, :]
     )
     if GLU:
-        u = _clipped_tile(
-            A,
-            B,
-            offs_m,
-            mask_m,
-            N + pid_n * BN,
-            K,
-            stride_am,
-            stride_bk,
-            lo,
-            hi,
-            BM,
-            BN,
-            BK,
-        )
         u = tl.minimum(
             tl.maximum(u, tl.load(OLO + N + offs_n)[None, :]),
             tl.load(OHI + N + offs_n)[None, :],
@@ -1820,6 +1859,7 @@ def matmul_clip(
     block_n=256,
     block_k=64,
     num_warps=8,
+    num_stages=1,
 ):
     """`Gemma4ClippableLinear`: clamp the input, project, clamp the output.
 
@@ -1856,35 +1896,45 @@ def matmul_clip(
         BK=block_k,
         GLU=glu,
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=num_stages,
     )
     return out
 
 
 @triton.jit
-def _vision_qkv_kernel(QKV, QN, KN, LX, LY, Q, K, V, eps, NH: tl.constexpr):
-    """One patch and one head of the vision tower's q, k and v.
+def _vision_qkv_kernel(
+    QKV, QN, KN, LX, LY, Q, K, V, eps, NH: tl.constexpr, BH: tl.constexpr
+):
+    """One patch's q, k and v, every head at once.
 
-    Each is RMS-normed over the head's 64 lanes, q and k with their learned
+    Each head is RMS-normed over its 64 lanes, q and k with their learned
     weights and v with none. q and k then get the 2-D rotary: lanes 0-31 on
     the patch's x coordinate and lanes 32-63 on its y, each half rotating its
-    pairs `(i, i + 16)` against a `[cos16, sin16]` table row.
+    pairs `(i, i + 16)` against a `[cos16, sin16]` table row. A program per
+    head left most of each warp idle on 16-lane rows: 1.27 -> 0.43 ms a layer
+    at 2520 patches.
     """
     p = tl.program_id(0)
-    h = tl.program_id(1)
-    o = tl.arange(0, 16)
+    o = tl.arange(0, 16)[None, :]
+    h = tl.arange(0, BH)[:, None]
+    hm = h < NH
     cx = tl.load(LX + p * 32 + o)
     sx = tl.load(LX + p * 32 + 16 + o)
     cy = tl.load(LY + p * 32 + o)
     sy = tl.load(LY + p * 32 + 16 + o)
     for part in tl.static_range(3):
         src = QKV + p * (3 * NH * 64) + part * (NH * 64) + h * 64
-        x0 = tl.load(src + o).to(tl.float32)
-        x1 = tl.load(src + 16 + o).to(tl.float32)
-        x2 = tl.load(src + 32 + o).to(tl.float32)
-        x3 = tl.load(src + 48 + o).to(tl.float32)
-        ss = tl.sum(x0 * x0) + tl.sum(x1 * x1) + tl.sum(x2 * x2) + tl.sum(x3 * x3)
-        inv = 1.0 / tl.sqrt(ss / 64 + eps)
+        x0 = tl.load(src + o, mask=hm, other=0.0).to(tl.float32)
+        x1 = tl.load(src + 16 + o, mask=hm, other=0.0).to(tl.float32)
+        x2 = tl.load(src + 32 + o, mask=hm, other=0.0).to(tl.float32)
+        x3 = tl.load(src + 48 + o, mask=hm, other=0.0).to(tl.float32)
+        ss = (
+            tl.sum(x0 * x0, 1)
+            + tl.sum(x1 * x1, 1)
+            + tl.sum(x2 * x2, 1)
+            + tl.sum(x3 * x3, 1)
+        )
+        inv = (1.0 / tl.sqrt(ss / 64 + eps))[:, None]
         x0, x1, x2, x3 = x0 * inv, x1 * inv, x2 * inv, x3 * inv
         if part < 2:
             W = QN if part == 0 else KN
@@ -1895,10 +1945,10 @@ def _vision_qkv_kernel(QKV, QN, KN, LX, LY, Q, K, V, eps, NH: tl.constexpr):
             x0, x1 = x0 * cx - x1 * sx, x0 * sx + x1 * cx
             x2, x3 = x2 * cy - x3 * sy, x2 * sy + x3 * cy
         dst = (Q if part == 0 else (K if part == 1 else V)) + p * NH * 64 + h * 64
-        tl.store(dst + o, x0)
-        tl.store(dst + 16 + o, x1)
-        tl.store(dst + 32 + o, x2)
-        tl.store(dst + 48 + o, x3)
+        tl.store(dst + o, x0, mask=hm)
+        tl.store(dst + 16 + o, x1, mask=hm)
+        tl.store(dst + 32 + o, x2, mask=hm)
+        tl.store(dst + 48 + o, x3, mask=hm)
 
 
 def vision_qkv_post(qkv, q_norm, k_norm, lut_x, lut_y, n_heads, eps):
@@ -1910,7 +1960,7 @@ def vision_qkv_post(qkv, q_norm, k_norm, lut_x, lut_y, n_heads, eps):
         torch.empty((P, n_heads * 64), dtype=torch.float16, device=qkv.device)
         for _ in range(3)
     )
-    _vision_qkv_kernel[(P, n_heads)](
+    _vision_qkv_kernel[(P,)](
         qkv.contiguous(),
         q_norm,
         k_norm,
@@ -1921,6 +1971,8 @@ def vision_qkv_post(qkv, q_norm, k_norm, lut_x, lut_y, n_heads, eps):
         v,
         eps,
         NH=n_heads,
+        BH=_pow2(n_heads),
+        num_warps=2,
     )
     return q, k, v
 
@@ -2201,7 +2253,8 @@ def _attn_prefill_fa_kernel(
         s = tl.zeros((BM, BN), tl.float32)
         for c0 in tl.range(0, DH, DC, loop_unroll_factor=1):
             s = _fa_qk_slice(q_row, K, j, mask_t, mask_j, c0, dc, KS, s)
-        s = s * scale
+        # Scores in log2 units, for exp2: 3.75 -> 3.44 ms a vision layer.
+        s = s * (scale * 1.4426950408889634)
         keep = mask_j[None, :]
         if CAUSAL:
             keep = keep & (j[None, :] <= t[:, None])
@@ -2212,8 +2265,8 @@ def _attn_prefill_fa_kernel(
         # See `_attn_prefill_kernel`: a fully masked block leaves m_new at
         # -inf, and a finite stand-in keeps exp() from producing NaN.
         m_exp = tl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = tl.exp(m_i - m_exp)
-        p = tl.exp(s - m_exp[:, None])
+        alpha = tl.exp2(m_i - m_exp)
+        p = tl.exp2(s - m_exp[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         v = tl.load(V + j[:, None] * KS + d[None, :], mask=mask_j[:, None], other=0.0)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
