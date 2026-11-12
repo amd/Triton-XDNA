@@ -2253,7 +2253,8 @@ def _attn_prefill_fa_kernel(
         s = tl.zeros((BM, BN), tl.float32)
         for c0 in tl.range(0, DH, DC, loop_unroll_factor=1):
             s = _fa_qk_slice(q_row, K, j, mask_t, mask_j, c0, dc, KS, s)
-        s = s * scale
+        # Scores in log2 units, for exp2: 3.75 -> 3.44 ms a vision layer.
+        s = s * (scale * 1.4426950408889634)
         keep = mask_j[None, :]
         if CAUSAL:
             keep = keep & (j[None, :] <= t[:, None])
@@ -2264,8 +2265,8 @@ def _attn_prefill_fa_kernel(
         # See `_attn_prefill_kernel`: a fully masked block leaves m_new at
         # -inf, and a finite stand-in keeps exp() from producing NaN.
         m_exp = tl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = tl.exp(m_i - m_exp)
-        p = tl.exp(s - m_exp[:, None])
+        alpha = tl.exp2(m_i - m_exp)
+        p = tl.exp2(s - m_exp[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         v = tl.load(V + j[:, None] * KS + d[None, :], mask=mask_j[:, None], other=0.0)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
