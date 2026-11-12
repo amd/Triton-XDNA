@@ -56,7 +56,8 @@ from .fused_device import (
 class _Wave(int):
     """An int argument that stands for `a * wave + b`. Its int value is only
     what Triton specializes the kernel on, chosen to be neither 1 nor a
-    multiple of 16 so that no specialization assumes anything about it."""
+    multiple of 16 so that no specialization assumes anything about it;
+    `Superkernel.call` checks that none did."""
 
     def __new__(cls, a=1, b=0):
         w = int.__new__(cls, 7)
@@ -283,8 +284,24 @@ class Superkernel:
         runtime = [
             p.name for p, a in zip(params, args) if isinstance(a, (_Wave, Scalar))
         ]
+        for p, a in zip(params, args):
+            if p.is_constexpr and isinstance(a, (_Wave, Scalar)):
+                raise ValueError(
+                    f"{kernel.fn.__name__}: {p.name} is a constexpr, so it "
+                    f"cannot take {a!r}"
+                )
         with driver_scope("npu"), config_context(compile_only=True):
             c = kernel.warmup(*warm, grid=g, **(constexprs or {}))
+        # The run-time value replaces the traced one, so the kernel must not
+        # have been specialized on it.
+        for i, p in enumerate(params):
+            if p.name in runtime and (
+                c.src.signature[p.name] != "i32" or c.src.attrs.get((i,))
+            ):
+                raise ValueError(
+                    f"{kernel.fn.__name__}: Triton specialized {p.name} as "
+                    f"{c.src.signature[p.name]} {c.src.attrs.get((i,))}"
+                )
         with config_context(transform_tiling_script=transform_script):
             m = _ttshared_to_air(c.asm["ttsharedir"], *g)
         _bind_ints(m, kernel, warm, keep=runtime)

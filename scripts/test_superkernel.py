@@ -240,6 +240,13 @@ def error_checks(Superkernel, scale, add, sub, script, proj):
         check(False, "a call outside sk.cores is an error")
     except ValueError as e:
         check("sk.cores" in str(e), f"call outside cores: {e}")
+    try:
+        with sk.wave():
+            with sk.cores((2, 2), "a"):
+                add[(1,)](x, x, h, WAVE, DP)
+        check(False, "WAVE for a constexpr is an error")
+    except ValueError as e:
+        check("is a constexpr" in str(e), f"WAVE for a constexpr: {e}")
 
     sk = Superkernel("bad_phases", proj, WAVES)
     x = sk.ddr("x", D, torch.bfloat16)
