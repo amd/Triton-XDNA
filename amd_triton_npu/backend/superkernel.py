@@ -38,7 +38,7 @@ import functools
 import os
 import re
 
-from .arg_access import written_args
+from .arg_access import read_args, written_args
 from .config import config_context
 from .driver import _aircc_compile, _ttshared_to_air, detect_npu_version
 from .driver_scope import driver_scope
@@ -151,11 +151,35 @@ class _Call:
     """One traced call: its kernel, its compiled AIR module and how the
     module's func arguments bind to the superkernel's tensors and ints."""
 
-    def __init__(self, kernel, grid, args, at, herd, air, binds, written):
+    def __init__(self, kernel, grid, args, at, herd, air, binds, read, written):
         self.kernel, self.grid, self.args = kernel, grid, args
         self.at, self.herd, self.air = at, herd, air
         self.binds = binds  # per func argument: a Tensor, _Wave or Scalar
+        self.read = read  # the tensors the call reads
         self.written = written  # the tensors the call writes
+
+
+def _check_phase_order(calls, g):
+    """Reject phases `g` that cannot all run where the first one is traced.
+    The phase loop runs every phase at that point, ahead of the calls traced
+    between the phases; a DDR buffer that such a call writes must not be
+    used by a later phase, nor one it reads be written by a later phase."""
+    at = [next(i for i, c in enumerate(calls) if c is x) for x in g]
+    for k in range(1, len(g)):
+        for c in calls[at[k - 1] + 1 : at[k]]:
+            if any(c is x for x in g):
+                continue
+            for later in g[k:]:
+                uses = later.read + later.written
+                clash = [t for t in c.written if not t.onchip and t in uses]
+                clash += [t for t in c.read if not t.onchip and t in later.written]
+                if clash:
+                    raise ValueError(
+                        f"herd {g[0].herd}: a later phase uses {clash[0]}, "
+                        f"which {c.kernel.fn.__name__}, traced between the "
+                        "phases, also accesses; the phase loop would run "
+                        "that phase before it"
+                    )
 
 
 class Superkernel:
@@ -252,17 +276,9 @@ class Superkernel:
         `later` lists on-chip tensors the call reads that a later call in
         the wave writes. Reading an on-chip tensor that no earlier call has
         written is an error otherwise."""
-        import torch
-
         g = tuple(grid) + (1,) * (3 - len(grid))
-        warm = [
-            (
-                torch.zeros(a.n, dtype=a.dtype)
-                if isinstance(a, Tensor)
-                else int(a) if isinstance(a, (_Wave, Scalar)) else a
-            )
-            for a in args
-        ]
+        # Warmup only needs a tensor's dtype and alignment, which Tensor has.
+        warm = [int(a) if isinstance(a, (_Wave, Scalar)) else a for a in args]
         params = list(kernel.params)
         runtime = [
             p.name for p, a in zip(params, args) if isinstance(a, (_Wave, Scalar))
@@ -292,11 +308,15 @@ class Superkernel:
         w = written_args(c.asm["ttir"], names)
         if w is None:
             raise ValueError(f"{kernel.fn.__name__}: can't tell what it writes")
-        written = [a for p, a in plain if p.name in w and isinstance(a, Tensor)]
-        for t in (a for a in args if isinstance(a, Tensor)):
+        r = read_args(c.asm["ttir"], names)
+        if r is None:  # every pointer argument may be read
+            r = set(names)
+        tensors = [(p, a) for p, a in plain if isinstance(a, Tensor)]
+        written = [a for p, a in tensors if p.name in w]
+        read = [a for p, a in tensors if p.name in r]
+        for t in read:
             if (
                 t.onchip
-                and t not in written
                 and not any(t is x for x in later)
                 and not any(t in c.written for c in self.calls)
             ):
@@ -307,7 +327,7 @@ class Superkernel:
         for c2 in self.calls:
             if c2.herd == herd and c2.at != tuple(at):
                 raise ValueError(f"herd {herd} placed at {c2.at} and {at}")
-        call = _Call(kernel, g, args, tuple(at), herd, str(m), binds, written)
+        call = _Call(kernel, g, args, tuple(at), herd, str(m), binds, read, written)
         self.calls.append(call)
 
     def _phases(self):
@@ -323,6 +343,7 @@ class Superkernel:
             body = re.sub(r"%[\w.]+", "%v", re.sub(r"\d+", "N", c.air))
             groups.setdefault((c.herd, body), []).append(c)
         for g in groups.values():
+            _check_phase_order(self.calls, g)
             for i in range(len(g[0].binds)):
                 vals = [c.binds[i] for c in g]
                 if all(v is vals[0] for v in vals) or all(
@@ -890,6 +911,9 @@ def _core_packet_out(module, loop, d, per, dst_pattern, name):
     l1 = w.opview.src
     if _space(l1) != 2 or w.attributes["static_src_sizes"] != DenseI64ArrayAttr.get([]):
         return False
+    # The 32-bit packet header takes the two elements before the payload.
+    if str(MemRefType(l1.type).element_type) not in ("bf16", "f16", "i16"):
+        return False
     bufs = []
     for b in per:
         if not any(b == x for x in bufs):
@@ -1409,6 +1433,9 @@ def _phase_numbers(seg, others):
 
     mine = _walk(seg)
     theirs = [_walk(_ops_named(_entry(m), "air.segment")[0]) for m in others]
+    wiring = _wiring(mine)
+    if any(len(t) != len(mine) or _wiring(t) != wiring for t in theirs):
+        raise ValueError("the phases of a herd differ in their structure")
     diffs = []
     for k, (op, in_herd) in enumerate(mine):
         peers = [t[k][0] for t in theirs]
@@ -1452,6 +1479,28 @@ def _phase_numbers(seg, others):
         ):
             raise ValueError(f"the phases of a herd differ in {op.name}")
     return diffs
+
+
+def _wiring(ops):
+    """For each op of `ops` (as _walk lists them), where each operand comes
+    from: the position of its defining op and the result number, or the
+    position of the op owning its block and the argument number (-1 for ops
+    outside `ops`)."""
+    from air.ir import BlockArgument, OpResult
+
+    pos = {op.operation: k for k, (op, _) in enumerate(ops)}
+    out = []
+    for op, _ in ops:
+        keys = []
+        for v in op.operands:
+            if isinstance(v, OpResult):
+                keys.append(("r", pos.get(v.owner.operation, -1), v.result_number))
+            elif isinstance(v, BlockArgument):
+                keys.append(("a", pos.get(v.owner.owner.operation, -1), v.arg_number))
+            else:
+                keys.append(("?", -1, -1))
+        out.append(keys)
+    return out
 
 
 def _phase_value(vals, ph, type_):

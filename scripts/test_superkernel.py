@@ -12,7 +12,7 @@ module it lowers to, then compiles it and runs it on the NPU against numpy:
           phase writing a different on-chip tensor
   table   a per-wave `Table` argument and a host-set `Scalar`
 
-Also checks the errors tracing reports. Needs an npu2 device for the runs;
+Also checks the errors tracing and lowering report. Needs an npu2 device for the runs;
 with no NPU only the IR checks run.
 """
 
@@ -95,7 +95,14 @@ def kernels():
         m = i < D
         tl.store(Z + i, tl.load(X + i, mask=m) + tl.load(Y + i, mask=m), mask=m)
 
-    return scale, add
+    @triton.jit
+    def sub(X, Y, Z, D: tl.constexpr, DP: tl.constexpr, SWAP: tl.constexpr):
+        i = tl.arange(0, DP)
+        m = i < D
+        a, b = tl.load(X + i, mask=m), tl.load(Y + i, mask=m)
+        tl.store(Z + i, b - a if SWAP else a - b, mask=m)
+
+    return scale, add, sub
 
 
 def bf(a):
@@ -203,8 +210,9 @@ def ir_checks(name, text):
         check("arith.select" in text, "table: per-wave values selected")
 
 
-def error_checks(Superkernel, scale, add, script, proj):
+def error_checks(Superkernel, scale, add, sub, script, proj):
     import torch
+    from triton.backends.amd_triton_npu.superkernel import WAVE
 
     sk = Superkernel("bad", proj, WAVES)
     x = sk.ddr("x", D, torch.bfloat16)
@@ -249,6 +257,57 @@ def error_checks(Superkernel, scale, add, script, proj):
         check(False, "phases reading different on-chip tensors are rejected")
     except ValueError as e:
         check("not supported" in str(e), f"phases with different inputs: {e}")
+
+    sk = Superkernel("bad_in_place", proj, WAVES)
+    x = sk.ddr("x", D, torch.bfloat16)
+    h = sk.onchip("h", D, torch.bfloat16)
+    sk.schedule(add, script)
+    try:
+        with sk.wave():
+            with sk.cores((2, 2), "a"):
+                add[(1,)](h, x, h, D, DP)
+        check(False, "a call reading the on-chip tensor it writes first is an error")
+    except ValueError as e:
+        check("before any call writes it" in str(e), f"in-place first write: {e}")
+
+    sk = Superkernel("bad_order", proj, WAVES)
+    x = sk.ddr("x", D, torch.bfloat16)
+    w = sk.ddr("w", 2 * WAVES * D, torch.bfloat16)
+    h0, h1 = (sk.onchip(n, D, torch.bfloat16) for n in ("h0", "h1"))
+    sk.schedule(scale, script)
+    sk.schedule(add, script)
+    with sk.wave():
+        with sk.cores((2, 2), "s"):
+            scale[(1,)](x, w, h0, WAVE * 2, D, DP)
+        with sk.cores((3, 2), "a"):
+            add[(1,)](x, h0, x, D, DP)
+        with sk.cores((2, 2), "s"):
+            scale[(1,)](x, w, h1, WAVE * 2 + 1, D, DP)
+        with sk.cores((4, 2), "b"):
+            add[(1,)](x, h1, x, D, DP)
+    try:
+        sk.module_text()
+        check(False, "phases that would run before a call they depend on")
+    except ValueError as e:
+        check("traced between the phases" in str(e), f"phase order: {e}")
+
+    sk = Superkernel("bad_wiring", proj, WAVES)
+    x = sk.ddr("x", D, torch.bfloat16)
+    y = sk.ddr("y", D, torch.bfloat16)
+    o0, o1 = (sk.onchip(n, D, torch.bfloat16) for n in ("o0", "o1"))
+    sk.schedule(sub, script)
+    sk.schedule(add, script)
+    with sk.wave():
+        with sk.cores((2, 2), "d"):
+            sub[(1,)](x, y, o0, D, DP, False)
+            sub[(1,)](x, y, o1, D, DP, True)
+        with sk.cores((3, 2), "a"):
+            add[(1,)](o0, o1, x, D, DP)
+    try:
+        sk.module_text()
+        check(False, "phases computing different things share one core body")
+    except ValueError as e:
+        check("differ" in str(e), f"phases with other operand order: {e}")
 
 
 def run(name, sk, xclbin, header, ref, rt):
@@ -298,13 +357,13 @@ def main():
         npu = False
     os.environ.setdefault("AMD_TRITON_NPU_TARGET", "npu2")
 
-    scale, add = kernels()
+    scale, add, sub = kernels()
     with tempfile.TemporaryDirectory() as tmp:
         script = os.path.join(tmp, "elementwise.mlir")
         with open(script, "w") as f:
             f.write(ELEMENTWISE)
         with config_context(bf16_emulation=False):
-            error_checks(Superkernel, scale, add, script, os.path.join(tmp, "bad"))
+            error_checks(Superkernel, scale, add, sub, script, os.path.join(tmp, "bad"))
             for name, build, rt in (
                 ("chain", chain, ()),
                 ("phases", phases, ()),
