@@ -548,13 +548,14 @@ def _codec_r(G, dev):
     ):
         w = _random_q4nx(G, N, K, "cpu").to_codec_r().to(dev)
         wf = G.dequant_q4nx(w).to(torch.bfloat16).float()
-        for M in (1, 37, 128, 276):
+        # 140, 267, 450: row blocks with a tail block (`_gemm_q4r_tiles`).
+        for M in (1, 37, 128, 140, 267, 276, 450):
             x = torch.randn(M, K, device=dev)
             ref = x.to(torch.bfloat16).float() @ wf
             ok &= check(f"gemm K={K} N={N} M={M}", G.gemm_w4a8(x, w), ref, tol=1e-4)
     for inter in (2048, 6144):
         w = _random_q4nx(G, 2 * inter, D, "cpu").to_codec_r().to(dev)
-        for M in (1, 37, 276):
+        for M in (1, 37, 160, 267, 276):
             x = torch.randn(M, D, device=dev)
             gu = G.gemm_w4a8(x, w)
             want = G.geglu(gu[:, :inter], gu[:, inter:]).view(M, inter)

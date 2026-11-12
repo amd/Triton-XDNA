@@ -516,13 +516,13 @@ class Gemma4GpuVisionTower:
     `trace` is not supported.
     """
 
-    #: `matmul_clip` tiles per projection, tuned at the default image size
-    #: with bf16 inputs.
+    #: `matmul_clip` tiles per projection, tuned on gfx1152 (Radeon 860M)
+    #: at 2520 patches (a 280-token budget) with bf16 inputs.
     TILES = {
-        "qkv": dict(block_m=64, block_n=256, block_k=64, num_warps=8),
-        "o": dict(block_m=64, block_n=256, block_k=64, num_warps=8),
-        "gate_up": dict(block_m=64, block_n=256, block_k=32, num_warps=8),
-        "down": dict(block_m=64, block_n=256, block_k=64, num_warps=8),
+        "qkv": dict(block_m=64, block_n=256, block_k=32, num_warps=4),
+        "o": dict(block_m=64, block_n=128, block_k=64, num_warps=4, num_stages=2),
+        "gate_up": dict(block_m=64, block_n=128, block_k=32, num_warps=4),
+        "down": dict(block_m=64, block_n=128, block_k=64, num_warps=4, num_stages=2),
     }
 
     def __init__(self, weights=None, model=None, device="cuda"):
