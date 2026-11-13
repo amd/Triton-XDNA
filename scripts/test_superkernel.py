@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Superkernels: several Triton kernels in one dispatch that loops over waves.
+"""Superkernels: one @triton.jit function that runs kernels side by side on
+the NPU, wave after wave (`tl.extra.npu.spatial`).
 
-Each case traces a wave of one-core elementwise kernels, checks the AIR
-module it lowers to, then compiles it and runs it on the NPU against numpy:
+Each case checks the AIR module its superkernel lowers to, then launches it
+on the NPU and compares with numpy:
 
-  chain   a call writes an on-chip tensor that the next call reads, and a
-          DDR buffer is updated in place every wave
-  phases  two calls of one kernel on one herd become a phase loop, each
-          phase writing a different on-chip tensor
-  table   a per-wave `Table` argument and a host-set `Scalar`
+  chain      one partition writes an L2 buffer that the other reads, and a
+             DDR buffer is updated in place every wave
+  phases     a partition calls one kernel twice per wave, writing two L2
+             buffers: a loop over phases
+  table      an int per wave from `npu.table`, and an int argument set by
+             the host
+  multicore  a partition on two cores, its schedule given the core count
 
-Also checks the errors tracing and lowering report. Needs an npu2 device for the runs;
-with no NPU only the IR checks run.
+Also checks the errors reading a superkernel reports. Needs an npu2 device
+for the runs; with no NPU only the IR checks run.
 """
 
 from __future__ import annotations
@@ -23,14 +26,28 @@ import re
 import sys
 import tempfile
 
-D, DP = 1536, 2048  # vector length, and the power of two it is padded to
-WAVES = 4
+try:
+    import torch
+    import triton
+    import triton.language as tl
+    from triton.language.extra import npu
+except ImportError as e:
+    print(f"SKIP: {e}")
+    sys.exit(77)
 
-# The vector-add schedule with the whole vector on one core.
+D, DP = 1536, 2048  # vector length, and the power of two it is padded to
+# A vector the two cores of the multicore case split evenly: an L2 buffer only
+# holds a masked vector's valid elements.
+D2 = 2048
+WAVES = 4
+ROWS = (3, 0, 2, 1)
+
+# The vector-add schedule, on as many cores as the partition is given.
 ELEMENTWISE = """
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(
-      %arg1: !transform.any_op {transform.readonly}) {
+      %arg1: !transform.any_op {transform.readonly},
+      %cores: !transform.param<i64>) {
     %op = transform.structured.match ops{["linalg.generic"]} in %arg1
         : (!transform.any_op) -> !transform.any_op
     %flat = transform.structured.flatten_elementwise %op
@@ -41,8 +58,9 @@ module attributes {transform.with_named_sequence} {
     %op1 = transform.structured.match ops{["linalg.generic"]} in %arg1
         : (!transform.any_op) -> !transform.any_op
     %tiled, %forall = transform.structured.tile_using_forall %op1
-        num_threads [1] (mapping = [#gpu.thread<x>])
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+        num_threads [%cores] (mapping = [#gpu.thread<x>])
+        : (!transform.any_op, !transform.param<i64>)
+        -> (!transform.any_op, !transform.any_op)
     transform.include @canonicalize_with_cse failures(propagate)
         (%arg1) : (!transform.any_op) -> ()
     transform.include @pad_and_promote_binary_bf16 failures(propagate)
@@ -62,8 +80,6 @@ module attributes {transform.with_named_sequence} {
 }
 """
 
-AIRCC_ARGS = ("--air-channel-multiplexing=L1", "--omit-ping-pong-transform=L1")
-
 failures = 0
 
 
@@ -73,36 +89,193 @@ def check(ok, what):
     failures += not ok
 
 
-def skip(msg):
-    print(f"SKIP: {msg}")
-    sys.exit(77)
+@triton.jit
+def scale(X, W, Y, row, D: tl.constexpr, DP: tl.constexpr):
+    i = tl.arange(0, DP)
+    m = i < D
+    x = tl.load(X + i, mask=m)
+    tl.store(Y + i, x * tl.load(W + row * D + i, mask=m), mask=m)
 
 
-def kernels():
-    import triton
-    import triton.language as tl
+@triton.jit
+def add(X, Y, Z, D: tl.constexpr, DP: tl.constexpr):
+    i = tl.arange(0, DP)
+    m = i < D
+    tl.store(Z + i, tl.load(X + i, mask=m) + tl.load(Y + i, mask=m), mask=m)
 
-    @triton.jit
-    def scale(X, W, Y, row, D: tl.constexpr, DP: tl.constexpr):
-        i = tl.arange(0, DP)
-        m = i < D
-        x = tl.load(X + i, mask=m)
-        tl.store(Y + i, x * tl.load(W + row * D + i, mask=m), mask=m)
 
-    @triton.jit
-    def add(X, Y, Z, D: tl.constexpr, DP: tl.constexpr):
-        i = tl.arange(0, DP)
-        m = i < D
-        tl.store(Z + i, tl.load(X + i, mask=m) + tl.load(Y + i, mask=m), mask=m)
+@triton.jit
+def sub(X, Y, Z, D: tl.constexpr, DP: tl.constexpr, SWAP: tl.constexpr):
+    i = tl.arange(0, DP)
+    m = i < D
+    a, b = tl.load(X + i, mask=m), tl.load(Y + i, mask=m)
+    tl.store(Z + i, b - a if SWAP else a - b, mask=m)
 
-    @triton.jit
-    def sub(X, Y, Z, D: tl.constexpr, DP: tl.constexpr, SWAP: tl.constexpr):
-        i = tl.arange(0, DP)
-        m = i < D
-        a, b = tl.load(X + i, mask=m), tl.load(Y + i, mask=m)
-        tl.store(Z + i, b - a if SWAP else a - b, mask=m)
 
-    return scale, add, sub
+@triton.jit
+def chain(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
+    h = npu.allocate_l2([D], tl.bfloat16)
+    for wave in range(NW):
+        npu.spatial(
+            [(scale, (X, W, h, wave, D, DP)), (add, (X, h, X, D, DP))],
+            cores=[1, 1],
+            schedules=[S, S],
+        )
+
+
+@triton.jit
+def scale_twice(X, W, h0, h1, wave, D: tl.constexpr, DP: tl.constexpr):
+    hs = (h0, h1)
+    for p in tl.static_range(2):
+        scale(X, W, hs[p], wave * 2 + p, D, DP)
+
+
+@triton.jit
+def phases(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
+    h0 = npu.allocate_l2([D], tl.bfloat16)
+    h1 = npu.allocate_l2([D], tl.bfloat16)
+    for wave in range(NW):
+        npu.spatial(
+            [(scale_twice, (X, W, h0, h1, wave, D, DP)), (add, (h0, h1, X, D, DP))],
+            cores=[1, 1],
+            schedules=[S, S],
+        )
+
+
+@triton.jit(do_not_specialize=["k"])
+def table(
+    X,
+    W,
+    k,
+    NW: tl.constexpr,
+    D: tl.constexpr,
+    DP: tl.constexpr,
+    S: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    h = npu.allocate_l2([D], tl.bfloat16)
+    for wave in range(NW):
+        npu.spatial(
+            [
+                (scale, (X, W, h, npu.table(ROWS, wave), D, DP)),
+                (scale, (h, W, X, k, D, DP)),
+            ],
+            cores=[1, 1],
+            schedules=[S, S],
+        )
+
+
+@triton.jit
+def multicore(
+    X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
+):
+    h = npu.allocate_l2([D], tl.bfloat16)
+    for wave in range(NW):
+        npu.spatial(
+            [(scale, (X, W, h, wave, D, DP)), (add, (X, h, X, D, DP))],
+            cores=[1, 2],
+            schedules=[S, S],
+        )
+
+
+# Superkernels that reading rejects.
+
+
+@triton.jit
+def unwritten(X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
+    h = npu.allocate_l2([D], tl.bfloat16)
+    for wave in range(NW):
+        npu.spatial([(add, (h, X, X, D, DP))], cores=[1], schedules=[S])
+
+
+@triton.jit
+def overlap(X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
+    for wave in range(NW):
+        npu.spatial(
+            [(add, (X, X, X, D, DP)), (add, (X, X, X, D, DP))],
+            cores=[2, 1],
+            schedules=[S, S],
+            at=[(2, 2), (3, 2)],
+        )
+
+
+@triton.jit
+def two_steps(X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
+    for wave in range(NW):
+        npu.spatial([(add, (X, X, X, D, DP))], cores=[1], schedules=[S])
+        npu.spatial([(add, (X, X, X, D, DP))], cores=[1], schedules=[S])
+
+
+@triton.jit
+def wave_and_scalar(
+    X, W, k, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
+):
+    for wave in range(NW):
+        npu.spatial([(scale, (X, W, X, wave + k, D, DP))], cores=[1], schedules=[S])
+
+
+@triton.jit
+def read_two(X, h0, h1, o, D: tl.constexpr, DP: tl.constexpr):
+    add(h0, X, o, D, DP)
+    add(h1, X, o, D, DP)
+
+
+@triton.jit
+def phased_inputs(
+    X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
+):
+    h0 = npu.allocate_l2([D], tl.bfloat16)
+    h1 = npu.allocate_l2([D], tl.bfloat16)
+    o = npu.allocate_l2([D], tl.bfloat16)
+    for wave in range(NW):
+        npu.spatial(
+            [
+                (scale_twice, (X, X, h0, h1, wave, D, DP)),
+                (read_two, (X, h0, h1, o, D, DP)),
+                (add, (o, X, X, D, DP)),
+            ],
+            cores=[1, 1, 1],
+            schedules=[S, S, S],
+        )
+
+
+@triton.jit
+def interleaved(X, W, h0, h1, wave, D: tl.constexpr, DP: tl.constexpr):
+    scale(X, W, h0, wave * 2, D, DP)
+    add(X, h0, X, D, DP)
+    scale(X, W, h1, wave * 2 + 1, D, DP)
+
+
+@triton.jit
+def phase_order(
+    X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
+):
+    h0 = npu.allocate_l2([D], tl.bfloat16)
+    h1 = npu.allocate_l2([D], tl.bfloat16)
+    for wave in range(NW):
+        npu.spatial(
+            [(interleaved, (X, W, h0, h1, wave, D, DP)), (add, (X, h1, X, D, DP))],
+            cores=[1, 1],
+            schedules=[S, S],
+        )
+
+
+@triton.jit
+def both_ways(X, Y, o0, o1, D: tl.constexpr, DP: tl.constexpr):
+    sub(X, Y, o0, D, DP, False)
+    sub(X, Y, o1, D, DP, True)
+
+
+@triton.jit
+def wiring(X, Y, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
+    o0 = npu.allocate_l2([D], tl.bfloat16)
+    o1 = npu.allocate_l2([D], tl.bfloat16)
+    for wave in range(NW):
+        npu.spatial(
+            [(both_ways, (X, Y, o0, o1, D, DP)), (add, (o0, o1, X, D, DP))],
+            cores=[1, 1],
+            schedules=[S, S],
+        )
 
 
 def bf(a):
@@ -114,80 +287,53 @@ def bf(a):
     return u.view(np.float32)
 
 
-def chain(sk, scale, add, script):
-    import torch
-    from triton.backends.amd_triton_npu.superkernel import WAVE
-
-    x = sk.ddr("x", D, torch.bfloat16)
-    w = sk.ddr("w", WAVES * D, torch.bfloat16)
-    h = sk.onchip("h", D, torch.bfloat16)
-    sk.schedule(scale, script)
-    sk.schedule(add, script)
-    with sk.wave():
-        with sk.cores((2, 2), "scale"):
-            scale[(1,)](x, w, h, WAVE, D, DP)
-        with sk.cores((3, 2), "add"):
-            add[(1,)](x, h, x, D, DP)
-
-    def ref(x, b, rt):
-        for l in range(WAVES):
-            x = bf(x + bf(x * b["w"][l]))
-        return x
-
-    return ref
+def ref_chain(x, w):
+    w = w.reshape(-1, x.size)
+    for l in range(WAVES):
+        x = bf(x + bf(x * w[l]))
+    return x
 
 
-def phases(sk, scale, add, script):
-    import torch
-    from triton.backends.amd_triton_npu.superkernel import WAVE
-
-    x = sk.ddr("x", D, torch.bfloat16)
-    w = sk.ddr("w", 2 * WAVES * D, torch.bfloat16)
-    h0 = sk.onchip("h0", D, torch.bfloat16)
-    h1 = sk.onchip("h1", D, torch.bfloat16)
-    sk.schedule(scale, script)
-    sk.schedule(add, script)
-    with sk.wave():
-        with sk.cores((2, 2), "scale"):
-            scale[(1,)](x, w, h0, WAVE * 2, D, DP)
-            scale[(1,)](x, w, h1, WAVE * 2 + 1, D, DP)
-        with sk.cores((3, 2), "add"):
-            add[(1,)](h0, h1, x, D, DP)
-
-    def ref(x, b, rt):
-        w = b["w"]
-        for l in range(WAVES):
-            x = bf(bf(x * w[2 * l]) + bf(x * w[2 * l + 1]))
-        return x
-
-    return ref
+def ref_phases(x, w):
+    w = w.reshape(-1, x.size)
+    for l in range(WAVES):
+        x = bf(bf(x * w[2 * l]) + bf(x * w[2 * l + 1]))
+    return x
 
 
-ROWS = [3, 0, 2, 1]
+def ref_table(x, w, k):
+    w = w.reshape(-1, x.size)
+    for l in range(WAVES):
+        x = bf(bf(x * w[ROWS[l]]) * w[k])
+    return x
 
 
-def table(sk, scale, add, script):
-    import torch
-    from triton.backends.amd_triton_npu.superkernel import Table
+def ref_multicore(x, w):
+    w = w.reshape(-1, x.size)
+    for l in range(WAVES):
+        x = bf(x + bf(x * w[l]))
+    return x
 
-    x = sk.ddr("x", D, torch.bfloat16)
-    w = sk.ddr("w", WAVES * D, torch.bfloat16)
-    h = sk.onchip("h", D, torch.bfloat16)
-    k = sk.scalar("k")
-    sk.schedule(scale, script)
-    with sk.wave():
-        with sk.cores((2, 2), "pick"):
-            scale[(1,)](x, w, h, Table(ROWS), D, DP)
-        with sk.cores((3, 2), "fixed"):
-            scale[(1,)](h, w, x, k, D, DP)
 
-    def ref(x, b, rt):
-        w = b["w"]
-        for l in range(WAVES):
-            x = bf(bf(x * w[ROWS[l]]) * w[rt[0]])
-        return x
+CASES = {
+    "chain": (chain, (), {}, ref_chain, D),
+    "phases": (phases, (), {}, ref_phases, D),
+    "table": (table, (2,), {"ROWS": ROWS}, ref_table, D),
+    "multicore": (multicore, (), {}, ref_multicore, D2),
+}
 
-    return ref
+
+def module_text(kernel, args, kwargs, proj):
+    """The AIR module the superkernel `kernel` lowers to, as text."""
+    from triton.backends.amd_triton_npu.config import config_context
+    from triton.backends.amd_triton_npu.driver_scope import driver_scope
+    from triton.backends.amd_triton_npu.superkernel_jit import read
+
+    with driver_scope("npu"), config_context(compile_only=True):
+        c = kernel.warmup(*args, grid=(1,), **kwargs)
+    ttir = c.asm["ttsharedir"]
+    ttir = ttir.decode() if isinstance(ttir, bytes) else ttir
+    return read(ttir, proj)[0].module_text()
 
 
 def ir_checks(name, text):
@@ -199,195 +345,100 @@ def ir_checks(name, text):
         rf"{re.escape(loop[1])} = arith.constant (\d+) : index", text
     )
     check(bool(trips) and int(trips[1]) == WAVES, f"{name}: a loop over the waves")
-    check("air.channel @" in text, f"{name}: on-chip tensors moved by channels")
-    if name == "chain":
-        check(func.count("memref<*xbf16>") == 2, "chain: only x and w are buffers")
+    check("air.channel @" in text, f"{name}: L2 buffers moved by channels")
+    check(func.count("memref<*xbf16>") == 2, f"{name}: only X and W are buffers")
     if name == "phases":
         check("air.disable_ping_pong" in text, "phases: a phase loop")
         check("npu_dma_packet" in text, "phases: outputs routed by packet")
     if name == "table":
-        check("i32" in func, "table: the scalar is an argument of the func")
+        check("i32" in func, "table: k is an argument of the func")
         check("arith.select" in text, "table: per-wave values selected")
+    if name == "multicore":
+        sizes = re.findall(r"air\.herd @(\w+) .*? in \(%\w+=(%\w+)", text)
+        two = [h for h, s in sizes if re.search(rf"{s} = arith.constant 2 :", text)]
+        check(bool(two), "multicore: a herd on two cores")
 
 
-def error_checks(Superkernel, scale, add, sub, script, proj):
-    import torch
-    from triton.backends.amd_triton_npu.superkernel import WAVE
-
-    sk = Superkernel("bad", proj, WAVES)
-    x = sk.ddr("x", D, torch.bfloat16)
-    h = sk.onchip("h", D, torch.bfloat16)
-    sk.schedule(add, script)
+def error_checks(script, proj):
+    x = torch.empty(D, dtype=torch.bfloat16)
+    common = dict(NW=WAVES, D=D, DP=DP, S=script)
+    bad = [
+        ("unwritten", unwritten, (x,), "which no call writes"),
+        ("overlap", overlap, (x,), "overlaps"),
+        ("two spatials", two_steps, (x,), "one npu.spatial"),
+        ("wave and scalar", wave_and_scalar, (x, x, 3), "only ints from constants"),
+        ("phased inputs", phased_inputs, (x,), "not supported"),
+        ("phase order", phase_order, (x, x), "listed between the phases"),
+        ("phase wiring", wiring, (x, x), "differ"),
+    ]
+    for what, kernel, args, want in bad:
+        try:
+            module_text(kernel, args, common, os.path.join(proj, what))
+            check(False, f"{what}: no error")
+        except ValueError as e:
+            check(want in str(e), f"{what}: {e}")
+    with open(script) as f:
+        fixed = (
+            f.read()
+            .replace(",\n      %cores: !transform.param<i64>) {", ") {")
+            .replace("[%cores]", "[1]")
+            .replace("!transform.any_op, !transform.param<i64>", "!transform.any_op")
+        )
+    lit = os.path.join(proj, "fixed.mlir")
+    with open(lit, "w") as f:
+        f.write(fixed)
     try:
-        with sk.wave():
-            with sk.cores((2, 2), "a"):
-                add[(1,)](h, x, x, D, DP)
-        check(False, "a read of an unwritten on-chip tensor is an error")
+        module_text(chain, (x, x), dict(common, S=lit), os.path.join(proj, "fixed"))
+        check(False, "a schedule without core counts is an error")
     except ValueError as e:
-        check("before any call writes it" in str(e), f"read before write: {e}")
-    try:
-        with sk.wave():
-            with sk.cores((2, 2), "a"):
-                add[(1,)](x, x, h, D, DP)
-            with sk.cores((3, 2), "a"):
-                add[(1,)](h, x, x, D, DP)
-        check(False, "one herd at two corners is an error")
-    except ValueError as e:
-        check("placed at" in str(e), f"herd placed twice: {e}")
-    try:
-        with sk.wave():
-            add[(1,)](x, x, x, D, DP)
-        check(False, "a call outside sk.cores is an error")
-    except ValueError as e:
-        check("sk.cores" in str(e), f"call outside cores: {e}")
-    try:
-        with sk.wave():
-            with sk.cores((2, 2), "a"):
-                add[(1,)](x, x, h, WAVE, DP)
-        check(False, "WAVE for a constexpr is an error")
-    except ValueError as e:
-        check("is a constexpr" in str(e), f"WAVE for a constexpr: {e}")
-
-    sk = Superkernel("bad_phases", proj, WAVES)
-    x = sk.ddr("x", D, torch.bfloat16)
-    h0, h1, o = (sk.onchip(n, D, torch.bfloat16) for n in ("h0", "h1", "o"))
-    sk.schedule(add, script)
-    with sk.wave():
-        with sk.cores((2, 2), "w"):
-            add[(1,)](x, x, h0, D, DP)
-            add[(1,)](x, x, h1, D, DP)
-        with sk.cores((3, 2), "r"):
-            add[(1,)](h0, x, o, D, DP)
-            add[(1,)](h1, x, o, D, DP)
-    try:
-        sk.module_text()
-        check(False, "phases reading different on-chip tensors are rejected")
-    except ValueError as e:
-        check("not supported" in str(e), f"phases with different inputs: {e}")
-
-    sk = Superkernel("bad_in_place", proj, WAVES)
-    x = sk.ddr("x", D, torch.bfloat16)
-    h = sk.onchip("h", D, torch.bfloat16)
-    sk.schedule(add, script)
-    try:
-        with sk.wave():
-            with sk.cores((2, 2), "a"):
-                add[(1,)](h, x, h, D, DP)
-        check(False, "a call reading the on-chip tensor it writes first is an error")
-    except ValueError as e:
-        check("before any call writes it" in str(e), f"in-place first write: {e}")
-
-    sk = Superkernel("bad_order", proj, WAVES)
-    x = sk.ddr("x", D, torch.bfloat16)
-    w = sk.ddr("w", 2 * WAVES * D, torch.bfloat16)
-    h0, h1 = (sk.onchip(n, D, torch.bfloat16) for n in ("h0", "h1"))
-    sk.schedule(scale, script)
-    sk.schedule(add, script)
-    with sk.wave():
-        with sk.cores((2, 2), "s"):
-            scale[(1,)](x, w, h0, WAVE * 2, D, DP)
-        with sk.cores((3, 2), "a"):
-            add[(1,)](x, h0, x, D, DP)
-        with sk.cores((2, 2), "s"):
-            scale[(1,)](x, w, h1, WAVE * 2 + 1, D, DP)
-        with sk.cores((4, 2), "b"):
-            add[(1,)](x, h1, x, D, DP)
-    try:
-        sk.module_text()
-        check(False, "phases that would run before a call they depend on")
-    except ValueError as e:
-        check("traced between the phases" in str(e), f"phase order: {e}")
-
-    sk = Superkernel("bad_wiring", proj, WAVES)
-    x = sk.ddr("x", D, torch.bfloat16)
-    y = sk.ddr("y", D, torch.bfloat16)
-    o0, o1 = (sk.onchip(n, D, torch.bfloat16) for n in ("o0", "o1"))
-    sk.schedule(sub, script)
-    sk.schedule(add, script)
-    with sk.wave():
-        with sk.cores((2, 2), "d"):
-            sub[(1,)](x, y, o0, D, DP, False)
-            sub[(1,)](x, y, o1, D, DP, True)
-        with sk.cores((3, 2), "a"):
-            add[(1,)](o0, o1, x, D, DP)
-    try:
-        sk.module_text()
-        check(False, "phases computing different things share one core body")
-    except ValueError as e:
-        check("differ" in str(e), f"phases with other operand order: {e}")
+        check("does not take the core counts" in str(e), f"fixed cores: {e}")
 
 
-def run(name, sk, xclbin, header, ref, rt):
+def run(name, kernel, extra, kw, ref, n):
     import numpy as np
-    from triton.backends.amd_triton_npu.npu_runner import Device, sync_from, sync_to
 
     rng = np.random.default_rng(0)
-    x0 = bf(rng.standard_normal(D))
-    data = {"x": x0}
-    for t in sk.buffers:
-        if t.name != "x":
-            data[t.name] = bf(1 + 0.1 * rng.standard_normal(t.n))
-    dev = Device(xclbin, len(sk.buffers), header)
-    bos = {}
-    for i, t in enumerate(sk.buffers):
-        v = data[t.name].view(np.uint32) >> 16  # bfloat16 bits
-        v = v.astype(np.uint16)
-        bo = dev.bo(v.nbytes, i)
-        np.frombuffer(bo.map(), np.uint16, v.size)[:] = v
-        sync_to(bo)
-        bos[i] = bo
-    la = dev.launch(sk.name, bos, rt=rt)
-    la.start()
-    la.wait()
-    xi = [t.name for t in sk.buffers].index("x")
-    sync_from(bos[xi])
-    got = np.frombuffer(bos[xi].map(), np.uint16, D).astype(np.uint32) << 16
-    got = got.view(np.float32)
-    want = ref(x0, {k: v.reshape(-1, D) for k, v in data.items()}, rt)
+    x0 = bf(rng.standard_normal(n))
+    w0 = bf(1 + 0.1 * rng.standard_normal(2 * WAVES * n))
+    x = torch.from_numpy(x0).to(torch.bfloat16)
+    w = torch.from_numpy(w0).to(torch.bfloat16)
+    kernel[(1,)](x, w, *extra, **kw)
+    got = x.to(torch.float32).numpy()
+    want = ref(x0, w0, *extra)
     err = float(np.max(np.abs(got - want) / (np.abs(want) + 1e-2)))
     check(err < 2e-2, f"{name}: NPU result matches numpy (max rel err {err:.2e})")
 
 
 def main():
     try:
-        from triton.backends.amd_triton_npu.config import config_context
-        from triton.backends.amd_triton_npu.superkernel import Superkernel
-    except ImportError as e:
-        skip(f"cannot import the backend: {e}")
-    try:
         import pyxrt
 
         pyxrt.device(0)
-        npu = True
+        has_npu = True
     except Exception as e:
         print(f"no NPU ({e}): IR checks only")
-        npu = False
+        has_npu = False
     os.environ.setdefault("AMD_TRITON_NPU_TARGET", "npu2")
+    from triton.backends.amd_triton_npu.config import config_context
+    from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
-    scale, add, sub = kernels()
     with tempfile.TemporaryDirectory() as tmp:
         script = os.path.join(tmp, "elementwise.mlir")
         with open(script, "w") as f:
             f.write(ELEMENTWISE)
         with config_context(bf16_emulation=False):
-            error_checks(Superkernel, scale, add, sub, script, os.path.join(tmp, "bad"))
-            for name, build, rt in (
-                ("chain", chain, ()),
-                ("phases", phases, ()),
-                ("table", table, (2,)),
-            ):
+            error_checks(script, os.path.join(tmp, "bad"))
+            for name, (kernel, extra, kwargs, ref, n) in CASES.items():
                 print(f"{name}:", flush=True)
-                sk = Superkernel(name, os.path.join(tmp, name), WAVES)
-                ref = build(sk, scale, add, script)
-                ir_checks(name, sk.module_text())
-                if not npu:
-                    continue
-                xclbin, header = sk.compile(
-                    runtime_loop_tiling_sizes=(),
-                    bf16_emulation=False,
-                    extra_args=AIRCC_ARGS,
-                )
-                run(name, sk, xclbin, header, ref, rt)
+                x = torch.empty(n, dtype=torch.bfloat16)
+                w = torch.empty(2 * WAVES * n, dtype=torch.bfloat16)
+                dp = 1 << (n - 1).bit_length()
+                kw = dict(NW=WAVES, D=n, DP=dp, S=script, **kwargs)
+                text = module_text(kernel, (x, w, *extra), kw, os.path.join(tmp, name))
+                ir_checks(name, text)
+                if has_npu:
+                    with driver_scope("npu"):
+                        run(name, kernel, extra, kw, ref, n)
     if failures:
         print(f"{failures} check(s) failed")
         sys.exit(1)

@@ -1,50 +1,36 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Several Triton kernels run as one NPU dispatch that loops over waves.
+"""The AIR module of a superkernel (see `tl.extra.npu.spatial`): several
+kernels in one NPU dispatch that loops over waves.
 
-A `Superkernel` records the Triton calls of one wave, in order. Each call is
-compiled like a `FusedDevice` op, and the bodies of their segments are merged
-into one segment that the runtime sequence launches once per wave:
+`superkernel_jit` reads a superkernel's TTIR into a `Superkernel`: its
+buffers, and one call per kernel in the order its partitions list them. Each
+call is compiled like a `FusedDevice` op, and the bodies of their segments are
+merged into one segment that the runtime sequence launches once per wave:
 
-    func @name(ddr buffers) {
+    func @name(ddr buffers, scalars) {
       scf.for wave = 0 .. waves {
         air.launch { air.segment @seg { every call's body } }
       }
     }
 
 The cores are configured once and stay resident; each wave only writes their
-run-time parameters. A tensor made with `onchip` has no DDR buffer. It is a
-single L2 buffer: where a call on its own would copy to or from DDR, its
-writers copy into the L2 buffer and its readers copy out of it. Tensors made
-with `ddr` are the func's buffer arguments, read and written in place every
-wave.
-
-The calls are traced inside `with sk.wave():`. An int argument given `WAVE`
-takes the wave's index at run time. `with sk.cores(at, herd):` sets the corner
-(column, row) and the name of the herds of the calls inside it; calls with the
-same herd name run in turn on the same cores. `sk.schedule(kernel, script)`
-sets a kernel's transform script.
-
-    with sk.wave():
-        with sk.cores((2, 2), "rms"):
-            scale[(1,)](x, s, xn, WAVE, D)
-        with sk.cores((0, 2), "proj"):
-            gemv[(1,)](w, xn, y, WAVE, ...)
+run-time parameters. An on-chip tensor has no DDR buffer. It is a single L2
+buffer: where a call on its own would copy to or from DDR, its writers copy
+into the L2 buffer and its readers copy out of it. DDR tensors are the func's
+buffer arguments, read and written in place every wave.
 """
 
-import contextlib
-import functools
 import os
 import re
 
 from .arg_access import read_args, written_args
+from .compiler import _optimize_ttsharedir, _ttir_to_ttsharedir
 from .config import config_context
 from .driver import _aircc_compile, _ttshared_to_air, detect_npu_version
-from .driver_scope import driver_scope
 from .fused_device import (
     SEG,
-    _bind_ints,
     _drop_unused_scalars,
     _entry,
     _herd_width,
@@ -53,116 +39,64 @@ from .fused_device import (
 )
 
 
-class _Wave(int):
-    """An int argument that stands for `a * wave + b`. Its int value is only
-    what Triton specializes the kernel on, chosen to be neither 1 nor a
-    multiple of 16 so that no specialization assumes anything about it;
-    `Superkernel.call` checks that none did."""
+class _Wave:
+    """An int argument worth `a * wave + b` at wave `wave`."""
 
-    def __new__(cls, a=1, b=0):
-        w = int.__new__(cls, 7)
-        w.a, w.b = a, b
-        return w
-
-    def __mul__(self, k):
-        if isinstance(k, _Wave):  # as a plain int
-            return int(self) * int(k)
-        return _Wave(self.a * k, self.b * k)
-
-    __rmul__ = __mul__
-
-    def __add__(self, k):
-        if isinstance(k, _Wave):
-            return int(self) + int(k)
-        return _Wave(self.a, self.b + k)
-
-    __radd__ = __add__
+    def __init__(self, a=1, b=0):
+        self.a, self.b = a, b
 
     def __repr__(self):
-        return f"WAVE*{self.a}+{self.b}" if (self.a, self.b) != (1, 0) else "WAVE"
+        return f"wave*{self.a}+{self.b}"
 
 
-#: the wave's index, as a call's run-time int argument
-WAVE = _Wave()
+class _Table(_Wave):
+    """An int argument worth `values[wave]`, for per-wave values that are not
+    affine in the wave's index. Lowered as a chain of selects on the wave's
+    index."""
 
-
-class Table(_Wave):
-    """An int argument that stands for `values[wave]`, for per-wave values
-    that are not affine in the wave's index. Lowered as a chain of selects on
-    the wave's index."""
-
-    def __new__(cls, values):
-        w = _Wave.__new__(cls)
-        w.table = tuple(int(v) for v in values)
-        return w
-
-    def __mul__(self, k):
-        if isinstance(k, _Wave):
-            return int(self) * int(k)
-        return Table([v * k for v in self.table])
-
-    __rmul__ = __mul__
-
-    def __add__(self, k):
-        if isinstance(k, _Wave):
-            return int(self) + int(k)
-        return Table([v + k for v in self.table])
-
-    __radd__ = __add__
+    def __init__(self, values):
+        super().__init__()
+        self.table = tuple(int(v) for v in values)
 
     def __repr__(self):
         return f"table{self.table}"
 
 
-class Scalar(int):
-    """An int argument the host sets at each dispatch. As with `WAVE`, its
-    int value is only what the kernel is specialized on."""
+class _Scalar:
+    """An int argument of the func, set by the host at each dispatch."""
 
-    def __new__(cls, name):
-        v = int.__new__(cls, 7)
-        v.name = name
-        return v
+    def __init__(self, name):
+        self.name = name
 
     def __repr__(self):
         return f"scalar({self.name})"
 
 
 class Tensor:
-    """A flat tensor of `n` elements of a torch `dtype`."""
+    """A flat tensor of `n` elements of `dtype`, an MLIR element type such as
+    "bf16"."""
 
     def __init__(self, name, n, dtype, onchip):
         self.name, self.n, self.dtype, self.onchip = name, n, dtype, onchip
-
-    def data_ptr(self):
-        # Triton specializes pointer arguments on their alignment.
-        return 1 << 20
 
     def __repr__(self):
         return f"{'onchip' if self.onchip else 'ddr'}({self.name})"
 
 
-_MLIR_TYPES = {"bfloat16": "bf16", "float32": "f32", "int16": "i16", "int8": "i8"}
-
-
-def _mlir_type(dtype):
-    return _MLIR_TYPES[str(dtype).split(".")[-1]]
-
-
 class _Call:
-    """One traced call: its kernel, its compiled AIR module and how the
+    """One call: its kernel's name, its compiled AIR module and how the
     module's func arguments bind to the superkernel's tensors and ints."""
 
-    def __init__(self, kernel, grid, args, at, herd, air, binds, read, written):
-        self.kernel, self.grid, self.args = kernel, grid, args
-        self.at, self.herd, self.air = at, herd, air
-        self.binds = binds  # per func argument: a Tensor, _Wave or Scalar
+    def __init__(self, name, at, herd, air, binds, read, written):
+        self.name, self.at, self.herd, self.air = name, at, herd, air
+        self.binds = binds  # per func argument: a Tensor, _Wave or _Scalar
         self.read = read  # the tensors the call reads
         self.written = written  # the tensors the call writes
 
 
 def _check_phase_order(calls, g):
-    """Reject phases `g` that cannot all run where the first one is traced.
-    The phase loop runs every phase at that point, ahead of the calls traced
+    """Reject phases `g` that cannot all run where the first one is. The
+    phase loop runs every phase at that point, ahead of the calls listed
     between the phases; a DDR buffer that such a call writes must not be
     used by a later phase, nor one it reads be written by a later phase."""
     at = [next(i for i, c in enumerate(calls) if c is x) for x in g]
@@ -177,15 +111,15 @@ def _check_phase_order(calls, g):
                 if clash:
                     raise ValueError(
                         f"herd {g[0].herd}: a later phase uses {clash[0]}, "
-                        f"which {c.kernel.fn.__name__}, traced between the "
-                        "phases, also accesses; the phase loop would run "
-                        "that phase before it"
+                        f"which {c.name}, listed between the phases, also "
+                        "accesses; the phase loop would run that phase "
+                        "before it"
                     )
 
 
 class Superkernel:
-    """A dispatch named `name` that runs `waves` waves of traced Triton
-    calls. Build artifacts go to `air_project_path`."""
+    """A dispatch named `name` that runs `waves` waves of its calls. Build
+    artifacts go to `air_project_path`."""
 
     def __init__(self, name, air_project_path, waves):
         self.name, self.proj, self.waves = (
@@ -195,48 +129,10 @@ class Superkernel:
         )
         self.tensors, self.calls = [], []
         self.scalars = []  # the func's int arguments after its buffers
-        self.scripts = {}  # kernel -> transform script
-        self._cores = None  # (at, herd) for the calls being traced
-
-    def schedule(self, kernel, transform_script):
-        """Compile the calls of `kernel` with `transform_script`."""
-        self.scripts[kernel] = transform_script
-
-    @contextlib.contextmanager
-    def cores(self, at, herd=None):
-        """Place the calls inside on herds with corner `at`, named `herd`."""
-        outer, self._cores = self._cores, (tuple(at), herd)
-        try:
-            yield
-        finally:
-            self._cores = outer
-
-    @contextlib.contextmanager
-    def wave(self):
-        """Trace the Triton calls inside as the wave's calls, in order."""
-        import triton
-
-        cfg = triton.runtime.driver
-        outer = getattr(cfg, "_active", None)
-        cfg.set_active(_tracer(self))
-        try:
-            yield self
-        finally:
-            cfg._active = outer
-
-    def _traced(self, kernel, grid, args):
-        if self._cores is None:
-            raise ValueError(
-                f"{kernel.fn.__name__}: call it inside `with sk.cores(...)`"
-            )
-        at, herd = self._cores
-        self.call(
-            kernel, grid, args, at, herd, transform_script=self.scripts.get(kernel)
-        )
 
     def scalar(self, name):
         """A new int argument of the func, set by the host at each dispatch."""
-        v = Scalar(name)
+        v = _Scalar(name)
         self.scalars.append(v)
         return v
 
@@ -260,97 +156,55 @@ class Superkernel:
         """The func's buffer arguments, in order."""
         return [t for t in self.tensors if not t.onchip]
 
-    def call(
-        self,
-        kernel,
-        grid,
-        args,
-        at,
-        herd=None,
-        constexprs=None,
-        transform_script=None,
-        later=(),
-    ):
-        """Add a call of `kernel` on `args` to the wave, on herds with corner
-        `at` named `herd` (a new name per call by default).
-
-        `later` lists on-chip tensors the call reads that a later call in
-        the wave writes. Reading an on-chip tensor that no earlier call has
-        written is an error otherwise."""
-        g = tuple(grid) + (1,) * (3 - len(grid))
-        # Warmup only needs a tensor's dtype and alignment, which Tensor has.
-        warm = [int(a) if isinstance(a, (_Wave, Scalar)) else a for a in args]
-        params = list(kernel.params)
-        runtime = [
-            p.name for p, a in zip(params, args) if isinstance(a, (_Wave, Scalar))
-        ]
-        for p, a in zip(params, args):
-            if p.is_constexpr and isinstance(a, (_Wave, Scalar)):
+    def call(self, name, ttir, args, at, herd, schedule, cores):
+        """Add a call to the wave: the kernel `name` with TTIR `ttir` (one
+        public function), on `args` (per argument of that function: a Tensor,
+        _Wave, _Scalar or int), on the herd `herd` with corner `at`, compiled
+        with the transform script at path `schedule` into `cores` (columns,
+        rows) cores."""
+        ttshared = _optimize_ttsharedir(_ttir_to_ttsharedir(ttir), {})
+        with config_context(transform_tiling_script=schedule):
+            m = _ttshared_to_air(ttshared, 1, 1, 1)
+        for h in _ops_named(_entry(m), "air.herd"):
+            shape = (_herd_width(h), _herd_height(h))
+            if shape != tuple(cores):
                 raise ValueError(
-                    f"{kernel.fn.__name__}: {p.name} is a constexpr, so it "
-                    f"cannot take {a!r}"
+                    f"{name}: its schedule makes a {shape[0]}x{shape[1]} herd "
+                    f"for {cores[0]}x{cores[1]} cores"
                 )
-        with driver_scope("npu"), config_context(compile_only=True):
-            c = kernel.warmup(*warm, grid=g, **(constexprs or {}))
-        # The run-time value replaces the traced one, so the kernel must not
-        # have been specialized on it.
-        for i, p in enumerate(params):
-            if p.name in runtime and (
-                c.src.signature[p.name] != "i32" or c.src.attrs.get((i,))
-            ):
-                raise ValueError(
-                    f"{kernel.fn.__name__}: Triton specialized {p.name} as "
-                    f"{c.src.signature[p.name]} {c.src.attrs.get((i,))}"
-                )
-        with config_context(transform_tiling_script=transform_script):
-            m = _ttshared_to_air(c.asm["ttsharedir"], *g)
-        _bind_ints(m, kernel, warm, keep=runtime)
+        _bind_plain_ints(m, args)
         kept = _drop_unused_scalars(_entry(m))
-        # The func's arguments are the kernel's non-constexpr parameters,
-        # then Triton's grid ints; `kept` says which survived.
-        plain = [(p, a) for p, a in zip(params, args) if not p.is_constexpr]
-        named = plain + [(None, None)] * (len(kept) - len(plain))
-        binds = []
-        for (p, a), k in zip(named, kept):
-            if not k:
-                continue
-            if isinstance(a, (Tensor, _Wave, Scalar)):
-                binds.append(a)
-            else:
-                raise ValueError(
-                    f"{kernel.fn.__name__}: argument {p and p.name} "
-                    "is not a tensor, WAVE, Table or Scalar"
-                )
-        names = [p.name for p, _ in plain]
-        w = written_args(c.asm["ttir"], names)
+        # The func's arguments are the kernel's, then the grid's ints, which
+        # triton-shared adds; `kept` says which survived.
+        named = list(args) + [None] * (len(kept) - len(args))
+        binds = [a for a, k in zip(named, kept) if k]
+        names = [f"a{i}" for i in range(len(args))]
+        w = written_args(ttir, names)
         if w is None:
-            raise ValueError(f"{kernel.fn.__name__}: can't tell what it writes")
-        r = read_args(c.asm["ttir"], names)
+            raise ValueError(f"{name}: can't tell what it writes")
+        r = read_args(ttir, names)
         if r is None:  # every pointer argument may be read
             r = set(names)
-        tensors = [(p, a) for p, a in plain if isinstance(a, Tensor)]
-        written = [a for p, a in tensors if p.name in w]
-        read = [a for p, a in tensors if p.name in r]
-        for t in read:
-            if (
-                t.onchip
-                and not any(t is x for x in later)
-                and not any(t in c.written for c in self.calls)
-            ):
-                raise ValueError(
-                    f"{kernel.fn.__name__} reads {t} before any call writes it"
-                )
-        herd = herd or f"{kernel.fn.__name__}_{len(self.calls)}"
+        tensors = [(n, a) for n, a in zip(names, args) if isinstance(a, Tensor)]
+        written = [a for n, a in tensors if n in w]
+        read = [a for n, a in tensors if n in r]
         for c2 in self.calls:
             if c2.herd == herd and c2.at != tuple(at):
                 raise ValueError(f"herd {herd} placed at {c2.at} and {at}")
-        call = _Call(kernel, g, args, tuple(at), herd, str(m), binds, read, written)
-        self.calls.append(call)
+        self.calls.append(_Call(name, tuple(at), herd, str(m), binds, read, written))
+
+    def _check_writers(self):
+        """Every on-chip tensor a call reads is written by some call."""
+        for c in self.calls:
+            for t in c.read:
+                if t.onchip and not any(t in x.written for x in self.calls):
+                    raise ValueError(f"{c.name} reads {t}, which no call writes")
 
     def _phases(self):
         """The calls grouped into phases. Calls of one kernel at one shape on
         the same herd become the trips of one loop over phases. Returns the
         groups, each a list of calls in order."""
+        self._check_writers()
         groups = {}
         for c in self.calls:
             # Phases may differ in the numbers the segment computes with, such
@@ -562,7 +416,7 @@ class Superkernel:
     def _skeleton(self, bufs, edges):
         """MLIR text of the func with its wave loop, launch and segment. The
         segment holds only the on-chip tensors' L2 buffers."""
-        bt = [f"memref<*x{_mlir_type(t.dtype)}>" for t in bufs]
+        bt = [f"memref<*x{t.dtype}>" for t in bufs]
         ns = len(self.scalars)
         fargs = ", ".join(
             [f"%a{i}: {t}" for i, t in enumerate(bt)]
@@ -584,7 +438,7 @@ class Superkernel:
             + ["%sw=%bw"]
             + [f"%sr{i}=%br{i}" for i in range(ns)]
         )
-        l2 = [f"memref<{t.n}x{_mlir_type(t.dtype)}, 1 : i32>" for t in edges]
+        l2 = [f"memref<{t.n}x{t.dtype}, 1 : i32>" for t in edges]
         alloc = "".join(
             f"        %e{i} = memref.alloc() : {t}\n" for i, t in enumerate(l2)
         )
@@ -652,6 +506,25 @@ module {{
             os.chdir(cwd)
         header = os.path.join(self.proj, "air_project", f"npu.{self.name}.air.txn.h")
         return out["bin_path"], header
+
+
+def _herd_height(h):
+    """The row count of herd `h`, a constant operand."""
+    return _const(h.operands[1])
+
+
+def _bind_plain_ints(m, args):
+    """Replace the func's arguments that `args` gives as ints by constants."""
+    from air.dialects import arith
+    from air.ir import InsertionPoint, IntegerAttr, Location
+
+    block = _entry(m).regions[0].blocks[0]
+    with m.context, Location.unknown(m.context):
+        ip = InsertionPoint.at_block_begin(block)
+        for a, v in zip(block.arguments, args):
+            if isinstance(v, int) and not isinstance(v, bool):
+                c = arith.ConstantOp(a.type, IntegerAttr.get(a.type, v), ip=ip)
+                a.replace_all_uses_with(c.result)
 
 
 def _retype_herd_args(seg):
@@ -1261,36 +1134,6 @@ def _get_loop(name, dst, pattern, trips):
     return t.owner.owner
 
 
-#: number of arguments Triton passes a launcher before the kernel's own; the
-#: grid comes first
-_LAUNCH_PREFIX = 9
-
-
-class _Recorder:
-    """A launcher that records the call in the superkernel instead of
-    running it."""
-
-    def __init__(self, sk, src, metadata):
-        self.sk, self.kernel = sk, src.fn
-
-    def __call__(self, *args):
-        grid = tuple(args[:3])
-        self.sk._traced(self.kernel, grid, list(args[_LAUNCH_PREFIX:]))
-
-
-def _tracer(sk):
-    """An NPU driver whose launches are recorded in `sk`."""
-    from .driver import NPUDriver
-    from .fused_program import _Utils
-
-    d = NPUDriver()
-    d.launcher_cls = functools.partial(_Recorder, sk)
-    d.utils = _Utils(d.utils)
-    device = f"npu:superkernel:{id(sk)}"
-    d.get_current_device = lambda: device
-    return d
-
-
 def _wave_value(per_phase, wave, ph, const32):
     """The i32 value of a call's wave argument at wave `wave`. With a phase
     loop (index `ph`), `per_phase` holds each phase's argument."""
@@ -1318,12 +1161,12 @@ def _wave_value(per_phase, wave, ph, const32):
             out = arith.select(is_k, const32(vals[k]), out)
         return out
 
-    if any(isinstance(w, Table) for w in per_phase):
-        n = max(len(w.table) for w in per_phase if isinstance(w, Table))
+    if any(isinstance(w, _Table) for w in per_phase):
+        n = max(len(w.table) for w in per_phase if isinstance(w, _Table))
 
         def chain(w):
             vals = (
-                w.table if isinstance(w, Table) else [w.a * i + w.b for i in range(n)]
+                w.table if isinstance(w, _Table) else [w.a * i + w.b for i in range(n)]
             )
             out = const32(vals[-1])
             for i in reversed(range(len(vals) - 1)):
