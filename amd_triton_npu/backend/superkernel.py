@@ -401,6 +401,7 @@ class Superkernel:
             shared = [value[id(t)] for t in onchip if t.space == 2]
             _in_place(seg, homes, shared)
             _forward_private_vectors(seg)
+            _scalar_transfers(seg)
             _hoist_ddr_reads(sblock, sargs[: len(bufs)], end)
             # A herd whose kernel took a DDR buffer directly now takes the
             # on-chip tensor's L2 buffer instead.
@@ -1317,6 +1318,32 @@ def _l1_copies(h, mine):
             if channel_buffer(tmp) and _home_of(view, mine):
                 out.append(([w, r], tmp, view))
     return out
+
+
+def _scalar_transfers(seg):
+    """In the herds, vector reads and writes of a 0-d buffer (a reduction's
+    scalar result) as a scalar load and store."""
+    from air.dialects import memref, vector
+    from air.ir import InsertionPoint, MemRefType, VectorType
+
+    for h in _ops_named(seg, "air.herd"):
+        for r in _ops_named(h, "vector.transfer_read"):
+            src = r.operands[0]
+            if MemRefType(src.type).rank != 0:
+                continue
+            with InsertionPoint(r):
+                v = memref.LoadOp(src, []).result
+                b = vector.BroadcastOp(VectorType(r.results[0].type), v).result
+            r.results[0].replace_all_uses_with(b)
+            r.erase()
+        for w in _ops_named(h, "vector.transfer_write"):
+            dst = w.operands[1]
+            if MemRefType(dst.type).rank != 0:
+                continue
+            with InsertionPoint(w):
+                v = vector.ExtractOp(w.operands[0], [], []).result
+                memref.StoreOp(v, dst, [])
+            w.erase()
 
 
 def _forward_private_vectors(seg):

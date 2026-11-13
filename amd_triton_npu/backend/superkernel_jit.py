@@ -65,7 +65,9 @@ def _attr(op, name, default=None):
 
 
 def _callee(op):
-    return str(op.attributes["callee"]).lstrip("@")
+    from air.ir import FlatSymbolRefAttr
+
+    return FlatSymbolRefAttr(op.attributes["callee"]).value
 
 
 def _kernel_name(symbol):
