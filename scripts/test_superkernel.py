@@ -576,8 +576,10 @@ def q4_group(xq, w, acc, t, sx, g):
     and mins [8][32] as bf16, then per group 8 words a row, word j of a row
     holding its columns 4 j .. 4 j + 3 at bits 0, 4, 8 and 12) times x, added
     to the 32 rows' sums at acc. xq [4][256] holds x times 2^(-4 s) for s =
-    0 .. 3, sx each group's sum of x; t is a buffer for the group's sums."""
+    0 .. 3, then 32 elements in which a value of x is repeated; sx each
+    group's sum of x; t is a buffer for the group's sums."""
     r = tl.arange(0, 32)
+    xv = xq + 1024
     tl.store(t + r, tl.zeros([32], tl.float32))
     for j in range(8):
         v = tl.load(w + 512 + g * 256 + j * 32 + r)
@@ -591,10 +593,12 @@ def q4_group(xq, w, acc, t, sx, g):
             else:
                 q = (v & (15 << (4 * s))).to(tl.bfloat16)
             xs = tl.load(xq + s * 256 + g * 32 + j * 4 + s)
-            tj += q.to(tl.float32) * tl.full([32], xs, tl.bfloat16).to(tl.float32)
+            tl.store(xv + r, tl.full([32], xs, tl.bfloat16))
+            tj += q.to(tl.float32) * tl.load(xv + r).to(tl.float32)
         tl.store(t + r, tj)
     part = tl.load(t + r).to(tl.bfloat16).to(tl.float32)
-    red = tl.full([32], tl.load(sx + g).to(tl.bfloat16), tl.bfloat16).to(tl.float32)
+    tl.store(xv + r, tl.full([32], tl.load(sx + g).to(tl.bfloat16), tl.bfloat16))
+    red = tl.load(xv + r).to(tl.float32)
     scale = tl.load(w + g * 32 + r).to(tl.bfloat16, bitcast=True).to(tl.float32)
     mn = tl.load(w + 256 + g * 32 + r).to(tl.bfloat16, bitcast=True).to(tl.float32)
     tl.store(acc + r, tl.load(acc + r) + part * scale + mn * red)
@@ -618,7 +622,7 @@ def gemv_core(NB: tl.constexpr):
     w = air.alloc([2560], tl.int16, memory_space=air.L1)
     xb = air.alloc([256], tl.bfloat16, memory_space=air.L1)
     acc = air.alloc([32], tl.float32, memory_space=air.L1)
-    xq = air.alloc([1024], tl.bfloat16, memory_space=air.L1)
+    xq = air.alloc([1056], tl.bfloat16, memory_space=air.L1)
     t = air.alloc([32], tl.float32, memory_space=air.L1)
     sx = air.alloc([8], tl.float32, memory_space=air.L1)
     r = tl.arange(0, 32)
@@ -660,7 +664,7 @@ def proj_core(CX0: tl.constexpr, I2: tl.constexpr, J2: tl.constexpr):
     w = air.alloc([2560], tl.int16, memory_space=air.L1)
     xb = air.alloc([256], tl.bfloat16, memory_space=air.L1)
     acc = air.alloc([32], tl.float32, memory_space=air.L1)
-    xq = air.alloc([1024], tl.bfloat16, memory_space=air.L1)
+    xq = air.alloc([1056], tl.bfloat16, memory_space=air.L1)
     t = air.alloc([32], tl.float32, memory_space=air.L1)
     sx = air.alloc([8], tl.float32, memory_space=air.L1)
     # The rows at [32, 64), where a vector store is aligned; the packet's
