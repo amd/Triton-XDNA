@@ -171,3 +171,34 @@ def _inject_transform_library(user_script):
                 )
 
     return result
+
+
+def _bind_core_counts(script, cores):
+    """`script` with its core-count parameters bound to `cores`, a (columns,
+    rows) pair. A superkernel partition's `@__transform_main` takes, after the
+    payload, one `!transform.param<i64>` per core dimension; they become
+    constants at the start of its body."""
+    m = re.search(r"transform\.named_sequence\s+@__transform_main\s*\(", script)
+    if not m:
+        raise ValueError("the schedule has no @__transform_main")
+    depth, i = 1, m.end()
+    while depth:
+        depth += {"(": 1, ")": -1}.get(script[i], 0)
+        i += 1
+    params = re.findall(r"(%\w+)\s*:\s*!transform\.param<i64>", script[m.end() : i])
+    if not params:
+        raise ValueError(
+            "the schedule does not take the core counts: give @__transform_main "
+            "a !transform.param<i64> argument per core dimension after the payload"
+        )
+    if len(params) > 2 or (len(params) == 1 and cores[1] != 1):
+        raise ValueError(
+            f"the schedule takes {len(params)} core counts for {cores[0]}x{cores[1]} cores"
+        )
+    payload = script[m.end() : i - 1].split(",")[0]
+    body = script.index("{", i) + 1
+    consts = "".join(
+        f"\n    {p} = transform.param.constant {n} : i64 -> !transform.param<i64>"
+        for p, n in zip(params, cores)
+    )
+    return script[: m.end()] + payload + ")" + script[i:body] + consts + script[body:]
