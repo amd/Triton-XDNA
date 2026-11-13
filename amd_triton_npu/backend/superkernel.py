@@ -1127,17 +1127,19 @@ def _lower_locals(seg, owns):
     return homes
 
 
-_VIEWS = ("memref.reinterpret_cast", "memref.subview", "memref.cast")
+_VIEWS = ("memref.reinterpret_cast", "memref.subview", "memref.cast", "memref.view")
 
 
 def _allocate_locals(ttshared, args):
     """Have kernel function `ttshared` allocate its own L1 buffers (the
     arguments `args` gives as _Local) in its body, so that its schedule
     places them with its other buffers. Each allocation is tagged with its
-    buffer's symbol."""
-    from air.dialects import memref
-    from air.ir import Context, InsertionPoint, Location, MemRefType, Module
-    from air.ir import StringAttr, Type
+    buffer's symbol. A kernel may read an int8 buffer as another type
+    (a pointer cast, which triton-shared leaves as an unrealized cast): that
+    use becomes a `memref.view` of the bytes."""
+    from air.dialects import arith, memref
+    from air.ir import Context, IndexType, InsertionPoint, IntegerAttr, Location
+    from air.ir import MemRefType, Module, StringAttr, Type, UnrankedMemRefType
 
     own = [(i, a) for i, a in enumerate(args) if isinstance(a, _Local)]
     if not own:
@@ -1157,10 +1159,31 @@ def _allocate_locals(ttshared, args):
             a.attributes["air.local"] = StringAttr.get(b.symbol)
             arg = block.arguments[i]
             for u in list(arg.uses):
-                if u.owner.name != "memref.reinterpret_cast":
+                op = u.owner
+                if op.name == "memref.reinterpret_cast":
+                    continue
+                if op.name != "builtin.unrealized_conversion_cast":
+                    raise ValueError(f"an L1 buffer of the kernel used by {op.name}")
+                if b.dtype != "i8":
                     raise ValueError(
-                        f"an L1 buffer of the kernel used by {u.owner.name}"
+                        "a kernel reads an L1 buffer as another type only if the "
+                        "buffer is int8"
                     )
+                to = UnrankedMemRefType(op.results[0].type)
+                width = to.element_type.width // 8
+                with InsertionPoint(op):
+                    zero = arith.ConstantOp(
+                        IndexType.get(), IntegerAttr.get(IndexType.get(), 0)
+                    )
+                    view = memref.ViewOp(
+                        MemRefType.get([b.n // width], to.element_type),
+                        a.result,
+                        zero,
+                        [],
+                    )
+                    cast = memref.CastOp(op.results[0].type, view.result)
+                op.results[0].replace_all_uses_with(cast.result)
+                op.erase()
             arg.replace_all_uses_with(a.result)
         return str(m)
 

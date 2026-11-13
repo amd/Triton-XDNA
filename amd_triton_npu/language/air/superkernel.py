@@ -208,6 +208,8 @@ def backend(
     merge_contiguous_feeds=None,
     stack_size=None,
     allow_deadlock_prone_routing=None,
+    trace_size=None,
+    trace_offset=None,
     _semantic=None,
     _generator=None,
 ):
@@ -216,7 +218,9 @@ def backend(
     levels, such as ["L1"]), the lock race fixes, `stack_size`,
     `allow_deadlock_prone_routing` (route flows aiecc's static check cannot
     prove drain, where the order of the transfers rules the cycle out); and
-    whether the host's feed loops are unrolled and contiguous feeds merged. Called
+    whether the host's feed loops are unrolled and contiguous feeds merged; and
+    `trace_size` bytes of the cores' and memtiles' event traces, which AIR
+    writes into the third pointer argument from byte `trace_offset`. Called
     once, in the superkernel; without it, the defaults suit superkernels
     whose herds only exchange L2 buffers."""
     b = _semantic.builder
@@ -236,6 +240,8 @@ def backend(
         allow_deadlock_prone_routing=allow_deadlock_prone_routing,
         merge_contiguous_feeds=merge_contiguous_feeds,
         stack_size=stack_size,
+        trace_size=trace_size,
+        trace_offset=trace_offset,
     )
     for k, v in opts.items():
         v = core._unwrap_if_constexpr(v)

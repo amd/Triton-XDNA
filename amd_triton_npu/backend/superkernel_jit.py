@@ -888,6 +888,9 @@ def _aircc_options(opts):
         feeds.append("--unroll-feed-loops")
     if opts.get("merge_contiguous_feeds", "True") == "True":
         feeds.append("--merge-contiguous-feeds")
+    if int(opts.get("trace_size") or 0) > 0:
+        args.append(f"--trace-size={opts['trace_size']}")
+        args.append(f"--trace-offset={opts.get('trace_offset', 0)}")
     out = dict(extra_args=tuple(args), feed_args=tuple(feeds))
     if opts.get("stack_size"):
         out["stack_size"] = int(opts["stack_size"])
@@ -993,6 +996,12 @@ class Launcher:
             any(t in c.written for c in sk.calls) or any(t in g.writes for g in segs)
             for t in sk.buffers
         ]
+        if (
+            sk.backend
+            and int(sk.backend.get("trace_size") or 0) > 0
+            and len(written) > 2
+        ):
+            written[2] = True  # where AIR writes the traces
         return sk.name, kinds, xclbin, header, written
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):
