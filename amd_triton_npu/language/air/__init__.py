@@ -9,12 +9,14 @@ to one device; see ``superkernel.py``.
 """
 
 from .superkernel import (
+    L1,
+    L2,
     Channel,
     ChannelGet,
     ChannelPut,
-    allocate_l2,
-    spatial,
+    alloc,
+    herd,
     table,
 )
 
-__all__ = ["Channel", "ChannelGet", "ChannelPut", "allocate_l2", "spatial", "table"]
+__all__ = ["Channel", "ChannelGet", "ChannelPut", "L1", "L2", "alloc", "herd", "table"]

@@ -1,10 +1,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Superkernels (see `tl.extra.air.spatial`) from their TTIR.
+"""Superkernels (see `tl.extra.air`) from their TTIR.
 
 The TTIR of a superkernel is its function with the loop over the waves, the
-functions of its partitions, the kernels they call, and one declaration per
+functions of its herds, the kernels they call, and one declaration per
 L2 buffer. `read` turns it into a `Superkernel`: each kernel call becomes a
 call compiled on its own, with every argument traced back to a DDR buffer, an
 L2 buffer, an int argument of the function, a constant, or a value of the
@@ -28,7 +28,7 @@ from .superkernel import (
     _Wave,
 )
 
-#: the core array npu2 places partitions on: columns, then the core rows
+#: the core array npu2 places herds on: columns, then the core rows
 _ARRAY = {"npu2": (8, range(2, 6))}
 
 
@@ -160,14 +160,14 @@ def _evaluate(op, env, what):
 def _array(npu):
     if npu not in _ARRAY:
         raise ValueError(
-            f"superkernels place partitions on npu2 only; give `at` for every "
-            f"partition on {npu}"
+            f"superkernels place herds on npu2 only; give `at` for every "
+            f"herd on {npu}"
         )
     return _ARRAY[npu]
 
 
 def _place(parts, npu):
-    """The corner of each partition: its own `at`, or the first free spot
+    """The corner of each herd: its own `at`, or the first free spot
     for its cores, row by row from the bottom."""
     cols, rows = None, None
     taken = set()
@@ -182,7 +182,7 @@ def _place(parts, npu):
         if p["at"] is not None:
             got = cells(p["at"], p["cores"])
             if got & taken:
-                raise ValueError(f"partition {p['name']} at {p['at']} overlaps another")
+                raise ValueError(f"herd {p['name']} at {p['at']} overlaps another")
             taken |= got
     for p in parts:
         if p["at"] is not None:
@@ -202,7 +202,7 @@ def _place(parts, npu):
             None,
         )
         if spot is None:
-            raise ValueError(f"no room on the array for partition {p['name']}")
+            raise ValueError(f"no room on the array for herd {p['name']}")
         taken |= cells(spot, p["cores"])
         corners.append(spot)
     return corners
@@ -421,13 +421,13 @@ def read(ttir, air_project_path):
             if n.startswith("arith."):
                 env[o.result] = _evaluate(o, env, name)
                 continue
-            if n != "tt.call" or _attr(funcs[_callee(o)], "air.partition") is None:
-                raise ValueError(f"{name}: {n} in the wave loop outside npu.spatial")
+            if n != "tt.call" or _attr(funcs[_callee(o)], "air.herd") is None:
+                raise ValueError(f"{name}: {n} in the wave loop is not an air.herd")
             parts.append((o, funcs[_callee(o)]))
         if not parts:
-            raise ValueError(f"{name}: the wave loop runs no npu.spatial")
+            raise ValueError(f"{name}: the wave loop runs no air.herd")
 
-        # Partitions of one name, in any of the wave's spatials, run in turn
+        # Herds of one name run in turn
         # on the same cores.
         settings = [_settings(f) for _, f in parts]
         herds = {}
@@ -435,11 +435,11 @@ def read(ttir, air_project_path):
             h = herds.setdefault(p["name"], dict(p))
             if p["cores"] != h["cores"]:
                 raise ValueError(
-                    f"partition {p['name']} is given {h['cores']} and {p['cores']} cores"
+                    f"herd {p['name']} is given {h['cores']} and {p['cores']} cores"
                 )
             if p["at"] is not None and h["at"] not in (None, p["at"]):
                 raise ValueError(
-                    f"partition {p['name']} is placed at {h['at']} and {p['at']}"
+                    f"herd {p['name']} is placed at {h['at']} and {p['at']}"
                 )
             h["at"] = h["at"] or p["at"]
         places = _place(
@@ -481,7 +481,7 @@ def read(ttir, air_project_path):
 
 
 def _settings(f):
-    """The settings `spatial` gave partition function `f`."""
+    """The settings `herd` gave herd function `f`."""
     at = None
     if _attr(f, "air.at_col") is not None:
         at = (_attr(f, "air.at_col"), _attr(f, "air.at_row"))
@@ -494,7 +494,7 @@ def _settings(f):
 
 
 def _bound_schedule(p, sched_dir):
-    """The path of partition `p`'s schedule with its core counts bound."""
+    """The path of herd `p`'s schedule with its core counts bound."""
     from .transform_inject import _bind_core_counts
 
     with open(p["schedule"]) as f:
@@ -502,7 +502,7 @@ def _bound_schedule(p, sched_dir):
     try:
         text = _bind_core_counts(text, p["cores"])
     except ValueError as e:
-        raise ValueError(f"partition {p['name']}: {e}") from None
+        raise ValueError(f"herd {p['name']}: {e}") from None
     path = os.path.join(sched_dir, f"{p['name']}.mlir")
     with open(path, "w") as f:
         f.write(text)
@@ -510,8 +510,8 @@ def _bound_schedule(p, sched_dir):
 
 
 def _kernel_calls(call, f, funcs, env, what):
-    """The kernels partition function `f`, called by `call`, runs, in order:
-    (function symbol, argument values). A partition that is a kernel runs
+    """The kernels herd function `f`, called by `call`, runs, in order:
+    (function symbol, argument values). A herd function that is a kernel runs
     itself; otherwise it holds only calls of kernels and int arithmetic."""
     args = [env.get(v) for v in call.operands]
     body = f.regions[0].blocks[0]

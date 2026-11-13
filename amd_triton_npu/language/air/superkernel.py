@@ -1,41 +1,39 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Superkernels: one `@triton.jit` function that runs several kernels side by
-side on the NPU's cores, wave after wave, as a single dispatch.
+"""Superkernels: one `@triton.jit` function that runs kernels as AIR herds,
+side by side, wave after wave, as a single dispatch.
 
     @triton.jit
     def layer(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr):
-        h = air.allocate_l2([DP], tl.bfloat16)
+        h = air.alloc([DP], tl.bfloat16, memory_space=air.L2)
         for wave in range(NW):
-            air.spatial(
-                [(scale, (X, W, h, wave, D, DP)), (add, (X, h, X, D, DP))],
-                cores=[1, 1],
-                schedules=[SCHEDULE, SCHEDULE],
-            )
+            air.herd(scale, (X, W, h, wave, D, DP), [1, 1], SCHEDULE)
+            air.herd(add, (X, h, X, D, DP), [1, 1], SCHEDULE)
 
     layer[(1,)](x, w, NW=4, D=1536, DP=2048)
 
-`spatial` runs each partition on its own cores, all at the same time. A
-partition is a kernel and its arguments, or a `@triton.jit` function that calls
-kernels in turn on the same cores; calls of one kernel that differ only in
-their numbers and in the on-chip buffers they write become one loop over
-phases. Partitions exchange data through L2 buffers from `allocate_l2`: a
-buffer read in a wave must be written by some partition in that wave, which
-the cores wait for. DDR buffers, the pointer arguments, are updated in place;
-a partition sees the DDR writes of the partitions before it.
+The function's body is AIR's segment, looped over the waves. `herd` runs a
+kernel on its own cores; the herds of a wave all run at the same time, as in
+a segment, and their program order is the order of the DDR writes they see
+and of the transfers the dispatch issues. A herd's function is a kernel and
+its arguments, or a `@triton.jit` function that calls kernels in turn on the
+same cores; calls of one kernel that differ only in their numbers and in the
+L2 buffers they write become one loop over phases. Herds of one name run in
+turn on the same cores.
 
-A wave may call `spatial` several times. The calls take effect in program
-order, which is the order of the DDR writes the partitions see and of the
-transfers the dispatch issues; L2 buffers synchronize by themselves.
-Partitions of one name, within a call or across calls, run in turn on the
-same cores.
+Herds exchange data through L2 buffers from `alloc` (a buffer read in a wave
+must be written by some herd in that wave, which the cores wait for) and
+through channels (`Channel`, `ChannelPut`, `ChannelGet`, as AIR's). DDR
+buffers, the pointer arguments, are updated in place.
 
-`cores[i]` is partition i's core count, an int or (columns, rows). It drives
-the partition's schedule: `schedules[i]` is the path of a transform script
-whose `@__transform_main` takes, after the payload, one `!transform.param<i64>`
-per core dimension, for use as `num_threads`. The partitions are placed on the
-array in order unless `at[i]` gives the (column, row) of partition i's corner.
+A herd's `size` is its core count, an int or (columns, rows). A kernel that
+reads `tl.program_id` runs one program a core, its program ids the core's
+index in the herd. Any other kernel is split over its cores by its
+`schedule`: the path of a transform script whose `@__transform_main` takes,
+after the payload, one `!transform.param<i64>` per core dimension, for use
+as `num_threads`. Herds are placed on the array in order unless `at` gives
+the (column, row) of a herd's corner.
 
 The loop over the waves must have a constexpr trip count. Ints computed from
 the wave index, such as `wave * 2 + 1` or `air.table(values, wave)`, are
@@ -47,12 +45,16 @@ new value does not recompile the dispatch).
 from triton._C.libtriton import ir
 from triton.language import core
 
-__all__ = ["Channel", "ChannelGet", "ChannelPut", "allocate_l2", "spatial", "table"]
+__all__ = ["Channel", "ChannelGet", "ChannelPut", "L1", "L2", "alloc", "herd", "table"]
+
+#: AIR's memory spaces
+L1 = core.constexpr(2)
+L2 = core.constexpr(1)
 
 
 class _PartitionContext:
-    """Compiles a partition's function apart from the caller's, under a name
-    of its own, and marks it with the partition's settings. The functions it
+    """Compiles a herd's function apart from the caller's, under a name of
+    its own, and marks it with the herd's settings. The functions it
     calls stay out of line as well, so that the backend finds the kernels."""
 
     def __init__(self, step, index, cores, schedule, at, name):
@@ -61,7 +63,7 @@ class _PartitionContext:
         self.marked = False
 
     def mangle(self):
-        return f"_SK{self.step}P{self.index}"
+        return f"_H{self.step}"
 
     def initialize_callee(self, fn, builder):
         fn.set_attr("noinline", builder.get_bool_attr(True))
@@ -70,7 +72,7 @@ class _PartitionContext:
         self.marked = True
         i32 = builder.get_int32_attr
         fn.set_attr("air.step", i32(self.step))
-        fn.set_attr("air.partition", i32(self.index))
+        fn.set_attr("air.herd", i32(self.index))
         fn.set_attr("air.cores_x", i32(self.cores[0]))
         fn.set_attr("air.cores_y", i32(self.cores[1]))
         fn.set_attr("air.schedule", builder.get_string_attr(self.schedule))
@@ -85,14 +87,14 @@ def _values(seq):
     return [core._unwrap_if_constexpr(v) for v in seq]
 
 
-def _shape(cores):
-    cores = core._unwrap_if_constexpr(cores)
-    if isinstance(cores, int):
-        return (cores, 1)
-    cores = tuple(_values(cores))
-    if len(cores) != 2 or not all(isinstance(c, int) and c > 0 for c in cores):
-        raise ValueError(f"cores must be an int or (columns, rows), not {cores}")
-    return cores
+def _shape(size):
+    size = core._unwrap_if_constexpr(size)
+    if isinstance(size, int):
+        return (size, 1)
+    size = tuple(_values(size))
+    if len(size) != 2 or not all(isinstance(c, int) and c > 0 for c in size):
+        raise ValueError(f"a herd's size is an int or (columns, rows), not {size}")
+    return size
 
 
 def _next_id(generator, counter):
@@ -102,39 +104,28 @@ def _next_id(generator, counter):
 
 
 @core.builtin
-def spatial(
-    partitions, cores, schedules, at=None, names=None, _semantic=None, _generator=None
-):
-    """Run `partitions`, a list of (function, arguments), side by side; see
-    the module's documentation."""
-    parts = list(core._unwrap_if_constexpr(partitions))
-    cores = [_shape(c) for c in core._unwrap_if_constexpr(cores)]
-    schedules = _values(schedules)
-    at = [None] * len(parts) if at is None else _values(at)
-    names = [None] * len(parts) if names is None else _values(names)
-    for what, v in (
-        ("cores", cores),
-        ("schedules", schedules),
-        ("at", at),
-        ("names", names),
-    ):
-        if len(v) != len(parts):
-            raise ValueError(f"spatial: {len(parts)} partitions but {len(v)} {what}")
-    step = _next_id(_generator, "_npu_spatial_steps")
-    for i, part in enumerate(parts):
-        fn, args = _values(part)
-        if not isinstance(schedules[i], str):
-            raise ValueError(f"spatial: schedules[{i}] must be a path")
-        corner = None if at[i] is None else tuple(_values(at[i]))
-        name = names[i] or f"{fn.__name__}_{step}_{i}"
-        ctx = _PartitionContext(step, i, cores[i], schedules[i], corner, name)
-        _generator.call_JitFunction(fn, list(args), kwargs={}, caller_context=ctx)
+def herd(fn, args, size, schedule, name=None, at=None, _semantic=None, _generator=None):
+    """Run `fn` on `args` as a herd of `size` cores; see the module's
+    documentation."""
+    fn = core._unwrap_if_constexpr(fn)
+    schedule = core._unwrap_if_constexpr(schedule)
+    if not isinstance(schedule, str):
+        raise ValueError(f"herd {fn.__name__}: the schedule must be a path")
+    step = _next_id(_generator, "_air_herds")
+    at = core._unwrap_if_constexpr(at)
+    corner = None if at is None else tuple(_values(at))
+    name = core._unwrap_if_constexpr(name) or f"{fn.__name__}_{step}"
+    ctx = _PartitionContext(step, 0, _shape(size), schedule, corner, name)
+    _generator.call_JitFunction(fn, list(_values(args)), kwargs={}, caller_context=ctx)
 
 
 @core.builtin
-def allocate_l2(shape, dtype, _semantic=None, _generator=None):
-    """A new buffer of `shape` elements of `dtype` in L2, as a pointer to its
-    first element. Only partitions of a `spatial` may access it."""
+def alloc(shape, dtype, memory_space=L2, _semantic=None, _generator=None):
+    """A new buffer of `shape` elements of `dtype` in `memory_space`, as a
+    pointer to its first element. Only L2 for now: a buffer of the segment,
+    which only its herds access."""
+    if core._unwrap_if_constexpr(memory_space) != L2.value:
+        raise ValueError("alloc: only memory_space=air.L2 for now")
     shape = core._unwrap_if_constexpr(shape)
     n = 1
     for d in [shape] if isinstance(shape, int) else _values(shape):
@@ -144,7 +135,7 @@ def allocate_l2(shape, dtype, _semantic=None, _generator=None):
     ptr = core.pointer_type(dtype)
     # A call of a function declared for this buffer alone: the backend finds
     # the buffer's size there, and no two buffers fold into one value.
-    name = f"air.l2.{_next_id(_generator, '_npu_l2_buffers')}"
+    name = f"air.l2.{_next_id(_generator, '_air_l2_buffers')}"
     module = _generator.module
     decl = ir.builder(_generator.context).get_or_insert_function(
         module, name, b.get_function_ty([], [ptr.to_ir(b)]), "private", None
