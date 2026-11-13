@@ -112,6 +112,16 @@ class _Channel:
         return f"channel({self.name})"
 
 
+class _Segment:
+    """Code of the segment between herds: the text of a func whose arguments
+    are the values it uses from outside (`binds`, each an int, a _Wave, a
+    _Scalar, an on-chip Tensor or the name of a buffer an earlier segment
+    code exports) and whose results are the buffers it exports by name."""
+
+    def __init__(self, text, binds, exports):
+        self.text, self.binds, self.exports = text, binds, exports
+
+
 class _Call:
     """One call: its kernel's name, its compiled AIR module and how the
     module's func arguments bind to the superkernel's tensors and ints."""
@@ -160,6 +170,7 @@ class Superkernel:
         self.tensors, self.calls = [], []
         self.scalars = []  # the func's int arguments after its buffers
         self.channels = []
+        self.items = []  # ("call", _Call) and ("segment", _Segment), in order
 
     def scalar(self, name):
         """A new int argument of the func, set by the host at each dispatch."""
@@ -237,11 +248,15 @@ class Superkernel:
         for c2 in self.calls:
             if c2.herd == herd and c2.at != tuple(at):
                 raise ValueError(f"herd {herd} placed at {c2.at} and {at}")
-        self.calls.append(
-            _Call(
-                name, tuple(at), herd, str(m), binds, read, written, tuple(cores), spmd
-            )
+        call = _Call(
+            name, tuple(at), herd, str(m), binds, read, written, tuple(cores), spmd
         )
+        self.calls.append(call)
+        self.items.append(("call", call))
+
+    def segment(self, seg):
+        """Add segment code, a `_Segment`, to the wave after the calls so far."""
+        self.items.append(("segment", seg))
 
     def _check_writers(self):
         """Every on-chip tensor a call reads is written by some call."""
@@ -280,7 +295,7 @@ class Superkernel:
 
     def module_text(self):
         """The AIR module of the whole dispatch, as text."""
-        from air.dialects import arith
+        from air.dialects import arith, memref
         from air.ir import (
             BoolAttr,
             Context,
@@ -326,8 +341,19 @@ class Superkernel:
                     c = arith.ConstantOp(i32, IntegerAttr.get(i32, -1 - a))
                     tiles[a] = c.result
                     value[id(t)] = c.result
-            for g in self._phases():
-                self._add_phase_group(top, g, end, value, wave, phased, loops)
+            groups = self._phases()
+            first = {id(g[0]): g for g in groups}
+            made = {}  # a segment's exported buffers, by name
+            for kind, item in self.items:
+                if kind == "segment":
+                    _emit_segment(top, item, end, value, wave, made, self.channels)
+                elif id(item) in first:
+                    self._add_phase_group(
+                        top, first[id(item)], end, value, wave, phased, loops
+                    )
+            with InsertionPoint(end):
+                for v in made.values():
+                    memref.DeallocOp(v)
             spmd = {c.herd: c.cores for c in self.calls if c.spmd}
             _bind_tile_ids(seg, tiles, spmd)
             _lower_channels(top, seg, [(c, value[id(c)]) for c in self.channels])
@@ -569,6 +595,46 @@ module {{
             os.chdir(cwd)
         header = os.path.join(self.proj, "air_project", f"npu.{self.name}.air.txn.h")
         return out["bin_path"], header
+
+
+def _emit_segment(top, sg, end, value, wave, made, channels):
+    """Put segment code `sg` before `end`, its arguments bound."""
+    from air.dialects import arith
+    from air.ir import InsertionPoint, IntegerAttr, IntegerType, Module
+
+    decls = "".join(
+        f"air.channel @{c.name} [{', '.join(map(str, c.size))}]\n" for c in channels
+    )
+    m = Module.parse(decls + sg.text)
+    f = next(o for o in m.body.operations if o.operation.name == "func.func")
+    block = f.regions[0].blocks[0]
+    i32 = IntegerType.get_signless(32)
+    const32 = lambda v: arith.ConstantOp(
+        i32, IntegerAttr.get(i32, v)
+    ).result  # noqa: E731
+    with InsertionPoint(end):
+        for a, b in zip(block.arguments, sg.binds):
+            if isinstance(b, str):
+                v = made[b]
+            elif isinstance(b, bool):
+                v = arith.ConstantOp(a.type, IntegerAttr.get(a.type, int(b))).result
+            elif isinstance(b, int):
+                v = arith.ConstantOp(a.type, IntegerAttr.get(a.type, b)).result
+            elif isinstance(b, _Wave):
+                v = _wave_value([b], wave, None, const32)
+                if str(a.type) == "i1":
+                    v = arith.cmpi(arith.CmpIPredicate.ne, v, const32(0))
+                elif str(a.type) != "i32":
+                    v = arith.extsi(a.type, v)
+            else:
+                v = value[id(b)]
+            a.replace_all_uses_with(v)
+    ops = list(block.operations)
+    ret = ops[-1]
+    for name, v in zip(sg.exports, ret.operands):
+        made[name] = v
+    for o in ops[:-1]:
+        o.operation.move_before(end)
 
 
 def _herd_height(h):

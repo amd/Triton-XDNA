@@ -254,19 +254,109 @@ def _fifo(chan_name, n, dtype, indices, _semantic, _generator):
     return ptr.__add__(core.arange(0, n, _semantic=_semantic), _semantic=_semantic)
 
 
+def _dma(kind, chan_name, buf, offsets, sizes, strides, indices, _semantic, _generator):
+    """A channel op on a buffer, as AIR's: `sizes` elements of the buffer
+    `buf` points to, at `offsets` with `strides`. Recorded as a call of a
+    function declared for it, whose attributes hold the static parts."""
+    name = core._unwrap_if_constexpr(chan_name)
+    if not _generator.module.has_function(f"air.channel.{name}"):
+        raise ValueError(f"channel {name} is not declared")
+    sizes, strides = _ints(sizes), _ints(
+        strides if strides is not None else [1] * len(_ints(sizes))
+    )
+    offsets = [0] * len(sizes) if offsets is None else _values(offsets)
+    indices = core._unwrap_if_constexpr(indices)
+    indices = (
+        list(indices) if isinstance(indices, (tuple, list, core.tuple)) else [indices]
+    )
+    if not (len(offsets) == len(sizes) == len(strides)):
+        raise ValueError(f"{kind} {name}: offsets, sizes and strides of one rank")
+    b = _semantic.builder
+    i32 = lambda v: (  # noqa: E731
+        _semantic.to_tensor(v) if isinstance(v, int) else v
+    ).to(core.int32, _semantic=_semantic)
+    operands = [buf] + [i32(v) for v in offsets] + [i32(v) for v in indices]
+    module = _generator.module
+    symbol = f"air.dma.{_next_id(_generator, '_air_dmas')}"
+    decl = ir.builder(_generator.context).get_or_insert_function(
+        module,
+        symbol,
+        b.get_function_ty([o.type.to_ir(b) for o in operands], []),
+        "private",
+        None,
+    )
+    module.push_back(decl)
+    text = lambda v: b.get_string_attr(",".join(map(str, v)))  # noqa: E731
+    decl.set_attr("air.dma_channel", b.get_string_attr(name))
+    decl.set_attr("air.dma_put", b.get_bool_attr(kind == "ChannelPut"))
+    decl.set_attr("air.dma_sizes", text(sizes))
+    decl.set_attr("air.dma_strides", text(strides))
+    decl.set_attr("air.dma_indices", b.get_int32_attr(len(indices)))
+    b.call(module.get_function(symbol), [o.handle for o in operands])
+
+
 @core.builtin
-def ChannelPut(chan_name, src, indices=(), _semantic=None, _generator=None):
-    """Put the 1-D block `src` into channel `chan_name` at `indices`, as
-    AIR's `ChannelPut`. Waits while the FIFO is full."""
+def ChannelPut(
+    chan_name,
+    src,
+    indices=(),
+    offsets=None,
+    sizes=None,
+    strides=None,
+    _semantic=None,
+    _generator=None,
+):
+    """Put into channel `chan_name` at `indices`, as AIR's `ChannelPut`.
+    In a kernel, `src` is a 1-D block of the core's. With `sizes`, `src`
+    points to a buffer, of DDR or L2, and the put sends `sizes` elements of
+    it at `offsets` with `strides`: a transfer of the segment, not of a core.
+    Waits while the FIFO is full."""
+    if sizes is not None:
+        return _dma(
+            "ChannelPut",
+            chan_name,
+            src,
+            offsets,
+            sizes,
+            strides,
+            indices,
+            _semantic,
+            _generator,
+        )
     addr = _fifo(chan_name, src.shape[0], src.dtype, indices, _semantic, _generator)
     core.store(addr, src, _semantic=_semantic)
 
 
 @core.builtin
-def ChannelGet(chan_name, shape, dtype, indices=(), _semantic=None, _generator=None):
-    """The next block of `shape` (1-D) elements of `dtype` from channel
-    `chan_name` at `indices`, as AIR's `ChannelGet`. Waits for it."""
-    n = _ints(shape)
+def ChannelGet(
+    chan_name,
+    dst,
+    dtype=None,
+    indices=(),
+    offsets=None,
+    sizes=None,
+    strides=None,
+    _semantic=None,
+    _generator=None,
+):
+    """Get from channel `chan_name` at `indices`, as AIR's `ChannelGet`. In
+    a kernel, `dst` is the shape of a 1-D block of `dtype`, which the get
+    returns. With `sizes`, `dst` points to a buffer, of DDR or L2, that the
+    get fills: `sizes` elements at `offsets` with `strides`. Waits for the
+    data."""
+    if sizes is not None:
+        return _dma(
+            "ChannelGet",
+            chan_name,
+            dst,
+            offsets,
+            sizes,
+            strides,
+            indices,
+            _semantic,
+            _generator,
+        )
+    n = _ints(dst)
     if len(n) != 1:
         raise ValueError("ChannelGet: a 1-D block")
     dtype = core._unwrap_if_constexpr(dtype)

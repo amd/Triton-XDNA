@@ -20,6 +20,7 @@ import tempfile
 from .superkernel import (
     _TILE,
     Superkernel,
+    _Segment,
     Tensor,
     _Channel,
     _Scalar,
@@ -114,7 +115,13 @@ _BINARY = {
     "arith.minsi": min,
 }
 
-_CASTS = ("arith.extsi", "arith.extui", "arith.trunci", "arith.index_cast")
+_CASTS = (
+    "arith.extsi",
+    "arith.extui",
+    "arith.trunci",
+    "arith.index_cast",
+    "arith.index_castui",
+)
 
 
 def _evaluate(op, env, what):
@@ -413,17 +420,30 @@ def read(ttir, air_project_path):
         lbody = loop.regions[0].blocks[0]
         env[lbody.arguments[0]] = _PerWave(waves)
 
-        parts = []
+        # The wave's body: herds, and the segment code between them.
+        parts, order, pending = [], [], []
         for o in lbody.operations:
             n = o.operation.name
             if n == "scf.yield":
                 continue
             if n.startswith("arith."):
-                env[o.result] = _evaluate(o, env, name)
+                try:
+                    env[o.result] = _evaluate(o, env, name)
+                except ValueError as e:
+                    # Segment code may compute it; a herd may not take it.
+                    env[o.result] = e
+                    pending.append(o)
                 continue
-            if n != "tt.call" or _attr(funcs[_callee(o)], "air.herd") is None:
-                raise ValueError(f"{name}: {n} in the wave loop is not an air.herd")
-            parts.append((o, funcs[_callee(o)]))
+            if n == "tt.call" and _attr(funcs[_callee(o)], "air.herd") is not None:
+                if pending:
+                    order.append(("segment", pending))
+                    pending = []
+                order.append(("herd", len(parts)))
+                parts.append((o, funcs[_callee(o)]))
+                continue
+            pending.append(o)
+        if pending:
+            order.append(("segment", pending))
         if not parts:
             raise ValueError(f"{name}: the wave loop runs no air.herd")
 
@@ -455,8 +475,12 @@ def read(ttir, air_project_path):
 
         sched_dir = os.path.join(sk.proj, "schedules")
         os.makedirs(sched_dir, exist_ok=True)
-        leaves = {}
-        for (call, f), p, at in zip(parts, settings, corners):
+        leaves, exported = {}, {}
+        for kind, item in order:
+            if kind == "segment":
+                sk.segment(_SegmentWriter(env, funcs, chans, exported).write(item))
+                continue
+            (call, f), p, at = parts[item], settings[item], corners[item]
             schedule = _bound_schedule(p, sched_dir)
             for sym, args in _kernel_calls(call, f, funcs, env, p["name"]):
                 kname = _kernel_name(sym)
@@ -469,6 +493,8 @@ def read(ttir, air_project_path):
                 args = list(args) + [_TILE[a] for a in axes] + [chans[n] for n in used]
                 vals = []
                 for v in args:
+                    if isinstance(v, ValueError):
+                        raise v
                     if isinstance(v, _PerWave):
                         v = v.lowered()
                     if not isinstance(
@@ -478,6 +504,227 @@ def read(ttir, air_project_path):
                     vals.append(v)
                 sk.call(kname, leaf, vals, at, p["name"], schedule, p["cores"])
         return sk, kinds
+
+
+_PREDICATES = ["eq", "ne", "slt", "sle", "sgt", "sge", "ult", "ule", "ugt", "uge"]
+_BINARY_TEXT = (
+    "arith.addi",
+    "arith.subi",
+    "arith.muli",
+    "arith.divsi",
+    "arith.divui",
+    "arith.remsi",
+    "arith.remui",
+    "arith.maxsi",
+    "arith.minsi",
+    "arith.andi",
+    "arith.ori",
+    "arith.xori",
+    "arith.shli",
+    "arith.shrsi",
+    "arith.shrui",
+)
+
+
+class _SegmentWriter:
+    """Writes segment code, ops of the wave's body between herds, as an
+    AIR `_Segment`: loops and branches as they are (on index), L2 buffers
+    as allocs, and channel ops on buffers as AIR's. Values from outside are
+    the func's arguments; the buffers allocated at the wave's level are
+    exported, for later segment code and herds, and freed at the wave's
+    end."""
+
+    def __init__(self, env, funcs, chans, exported):
+        self.env, self.funcs, self.chans = env, funcs, chans
+        self.exported = exported  # TTIR value -> (name, memref type)
+        self.names, self.types = {}, {}
+        self.args, self.binds, self.lines = [], [], []
+        self.exports = []  # (name, local name, type)
+        self.n = 0
+
+    def fresh(self):
+        self.n += 1
+        return f"%v{self.n}"
+
+    def ref(self, v):
+        """The local name of TTIR value `v`, an argument if from outside."""
+        if v in self.names:
+            return self.names[v]
+        if isinstance(self.env.get(v), ValueError):
+            raise self.env[v]
+        name = f"%a{len(self.args)}"
+        if v in self.exported:
+            bind, typ = self.exported[v]
+            self.types[name] = typ
+        else:
+            bind = self.env.get(v)
+            if isinstance(bind, _PerWave):
+                bind = bind.lowered()
+            if isinstance(bind, Tensor) and bind.onchip:
+                typ = f"memref<{bind.n}x{bind.dtype}, 1 : i32>"
+                self.types[name] = typ
+            elif isinstance(bind, (bool, int, _Wave, _Scalar)):
+                typ = str(v.type)
+            else:
+                raise ValueError(f"segment code uses {bind!r}, from outside it")
+        self.args.append(f"{name}: {typ}")
+        self.binds.append(bind)
+        self.names[v] = name
+        return name
+
+    def constant(self, v):
+        """Whether TTIR value `v` is a constant."""
+        from air.ir import OpResult
+
+        if isinstance(self.env.get(v), int):
+            return True
+        if isinstance(v, OpResult) and v.owner.name == "arith.constant":
+            return True
+        if isinstance(v, OpResult) and v.owner.name in _CASTS:
+            return self.constant(v.owner.operands[0])
+        return False
+
+    def index(self, v):
+        """An index-typed name for TTIR int value `v`."""
+        a = self.ref(v)
+        if str(v.type) == "index":
+            return a
+        r = self.fresh()
+        self.lines.append(f"{r} = arith.index_cast {a} : {v.type} to index")
+        return r
+
+    def write(self, ops):
+        self.block(ops, top=True)
+        rets = [loc for _, loc, _ in self.exports]
+        types = [t for _, _, t in self.exports]
+        body = "\n".join(self.lines)
+        ret = f"return {', '.join(rets)} : {', '.join(types)}" if rets else "return"
+        text = (
+            f"func.func @segment({', '.join(self.args)}) -> ({', '.join(types)}) {{\n"
+            f"{body}\n{ret}\n}}\n"
+        )
+        for (name, _, typ), v in zip(self.exports, self._exported_values):
+            self.exported[v] = (name, typ)
+        return _Segment(text, self.binds, [n for n, _, _ in self.exports])
+
+    _exported_values = ()
+
+    def block(self, ops, top=False):
+        frees = []
+        for o in ops:
+            n = o.operation.name
+            if n in ("scf.yield", "tt.return"):
+                if n == "scf.yield" and len(o.operands):
+                    raise ValueError("segment code: loops and branches yield nothing")
+                continue
+            if n == "tt.call" and _callee(o).startswith("air.l2."):
+                decl = self.funcs[_callee(o)]
+                elt = str(o.results[0].type).split("<")[1].rstrip(">")
+                typ = f"memref<{_attr(decl, 'air.l2_elements')}x{elt}, 1 : i32>"
+                r = self.fresh()
+                self.lines.append(f"{r} = memref.alloc() : {typ}")
+                self.names[o.results[0]], self.types[r] = r, typ
+                if top:
+                    self.exports.append((f"{_callee(o)}", r, typ))
+                    self._exported_values = tuple(self._exported_values) + (
+                        o.results[0],
+                    )
+                else:
+                    frees.append((r, typ))
+            elif n == "tt.call" and _callee(o).startswith("air.dma."):
+                self.dma(o)
+            elif n == "scf.for":
+                if len(o.results):
+                    raise ValueError("segment code: a loop carries no values")
+                lb, ub, st = (self.index(v) for v in o.operands[:3])
+                body = o.regions[0].blocks[0]
+                iv, ivx = self.fresh(), self.fresh()
+                self.lines.append(f"scf.for {ivx} = {lb} to {ub} step {st} {{")
+                self.lines.append(
+                    f"{iv} = arith.index_cast {ivx} : index to {body.arguments[0].type}"
+                )
+                self.names[body.arguments[0]] = iv
+                self.block(list(body.operations))
+                self.lines.append("}")
+            elif n == "scf.if":
+                if len(o.results):
+                    raise ValueError("segment code: a branch yields no values")
+                c = self.ref(o.operands[0])
+                self.lines.append(f"scf.if {c} {{")
+                self.block(list(o.regions[0].blocks[0].operations))
+                if len(o.regions[1].blocks):
+                    self.lines.append("} else {")
+                    self.block(list(o.regions[1].blocks[0].operations))
+                self.lines.append("}")
+            elif n == "arith.constant":
+                r = self.fresh()
+                v = o.attributes["value"]
+                self.lines.append(f"{r} = arith.constant {v}")
+                self.names[o.result] = r
+            elif n in _BINARY_TEXT:
+                a, b = (self.ref(v) for v in o.operands)
+                r = self.fresh()
+                self.lines.append(f"{r} = {n} {a}, {b} : {o.result.type}")
+                self.names[o.result] = r
+            elif n == "arith.cmpi":
+                a, b = (self.ref(v) for v in o.operands)
+                r = self.fresh()
+                pred = _PREDICATES[_attr(o, "predicate")]
+                self.lines.append(
+                    f"{r} = arith.cmpi {pred}, {a}, {b} : {o.operands[0].type}"
+                )
+                self.names[o.result] = r
+            elif n == "arith.select":
+                c, a, b = (self.ref(v) for v in o.operands)
+                r = self.fresh()
+                self.lines.append(f"{r} = arith.select {c}, {a}, {b} : {o.result.type}")
+                self.names[o.result] = r
+            elif n in _CASTS:
+                a = self.ref(o.operands[0])
+                r = self.fresh()
+                self.lines.append(
+                    f"{r} = {n} {a} : {o.operands[0].type} to {o.result.type}"
+                )
+                self.names[o.result] = r
+            else:
+                raise ValueError(f"segment code: {n} is not supported")
+        for r, typ in frees:
+            self.lines.append(f"memref.dealloc {r} : {typ}")
+
+    def dma(self, o):
+        decl = self.funcs[_callee(o)]
+        ch = _attr(decl, "air.dma_channel")
+        if ch not in self.chans:
+            raise ValueError(f"channel {ch} is not declared")
+        ints = lambda t: [int(x) for x in t.split(",")]  # noqa: E731
+        sizes, strides = ints(_attr(decl, "air.dma_sizes")), ints(
+            _attr(decl, "air.dma_strides")
+        )
+        k = _attr(decl, "air.dma_indices")
+        ops = list(o.operands)
+        buf, offs, idx = ops[0], ops[1 : 1 + len(sizes)], ops[1 + len(sizes) :]
+        if len(idx) != k:
+            raise ValueError(f"channel {ch}: {len(idx)} indices, not {k}")
+        b = self.ref(buf)
+        if b not in self.types:
+            raise ValueError(
+                f"channel {ch}: a transfer of a buffer the segment has not"
+            )
+        for v in idx:
+            if not self.constant(v):
+                raise ValueError(
+                    f"channel {ch}: the segment's transfers take constant indices, "
+                    "the routes of the memtiles being fixed (unroll the loop with "
+                    "tl.static_range)"
+                )
+        o_ = [self.index(v) for v in offs]
+        i_ = [self.index(v) for v in idx]
+        op = "air.channel.put" if _attr(decl, "air.dma_put") else "air.channel.get"
+        self.lines.append(
+            f"{op} @{ch}[{', '.join(i_)}] ({b}[{', '.join(o_)}] "
+            f"[{', '.join(map(str, sizes))}] [{', '.join(map(str, strides))}]) "
+            f": ({self.types[b]})"
+        )
 
 
 def _settings(f):

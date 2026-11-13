@@ -20,6 +20,9 @@ on the NPU and compares with numpy:
   spmd       a kernel run as one program a core, program_id its core
   bcast      one core's blocks broadcast to the two cores of another
   merge      two cores put into a FIFO each, one core gets both
+  grid       a rank-3 channel between two 2x2 herds
+  gather     segment code gathers two cores' halves in an L2 buffer and
+             sends it three times to a third core
 
 Also checks the errors reading a superkernel reports. Needs an npu2 device
 for the runs; with no NPU only the IR checks run.
@@ -345,6 +348,48 @@ def grid(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constex
         air.herd(g_sink, (Y, D, T), (2, 2), S)
 
 
+@triton.jit
+def half(X, D: tl.constexpr, T: tl.constexpr):
+    p = tl.program_id(0)
+    air.ChannelPut("halves", tl.load(X + p * T + tl.arange(0, T)) * 2, indices=[p])
+
+
+@triton.jit
+def use3(Y, D: tl.constexpr, T: tl.constexpr):
+    acc = air.ChannelGet("whole", [2 * T], tl.bfloat16)
+    acc += air.ChannelGet("whole", [2 * T], tl.bfloat16)
+    acc += air.ChannelGet("whole", [2 * T], tl.bfloat16)
+    tl.store(Y + tl.arange(0, 2 * T), acc)
+
+
+@triton.jit
+def gather(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
+    air.Channel("halves", size=[2])
+    air.Channel("whole")
+    for wave in range(NW):
+        air.herd(half, (X, D, T), 2, S, name="half")
+        buf = air.alloc([2 * T], tl.bfloat16, memory_space=air.L2)
+        for h in tl.static_range(2):
+            air.ChannelGet("halves", buf, indices=[h], offsets=[h * T], sizes=[T])
+        for r in range(3):
+            air.ChannelPut("whole", buf, offsets=[0], sizes=[2 * T])
+        air.herd(use3, (Y, D, T), 1, S, name="use")
+
+
+@triton.jit
+def gather_dynamic(
+    X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr
+):
+    air.Channel("halves", size=[2])
+    air.Channel("whole")
+    for wave in range(NW):
+        air.herd(half, (X, D, T), 2, S, name="half")
+        buf = air.alloc([2 * T], tl.bfloat16, memory_space=air.L2)
+        for h in range(2):
+            air.ChannelGet("halves", buf, indices=[h], offsets=[h * T], sizes=[T])
+        air.herd(use3, (Y, D, T), 1, S, name="use")
+
+
 # Superkernels that reading rejects.
 
 
@@ -511,6 +556,13 @@ EXPLICIT = {
         lambda x: bf(bf(2 * x[:XD]) + bf(2 * x[XD:])),
         ["air.channel @parts [2]"],
     ),
+    "gather": (
+        gather,
+        2 * XT,
+        2 * XT,
+        lambda x: bf(bf(bf(2 * x) * 2) + bf(2 * x)),
+        ["air.channel.get  @halves[", "air.channel.put  @whole[] (%alloc"],
+    ),
     "grid": (
         grid,
         4 * XD,
@@ -583,7 +635,7 @@ def ir_checks(name, text):
         check(bool(two), "multicore: a herd on two cores")
 
 
-def error_checks(script, proj):
+def error_checks(script, direct, proj):
     x = torch.empty(D, dtype=torch.bfloat16)
     common = dict(NW=WAVES, D=D, DP=DP, S=script)
     bad = [
@@ -595,6 +647,15 @@ def error_checks(script, proj):
         ("phase order", phase_order, (x, x), "listed between the phases"),
         ("phase wiring", wiring, (x, x), "differ"),
     ]
+    explicit = dict(NW=2, D=XD, T=XT)
+    y = torch.empty(2 * XT, dtype=torch.bfloat16)
+    try:
+        module_text(
+            gather_dynamic, (y, y), dict(explicit, S=direct), os.path.join(proj, "dyn")
+        )
+        check(False, "dynamic segment indices: no error")
+    except ValueError as e:
+        check("constant indices" in str(e), f"dynamic segment indices: {e}")
     for what, kernel, args, want in bad:
         try:
             module_text(kernel, args, common, os.path.join(proj, what))
@@ -654,7 +715,7 @@ def main():
         with open(direct, "w") as f:
             f.write(DIRECT)
         with config_context(bf16_emulation=False):
-            error_checks(script, os.path.join(tmp, "bad"))
+            error_checks(script, direct, os.path.join(tmp, "bad"))
             for name in EXPLICIT:
                 print(f"{name}:", flush=True)
                 run_explicit(name, direct, has_npu, os.path.join(tmp, name))
