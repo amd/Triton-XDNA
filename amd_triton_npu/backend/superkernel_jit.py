@@ -881,6 +881,8 @@ def _aircc_options(opts):
         args.append("--use-lock-race-condition-fix")
     if yes("use_lock_race_condition_fix_v2"):
         args.append("--use-lock-race-condition-fix-v2")
+    if yes("allow_deadlock_prone_routing"):
+        args.append("--allow-deadlock-prone-routing")
     feeds = []
     if opts.get("unroll_feed_loops", "True") == "True":
         feeds.append("--unroll-feed-loops")

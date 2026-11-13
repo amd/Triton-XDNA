@@ -207,13 +207,16 @@ def backend(
     unroll_feed_loops=None,
     merge_contiguous_feeds=None,
     stack_size=None,
+    allow_deadlock_prone_routing=None,
     _semantic=None,
     _generator=None,
 ):
     """How aircc builds the superkernel, as AIR's `XRTBackend` takes it:
     `omit_pingpong` ("L1", "L2" or "all"), `channel_multiplexing` (memory
-    levels, such as ["L1"]), the lock race fixes, `stack_size`; and whether
-    the host's feed loops are unrolled and contiguous feeds merged. Called
+    levels, such as ["L1"]), the lock race fixes, `stack_size`,
+    `allow_deadlock_prone_routing` (route flows aiecc's static check cannot
+    prove drain, where the order of the transfers rules the cycle out); and
+    whether the host's feed loops are unrolled and contiguous feeds merged. Called
     once, in the superkernel; without it, the defaults suit superkernels
     whose herds only exchange L2 buffers."""
     b = _semantic.builder
@@ -230,6 +233,7 @@ def backend(
         use_lock_race_condition_fix=use_lock_race_condition_fix,
         use_lock_race_condition_fix_v2=use_lock_race_condition_fix_v2,
         unroll_feed_loops=unroll_feed_loops,
+        allow_deadlock_prone_routing=allow_deadlock_prone_routing,
         merge_contiguous_feeds=merge_contiguous_feeds,
         stack_size=stack_size,
     )
