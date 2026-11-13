@@ -30,7 +30,8 @@ on the NPU and compares with numpy:
              reads them in parts: 32 rows of a GEMV, in vectors
   proj16     a GEMV on 16 cores: x broadcast through a memtile, weight
              streams through the cores' memtiles, rows gathered back
-             through them
+             through them as packets whose header picks one of three
+             consumers
 
 Also checks the errors reading a superkernel reports. Needs an npu2 device
 for the runs; with no NPU only the IR checks run.
@@ -189,6 +190,11 @@ module attributes {transform.with_named_sequence} {
     %t, %l = transform.structured.tile_using_for %op tile_sizes [32] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.yield
   }
+  // Vectors where the op's shape allows; the rest stays scalar.
+  transform.named_sequence @vectorize_one(%op: !transform.any_op {transform.consumed}) {
+    transform.structured.vectorize %op : !transform.any_op
+    transform.yield
+  }
   transform.named_sequence @tile_rows(%op: !transform.any_op {transform.consumed}) {
     %t, %l = transform.structured.tile_using_for %op tile_sizes [1, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.yield
@@ -258,7 +264,7 @@ module attributes {transform.with_named_sequence} {
     %vg = transform.structured.match ops{["linalg.generic", "linalg.fill", "linalg.copy"]} in %h1r : (!transform.any_op) -> !transform.any_op
     transform.foreach %vg : !transform.any_op {
     ^bb0(%v: !transform.any_op):
-      transform.structured.vectorize %v : !transform.any_op
+      transform.include @vectorize_one failures(suppress) (%v) : (!transform.any_op) -> ()
     }
     %hc = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.include @post_vectorize_reduce_cleanup failures(propagate) (%hc) : (!transform.any_op) -> ()
@@ -634,7 +640,8 @@ def q4gemv(
 @triton.jit
 def proj_core(CX0: tl.constexpr, I2: tl.constexpr, J2: tl.constexpr):
     """Rows i 512 + cx 128 + cy 32 + [0, 32) of round i, over 2 J2 blocks of
-    256 columns; core (cx, cy) of the 4x4 cores of two herds."""
+    256 columns, sent to consumer i % 3; core (cx, cy) of the 4x4 cores of
+    two herds."""
     cx = CX0 + tl.program_id(0)
     cy = tl.program_id(1)
     w = air.alloc([2560], tl.int16, memory_space=air.L1)
@@ -643,6 +650,9 @@ def proj_core(CX0: tl.constexpr, I2: tl.constexpr, J2: tl.constexpr):
     xq = air.alloc([1024], tl.bfloat16, memory_space=air.L1)
     t = air.alloc([32], tl.float32, memory_space=air.L1)
     sx = air.alloc([8], tl.float32, memory_space=air.L1)
+    # The rows at [32, 64), where a vector store is aligned; the packet's
+    # header in the word before them.
+    y = air.alloc([64], tl.bfloat16, memory_space=air.L1)
     r = tl.arange(0, 32)
     for i in range(I2):
         tl.store(acc + r, tl.zeros([32], tl.float32))
@@ -650,15 +660,34 @@ def proj_core(CX0: tl.constexpr, I2: tl.constexpr, J2: tl.constexpr):
             air.ChannelGet("inX", xb, indices=[cx, cy], sizes=[256])
             air.ChannelGet("wL2ToL1", w, indices=[cx, cy], sizes=[2560])
             q4_block(xb, w, acc, xq, t, sx)
-        air.ChannelPut("outA", tl.load(acc + r).to(tl.bfloat16), indices=[cx, cy])
+        tl.store(y + 32 + r, tl.load(acc + r).to(tl.bfloat16))
+        air.ChannelPut(
+            "outA", y, indices=[cx, cy], offsets=[30], sizes=[34], dest=i % 3
+        )
+
+
+@triton.jit
+def consumer(D: tl.constexpr, N: tl.constexpr):
+    """Consumer D's N rounds, doubled, plus 64 D, to the host."""
+    for n in range(N):
+        v = air.ChannelGet("outY", [512], tl.bfloat16, indices=[0, D])
+        v = (v + v) + 64.0 * D
+        if D == 0:
+            air.ChannelPut("res0", v)
+        if D == 1:
+            air.ChannelPut("res1", v)
+        if D == 2:
+            air.ChannelPut("res2", v)
 
 
 @triton.jit
 def proj16(X, Y, W, I2: tl.constexpr, J2: tl.constexpr, S: tl.constexpr):
-    """y = W x on 16 cores, 512 rows a round: x lands in memtile 3 and is
-    broadcast to every core; each of 8 weight streams fills a memtile's
-    buffer with a block for each of two cores; each column's memtile
-    gathers its 4 cores' rows and memtile 2 the 4 columns'."""
+    """y = W x on 16 cores, 512 rows a round, round i to consumer i % 3: x
+    lands in memtile 3 and is broadcast to every core; each of 8 weight
+    streams fills a memtile's buffer with a block for each of two cores;
+    each column's memtile gathers its 4 cores' rows behind the first one's
+    packet header, memtile 2 the 4 columns', and the header picks the
+    consumer the round goes to."""
     air.backend(
         use_lock_race_condition_fix_v2=True,
         merge_contiguous_feeds=False,
@@ -670,7 +699,12 @@ def proj16(X, Y, W, I2: tl.constexpr, J2: tl.constexpr, S: tl.constexpr):
     air.Channel("wL2ToL1", size=[4, 4])
     air.Channel("outA", size=[4, 4], channel_type="npu_dma_packet")
     air.Channel("toMain", size=[4], channel_type="npu_dma_packet")
-    air.Channel("outY")
+    air.Channel(
+        "outY", size=[1, 1], broadcast_shape=[1, 3], channel_type="npu_dma_packet"
+    )
+    air.Channel("res0")
+    air.Channel("res1")
+    air.Channel("res2")
     NF: tl.constexpr = I2 * 2 * J2  # fills of each weight stream
     for i in range(I2):
         air.ChannelPut("xnorm", X, offsets=[0], sizes=[512 * J2])
@@ -704,16 +738,31 @@ def proj16(X, Y, W, I2: tl.constexpr, J2: tl.constexpr, S: tl.constexpr):
     for i in range(I2):
         for x in tl.static_range(4):
             g = air.alloc(
-                [128], tl.bfloat16, memory_space=air.L2, memtile_col=x + (x // 2) * 4
+                [130], tl.bfloat16, memory_space=air.L2, memtile_col=x + (x // 2) * 4
             )
-            for y in tl.static_range(4):
-                air.ChannelGet("outA", g, indices=[x, y], offsets=[y * 32], sizes=[32])
-            air.ChannelPut("toMain", g, indices=[x], offsets=[0], sizes=[128])
-        m = air.alloc([512], tl.bfloat16, memory_space=air.L2, memtile_col=2)
-        for x in tl.static_range(4):
-            air.ChannelGet("toMain", m, indices=[x], offsets=[x * 128], sizes=[128])
-        air.ChannelPut("outY", m, offsets=[0], sizes=[512])
-    air.ChannelGet("outY", Y, offsets=[0], sizes=[I2 * 512])
+            # the first row's packet with its header, the others' without
+            air.ChannelGet("outA", g, indices=[x, 0], offsets=[0], sizes=[34])
+            for c in tl.static_range(1, 4):
+                air.ChannelGet(
+                    "outA", g, indices=[x, c], offsets=[2 + c * 32], sizes=[32]
+                )
+            air.ChannelPut("toMain", g, indices=[x], offsets=[0], sizes=[130])
+        m = air.alloc([514], tl.bfloat16, memory_space=air.L2, memtile_col=2)
+        air.ChannelGet("toMain", m, indices=[0], offsets=[0], sizes=[130])
+        for x in tl.static_range(1, 4):
+            air.ChannelGet("toMain", m, indices=[x], offsets=[2 + x * 128], sizes=[128])
+        air.ChannelPut("outY", m, indices=[0, 0], offsets=[0], sizes=[514])
+    air.herd(consumer, (0, (I2 + 2) // 3), 1, S, name="rope", at=(2, 3))
+    air.herd(consumer, (1, (I2 + 1) // 3), 1, S, name="rms", at=(2, 2))
+    air.herd(consumer, (2, I2 // 3), 1, S, name="glu", at=(5, 3))
+    # consumer d's rounds at Y[d NC 512 ...]
+    NC: tl.constexpr = (I2 + 2) // 3
+    for n in range((I2 + 2) // 3):
+        air.ChannelGet("res0", Y, offsets=[n * 512], sizes=[512])
+    for n in range((I2 + 1) // 3):
+        air.ChannelGet("res1", Y, offsets=[(NC + n) * 512], sizes=[512])
+    for n in range(I2 // 3):
+        air.ChannelGet("res2", Y, offsets=[(2 * NC + n) * 512], sizes=[512])
 
 
 # Superkernels that reading rejects.
@@ -978,7 +1027,7 @@ def run_q4gemv(script, has_npu, proj):
 
 
 def run_proj16(script, has_npu, proj):
-    i2, j2 = 2, 1
+    i2, j2 = 6, 1
     rng = np.random.default_rng(3)
     x0 = bf(rng.standard_normal(512 * j2))
     nrb, ncb = i2 * 16, 2 * j2
@@ -993,12 +1042,18 @@ def run_proj16(script, has_npu, proj):
         ]
         for _ in range(nrb)
     ]
-    want = np.concatenate(
+    rows = np.concatenate(
         [
             bf(sum(q4_ref(x0[j * 256 : (j + 1) * 256], *blk[b][j]) for j in range(ncb)))
             for b in range(nrb)
         ]
     )
+    nc = (i2 + 2) // 3
+    want = np.zeros(3 * nc * 512, np.float32)
+    for i in range(i2):
+        d, n = i % 3, i // 3
+        part = bf(bf(2 * rows[i * 512 : (i + 1) * 512]) + 64.0 * d)
+        want[(d * nc + n) * 512 : (d * nc + n + 1) * 512] = part
     # Stream (x, k): per round i and column block j, the blocks of cores
     # (x, 2 k) and (x, 2 k + 1), whose rows are i 512 + x 128 + cy 32.
     order = [
@@ -1011,7 +1066,7 @@ def run_proj16(script, has_npu, proj):
     ]
     W = torch.from_numpy(np.concatenate([q4_pack(*blk[b][j]) for b, j in order]))
     x = _bfx(x0)
-    y = torch.zeros(i2 * 512, dtype=torch.bfloat16)
+    y = torch.zeros(3 * nc * 512, dtype=torch.bfloat16)
     kw = dict(I2=i2, J2=j2, S=script)
     text = module_text(proj16, (x, y, W), kw, proj)
     check(
@@ -1019,6 +1074,7 @@ def run_proj16(script, has_npu, proj):
         and "air.herd @proj_blk1" in text,
         "proj16: x broadcast to two 2x4 herds",
     )
+    check(text.count(" dest(") == 2, "proj16: the cores' puts pick the consumer")
     if not has_npu:
         return
     from triton.backends.amd_triton_npu.driver_scope import driver_scope
@@ -1029,7 +1085,7 @@ def run_proj16(script, has_npu, proj):
     ulp = np.abs(want) * 2.0**-7 + 1e-6
     check(
         bool(np.all(np.abs(got - want) <= ulp)),
-        "proj16: NPU result matches numpy to one ulp",
+        "proj16: each consumer gets its rounds, to one ulp",
     )
 
 

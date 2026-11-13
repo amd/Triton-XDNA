@@ -242,6 +242,8 @@ def table(values, index, _semantic=None, _generator=None):
 
 #: the radix of a channel index's digits in the address that encodes it
 _RADIX = 256
+# Each declared channel's rank, by module and name.
+_RANKS = {}
 
 
 def _ints(v):
@@ -285,6 +287,7 @@ def Channel(
     module.push_back(decl)
     text = lambda v: b.get_string_attr(",".join(map(str, v)))  # noqa: E731
     decl.set_attr("air.channel_size", text(size))
+    _RANKS[(id(module), name)] = len(size)
     broadcast_shape = core._unwrap_if_constexpr(broadcast_shape)
     if broadcast_shape is not None:
         broadcast_shape = _ints(broadcast_shape)
@@ -304,11 +307,12 @@ def Channel(
     b.call(module.get_function(symbol), [])
 
 
-def _fifo(chan_name, n, dtype, indices, _semantic, _generator, lanes=None):
+def _fifo(chan_name, n, dtype, indices, _semantic, _generator, lanes=None, dest=None):
     """The addresses of a block of `n` elements of `dtype` at `indices` of
     channel `chan_name`, as a block of `lanes` (`n` if not given) addresses.
     The indices go into the address as digits of radix _RADIX, each digit's
-    place a multiple of the block, in 64 bits."""
+    place a multiple of the block, in 64 bits; a put's `dest`, plus one, as
+    one more digit above them."""
     name = core._unwrap_if_constexpr(chan_name)
     module = _generator.module
     symbol = f"air.channel.{name}"
@@ -322,6 +326,14 @@ def _fifo(chan_name, n, dtype, indices, _semantic, _generator, lanes=None):
     indices = (
         list(indices) if isinstance(indices, (tuple, list, core.tuple)) else [indices]
     )
+    if dest is not None:
+        # the indices the put leaves out are the leading ones, 0
+        rank = _RANKS[(id(module), name)]
+        indices = [0] * (rank - len(indices)) + indices
+        dest = core._unwrap_if_constexpr(dest)
+        indices = [
+            dest + 1 if isinstance(dest, int) else dest.__add__(1, _semantic=_semantic)
+        ] + indices
     const, off = 0, None
     for k, v in enumerate(indices):
         v = core._unwrap_if_constexpr(v)
@@ -342,7 +354,18 @@ def _fifo(chan_name, n, dtype, indices, _semantic, _generator, lanes=None):
     )
 
 
-def _dma(kind, chan_name, buf, offsets, sizes, strides, indices, _semantic, _generator):
+def _dma(
+    kind,
+    chan_name,
+    buf,
+    offsets,
+    sizes,
+    strides,
+    indices,
+    _semantic,
+    _generator,
+    dest=None,
+):
     """A channel op on a buffer, as AIR's: `sizes` elements of the buffer
     `buf` points to, at `offsets` with `strides`. In the superkernel,
     recorded as a call of a function declared for it, whose attributes hold
@@ -366,8 +389,19 @@ def _dma(kind, chan_name, buf, offsets, sizes, strides, indices, _semantic, _gen
     ).to(core.int32, _semantic=_semantic)
     if not _generator.is_kernel:
         return _core_dma(
-            kind, name, buf, offsets, sizes, strides, indices, _semantic, _generator
+            kind,
+            name,
+            buf,
+            offsets,
+            sizes,
+            strides,
+            indices,
+            _semantic,
+            _generator,
+            dest,
         )
+    if dest is not None:
+        raise ValueError(f"{kind} {name}: dest on a put of the segment or the host")
     operands = [buf] + [i32(v) for v in offsets] + [i32(v) for v in indices]
     module = _generator.module
     symbol = _fresh_symbol(module, "air.dma.")
@@ -388,7 +422,9 @@ def _dma(kind, chan_name, buf, offsets, sizes, strides, indices, _semantic, _gen
     b.call(module.get_function(symbol), [o.handle for o in operands])
 
 
-def _core_dma(kind, name, buf, offsets, sizes, strides, indices, _semantic, _generator):
+def _core_dma(
+    kind, name, buf, offsets, sizes, strides, indices, _semantic, _generator, dest=None
+):
     """A kernel's transfer between a channel and its own buffer `buf`: a
     masked copy through a block of the next power of two, so that a block
     of any size moves as one transfer."""
@@ -405,7 +441,9 @@ def _core_dma(kind, name, buf, offsets, sizes, strides, indices, _semantic, _gen
     lanes = core.arange(0, p, _semantic=_semantic)
     mask = lanes.__lt__(n, _semantic=_semantic)
     mine = at.__add__(lanes, _semantic=_semantic)
-    fifo = _fifo(name, n, buf.dtype.element_ty, indices, _semantic, _generator, p)
+    fifo = _fifo(
+        name, n, buf.dtype.element_ty, indices, _semantic, _generator, p, dest=dest
+    )
     if kind == "ChannelPut":
         block = core.load(mine, mask=mask, _semantic=_semantic)
         core.store(fifo, block, mask=mask, _semantic=_semantic)
@@ -422,6 +460,7 @@ def ChannelPut(
     offsets=None,
     sizes=None,
     strides=None,
+    dest=None,
     _semantic=None,
     _generator=None,
 ):
@@ -430,7 +469,10 @@ def ChannelPut(
     points to a buffer and the put sends `sizes` elements of it at `offsets`
     with `strides`: in the superkernel a buffer of DDR or L2 and a transfer
     of the host or the segment; in a kernel a buffer of the core's own.
-    Waits while the FIFO is full."""
+    `dest`, in a kernel, makes the put start a packet for a packet channel's
+    demux: the index along the broadcast dimension of the get it is for, at
+    the end of the packet's hops. Waits while the FIFO is full."""
+    dest = core._unwrap_if_constexpr(dest)
     if sizes is not None:
         return _dma(
             "ChannelPut",
@@ -442,8 +484,11 @@ def ChannelPut(
             indices,
             _semantic,
             _generator,
+            dest=dest,
         )
-    addr = _fifo(chan_name, src.shape[0], src.dtype, indices, _semantic, _generator)
+    addr = _fifo(
+        chan_name, src.shape[0], src.dtype, indices, _semantic, _generator, dest=dest
+    )
     core.store(addr, src, _semantic=_semantic)
 
 

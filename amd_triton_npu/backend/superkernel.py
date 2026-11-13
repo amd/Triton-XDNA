@@ -943,12 +943,13 @@ def _linear(v):
 def _channel_indices(c, off, n):
     """The indices into channel `c` that a copy of `n` elements at offset
     `off` of its placeholder stands for: the offset's digits of radix
-    _RADIX, each digit's place a multiple of `n`. Emitted before the copy."""
+    _RADIX, each digit's place a multiple of `n`; and a put's dest, the
+    digit above them less one, or None. Emitted before the copy."""
     from air.dialects import arith
     from air.ir import IndexType, IntegerAttr
 
     idx = IndexType.get()
-    rank = len(c.size)
+    rank = len(c.size) + 1
     places = [n * _RADIX ** (rank - 1 - k) for k in range(rank)]
     const, terms = _linear(off)
     per = [[] for _ in range(rank)]
@@ -967,7 +968,7 @@ def _channel_indices(c, off, n):
         digits.insert(0, q % _RADIX)
         q //= _RADIX
     if q:
-        raise ValueError(f"{c}: more indices than its rank {rank}")
+        raise ValueError(f"{c}: more indices than its rank {rank - 1}")
     out = []
     for terms_, digit in zip(per, digits):
         v = None
@@ -983,7 +984,11 @@ def _channel_indices(c, off, n):
             d = arith.ConstantOp(idx, IntegerAttr.get(idx, digit)).result
             v = d if v is None else arith.AddIOp(v, d).result
         out.append(v)
-    return out
+    dest = None
+    if per[0] or digits[0]:
+        one = arith.ConstantOp(idx, IntegerAttr.get(idx, 1)).result
+        dest = arith.SubIOp(out[0], one).result
+    return out[1:], dest
 
 
 def _lower_channels(module, seg, chans):
@@ -1022,9 +1027,28 @@ def _lower_channels(module, seg, chans):
                     o, sz, st = _dma_pattern(d, other)
                     mem = getattr(d.opview, other)
                     with InsertionPoint(d):
-                        ends = _channel_indices(c, offs[0], sizes[0])
-                        op = ChannelPut if put else ChannelGet
-                        op(c.name, mem, offsets=o, sizes=sz, strides=st, indices=ends)
+                        ends, dest = _channel_indices(c, offs[0], sizes[0])
+                        if put:
+                            ChannelPut(
+                                c.name,
+                                mem,
+                                offsets=o,
+                                sizes=sz,
+                                strides=st,
+                                indices=ends,
+                                dest=dest,
+                            )
+                        else:
+                            if dest is not None:
+                                raise ValueError(f"{c}: a get with a dest: {d}")
+                            ChannelGet(
+                                c.name,
+                                mem,
+                                offsets=o,
+                                sizes=sz,
+                                strides=st,
+                                indices=ends,
+                            )
                     d.erase()
         for h in _ops_named(seg, "air.herd"):
             ops = list(h.operands)
@@ -1258,7 +1282,8 @@ def _l1_copies(h, mine):
         users = [u.owner for u in v.uses]
         return any(u.name.startswith("air.channel.") for u in users) and all(
             u.name.startswith("air.channel.")
-            or u.name in ("memref.dealloc", "memref.copy", "memref.subview")
+            or u.name in ("memref.dealloc", "memref.copy", "linalg.copy")
+            or u.name == "memref.subview"
             or u.name in ("vector.transfer_read", "vector.transfer_write")
             for u in users
         )
@@ -1276,7 +1301,7 @@ def _l1_copies(h, mine):
                 and _home_of(view, mine)
             ):
                 out.append(([loop], tmp, _prefix(view, n)))
-    for c in _ops_named(h, "memref.copy"):
+    for c in _ops_named(h, "memref.copy") + _ops_named(h, "linalg.copy"):
         src, dst = c.operands[0], c.operands[1]
         for tmp, view in ((src, dst), (dst, src)):
             if channel_buffer(tmp) and _home_of(view, mine):
