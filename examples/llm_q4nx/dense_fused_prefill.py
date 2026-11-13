@@ -118,7 +118,10 @@ class _FusedPrefill:
                 f"the fused prefill runs all {self._desc.layers} layers of "
                 f"{self.AIR_MODEL}; n_layers={self.n_layers} was asked for"
             )
-        self._fused = dense.DensePrefill(build_dir, self._desc)
+        self._fused = self._engine(build_dir, self._desc)
+
+    def _engine(self, build_dir, desc):
+        return _dense()[0].DensePrefill(build_dir, desc)
 
     def load_weights(self, model=None):
         """The fused prefill's weights only.
@@ -160,13 +163,27 @@ class _FusedPrefill:
         self._fused.suspend()
 
 
-def fused_prefill_class(base, air_model):
-    """`base` (a `LlamaPrefill` class) with its prefill on mlir-air's fused one.
+class _TritonFusedPrefill(_FusedPrefill):
+    """`_FusedPrefill` on the device `dense_triton_fused` builds, run by
+    `dense_npu_prefill`."""
+
+    ENGINE = "triton-fused"
+
+    def _engine(self, build_dir, desc):
+        from dense_npu_prefill import NpuPrefill
+
+        return NpuPrefill(build_dir, desc)
+
+
+def fused_prefill_class(base, air_model, triton=False):
+    """`base` (a `LlamaPrefill` class) with its prefill on mlir-air's fused
+    one, or with `triton` on the same device built from Triton.
 
     The result is constructed as `cls(build_dir, **base_kwargs)`.
     """
+    mixin = _TritonFusedPrefill if triton else _FusedPrefill
     return type(
-        f"Fused{base.__name__}",
-        (_FusedPrefill, base),
-        {"AIR_MODEL": air_model, "__doc__": _FusedPrefill.__doc__},
+        f"{'TritonFused' if triton else 'Fused'}{base.__name__}",
+        (mixin, base),
+        {"AIR_MODEL": air_model, "__doc__": mixin.__doc__},
     )
