@@ -424,6 +424,9 @@ def read(ttir, air_project_path):
         kinds = [
             "buffer" if "!tt.ptr" in str(a.type) else "scalar" for a in body.arguments
         ]
+        # Arithmetic hoisted out of the wave loop that needs the run-time
+        # scalars: the waves' segment code computes it.
+        hoisted = []
         for o in body.operations:
             n = o.operation.name
             if loop is None or o == loop or n == "tt.return":
@@ -436,7 +439,11 @@ def read(ttir, air_project_path):
             ):
                 continue
             if n.startswith("arith."):
-                env[o.result] = _evaluate(o, env, name)
+                try:
+                    env[o.result] = _evaluate(o, env, name)
+                except ValueError as e:
+                    env[o.result] = e
+                    hoisted.append(o)
                 continue
             raise ValueError(f"{name}: {n} outside the loop over the waves")
         if loop is None:
@@ -499,7 +506,7 @@ def read(ttir, air_project_path):
             env[lbody.arguments[0]] = _PerWave(waves)
 
         # The wave's body: herds, and the segment code between them.
-        parts, order, pending = [], [], []
+        parts, order, pending = [], [], list(hoisted)
         for o in lbody.operations:
             n = o.operation.name
             if n in ("scf.yield", "tt.return"):
