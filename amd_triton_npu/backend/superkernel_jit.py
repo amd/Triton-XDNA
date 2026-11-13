@@ -481,6 +481,7 @@ def read(ttir, air_project_path):
                 ints(bshape) if bshape else None,
                 _attr(f, "air.channel_type"),
                 _attr(f, "air.channel_buffer_resources"),
+                _attr(f, "air.channel_tile_dma"),
             )
         for o in body.operations:
             if o.operation.name == "tt.call":
@@ -489,7 +490,8 @@ def read(ttir, air_project_path):
                 if n:
                     elt = str(o.results[0].type).split("<")[1].rstrip(">")
                     space = _attr(decl, "air.memory_space")
-                    env[o.results[0]] = sk.onchip(_callee(o), n, elt, space)
+                    col = _attr(decl, "air.memtile_col")
+                    env[o.results[0]] = sk.onchip(_callee(o), n, elt, space, col)
         if loop is None:
             lbody = body
         else:

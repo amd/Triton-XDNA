@@ -76,9 +76,10 @@ class Tensor:
     """A flat tensor of `n` elements of `dtype`, an MLIR element type such as
     "bf16"."""
 
-    def __init__(self, name, n, dtype, onchip, space=1):
+    def __init__(self, name, n, dtype, onchip, space=1, col=None):
         self.name, self.n, self.dtype, self.onchip = name, n, dtype, onchip
         self.space = space  # an on-chip tensor's memory space: 1 L2, 2 L1
+        self.col = col  # an L2 tensor's memtile column, if pinned
 
     def __repr__(self):
         return f"{'onchip' if self.onchip else 'ddr'}({self.name})"
@@ -116,10 +117,19 @@ class _Channel:
     `n` and `dtype` give the placeholder buffer that stands for it until the
     copies through it become puts and gets."""
 
-    def __init__(self, name, size, broadcast_shape, channel_type, buffer_resources):
+    def __init__(
+        self,
+        name,
+        size,
+        broadcast_shape,
+        channel_type,
+        buffer_resources,
+        tile_dma_channel=None,
+    ):
         self.name, self.size = name, tuple(size)
         self.broadcast_shape, self.channel_type = broadcast_shape, channel_type
         self.buffer_resources = buffer_resources
+        self.tile_dma_channel = tile_dma_channel
         self.n, self.dtype = 1, "i8"
 
     def __repr__(self):
@@ -195,12 +205,25 @@ class Superkernel:
         return v
 
     def channel(
-        self, name, size, broadcast_shape=None, channel_type=None, buffer_resources=None
+        self,
+        name,
+        size,
+        broadcast_shape=None,
+        channel_type=None,
+        buffer_resources=None,
+        tile_dma_channel=None,
     ):
         """A new AIR channel named `name`."""
         if any(c.name == name for c in self.channels):
             raise ValueError(f"a channel named {name} exists")
-        c = _Channel(name, size, broadcast_shape, channel_type, buffer_resources)
+        c = _Channel(
+            name,
+            size,
+            broadcast_shape,
+            channel_type,
+            buffer_resources,
+            tile_dma_channel,
+        )
         self.channels.append(c)
         return c
 
@@ -208,15 +231,16 @@ class Superkernel:
         """A new buffer argument of the func, in DDR."""
         return self._tensor(name, n, dtype, False)
 
-    def onchip(self, name, n, dtype, space=1):
-        """A new tensor kept on chip in one buffer of the segment, in L2 or,
-        for neighbouring cores, L1 (`space` 2)."""
-        return self._tensor(name, n, dtype, True, space)
+    def onchip(self, name, n, dtype, space=1, col=None):
+        """A new tensor kept on chip in one buffer of the segment, in L2 (in
+        the memtile of column `col`, if given) or, for neighbouring cores, L1
+        (`space` 2)."""
+        return self._tensor(name, n, dtype, True, space, col)
 
-    def _tensor(self, name, n, dtype, onchip, space=1):
+    def _tensor(self, name, n, dtype, onchip, space=1, col=None):
         if any(t.name == name for t in self.tensors):
             raise ValueError(f"a tensor named {name} exists")
-        t = Tensor(name, n, dtype, onchip, space)
+        t = Tensor(name, n, dtype, onchip, space, col)
         self.tensors.append(t)
         return t
 
@@ -350,6 +374,9 @@ class Superkernel:
                 # Not shrunk to its current uses: the copies that read and
                 # write it are only made later.
                 a.attributes["air.shrinkage"] = BoolAttr.get(False)
+            for t, a in zip(holders, allocs):
+                if getattr(t, "col", None) is not None:
+                    a.attributes["air.memtile_col"] = IntegerAttr.get(i32, t.col)
             wave = sargs[len(bufs)]
             for i, v in enumerate(self.scalars):
                 value[id(v)] = sargs[len(bufs) + 1 + i]
@@ -423,6 +450,7 @@ class Superkernel:
             _lower_edges(top, seg, edge_buffers, by_buffer)
             for n, d in enumerate(_ops_named(seg, "air.dma_memcpy_nd")):
                 d.attributes["id"] = IntegerAttr.get(i32, n + 1)
+            _fold_constant_casts(top.operation, seg)
             return str(top)
 
     def _add_phase_group(self, top, g, end, value, wave, phased, loops):
@@ -1010,6 +1038,10 @@ def _lower_channels(module, seg, chans):
             decl.attributes["buffer_resources"] = IntegerAttr.get(
                 i64, c.buffer_resources
             )
+        if c.tile_dma_channel is not None:
+            decl.attributes["air.tile_dma_channel"] = IntegerAttr.get(
+                i64, c.tile_dma_channel
+            )
         for h in _ops_named(seg, "air.herd"):
             body = h.regions[0].blocks[0]
             first = len(body.arguments) - len(h.operands)
@@ -1318,6 +1350,32 @@ def _l1_copies(h, mine):
             if channel_buffer(tmp) and _home_of(view, mine):
                 out.append(([w, r], tmp, view))
     return out
+
+
+def _fold_constant_casts(op, seg):
+    """Index casts of integer constants in `op`, as index constants, and
+    unused casts in segment `seg` dropped: AIR reads loop bounds and offsets
+    as constants only when they are, and a loop of the segment that only
+    re-sends a buffer as one re-sent buffer only when its body holds nothing
+    else that reads the loop's index. (The host's loops keep theirs: a
+    transfer of the host is not re-sent.)"""
+    from air.dialects import arith
+    from air.ir import IndexType, InsertionPoint, IntegerAttr
+
+    idx = IndexType.get()
+    for c in _ops_named(seg, "arith.index_cast"):
+        if not list(c.results[0].uses):
+            c.erase()
+    for c in _ops_named(op, "arith.index_cast"):
+        src = c.operands[0]
+        d = getattr(src.owner, "name", None)
+        if d != "arith.constant":
+            continue
+        v = IntegerAttr(src.owner.attributes["value"]).value
+        with InsertionPoint(c):
+            k = arith.ConstantOp(idx, IntegerAttr.get(idx, v)).result
+        c.results[0].replace_all_uses_with(k)
+        c.erase()
 
 
 def _scalar_transfers(seg):

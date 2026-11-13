@@ -195,6 +195,11 @@ module attributes {transform.with_named_sequence} {
     transform.structured.vectorize %op : !transform.any_op
     transform.yield
   }
+  // AIE2P's vector transcendentals and float compares are bf16 only.
+  transform.named_sequence @match_transcendental(%op: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %op ["math.exp", "math.tanh"] : !transform.any_op
+    transform.yield %op : !transform.any_op
+  }
   transform.named_sequence @tile_rows(%op: !transform.any_op {transform.consumed}) {
     %t, %l = transform.structured.tile_using_for %op tile_sizes [1, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.yield
@@ -211,13 +216,13 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %f0 : !transform.any_op
-    %f1 = transform.air.fuse_elementwise_linalg %f0 : (!transform.any_op) -> !transform.any_op
+    %f1 = transform.air.fuse_elementwise_linalg %f0 no_recompute : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %f1 { transform.apply_patterns.canonicalization } : !transform.any_op
     // reductions as generics, the elementwise ops before them fused in
     %rd = transform.structured.match ops{["linalg.reduce"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %rdg = transform.structured.generalize %rd : (!transform.any_op) -> !transform.any_op
     %fz = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %fz1 = transform.air.fuse_elementwise_linalg %fz : (!transform.any_op) -> !transform.any_op
+    %fz1 = transform.air.fuse_elementwise_linalg %fz no_recompute : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %fz1 { transform.apply_patterns.canonicalization } : !transform.any_op
     %te = transform.structured.match ops{["tensor.empty"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %te1 = transform.cast %te : !transform.any_op to !transform.op<"tensor.empty">
@@ -268,6 +273,14 @@ module attributes {transform.with_named_sequence} {
     }
     %hc = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.include @post_vectorize_reduce_cleanup failures(propagate) (%hc) : (!transform.any_op) -> ()
+    // a reduction to a scalar as a vector.reduction
+    %hm = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %hm {
+      transform.apply_patterns.vector.multi_reduction_flattening lowering_strategy = "innerreduction"
+      transform.apply_patterns.vector.multi_reduction_unrolling lowering_strategy = "innerreduction"
+    } : !transform.any_op
+    %hx = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %hx1 = transform.foreach_match in %hx @match_transcendental -> @action_cast_to_bf16, @match_cmpf -> @action_cast_cmpf_to_bf16 : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
 }

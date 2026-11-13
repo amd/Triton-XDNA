@@ -122,6 +122,15 @@ def _fresh_symbol(module, prefix):
     return f"{prefix}{n}"
 
 
+# How deep code generation is in herds: their code is the cores'; code
+# outside them, in the superkernel or a function it calls, the segment's.
+_HERD = [0]
+
+
+def _in_herd():
+    return _HERD[0] > 0
+
+
 @core.builtin
 def herd(fn, args, size, schedule, name=None, at=None, _semantic=None, _generator=None):
     """Run `fn` on `args` as a herd of `size` cores; see the module's
@@ -135,7 +144,13 @@ def herd(fn, args, size, schedule, name=None, at=None, _semantic=None, _generato
     corner = None if at is None else tuple(_values(at))
     name = core._unwrap_if_constexpr(name) or f"{fn.__name__}_{step}"
     ctx = _PartitionContext(step, 0, _shape(size), schedule, corner, name)
-    _generator.call_JitFunction(fn, list(_values(args)), kwargs={}, caller_context=ctx)
+    _HERD[0] += 1
+    try:
+        _generator.call_JitFunction(
+            fn, list(_values(args)), kwargs={}, caller_context=ctx
+        )
+    finally:
+        _HERD[0] -= 1
 
 
 @core.builtin
@@ -156,7 +171,7 @@ def alloc(
     memory_space = core._unwrap_if_constexpr(memory_space)
     if memory_space not in (L1.value, L2.value):
         raise ValueError("alloc: memory_space is air.L1 or air.L2")
-    if not _generator.is_kernel and memory_space != L1.value:
+    if _in_herd() and memory_space != L1.value:
         raise ValueError("alloc: a kernel's own buffers are in L1")
     shape = core._unwrap_if_constexpr(shape)
     n = 1
@@ -167,7 +182,7 @@ def alloc(
     ptr = core.pointer_type(dtype)
     # A call of a function declared for this buffer alone: the backend finds
     # the buffer's size there, and no two buffers fold into one value.
-    kind = "alloc" if _generator.is_kernel else "local"
+    kind = "local" if _in_herd() else "alloc"
     name = _fresh_symbol(_generator.module, f"air.{kind}.")
     module = _generator.module
     decl = ir.builder(_generator.context).get_or_insert_function(
@@ -258,6 +273,7 @@ def Channel(
     broadcast_shape=None,
     channel_type=None,
     buffer_resources=None,
+    tile_dma_channel=None,
     _semantic=None,
     _generator=None,
 ):
@@ -266,7 +282,8 @@ def Channel(
     buffer of their own in between. `broadcast_shape`, of the bundle's rank,
     is the shape of cores that get each block put at one index;
     `channel_type` is AIR's ("npu_dma_packet", "npu_cascade", ...);
-    `buffer_resources` the FIFO's depth. Declared in the superkernel, outside
+    `buffer_resources` the FIFO's depth; `tile_dma_channel` the DMA channel
+    of the cores' tiles it takes (AIR's `air.tile_dma_channel`). Declared in the superkernel, outside
     the loop over the waves; its kernels use it by name."""
     name = core._unwrap_if_constexpr(sym_name)
     size = _ints(size)
@@ -297,6 +314,9 @@ def Channel(
     channel_type = core._unwrap_if_constexpr(channel_type)
     if channel_type is not None:
         decl.set_attr("air.channel_type", b.get_string_attr(channel_type))
+    tile_dma_channel = core._unwrap_if_constexpr(tile_dma_channel)
+    if tile_dma_channel is not None:
+        decl.set_attr("air.channel_tile_dma", b.get_int32_attr(tile_dma_channel))
     buffer_resources = core._unwrap_if_constexpr(buffer_resources)
     if buffer_resources is not None:
         decl.set_attr(
@@ -387,7 +407,7 @@ def _dma(
     i32 = lambda v: (  # noqa: E731
         _semantic.to_tensor(v) if isinstance(v, int) else v
     ).to(core.int32, _semantic=_semantic)
-    if not _generator.is_kernel:
+    if _in_herd():
         return _core_dma(
             kind,
             name,
