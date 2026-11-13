@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Superkernels (see `tl.extra.npu.spatial`) from their TTIR.
+"""Superkernels (see `tl.extra.air.spatial`) from their TTIR.
 
 The TTIR of a superkernel is its function with the loop over the waves, the
 functions of its partitions, the kernels they call, and one declaration per
@@ -237,7 +237,7 @@ def _channels_as_args(f):
     from air.ir import FunctionType, Location, TypeAttr
 
     block = f.regions[0].blocks[0]
-    prefix = "npu.channel."
+    prefix = "air.channel."
     uses = []  # (name, value standing for the channel, ops to erase)
     for o in _walk(f):
         if o.operation.name != "tt.call" or not _callee(o).startswith(prefix):
@@ -292,7 +292,7 @@ def _leaf_module(module, symbol, name):
     for s in order[1:]:
         for o in _walk(funcs[s]):
             if o.operation.name == "tt.get_program_id" or (
-                o.operation.name == "tt.call" and _callee(o).startswith("npu.channel.")
+                o.operation.name == "tt.call" and _callee(o).startswith("air.channel.")
             ):
                 raise ValueError(
                     f"{name}: a function it calls reads a program id or a channel"
@@ -369,7 +369,7 @@ def read(ttir, air_project_path):
             if o == loop or n == "tt.return":
                 continue
             decl = funcs[_callee(o)] if n == "tt.call" else None
-            if decl is not None and _attr(decl, "npu.l2_elements"):
+            if decl is not None and _attr(decl, "air.l2_elements"):
                 continue
             if n.startswith("arith."):
                 env[o.result] = _evaluate(o, env, name)
@@ -390,23 +390,23 @@ def read(ttir, air_project_path):
                 env[a] = sk.scalar(f"r{i}")
         chans = {}
         for f in funcs.values():
-            size = _attr(f, "npu.channel_size")
+            size = _attr(f, "air.channel_size")
             if size is None:
                 continue
             ints = lambda t: tuple(int(x) for x in t.split(","))  # noqa: E731
-            bshape = _attr(f, "npu.channel_broadcast_shape")
-            cname = _attr(f, "sym_name")[len("npu.channel.") :]
+            bshape = _attr(f, "air.channel_broadcast_shape")
+            cname = _attr(f, "sym_name")[len("air.channel.") :]
             chans[cname] = sk.channel(
                 cname,
                 ints(size),
                 ints(bshape) if bshape else None,
-                _attr(f, "npu.channel_type"),
-                _attr(f, "npu.channel_buffer_resources"),
+                _attr(f, "air.channel_type"),
+                _attr(f, "air.channel_buffer_resources"),
             )
         for o in body.operations:
             if o.operation.name == "tt.call":
                 decl = funcs[_callee(o)]
-                n = _attr(decl, "npu.l2_elements")
+                n = _attr(decl, "air.l2_elements")
                 elt = str(o.results[0].type).split("<")[1].rstrip(">")
                 if n:
                     env[o.results[0]] = sk.onchip(_callee(o), n, elt)
@@ -421,7 +421,7 @@ def read(ttir, air_project_path):
             if n.startswith("arith."):
                 env[o.result] = _evaluate(o, env, name)
                 continue
-            if n != "tt.call" or _attr(funcs[_callee(o)], "npu.partition") is None:
+            if n != "tt.call" or _attr(funcs[_callee(o)], "air.partition") is None:
                 raise ValueError(f"{name}: {n} in the wave loop outside npu.spatial")
             parts.append((o, funcs[_callee(o)]))
         if not parts:
@@ -483,13 +483,13 @@ def read(ttir, air_project_path):
 def _settings(f):
     """The settings `spatial` gave partition function `f`."""
     at = None
-    if _attr(f, "npu.at_col") is not None:
-        at = (_attr(f, "npu.at_col"), _attr(f, "npu.at_row"))
+    if _attr(f, "air.at_col") is not None:
+        at = (_attr(f, "air.at_col"), _attr(f, "air.at_row"))
     return {
-        "name": _attr(f, "npu.name"),
-        "cores": (_attr(f, "npu.cores_x"), _attr(f, "npu.cores_y")),
+        "name": _attr(f, "air.name"),
+        "cores": (_attr(f, "air.cores_x"), _attr(f, "air.cores_y")),
         "at": at,
-        "schedule": _attr(f, "npu.schedule"),
+        "schedule": _attr(f, "air.schedule"),
     }
 
 
@@ -551,7 +551,7 @@ class Launcher:
         from .driver import detect_npu_version
 
         key = hashlib.sha256(ttir.encode())
-        for path in sorted(set(re.findall(r'npu\.schedule = "([^"]*)"', ttir))):
+        for path in sorted(set(re.findall(r'air\.schedule = "([^"]*)"', ttir))):
             with open(path, "rb") as f:
                 key.update(f.read())
         key.update(f"{detect_npu_version()} {npu_config.bf16_emulation}".encode())

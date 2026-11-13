@@ -24,7 +24,6 @@ from .fused_decode import (
 )
 from .flash_attention import AttentionConfig, AttentionConfigError, flash_attention
 from .fused_prefill import PrefillConfig, PrefillConfigError, fused_prefill
-from .superkernel import Channel, ChannelGet, ChannelPut, allocate_l2, spatial, table
 
 __all__ = [
     "AttentionConfig",
@@ -38,10 +37,4 @@ __all__ = [
     "PrefillConfig",
     "PrefillConfigError",
     "fused_prefill",
-    "Channel",
-    "ChannelGet",
-    "ChannelPut",
-    "allocate_l2",
-    "spatial",
-    "table",
 ]

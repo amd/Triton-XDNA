@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 """Superkernels: one @triton.jit function that runs kernels side by side on
-the NPU, wave after wave (`tl.extra.npu.spatial`).
+the NPU, wave after wave (`tl.extra.air.spatial`).
 
 Each case checks the AIR module its superkernel lowers to, then launches it
 on the NPU and compares with numpy:
@@ -11,7 +11,7 @@ on the NPU and compares with numpy:
              DDR buffer is updated in place every wave
   phases     a partition calls one kernel twice per wave, writing two L2
              buffers: a loop over phases
-  table      an int per wave from `npu.table`, and an int argument set by
+  table      an int per wave from `air.table`, and an int argument set by
              the host
   multicore  a partition on two cores, its schedule given the core count
   steps      a wave of four spatials: the cores of one name run two phases,
@@ -37,7 +37,7 @@ try:
     import torch
     import triton
     import triton.language as tl
-    from triton.language.extra import npu
+    from triton.language.extra import air
 except ImportError as e:
     print(f"SKIP: {e}")
     sys.exit(77)
@@ -176,9 +176,9 @@ def sub(X, Y, Z, D: tl.constexpr, DP: tl.constexpr, SWAP: tl.constexpr):
 
 @triton.jit
 def chain(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
-    h = npu.allocate_l2([D], tl.bfloat16)
+    h = air.allocate_l2([D], tl.bfloat16)
     for wave in range(NW):
-        npu.spatial(
+        air.spatial(
             [(scale, (X, W, h, wave, D, DP)), (add, (X, h, X, D, DP))],
             cores=[1, 1],
             schedules=[S, S],
@@ -194,10 +194,10 @@ def scale_twice(X, W, h0, h1, wave, D: tl.constexpr, DP: tl.constexpr):
 
 @triton.jit
 def phases(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
-    h0 = npu.allocate_l2([D], tl.bfloat16)
-    h1 = npu.allocate_l2([D], tl.bfloat16)
+    h0 = air.allocate_l2([D], tl.bfloat16)
+    h1 = air.allocate_l2([D], tl.bfloat16)
     for wave in range(NW):
-        npu.spatial(
+        air.spatial(
             [(scale_twice, (X, W, h0, h1, wave, D, DP)), (add, (h0, h1, X, D, DP))],
             cores=[1, 1],
             schedules=[S, S],
@@ -215,11 +215,11 @@ def table(
     S: tl.constexpr,
     ROWS: tl.constexpr,
 ):
-    h = npu.allocate_l2([D], tl.bfloat16)
+    h = air.allocate_l2([D], tl.bfloat16)
     for wave in range(NW):
-        npu.spatial(
+        air.spatial(
             [
-                (scale, (X, W, h, npu.table(ROWS, wave), D, DP)),
+                (scale, (X, W, h, air.table(ROWS, wave), D, DP)),
                 (scale, (h, W, X, k, D, DP)),
             ],
             cores=[1, 1],
@@ -231,9 +231,9 @@ def table(
 def multicore(
     X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
 ):
-    h = npu.allocate_l2([D], tl.bfloat16)
+    h = air.allocate_l2([D], tl.bfloat16)
     for wave in range(NW):
-        npu.spatial(
+        air.spatial(
             [(scale, (X, W, h, wave, D, DP)), (add, (X, h, X, D, DP))],
             cores=[1, 2],
             schedules=[S, S],
@@ -242,34 +242,34 @@ def multicore(
 
 @triton.jit
 def steps(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
-    h0 = npu.allocate_l2([D], tl.bfloat16)
-    h1 = npu.allocate_l2([D], tl.bfloat16)
-    g = npu.allocate_l2([D], tl.bfloat16)
+    h0 = air.allocate_l2([D], tl.bfloat16)
+    h1 = air.allocate_l2([D], tl.bfloat16)
+    g = air.allocate_l2([D], tl.bfloat16)
     for wave in range(NW):
-        npu.spatial([(scale, (X, W, h0, wave * 2, D, DP))], [1], [S], names=["s"])
-        npu.spatial([(add, (h0, X, g, D, DP))], [1], [S], names=["b"])
-        npu.spatial([(scale, (X, W, h1, wave * 2 + 1, D, DP))], [1], [S], names=["s"])
-        npu.spatial([(add, (g, h1, X, D, DP))], [1], [S], names=["a"])
+        air.spatial([(scale, (X, W, h0, wave * 2, D, DP))], [1], [S], names=["s"])
+        air.spatial([(add, (h0, X, g, D, DP))], [1], [S], names=["b"])
+        air.spatial([(scale, (X, W, h1, wave * 2 + 1, D, DP))], [1], [S], names=["s"])
+        air.spatial([(add, (g, h1, X, D, DP))], [1], [S], names=["a"])
 
 
 @triton.jit
 def src(X, D: tl.constexpr, T: tl.constexpr):
     for t in range(D // T):
-        npu.ChannelPut("toSink", tl.load(X + t * T + tl.arange(0, T)) * 2)
+        air.ChannelPut("toSink", tl.load(X + t * T + tl.arange(0, T)) * 2)
 
 
 @triton.jit
 def sink(Y, D: tl.constexpr, T: tl.constexpr):
     for t in range(D // T):
-        y = npu.ChannelGet("toSink", [T], tl.bfloat16)
+        y = air.ChannelGet("toSink", [T], tl.bfloat16)
         tl.store(Y + t * T + tl.arange(0, T), y + 1)
 
 
 @triton.jit
 def stream(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
-    npu.Channel("toSink")
+    air.Channel("toSink")
     for wave in range(NW):
-        npu.spatial([(src, (X, D, T)), (sink, (Y, D, T))], [1, 1], [S, S])
+        air.spatial([(src, (X, D, T)), (sink, (Y, D, T))], [1, 1], [S, S])
 
 
 @triton.jit
@@ -282,30 +282,30 @@ def twice(X, Y, D: tl.constexpr):
 @triton.jit
 def spmd(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
     for wave in range(NW):
-        npu.spatial([(twice, (X, Y, D))], [2], [S])
+        air.spatial([(twice, (X, Y, D))], [2], [S])
 
 
 @triton.jit
 def bc_sink(Y, D: tl.constexpr, T: tl.constexpr):
     p = tl.program_id(0)
     for t in range(D // T):
-        y = npu.ChannelGet("toSink", [T], tl.bfloat16, indices=[p, 0])
+        y = air.ChannelGet("toSink", [T], tl.bfloat16, indices=[p, 0])
         tl.store(Y + p * D + t * T + tl.arange(0, T), y + p.to(tl.bfloat16))
 
 
 @triton.jit
 def bc_src(X, D: tl.constexpr, T: tl.constexpr):
     for t in range(D // T):
-        npu.ChannelPut(
+        air.ChannelPut(
             "toSink", tl.load(X + t * T + tl.arange(0, T)) * 2, indices=[0, 0]
         )
 
 
 @triton.jit
 def bcast(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
-    npu.Channel("toSink", size=[1, 1], broadcast_shape=[2, 1])
+    air.Channel("toSink", size=[1, 1], broadcast_shape=[2, 1])
     for wave in range(NW):
-        npu.spatial([(bc_src, (X, D, T)), (bc_sink, (Y, D, T))], [1, 2], [S, S])
+        air.spatial([(bc_src, (X, D, T)), (bc_sink, (Y, D, T))], [1, 2], [S, S])
 
 
 @triton.jit
@@ -313,22 +313,22 @@ def m_src(X, D: tl.constexpr, T: tl.constexpr):
     p = tl.program_id(0)
     for t in range(D // T):
         x = tl.load(X + p * D + t * T + tl.arange(0, T))
-        npu.ChannelPut("parts", x * 2, indices=[p])
+        air.ChannelPut("parts", x * 2, indices=[p])
 
 
 @triton.jit
 def m_sink(Y, D: tl.constexpr, T: tl.constexpr):
     for t in range(D // T):
-        a = npu.ChannelGet("parts", [T], tl.bfloat16, indices=[0])
-        b = npu.ChannelGet("parts", [T], tl.bfloat16, indices=[1])
+        a = air.ChannelGet("parts", [T], tl.bfloat16, indices=[0])
+        b = air.ChannelGet("parts", [T], tl.bfloat16, indices=[1])
         tl.store(Y + t * T + tl.arange(0, T), a + b)
 
 
 @triton.jit
 def merge(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
-    npu.Channel("parts", size=[2])
+    air.Channel("parts", size=[2])
     for wave in range(NW):
-        npu.spatial([(m_src, (X, D, T)), (m_sink, (Y, D, T))], [2, 1], [S, S])
+        air.spatial([(m_src, (X, D, T)), (m_sink, (Y, D, T))], [2, 1], [S, S])
 
 
 @triton.jit
@@ -337,7 +337,7 @@ def g_src(X, D: tl.constexpr, T: tl.constexpr):
     j = tl.program_id(1)
     for t in range(D // T):
         x = tl.load(X + (i * 2 + j) * D + t * T + tl.arange(0, T))
-        npu.ChannelPut("cells", x * 2, indices=[0, i, j])
+        air.ChannelPut("cells", x * 2, indices=[0, i, j])
 
 
 @triton.jit
@@ -345,15 +345,15 @@ def g_sink(Y, D: tl.constexpr, T: tl.constexpr):
     i = tl.program_id(0)
     j = tl.program_id(1)
     for t in range(D // T):
-        y = npu.ChannelGet("cells", [T], tl.bfloat16, indices=[0, i, j])
+        y = air.ChannelGet("cells", [T], tl.bfloat16, indices=[0, i, j])
         tl.store(Y + (i * 2 + j) * D + t * T + tl.arange(0, T), y + 1)
 
 
 @triton.jit
 def grid(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
-    npu.Channel("cells", size=[1, 2, 2])
+    air.Channel("cells", size=[1, 2, 2])
     for wave in range(NW):
-        npu.spatial([(g_src, (X, D, T)), (g_sink, (Y, D, T))], [(2, 2), (2, 2)], [S, S])
+        air.spatial([(g_src, (X, D, T)), (g_sink, (Y, D, T))], [(2, 2), (2, 2)], [S, S])
 
 
 # Superkernels that reading rejects.
@@ -361,15 +361,15 @@ def grid(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constex
 
 @triton.jit
 def unwritten(X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
-    h = npu.allocate_l2([D], tl.bfloat16)
+    h = air.allocate_l2([D], tl.bfloat16)
     for wave in range(NW):
-        npu.spatial([(add, (h, X, X, D, DP))], cores=[1], schedules=[S])
+        air.spatial([(add, (h, X, X, D, DP))], cores=[1], schedules=[S])
 
 
 @triton.jit
 def overlap(X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
     for wave in range(NW):
-        npu.spatial(
+        air.spatial(
             [(add, (X, X, X, D, DP)), (add, (X, X, X, D, DP))],
             cores=[2, 1],
             schedules=[S, S],
@@ -380,8 +380,8 @@ def overlap(X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.conste
 @triton.jit
 def two_shapes(X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
     for wave in range(NW):
-        npu.spatial([(add, (X, X, X, D, DP))], [1], [S], names=["a"])
-        npu.spatial([(add, (X, X, X, D, DP))], [2], [S], names=["a"])
+        air.spatial([(add, (X, X, X, D, DP))], [1], [S], names=["a"])
+        air.spatial([(add, (X, X, X, D, DP))], [2], [S], names=["a"])
 
 
 @triton.jit
@@ -389,7 +389,7 @@ def wave_and_scalar(
     X, W, k, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
 ):
     for wave in range(NW):
-        npu.spatial([(scale, (X, W, X, wave + k, D, DP))], cores=[1], schedules=[S])
+        air.spatial([(scale, (X, W, X, wave + k, D, DP))], cores=[1], schedules=[S])
 
 
 @triton.jit
@@ -402,11 +402,11 @@ def read_two(X, h0, h1, o, D: tl.constexpr, DP: tl.constexpr):
 def phased_inputs(
     X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
 ):
-    h0 = npu.allocate_l2([D], tl.bfloat16)
-    h1 = npu.allocate_l2([D], tl.bfloat16)
-    o = npu.allocate_l2([D], tl.bfloat16)
+    h0 = air.allocate_l2([D], tl.bfloat16)
+    h1 = air.allocate_l2([D], tl.bfloat16)
+    o = air.allocate_l2([D], tl.bfloat16)
     for wave in range(NW):
-        npu.spatial(
+        air.spatial(
             [
                 (scale_twice, (X, X, h0, h1, wave, D, DP)),
                 (read_two, (X, h0, h1, o, D, DP)),
@@ -428,10 +428,10 @@ def interleaved(X, W, h0, h1, wave, D: tl.constexpr, DP: tl.constexpr):
 def phase_order(
     X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
 ):
-    h0 = npu.allocate_l2([D], tl.bfloat16)
-    h1 = npu.allocate_l2([D], tl.bfloat16)
+    h0 = air.allocate_l2([D], tl.bfloat16)
+    h1 = air.allocate_l2([D], tl.bfloat16)
     for wave in range(NW):
-        npu.spatial(
+        air.spatial(
             [(interleaved, (X, W, h0, h1, wave, D, DP)), (add, (X, h1, X, D, DP))],
             cores=[1, 1],
             schedules=[S, S],
@@ -446,10 +446,10 @@ def both_ways(X, Y, o0, o1, D: tl.constexpr, DP: tl.constexpr):
 
 @triton.jit
 def wiring(X, Y, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
-    o0 = npu.allocate_l2([D], tl.bfloat16)
-    o1 = npu.allocate_l2([D], tl.bfloat16)
+    o0 = air.allocate_l2([D], tl.bfloat16)
+    o1 = air.allocate_l2([D], tl.bfloat16)
     for wave in range(NW):
-        npu.spatial(
+        air.spatial(
             [(both_ways, (X, Y, o0, o1, D, DP)), (add, (o0, o1, X, D, DP))],
             cores=[1, 1],
             schedules=[S, S],

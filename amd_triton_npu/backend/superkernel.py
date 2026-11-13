@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""The AIR module of a superkernel (see `tl.extra.npu.spatial`): several
+"""The AIR module of a superkernel (see `tl.extra.air.spatial`): several
 kernels in one NPU dispatch that loops over waves.
 
 `superkernel_jit` reads a superkernel's TTIR into a `Superkernel`: its
@@ -790,7 +790,7 @@ def _lower_edges(module, seg, edges, phased=None):
         d.erase()
 
 
-_RADIX = 256  # as in tl.extra.npu: a channel index's digits in its address
+_RADIX = 256  # as in tl.extra.air: a channel index's digits in its address
 
 _CASTS = (
     "arith.index_cast",

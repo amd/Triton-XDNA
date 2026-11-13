@@ -6,9 +6,9 @@ side on the NPU's cores, wave after wave, as a single dispatch.
 
     @triton.jit
     def layer(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr):
-        h = npu.allocate_l2([DP], tl.bfloat16)
+        h = air.allocate_l2([DP], tl.bfloat16)
         for wave in range(NW):
-            npu.spatial(
+            air.spatial(
                 [(scale, (X, W, h, wave, D, DP)), (add, (X, h, X, D, DP))],
                 cores=[1, 1],
                 schedules=[SCHEDULE, SCHEDULE],
@@ -38,7 +38,7 @@ per core dimension, for use as `num_threads`. The partitions are placed on the
 array in order unless `at[i]` gives the (column, row) of partition i's corner.
 
 The loop over the waves must have a constexpr trip count. Ints computed from
-the wave index, such as `wave * 2 + 1` or `npu.table(values, wave)`, are
+the wave index, such as `wave * 2 + 1` or `air.table(values, wave)`, are
 evaluated per wave when the dispatch is built; int arguments of the function
 are set by the host at each launch (mark them `do_not_specialize` so that a
 new value does not recompile the dispatch).
@@ -69,15 +69,15 @@ class _PartitionContext:
             return
         self.marked = True
         i32 = builder.get_int32_attr
-        fn.set_attr("npu.step", i32(self.step))
-        fn.set_attr("npu.partition", i32(self.index))
-        fn.set_attr("npu.cores_x", i32(self.cores[0]))
-        fn.set_attr("npu.cores_y", i32(self.cores[1]))
-        fn.set_attr("npu.schedule", builder.get_string_attr(self.schedule))
-        fn.set_attr("npu.name", builder.get_string_attr(self.name))
+        fn.set_attr("air.step", i32(self.step))
+        fn.set_attr("air.partition", i32(self.index))
+        fn.set_attr("air.cores_x", i32(self.cores[0]))
+        fn.set_attr("air.cores_y", i32(self.cores[1]))
+        fn.set_attr("air.schedule", builder.get_string_attr(self.schedule))
+        fn.set_attr("air.name", builder.get_string_attr(self.name))
         if self.at is not None:
-            fn.set_attr("npu.at_col", i32(self.at[0]))
-            fn.set_attr("npu.at_row", i32(self.at[1]))
+            fn.set_attr("air.at_col", i32(self.at[0]))
+            fn.set_attr("air.at_row", i32(self.at[1]))
 
 
 def _values(seq):
@@ -144,13 +144,13 @@ def allocate_l2(shape, dtype, _semantic=None, _generator=None):
     ptr = core.pointer_type(dtype)
     # A call of a function declared for this buffer alone: the backend finds
     # the buffer's size there, and no two buffers fold into one value.
-    name = f"npu.l2.{_next_id(_generator, '_npu_l2_buffers')}"
+    name = f"air.l2.{_next_id(_generator, '_npu_l2_buffers')}"
     module = _generator.module
     decl = ir.builder(_generator.context).get_or_insert_function(
         module, name, b.get_function_ty([], [ptr.to_ir(b)]), "private", None
     )
     module.push_back(decl)
-    decl.set_attr("npu.l2_elements", b.get_int32_attr(n))
+    decl.set_attr("air.l2_elements", b.get_int32_attr(n))
     call = b.call(module.get_function(name), [])
     return core.tensor(call.get_result(0), ptr)
 
@@ -199,7 +199,7 @@ def Channel(
         raise ValueError(f"channel {name}: each extent of {size} below {_RADIX}")
     b = _semantic.builder
     module = _generator.module
-    symbol = f"npu.channel.{name}"
+    symbol = f"air.channel.{name}"
     if module.has_function(symbol):
         raise ValueError(f"channel {name} is declared twice")
     decl = ir.builder(_generator.context).get_or_insert_function(
@@ -211,20 +211,20 @@ def Channel(
     )
     module.push_back(decl)
     text = lambda v: b.get_string_attr(",".join(map(str, v)))  # noqa: E731
-    decl.set_attr("npu.channel_size", text(size))
+    decl.set_attr("air.channel_size", text(size))
     broadcast_shape = core._unwrap_if_constexpr(broadcast_shape)
     if broadcast_shape is not None:
         broadcast_shape = _ints(broadcast_shape)
         if len(broadcast_shape) != len(size):
             raise ValueError(f"channel {name}: broadcast_shape is not of size's rank")
-        decl.set_attr("npu.channel_broadcast_shape", text(broadcast_shape))
+        decl.set_attr("air.channel_broadcast_shape", text(broadcast_shape))
     channel_type = core._unwrap_if_constexpr(channel_type)
     if channel_type is not None:
-        decl.set_attr("npu.channel_type", b.get_string_attr(channel_type))
+        decl.set_attr("air.channel_type", b.get_string_attr(channel_type))
     buffer_resources = core._unwrap_if_constexpr(buffer_resources)
     if buffer_resources is not None:
         decl.set_attr(
-            "npu.channel_buffer_resources", b.get_int32_attr(buffer_resources)
+            "air.channel_buffer_resources", b.get_int32_attr(buffer_resources)
         )
 
 
@@ -234,7 +234,7 @@ def _fifo(chan_name, n, dtype, indices, _semantic, _generator):
     _RADIX, each digit's place a multiple of the block, in 64 bits."""
     name = core._unwrap_if_constexpr(chan_name)
     module = _generator.module
-    symbol = f"npu.channel.{name}"
+    symbol = f"air.channel.{name}"
     if not module.has_function(symbol):
         raise ValueError(f"channel {name} is not declared")
     b = _semantic.builder

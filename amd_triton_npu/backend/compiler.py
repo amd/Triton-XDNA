@@ -100,11 +100,11 @@ def _optimize_ttsharedir(ttsharedir: str, metadata):
 
 
 def _superkernel_ttir(mod, metadata):
-    """A superkernel's TTIR (see `tl.extra.npu.spatial`), or None for any
+    """A superkernel's TTIR (see `tl.extra.air.spatial`), or None for any
     other kernel. It is kept as TTIR: its launcher compiles each of its
     kernels on its own."""
     text = str(mod)
-    if "npu.partition" not in text:
+    if "air.partition" not in text:
         return None
     metadata["name"] = mod.get_entry_func_name()
     metadata["npu_superkernel"] = True
