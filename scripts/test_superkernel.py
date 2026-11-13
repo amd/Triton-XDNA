@@ -25,6 +25,7 @@ on the NPU and compares with numpy:
              sends it three times to a third core
   feed       the host puts DDR blocks into a channel a core gets, and gets
              the core's results back into DDR
+  neighbours two neighbouring cores share an L1 buffer of the segment
 
 Also checks the errors reading a superkernel reports. Needs an npu2 device
 for the runs; with no NPU only the IR checks run.
@@ -411,6 +412,26 @@ def feed(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constex
             air.ChannelGet("out", Y, offsets=[t * T], sizes=[T])
 
 
+@triton.jit
+def wr(X, Sh, D: tl.constexpr):
+    tl.store(Sh + tl.arange(0, D), tl.load(X + tl.arange(0, D)) * 2)
+
+
+@triton.jit
+def rd(Sh, Y, D: tl.constexpr):
+    tl.store(Y + tl.arange(0, D), tl.load(Sh + tl.arange(0, D)) + 1)
+
+
+@triton.jit
+def neighbours(
+    X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr
+):
+    sh = air.alloc([D], tl.bfloat16, memory_space=air.L1)
+    for wave in range(NW):
+        air.herd(wr, (X, sh, D), 1, S, name="wr", at=(2, 2))
+        air.herd(rd, (sh, Y, D), 1, S, name="rd", at=(3, 2))
+
+
 # Superkernels that reading rejects.
 
 
@@ -587,6 +608,13 @@ EXPLICIT = {
             "air.channel.put  @whole[] (%alloc",
             "{air.memtile_col = 3 : i32}",
         ],
+    ),
+    "neighbours": (
+        neighbours,
+        XD,
+        XD,
+        lambda x: bf(bf(2 * x) + 1),
+        ["memref<1024xbf16, 2 : i32>, memref<*xbf16>"],
     ),
     "feed": (
         feed,

@@ -376,7 +376,7 @@ def read(ttir, air_project_path):
             if o == loop or n == "tt.return":
                 continue
             decl = funcs[_callee(o)] if n == "tt.call" else None
-            if decl is not None and _attr(decl, "air.l2_elements"):
+            if decl is not None and _attr(decl, "air.alloc_elements"):
                 continue
             if n.startswith("arith."):
                 env[o.result] = _evaluate(o, env, name)
@@ -415,10 +415,11 @@ def read(ttir, air_project_path):
         for o in body.operations:
             if o.operation.name == "tt.call":
                 decl = funcs[_callee(o)]
-                n = _attr(decl, "air.l2_elements")
+                n = _attr(decl, "air.alloc_elements")
                 elt = str(o.results[0].type).split("<")[1].rstrip(">")
                 if n:
-                    env[o.results[0]] = sk.onchip(_callee(o), n, elt)
+                    space = _attr(decl, "air.memory_space")
+                    env[o.results[0]] = sk.onchip(_callee(o), n, elt, space)
         lbody = loop.regions[0].blocks[0]
         env[lbody.arguments[0]] = _PerWave(waves)
 
@@ -570,7 +571,7 @@ class _SegmentWriter:
             if isinstance(bind, _PerWave):
                 bind = bind.lowered()
             if isinstance(bind, Tensor) and bind.onchip:
-                typ = f"memref<{bind.n}x{bind.dtype}, 1 : i32>"
+                typ = f"memref<{bind.n}x{bind.dtype}, {bind.space} : i32>"
                 self.types[name] = typ
             elif isinstance(bind, Tensor) and self.where == "launch":
                 typ = f"memref<*x{bind.dtype}>"
@@ -634,7 +635,7 @@ class _SegmentWriter:
             if x.operation.name != "tt.call":
                 continue
             c = _callee(x)
-            if c.startswith("air.l2."):
+            if c.startswith("air.alloc."):
                 sides.add("segment")
             elif c.startswith("air.dma."):
                 b = self.env.get(x.operands[0])
@@ -656,10 +657,12 @@ class _SegmentWriter:
                 if n == "scf.yield" and len(o.operands):
                     raise ValueError("segment code: loops and branches yield nothing")
                 continue
-            if n == "tt.call" and _callee(o).startswith("air.l2."):
+            if n == "tt.call" and _callee(o).startswith("air.alloc."):
                 decl = self.funcs[_callee(o)]
                 elt = str(o.results[0].type).split("<")[1].rstrip(">")
-                typ = f"memref<{_attr(decl, 'air.l2_elements')}x{elt}, 1 : i32>"
+                space = _attr(decl, "air.memory_space")
+                n_ = _attr(decl, "air.alloc_elements")
+                typ = f"memref<{n_}x{elt}, {space} : i32>"
                 r = self.fresh()
                 col = _attr(decl, "air.memtile_col")
                 at = "" if col is None else f" {{air.memtile_col = {col} : i32}}"

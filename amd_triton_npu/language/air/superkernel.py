@@ -123,12 +123,15 @@ def herd(fn, args, size, schedule, name=None, at=None, _semantic=None, _generato
 def alloc(
     shape, dtype, memory_space=L2, memtile_col=None, _semantic=None, _generator=None
 ):
-    """A new buffer of `shape` elements of `dtype` in `memory_space`, as a
-    pointer to its first element. Only L2 for now: a buffer of the segment,
-    which only its herds and segment code access. `memtile_col` places it,
-    as AIR's `air.memtile_col`."""
-    if core._unwrap_if_constexpr(memory_space) != L2.value:
-        raise ValueError("alloc: only memory_space=air.L2 for now")
+    """A new buffer of the segment, of `shape` elements of `dtype` in
+    `memory_space`, as a pointer to its first element; only its herds and
+    segment code access it. An L2 buffer is in a memtile, which
+    `memtile_col` picks (AIR's `air.memtile_col`). An L1 buffer is in one
+    core's memory, which the cores next to it access as their own: herds
+    passed it must be neighbours."""
+    memory_space = core._unwrap_if_constexpr(memory_space)
+    if memory_space not in (L1.value, L2.value):
+        raise ValueError("alloc: memory_space is air.L1 or air.L2")
     shape = core._unwrap_if_constexpr(shape)
     n = 1
     for d in [shape] if isinstance(shape, int) else _values(shape):
@@ -138,13 +141,14 @@ def alloc(
     ptr = core.pointer_type(dtype)
     # A call of a function declared for this buffer alone: the backend finds
     # the buffer's size there, and no two buffers fold into one value.
-    name = f"air.l2.{_next_id(_generator, '_air_l2_buffers')}"
+    name = f"air.alloc.{_next_id(_generator, '_air_allocs')}"
     module = _generator.module
     decl = ir.builder(_generator.context).get_or_insert_function(
         module, name, b.get_function_ty([], [ptr.to_ir(b)]), "private", None
     )
     module.push_back(decl)
-    decl.set_attr("air.l2_elements", b.get_int32_attr(n))
+    decl.set_attr("air.alloc_elements", b.get_int32_attr(n))
+    decl.set_attr("air.memory_space", b.get_int32_attr(memory_space))
     memtile_col = core._unwrap_if_constexpr(memtile_col)
     if memtile_col is not None:
         decl.set_attr("air.memtile_col", b.get_int32_attr(memtile_col))

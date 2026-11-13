@@ -76,8 +76,9 @@ class Tensor:
     """A flat tensor of `n` elements of `dtype`, an MLIR element type such as
     "bf16"."""
 
-    def __init__(self, name, n, dtype, onchip):
+    def __init__(self, name, n, dtype, onchip, space=1):
         self.name, self.n, self.dtype, self.onchip = name, n, dtype, onchip
+        self.space = space  # an on-chip tensor's memory space: 1 L2, 2 L1
 
     def __repr__(self):
         return f"{'onchip' if self.onchip else 'ddr'}({self.name})"
@@ -193,14 +194,15 @@ class Superkernel:
         """A new buffer argument of the func, in DDR."""
         return self._tensor(name, n, dtype, False)
 
-    def onchip(self, name, n, dtype):
-        """A new tensor kept on chip in one L2 buffer."""
-        return self._tensor(name, n, dtype, True)
+    def onchip(self, name, n, dtype, space=1):
+        """A new tensor kept on chip in one buffer of the segment, in L2 or,
+        for neighbouring cores, L1 (`space` 2)."""
+        return self._tensor(name, n, dtype, True, space)
 
-    def _tensor(self, name, n, dtype, onchip):
+    def _tensor(self, name, n, dtype, onchip, space=1):
         if any(t.name == name for t in self.tensors):
             raise ValueError(f"a tensor named {name} exists")
-        t = Tensor(name, n, dtype, onchip)
+        t = Tensor(name, n, dtype, onchip, space)
         self.tensors.append(t)
         return t
 
@@ -365,6 +367,7 @@ class Superkernel:
             with InsertionPoint(end):
                 for v in made.values():
                     memref.DeallocOp(v)
+            _share_l1(seg, [value[id(t)] for t in onchip if t.space == 2])
             spmd = {c.herd: c.cores for c in self.calls if c.spmd}
             _bind_tile_ids(seg, tiles, spmd)
             _lower_channels(top, seg, [(c, value[id(c)]) for c in self.channels])
@@ -538,7 +541,7 @@ class Superkernel:
             + ["%sw=%bw"]
             + [f"%sr{i}=%br{i}" for i in range(ns)]
         )
-        l2 = [f"memref<{t.n}x{t.dtype}, 1 : i32>" for t in edges]
+        l2 = [f"memref<{t.n}x{t.dtype}, {getattr(t, 'space', 1)} : i32>" for t in edges]
         alloc = "".join(
             f"        %e{i} = memref.alloc() : {t}\n" for i, t in enumerate(l2)
         )
@@ -1002,6 +1005,47 @@ def _lower_channels(module, seg, chans):
                 raise ValueError(f"{c}: its placeholder is used by {u.owner.name}")
             u.owner.erase()
         holder.owner.erase()
+
+
+def _share_l1(seg, shared):
+    """Have the herds use the segment's L1 buffers `shared` in place. A
+    kernel compiled alone copies between such a buffer and one of its own;
+    the copy goes, the core's buffer becoming the shared one."""
+    from air.ir import MemRefType, OpResult
+
+    for h in _ops_named(seg, "air.herd"):
+        body = h.regions[0].blocks[0]
+        first = len(body.arguments) - len(h.operands)
+        for i, v in enumerate(h.operands):
+            if not any(v == x for x in shared):
+                continue
+            arg = body.arguments[first + i]
+            for u in list(arg.uses):
+                d = u.owner
+                if d.name != "air.dma_memcpy_nd":
+                    continue
+                side, other = ("dst", "src") if d.opview.dst == arg else ("src", "dst")
+                mine = getattr(d.opview, other)
+                # (The herd's argument takes the buffer's type only later.)
+                n = MemRefType(v.type).shape[0]
+                if not (
+                    isinstance(mine, OpResult)
+                    and mine.owner.name == "memref.alloc"
+                    and mine.type == v.type
+                    and _is_whole(d, side, n)
+                    and _is_whole(d, other, n)
+                ):
+                    raise ValueError(
+                        "a herd copies part of a shared L1 buffer; it must use "
+                        f"the whole buffer: {d}"
+                    )
+                d.erase()
+                alloc = mine.owner
+                for w in list(mine.uses):
+                    if w.owner.name == "memref.dealloc":
+                        w.owner.erase()
+                mine.replace_all_uses_with(arg)
+                alloc.erase()
 
 
 def _bind_tile_ids(seg, tiles, shapes):
