@@ -403,6 +403,8 @@ def read(ttir, air_project_path):
             ints = lambda t: tuple(int(x) for x in t.split(","))  # noqa: E731
             bshape = _attr(f, "air.channel_broadcast_shape")
             cname = _attr(f, "sym_name")[len("air.channel.") :]
+            if cname == name:
+                raise ValueError(f"channel {cname} has the superkernel's name")
             chans[cname] = sk.channel(
                 cname,
                 ints(size),
@@ -478,7 +480,10 @@ def read(ttir, air_project_path):
         leaves, exported = {}, {}
         for kind, item in order:
             if kind == "segment":
-                sk.segment(_SegmentWriter(env, funcs, chans, exported).write(item))
+                for where in ("launch", "segment"):
+                    sg = _SegmentWriter(env, funcs, chans, exported, where).write(item)
+                    if not sg.empty:
+                        sk.segment(sg)
                 continue
             (call, f), p, at = parts[item], settings[item], corners[item]
             schedule = _bound_schedule(p, sched_dir)
@@ -534,12 +539,16 @@ class _SegmentWriter:
     exported, for later segment code and herds, and freed at the wave's
     end."""
 
-    def __init__(self, env, funcs, chans, exported):
+    def __init__(self, env, funcs, chans, exported, where="segment"):
         self.env, self.funcs, self.chans = env, funcs, chans
+        # "segment": the code on L2 buffers; "launch": the transfers to and
+        # from DDR buffers, which the host issues, outside the segment.
+        self.where = where
         self.exported = exported  # TTIR value -> (name, memref type)
         self.names, self.types = {}, {}
         self.args, self.binds, self.lines = [], [], []
         self.exports = []  # (name, local name, type)
+        self.writes = []  # the DDR tensors its gets fill
         self.n = 0
 
     def fresh(self):
@@ -562,6 +571,9 @@ class _SegmentWriter:
                 bind = bind.lowered()
             if isinstance(bind, Tensor) and bind.onchip:
                 typ = f"memref<{bind.n}x{bind.dtype}, 1 : i32>"
+                self.types[name] = typ
+            elif isinstance(bind, Tensor) and self.where == "launch":
+                typ = f"memref<*x{bind.dtype}>"
                 self.types[name] = typ
             elif isinstance(bind, (bool, int, _Wave, _Scalar)):
                 typ = str(v.type)
@@ -605,14 +617,41 @@ class _SegmentWriter:
         )
         for (name, _, typ), v in zip(self.exports, self._exported_values):
             self.exported[v] = (name, typ)
-        return _Segment(text, self.binds, [n for n, _, _ in self.exports])
+        sg = _Segment(text, self.binds, [n for n, _, _ in self.exports], self.where)
+        sg.writes = self.writes
+        sg.empty = not any(
+            "air.channel" in ln or "memref.alloc" in ln for ln in self.lines
+        )
+        return sg
 
     _exported_values = ()
+
+    def side(self, o):
+        """Where top-level op `o` of the segment code goes: "launch" if it
+        moves DDR data, "segment" if L2 data, None if neither."""
+        sides = set()
+        for x in [o] + _walk(o):
+            if x.operation.name != "tt.call":
+                continue
+            c = _callee(x)
+            if c.startswith("air.l2."):
+                sides.add("segment")
+            elif c.startswith("air.dma."):
+                b = self.env.get(x.operands[0])
+                ddr = isinstance(b, Tensor) and not b.onchip
+                sides.add("launch" if ddr else "segment")
+        if len(sides) > 1:
+            raise ValueError(
+                "segment code: one loop or branch moves both DDR and L2 data"
+            )
+        return sides.pop() if sides else None
 
     def block(self, ops, top=False):
         frees = []
         for o in ops:
             n = o.operation.name
+            if top and self.side(o) not in (None, self.where):
+                continue
             if n in ("scf.yield", "tt.return"):
                 if n == "scf.yield" and len(o.operands):
                     raise ValueError("segment code: loops and branches yield nothing")
@@ -622,7 +661,9 @@ class _SegmentWriter:
                 elt = str(o.results[0].type).split("<")[1].rstrip(">")
                 typ = f"memref<{_attr(decl, 'air.l2_elements')}x{elt}, 1 : i32>"
                 r = self.fresh()
-                self.lines.append(f"{r} = memref.alloc() : {typ}")
+                col = _attr(decl, "air.memtile_col")
+                at = "" if col is None else f" {{air.memtile_col = {col} : i32}}"
+                self.lines.append(f"{r} = memref.alloc(){at} : {typ}")
                 self.names[o.results[0]], self.types[r] = r, typ
                 if top:
                     self.exports.append((f"{_callee(o)}", r, typ))
@@ -720,6 +761,9 @@ class _SegmentWriter:
         o_ = [self.index(v) for v in offs]
         i_ = [self.index(v) for v in idx]
         op = "air.channel.put" if _attr(decl, "air.dma_put") else "air.channel.get"
+        target = self.env.get(buf)
+        if op == "air.channel.get" and isinstance(target, Tensor) and not target.onchip:
+            self.writes.append(target)
         self.lines.append(
             f"{op} @{ch}[{', '.join(i_)}] ({b}[{', '.join(o_)}] "
             f"[{', '.join(map(str, sizes))}] [{', '.join(map(str, strides))}]) "
@@ -819,7 +863,11 @@ class Launcher:
             )
             with open(done, "w") as f:
                 json.dump([xclbin, header], f)
-        written = [any(t in c.written for c in sk.calls) for t in sk.buffers]
+        segs = [g for k, g in sk.items if k == "segment"]
+        written = [
+            any(t in c.written for c in sk.calls) or any(t in g.writes for g in segs)
+            for t in sk.buffers
+        ]
         return sk.name, kinds, xclbin, header, written
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):

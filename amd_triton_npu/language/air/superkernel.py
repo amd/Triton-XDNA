@@ -120,10 +120,13 @@ def herd(fn, args, size, schedule, name=None, at=None, _semantic=None, _generato
 
 
 @core.builtin
-def alloc(shape, dtype, memory_space=L2, _semantic=None, _generator=None):
+def alloc(
+    shape, dtype, memory_space=L2, memtile_col=None, _semantic=None, _generator=None
+):
     """A new buffer of `shape` elements of `dtype` in `memory_space`, as a
     pointer to its first element. Only L2 for now: a buffer of the segment,
-    which only its herds access."""
+    which only its herds and segment code access. `memtile_col` places it,
+    as AIR's `air.memtile_col`."""
     if core._unwrap_if_constexpr(memory_space) != L2.value:
         raise ValueError("alloc: only memory_space=air.L2 for now")
     shape = core._unwrap_if_constexpr(shape)
@@ -142,6 +145,9 @@ def alloc(shape, dtype, memory_space=L2, _semantic=None, _generator=None):
     )
     module.push_back(decl)
     decl.set_attr("air.l2_elements", b.get_int32_attr(n))
+    memtile_col = core._unwrap_if_constexpr(memtile_col)
+    if memtile_col is not None:
+        decl.set_attr("air.memtile_col", b.get_int32_attr(memtile_col))
     call = b.call(module.get_function(name), [])
     return core.tensor(call.get_result(0), ptr)
 

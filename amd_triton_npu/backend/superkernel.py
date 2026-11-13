@@ -118,8 +118,9 @@ class _Segment:
     _Scalar, an on-chip Tensor or the name of a buffer an earlier segment
     code exports) and whose results are the buffers it exports by name."""
 
-    def __init__(self, text, binds, exports):
+    def __init__(self, text, binds, exports, where="segment"):
         self.text, self.binds, self.exports = text, binds, exports
+        self.where = where  # "segment", or "launch" for the DDR transfers
 
 
 class _Call:
@@ -344,8 +345,18 @@ class Superkernel:
             groups = self._phases()
             first = {id(g[0]): g for g in groups}
             made = {}  # a segment's exported buffers, by name
+            # The launch's arguments: the buffers, the wave, the scalars.
+            launch = seg.operation.parent
+            nargs = len(bufs) + 1 + len(self.scalars)
+            largs = list(launch.regions[0].blocks[0].arguments)[-nargs:]
+            lvalue = {id(t): largs[i] for i, t in enumerate(bufs)}
+            for i, v in enumerate(self.scalars):
+                lvalue[id(v)] = largs[len(bufs) + 1 + i]
+            lwave = largs[len(bufs)]
             for kind, item in self.items:
-                if kind == "segment":
+                if kind == "segment" and item.where == "launch":
+                    _emit_segment(top, item, seg, lvalue, lwave, {}, self.channels)
+                elif kind == "segment":
                     _emit_segment(top, item, end, value, wave, made, self.channels)
                 elif id(item) in first:
                     self._add_phase_group(

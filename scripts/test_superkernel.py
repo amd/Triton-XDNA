@@ -23,6 +23,8 @@ on the NPU and compares with numpy:
   grid       a rank-3 channel between two 2x2 herds
   gather     segment code gathers two cores' halves in an L2 buffer and
              sends it three times to a third core
+  feed       the host puts DDR blocks into a channel a core gets, and gets
+             the core's results back into DDR
 
 Also checks the errors reading a superkernel reports. Needs an npu2 device
 for the runs; with no NPU only the IR checks run.
@@ -368,7 +370,7 @@ def gather(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.const
     air.Channel("whole")
     for wave in range(NW):
         air.herd(half, (X, D, T), 2, S, name="half")
-        buf = air.alloc([2 * T], tl.bfloat16, memory_space=air.L2)
+        buf = air.alloc([2 * T], tl.bfloat16, memory_space=air.L2, memtile_col=3)
         for h in tl.static_range(2):
             air.ChannelGet("halves", buf, indices=[h], offsets=[h * T], sizes=[T])
         for r in range(3):
@@ -388,6 +390,25 @@ def gather_dynamic(
         for h in range(2):
             air.ChannelGet("halves", buf, indices=[h], offsets=[h * T], sizes=[T])
         air.herd(use3, (Y, D, T), 1, S, name="use")
+
+
+@triton.jit
+def dbl(D: tl.constexpr, T: tl.constexpr):
+    for t in range(D // T):
+        x = air.ChannelGet("inp", [T], tl.bfloat16)
+        air.ChannelPut("out", x * 2)
+
+
+@triton.jit
+def feed(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
+    air.Channel("inp")
+    air.Channel("out")
+    for wave in range(NW):
+        for t in range(D // T):
+            air.ChannelPut("inp", X, offsets=[t * T], sizes=[T])
+        air.herd(dbl, (D, T), 1, S, name="dbl")
+        for t in range(D // T):
+            air.ChannelGet("out", Y, offsets=[t * T], sizes=[T])
 
 
 # Superkernels that reading rejects.
@@ -561,7 +582,18 @@ EXPLICIT = {
         2 * XT,
         2 * XT,
         lambda x: bf(bf(bf(2 * x) * 2) + bf(2 * x)),
-        ["air.channel.get  @halves[", "air.channel.put  @whole[] (%alloc"],
+        [
+            "air.channel.get  @halves[",
+            "air.channel.put  @whole[] (%alloc",
+            "{air.memtile_col = 3 : i32}",
+        ],
+    ),
+    "feed": (
+        feed,
+        XD,
+        XD,
+        lambda x: bf(2 * x),
+        ["air.channel.put  @inp[] (%arg", "air.channel.get  @out[] (%arg"],
     ),
     "grid": (
         grid,
