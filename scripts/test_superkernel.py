@@ -26,6 +26,8 @@ on the NPU and compares with numpy:
   feed       the host puts DDR blocks into a channel a core gets, and gets
              the core's results back into DDR
   neighbours two neighbouring cores share an L1 buffer of the segment
+  q4gemv     a core gets q4nx weight blocks into a buffer of its own and
+             reads them in parts: 32 rows of a GEMV, as the decode's
 
 Also checks the errors reading a superkernel reports. Needs an npu2 device
 for the runs; with no NPU only the IR checks run.
@@ -94,7 +96,8 @@ module attributes {transform.with_named_sequence} {
 """
 
 # A kernel whole on each of its cores, for kernels that move their own data
-# (channels, program ids): every copy a DMA of the core.
+# (channels, program ids): every copy a DMA of the core. Loops may carry
+# buffers.
 DIRECT = """
 // A kernel whole on one core: its body in a 1x1 herd, every buffer it
 // allocates in the core's L1, every copy a DMA of the core.
@@ -116,7 +119,8 @@ module attributes {transform.with_named_sequence} {
     %te = transform.structured.match ops{["tensor.empty"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %te1 = transform.cast %te : !transform.any_op to !transform.op<"tensor.empty">
     %te2 = transform.bufferization.empty_tensor_to_alloc_tensor %te1 : (!transform.op<"tensor.empty">) -> !transform.op<"bufferization.alloc_tensor">
-    transform.include @one_shot_bufferize failures(propagate) (%arg1) : (!transform.any_op) -> ()
+    %fbz = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %fbz1 = transform.bufferization.one_shot_bufferize %fbz <{allow_return_allocs_from_loops = true}> : (!transform.any_op) -> !transform.any_op
     // post_bufferize_cleanup, less eliminate_cascade_memcpy: a buffer each
     // value stored, none written again while its DMA may still read it
     %fb = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
@@ -432,6 +436,63 @@ def neighbours(
         air.herd(rd, (sh, Y, D), 1, S, name="rd", at=(3, 2))
 
 
+@triton.jit
+def q4_group(xb, w, acc, g):
+    """Group g (32 columns) of a q4nx block at w (2560 int16: scales, mins,
+    then the 4-bit values as [half][column][row in half]) times the x at
+    xb, added to the 32 rows' sums at acc."""
+    r = tl.arange(0, 32)
+    xg = tl.load(xb + g * 32 + r).to(tl.float32)
+    scale = tl.load(w + g * 32 + r).to(tl.bfloat16, bitcast=True).to(tl.float32)
+    mn = tl.load(w + 256 + g * 32 + r).to(tl.bfloat16, bitcast=True).to(tl.float32)
+    h = tl.arange(0, 2)[:, None, None]
+    c = tl.arange(0, 32)[None, :, None]
+    k = tl.arange(0, 4)[None, None, :]
+    v = tl.load(w + 512 + h * 1024 + (g * 32 + c) * 4 + k).to(tl.int32)
+    # Mask before shifting: the cores' shifts round what they shift out.
+    sh = (tl.arange(0, 4) * 4)[None, None, None, :]
+    nib = (v[:, :, :, None] & (15 << sh)) >> sh
+    q = tl.reshape(tl.permute(tl.reshape(nib, [2, 32, 16]), (1, 0, 2)), [32, 32])
+    part = tl.sum(q.to(tl.float32) * xg[:, None], axis=0).to(tl.bfloat16)
+    red = tl.sum(xg).to(tl.bfloat16).to(tl.float32)
+    tl.store(acc + r, tl.load(acc + r) + part.to(tl.float32) * scale + mn * red)
+
+
+@triton.jit
+def gemv_core(NB: tl.constexpr):
+    w = air.alloc([2560], tl.int16, memory_space=air.L1)
+    xb = air.alloc([256], tl.bfloat16, memory_space=air.L1)
+    acc = air.alloc([32], tl.float32, memory_space=air.L1)
+    r = tl.arange(0, 32)
+    tl.store(acc + r, tl.zeros([32], tl.float32))
+    for j in range(NB):
+        air.ChannelGet("inX", xb, sizes=[256])
+        air.ChannelGet("inW", w, sizes=[2560])
+        for g in range(8):
+            q4_group(xb, w, acc, g)
+    air.ChannelPut("outY", tl.load(acc + r).to(tl.bfloat16))
+
+
+@triton.jit
+def q4gemv(
+    X, Y, W, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr
+):
+    air.backend(
+        omit_pingpong="L1",
+        use_lock_race_condition_fix_v2=True,
+        merge_contiguous_feeds=False,
+    )
+    air.Channel("inX")
+    air.Channel("inW")
+    air.Channel("outY")
+    for wave in range(NW):
+        for j in range(D // T):
+            air.ChannelPut("inX", X, offsets=[j * 256], sizes=[256])
+            air.ChannelPut("inW", W, offsets=[j * 2560], sizes=[2560])
+        air.herd(gemv_core, (D // T,), 1, S, name="gemv")
+        air.ChannelGet("outY", Y, offsets=[0], sizes=[32])
+
+
 # Superkernels that reading rejects.
 
 
@@ -633,6 +694,65 @@ EXPLICIT = {
 }
 
 
+def q4_pack(q, scale, mn):
+    """q [32 rows, 256 columns] of 0..15 and scale, mn [8 groups, 32 rows]:
+    the 2560 int16 of a q4nx block."""
+    s16 = lambda a: (bf(a).view(np.uint32) >> 16).astype(np.uint16)  # noqa: E731
+    out = np.zeros(2560, np.uint16)
+    out[:256], out[256:512] = s16(scale).reshape(-1), s16(mn).reshape(-1)
+    nib = np.zeros(8192, np.uint8)
+    for r in range(32):
+        h, rr = divmod(r, 16)
+        nib[h * 4096 + np.arange(256) * 16 + rr] = q[r]
+    out[512:] = (nib[0::2] | (nib[1::2] << 4)).astype(np.uint8).view(np.uint16)
+    return out.view(np.int16)
+
+
+def q4_ref(x, q, scale, mn):
+    """A q4nx block's 32 rows times x, rounded as the decode's cores do."""
+    xg = x.reshape(8, 32)
+    part = bf(np.einsum("gcr,gc->gr", q.T.reshape(8, 32, 32).astype(np.float32), xg))
+    return (part * scale + mn * bf(xg.sum(1))[:, None]).sum(0)
+
+
+def run_q4gemv(script, has_npu, proj):
+    nb = 6
+    rng = np.random.default_rng(2)
+    x0 = bf(rng.standard_normal(nb * 256))
+    blocks = [
+        (
+            rng.integers(0, 16, (32, 256)),
+            bf(rng.uniform(0.01, 0.1, (8, 32))),
+            bf(rng.uniform(-0.5, 0, (8, 32))),
+        )
+        for _ in range(nb)
+    ]
+    W = torch.from_numpy(np.concatenate([q4_pack(*b) for b in blocks]))
+    want = bf(
+        sum(q4_ref(x0[j * 256 : (j + 1) * 256], *b) for j, b in enumerate(blocks))
+    )
+    x = _bfx(x0)
+    y = torch.zeros(32, dtype=torch.bfloat16)
+    kw = dict(NW=1, D=nb * 256, T=256, S=script)
+    text = module_text(q4gemv, (x, y, W), kw, proj)
+    check(
+        "air.channel.get  @inW[%c0" in text,
+        "q4gemv: weights get into the core's buffer",
+    )
+    if not has_npu:
+        return
+    from triton.backends.amd_triton_npu.driver_scope import driver_scope
+
+    with driver_scope("npu"):
+        q4gemv[(1,)](x, y, W, **kw)
+    got = y.to(torch.float32).numpy()
+    ulp = np.abs(want) * 2.0**-7 + 1e-6
+    check(
+        bool(np.all(np.abs(got - want) <= ulp)),
+        "q4gemv: NPU result matches numpy to one ulp",
+    )
+
+
 def run_explicit(name, script, has_npu, proj):
     kernel, nx, ny, ref, shows = EXPLICIT[name]
     rng = np.random.default_rng(1)
@@ -779,6 +899,8 @@ def main():
             for name in EXPLICIT:
                 print(f"{name}:", flush=True)
                 run_explicit(name, direct, has_npu, os.path.join(tmp, name))
+            print("q4gemv:", flush=True)
+            run_q4gemv(direct, has_npu, os.path.join(tmp, "q4gemv"))
             for name, (kernel, extra, kwargs, ref, n) in CASES.items():
                 print(f"{name}:", flush=True)
                 x = torch.empty(n, dtype=torch.bfloat16)

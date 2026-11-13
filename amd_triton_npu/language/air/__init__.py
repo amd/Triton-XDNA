@@ -15,8 +15,19 @@ from .superkernel import (
     ChannelGet,
     ChannelPut,
     alloc,
+    backend,
     herd,
     table,
 )
 
-__all__ = ["Channel", "ChannelGet", "ChannelPut", "L1", "L2", "alloc", "herd", "table"]
+__all__ = [
+    "Channel",
+    "ChannelGet",
+    "ChannelPut",
+    "L1",
+    "L2",
+    "alloc",
+    "backend",
+    "herd",
+    "table",
+]

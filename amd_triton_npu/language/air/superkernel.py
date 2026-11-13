@@ -45,7 +45,17 @@ new value does not recompile the dispatch).
 from triton._C.libtriton import ir
 from triton.language import core
 
-__all__ = ["Channel", "ChannelGet", "ChannelPut", "L1", "L2", "alloc", "herd", "table"]
+__all__ = [
+    "backend",
+    "Channel",
+    "ChannelGet",
+    "ChannelPut",
+    "L1",
+    "L2",
+    "alloc",
+    "herd",
+    "table",
+]
 
 #: AIR's memory spaces
 L1 = core.constexpr(2)
@@ -103,6 +113,15 @@ def _next_id(generator, counter):
     return n
 
 
+def _fresh_symbol(module, prefix):
+    """`prefix` and the first number no function of `module` is named with:
+    each herd's function has a code generator of its own."""
+    n = 0
+    while module.has_function(f"{prefix}{n}"):
+        n += 1
+    return f"{prefix}{n}"
+
+
 @core.builtin
 def herd(fn, args, size, schedule, name=None, at=None, _semantic=None, _generator=None):
     """Run `fn` on `args` as a herd of `size` cores; see the module's
@@ -123,15 +142,22 @@ def herd(fn, args, size, schedule, name=None, at=None, _semantic=None, _generato
 def alloc(
     shape, dtype, memory_space=L2, memtile_col=None, _semantic=None, _generator=None
 ):
-    """A new buffer of the segment, of `shape` elements of `dtype` in
-    `memory_space`, as a pointer to its first element; only its herds and
-    segment code access it. An L2 buffer is in a memtile, which
-    `memtile_col` picks (AIR's `air.memtile_col`). An L1 buffer is in one
-    core's memory, which the cores next to it access as their own: herds
-    passed it must be neighbours."""
+    """A new buffer of `shape` elements of `dtype` in `memory_space`, as a
+    pointer to its first element.
+
+    In the superkernel, a buffer of the segment, which only its herds and
+    segment code access. An L2 buffer is in a memtile, which `memtile_col`
+    picks (AIR's `air.memtile_col`). An L1 buffer is in one core's memory,
+    which the cores next to it access as their own: herds passed it must be
+    neighbours.
+
+    In a herd's kernel, an L1 buffer of each core's own, for blocks it gets
+    from channels and reads in parts."""
     memory_space = core._unwrap_if_constexpr(memory_space)
     if memory_space not in (L1.value, L2.value):
         raise ValueError("alloc: memory_space is air.L1 or air.L2")
+    if not _generator.is_kernel and memory_space != L1.value:
+        raise ValueError("alloc: a kernel's own buffers are in L1")
     shape = core._unwrap_if_constexpr(shape)
     n = 1
     for d in [shape] if isinstance(shape, int) else _values(shape):
@@ -141,7 +167,8 @@ def alloc(
     ptr = core.pointer_type(dtype)
     # A call of a function declared for this buffer alone: the backend finds
     # the buffer's size there, and no two buffers fold into one value.
-    name = f"air.alloc.{_next_id(_generator, '_air_allocs')}"
+    kind = "alloc" if _generator.is_kernel else "local"
+    name = _fresh_symbol(_generator.module, f"air.{kind}.")
     module = _generator.module
     decl = ir.builder(_generator.context).get_or_insert_function(
         module, name, b.get_function_ty([], [ptr.to_ir(b)]), "private", None
@@ -154,6 +181,51 @@ def alloc(
         decl.set_attr("air.memtile_col", b.get_int32_attr(memtile_col))
     call = b.call(module.get_function(name), [])
     return core.tensor(call.get_result(0), ptr)
+
+
+@core.builtin
+def backend(
+    omit_pingpong=None,
+    channel_multiplexing=None,
+    use_lock_race_condition_fix=None,
+    use_lock_race_condition_fix_v2=None,
+    unroll_feed_loops=None,
+    merge_contiguous_feeds=None,
+    stack_size=None,
+    _semantic=None,
+    _generator=None,
+):
+    """How aircc builds the superkernel, as AIR's `XRTBackend` takes it:
+    `omit_pingpong` ("L1", "L2" or "all"), `channel_multiplexing` (memory
+    levels, such as ["L1"]), the lock race fixes, `stack_size`; and whether
+    the host's feed loops are unrolled and contiguous feeds merged. Called
+    once, in the superkernel; without it, the defaults suit superkernels
+    whose herds only exchange L2 buffers."""
+    b = _semantic.builder
+    module = _generator.module
+    if module.has_function("air.backend"):
+        raise ValueError("air.backend is called once")
+    decl = ir.builder(_generator.context).get_or_insert_function(
+        module, "air.backend", b.get_function_ty([], []), "private", None
+    )
+    module.push_back(decl)
+    opts = dict(
+        omit_pingpong=omit_pingpong,
+        channel_multiplexing=channel_multiplexing,
+        use_lock_race_condition_fix=use_lock_race_condition_fix,
+        use_lock_race_condition_fix_v2=use_lock_race_condition_fix_v2,
+        unroll_feed_loops=unroll_feed_loops,
+        merge_contiguous_feeds=merge_contiguous_feeds,
+        stack_size=stack_size,
+    )
+    for k, v in opts.items():
+        v = core._unwrap_if_constexpr(v)
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple, core.tuple)):
+            v = ",".join(str(core._unwrap_if_constexpr(x)) for x in v)
+        decl.set_attr(f"air.backend.{k}", b.get_string_attr(str(v)))
+    b.call(module.get_function("air.backend"), [])
 
 
 @core.builtin
@@ -227,12 +299,16 @@ def Channel(
         decl.set_attr(
             "air.channel_buffer_resources", b.get_int32_attr(buffer_resources)
         )
+    # A call where it is declared keeps the declaration, which transfers on
+    # buffers only name, from being dropped as unused.
+    b.call(module.get_function(symbol), [])
 
 
-def _fifo(chan_name, n, dtype, indices, _semantic, _generator):
+def _fifo(chan_name, n, dtype, indices, _semantic, _generator, lanes=None):
     """The addresses of a block of `n` elements of `dtype` at `indices` of
-    channel `chan_name`. The indices go into the address as digits of radix
-    _RADIX, each digit's place a multiple of the block, in 64 bits."""
+    channel `chan_name`, as a block of `lanes` (`n` if not given) addresses.
+    The indices go into the address as digits of radix _RADIX, each digit's
+    place a multiple of the block, in 64 bits."""
     name = core._unwrap_if_constexpr(chan_name)
     module = _generator.module
     symbol = f"air.channel.{name}"
@@ -261,13 +337,16 @@ def _fifo(chan_name, n, dtype, indices, _semantic, _generator):
         ptr = ptr.__add__(off, _semantic=_semantic)
     if const:
         ptr = ptr.__add__(const, _semantic=_semantic)
-    return ptr.__add__(core.arange(0, n, _semantic=_semantic), _semantic=_semantic)
+    return ptr.__add__(
+        core.arange(0, lanes or n, _semantic=_semantic), _semantic=_semantic
+    )
 
 
 def _dma(kind, chan_name, buf, offsets, sizes, strides, indices, _semantic, _generator):
     """A channel op on a buffer, as AIR's: `sizes` elements of the buffer
-    `buf` points to, at `offsets` with `strides`. Recorded as a call of a
-    function declared for it, whose attributes hold the static parts."""
+    `buf` points to, at `offsets` with `strides`. In the superkernel,
+    recorded as a call of a function declared for it, whose attributes hold
+    the static parts. In a kernel, see `_core_dma`."""
     name = core._unwrap_if_constexpr(chan_name)
     if not _generator.module.has_function(f"air.channel.{name}"):
         raise ValueError(f"channel {name} is not declared")
@@ -285,9 +364,13 @@ def _dma(kind, chan_name, buf, offsets, sizes, strides, indices, _semantic, _gen
     i32 = lambda v: (  # noqa: E731
         _semantic.to_tensor(v) if isinstance(v, int) else v
     ).to(core.int32, _semantic=_semantic)
+    if not _generator.is_kernel:
+        return _core_dma(
+            kind, name, buf, offsets, sizes, strides, indices, _semantic, _generator
+        )
     operands = [buf] + [i32(v) for v in offsets] + [i32(v) for v in indices]
     module = _generator.module
-    symbol = f"air.dma.{_next_id(_generator, '_air_dmas')}"
+    symbol = _fresh_symbol(module, "air.dma.")
     decl = ir.builder(_generator.context).get_or_insert_function(
         module,
         symbol,
@@ -305,6 +388,32 @@ def _dma(kind, chan_name, buf, offsets, sizes, strides, indices, _semantic, _gen
     b.call(module.get_function(symbol), [o.handle for o in operands])
 
 
+def _core_dma(kind, name, buf, offsets, sizes, strides, indices, _semantic, _generator):
+    """A kernel's transfer between a channel and its own buffer `buf`: a
+    masked copy through a block of the next power of two, so that a block
+    of any size moves as one transfer."""
+    if len(sizes) != 1 or strides != [1]:
+        raise ValueError(f"{kind} {name}: a kernel moves a contiguous 1-D block")
+    n = sizes[0]
+    p = 1 << (n - 1).bit_length()
+    off = offsets[0]
+    at = (
+        buf.__add__(off, _semantic=_semantic)
+        if not (isinstance(off, int) and off == 0)
+        else buf
+    )
+    lanes = core.arange(0, p, _semantic=_semantic)
+    mask = lanes.__lt__(n, _semantic=_semantic)
+    mine = at.__add__(lanes, _semantic=_semantic)
+    fifo = _fifo(name, n, buf.dtype.element_ty, indices, _semantic, _generator, p)
+    if kind == "ChannelPut":
+        block = core.load(mine, mask=mask, _semantic=_semantic)
+        core.store(fifo, block, mask=mask, _semantic=_semantic)
+    else:
+        block = core.load(fifo, mask=mask, volatile=True, _semantic=_semantic)
+        core.store(mine, block, mask=mask, _semantic=_semantic)
+
+
 @core.builtin
 def ChannelPut(
     chan_name,
@@ -318,8 +427,9 @@ def ChannelPut(
 ):
     """Put into channel `chan_name` at `indices`, as AIR's `ChannelPut`.
     In a kernel, `src` is a 1-D block of the core's. With `sizes`, `src`
-    points to a buffer, of DDR or L2, and the put sends `sizes` elements of
-    it at `offsets` with `strides`: a transfer of the segment, not of a core.
+    points to a buffer and the put sends `sizes` elements of it at `offsets`
+    with `strides`: in the superkernel a buffer of DDR or L2 and a transfer
+    of the host or the segment; in a kernel a buffer of the core's own.
     Waits while the FIFO is full."""
     if sizes is not None:
         return _dma(
@@ -351,9 +461,9 @@ def ChannelGet(
 ):
     """Get from channel `chan_name` at `indices`, as AIR's `ChannelGet`. In
     a kernel, `dst` is the shape of a 1-D block of `dtype`, which the get
-    returns. With `sizes`, `dst` points to a buffer, of DDR or L2, that the
-    get fills: `sizes` elements at `offsets` with `strides`. Waits for the
-    data."""
+    returns. With `sizes`, `dst` points to a buffer that the get fills,
+    `sizes` elements at `offsets` with `strides`: of DDR or L2 in the
+    superkernel, of the core's own in a kernel. Waits for the data."""
     if sizes is not None:
         return _dma(
             "ChannelGet",

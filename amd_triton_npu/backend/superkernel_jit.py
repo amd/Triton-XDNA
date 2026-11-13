@@ -23,6 +23,7 @@ from .superkernel import (
     _Segment,
     Tensor,
     _Channel,
+    _Local,
     _Scalar,
     _Table,
     _TileId,
@@ -275,6 +276,41 @@ def _channels_as_args(f):
     return names
 
 
+def _locals_as_args(f, funcs):
+    """Replace kernel function `f`'s own L1 buffers by pointer arguments
+    appended to it. Returns each buffer's (symbol, elements, element type),
+    in the order of the new arguments."""
+    from air.ir import FunctionType, Location, TypeAttr
+
+    block = f.regions[0].blocks[0]
+    calls = [
+        o
+        for o in _walk(f)
+        if o.operation.name == "tt.call" and _callee(o).startswith("air.local.")
+    ]
+    out, types = [], []
+    for o in calls:
+        decl = funcs[_callee(o)]
+        t = o.results[0].type
+        a = block.add_argument(t, Location.unknown())
+        o.results[0].replace_all_uses_with(a)
+        out.append(
+            (
+                _callee(o),
+                _attr(decl, "air.alloc_elements"),
+                str(t).split("<")[1].rstrip(">"),
+            )
+        )
+        o.operation.erase()
+        types.append(t)
+    if out:
+        ft = FunctionType(TypeAttr(f.attributes["function_type"]).value)
+        f.attributes["function_type"] = TypeAttr.get(
+            FunctionType.get(list(ft.inputs) + types, list(ft.results))
+        )
+    return out
+
+
 def _leaf_module(module, symbol, name):
     """The TTIR of the kernel `symbol` of `module` as a module of its own: a
     public function `name` with the functions it calls inlined, run through
@@ -306,6 +342,7 @@ def _leaf_module(module, symbol, name):
                 )
     axes = _program_ids_as_args(funcs[symbol])
     chans = _channels_as_args(funcs[symbol])
+    own = _locals_as_args(funcs[symbol], funcs)
     texts = []
     for s in order:
         t = funcs[s].operation.get_asm(print_generic_op_form=True)
@@ -335,7 +372,7 @@ def _leaf_module(module, symbol, name):
         os.unlink(f.name)
     mod.context = ctx  # make_ttir's pass manager needs it, as in Triton's compile
     NPUBackend.make_ttir(mod, {}, None)
-    return str(mod), axes, chans
+    return str(mod), axes, chans, [_Local(n, t, sym) for sym, n, t in own]
 
 
 def _walk(op):
@@ -363,32 +400,63 @@ def read(ttir, air_project_path):
         top = next(f for f in funcs.values() if _attr(f, "sym_visibility") == "public")
         name = _attr(top, "sym_name")
         body = top.regions[0].blocks[0]
-        loops = [o for o in body.operations if o.operation.name == "scf.for"]
-        if len(loops) != 1:
+
+        def runs_herds(o):
+            return any(
+                x.operation.name == "tt.call"
+                and _attr(funcs[_callee(x)], "air.herd") is not None
+                for x in o.regions[0].blocks[0].operations
+            )
+
+        # The loop over the waves is the one that runs herds; with one wave
+        # it folds away and the function's body is the wave's.
+        loops = [
+            o
+            for o in body.operations
+            if o.operation.name == "scf.for" and runs_herds(o)
+        ]
+        if len(loops) > 1:
             raise ValueError(f"{name}: a superkernel loops over its waves once")
-        loop = loops[0]
+        loop = loops[0] if loops else None
         env = {}
         kinds = [
             "buffer" if "!tt.ptr" in str(a.type) else "scalar" for a in body.arguments
         ]
         for o in body.operations:
             n = o.operation.name
-            if o == loop or n == "tt.return":
+            if loop is None or o == loop or n == "tt.return":
                 continue
             decl = funcs[_callee(o)] if n == "tt.call" else None
-            if decl is not None and _attr(decl, "air.alloc_elements"):
+            if decl is not None and (
+                _attr(decl, "air.alloc_elements")
+                or _attr(decl, "air.channel_size")
+                or _callee(o) == "air.backend"
+            ):
                 continue
             if n.startswith("arith."):
                 env[o.result] = _evaluate(o, env, name)
                 continue
             raise ValueError(f"{name}: {n} outside the loop over the waves")
-        lb, ub, step = (env.get(v) for v in loop.operands[:3])
-        if not all(isinstance(x, int) for x in (lb, ub, step)):
-            raise ValueError(
-                f"{name}: the loop over the waves needs a constexpr trip count"
-            )
-        waves = list(range(lb, ub, step))
+        if loop is None:
+            waves = [0]
+        else:
+            lb, ub, step = (env.get(v) for v in loop.operands[:3])
+            if not all(isinstance(x, int) for x in (lb, ub, step)):
+                raise ValueError(
+                    f"{name}: the loop over the waves needs a constexpr trip count"
+                )
+            waves = list(range(lb, ub, step))
         sk = Superkernel(name, air_project_path, len(waves))
+        if "air.backend" in funcs:
+            f = funcs["air.backend"]
+            prefix = "air.backend."
+            sk.backend = {
+                k[len(prefix) :]: _attr(f, k)
+                for k in (
+                    str(a if isinstance(a, str) else a.name) for a in f.attributes
+                )
+                if k.startswith(prefix)
+            }
         for i, a in enumerate(body.arguments):
             if kinds[i] == "buffer":
                 elt = str(a.type).split("<")[1].rstrip(">")
@@ -416,19 +484,28 @@ def read(ttir, air_project_path):
             if o.operation.name == "tt.call":
                 decl = funcs[_callee(o)]
                 n = _attr(decl, "air.alloc_elements")
-                elt = str(o.results[0].type).split("<")[1].rstrip(">")
                 if n:
+                    elt = str(o.results[0].type).split("<")[1].rstrip(">")
                     space = _attr(decl, "air.memory_space")
                     env[o.results[0]] = sk.onchip(_callee(o), n, elt, space)
-        lbody = loop.regions[0].blocks[0]
-        env[lbody.arguments[0]] = _PerWave(waves)
+        if loop is None:
+            lbody = body
+        else:
+            lbody = loop.regions[0].blocks[0]
+            env[lbody.arguments[0]] = _PerWave(waves)
 
         # The wave's body: herds, and the segment code between them.
         parts, order, pending = [], [], []
         for o in lbody.operations:
             n = o.operation.name
-            if n == "scf.yield":
+            if n in ("scf.yield", "tt.return"):
                 continue
+            if loop is None and len(o.results) and o.results[0] in env:
+                continue  # a buffer of the function's body, made above
+            if n == "tt.call" and (
+                _callee(o).startswith("air.channel.") or _callee(o) == "air.backend"
+            ):
+                continue  # where a channel is declared, or the options given
             if n.startswith("arith."):
                 try:
                     env[o.result] = _evaluate(o, env, name)
@@ -492,11 +569,16 @@ def read(ttir, air_project_path):
                 kname = _kernel_name(sym)
                 if sym not in leaves:
                     leaves[sym] = _leaf_module(module, sym, kname)
-                leaf, axes, used = leaves[sym]
+                leaf, axes, used, own = leaves[sym]
                 missing = [n for n in used if n not in chans]
                 if missing:
                     raise ValueError(f"{kname}: channel {missing[0]} is not declared")
-                args = list(args) + [_TILE[a] for a in axes] + [chans[n] for n in used]
+                args = (
+                    list(args)
+                    + [_TILE[a] for a in axes]
+                    + [chans[n] for n in used]
+                    + own
+                )
                 vals = []
                 for v in args:
                     if isinstance(v, ValueError):
@@ -504,7 +586,8 @@ def read(ttir, air_project_path):
                     if isinstance(v, _PerWave):
                         v = v.lowered()
                     if not isinstance(
-                        v, (Tensor, _Channel, _Scalar, _TileId, _Wave, int, float)
+                        v,
+                        (Tensor, _Channel, _Local, _Scalar, _TileId, _Wave, int, float),
                     ):
                         raise ValueError(f"{p['name']}: {kname} takes {v!r}")
                     vals.append(v)
@@ -774,6 +857,37 @@ class _SegmentWriter:
         )
 
 
+def _aircc_options(opts):
+    """`Superkernel.compile`'s aircc arguments for `air.backend`'s options
+    `opts` (strings, by name), as AIR's XRTBackend passes them."""
+    if opts is None:
+        return dict(
+            extra_args=(
+                "--air-channel-multiplexing=L1",
+                "--omit-ping-pong-transform=L1",
+            )
+        )
+    yes = lambda k: opts.get(k) == "True"  # noqa: E731
+    args = []
+    if opts.get("omit_pingpong"):
+        args.append(f"--omit-ping-pong-transform={opts['omit_pingpong']}")
+    for level in filter(None, opts.get("channel_multiplexing", "").split(",")):
+        args.append(f"--air-channel-multiplexing={level}")
+    if yes("use_lock_race_condition_fix"):
+        args.append("--use-lock-race-condition-fix")
+    if yes("use_lock_race_condition_fix_v2"):
+        args.append("--use-lock-race-condition-fix-v2")
+    feeds = []
+    if opts.get("unroll_feed_loops", "True") == "True":
+        feeds.append("--unroll-feed-loops")
+    if opts.get("merge_contiguous_feeds", "True") == "True":
+        feeds.append("--merge-contiguous-feeds")
+    out = dict(extra_args=tuple(args), feed_args=tuple(feeds))
+    if opts.get("stack_size"):
+        out["stack_size"] = int(opts["stack_size"])
+    return out
+
+
 def _settings(f):
     """The settings `herd` gave herd function `f`."""
     at = None
@@ -849,6 +963,11 @@ class Launcher:
             with open(path, "rb") as f:
                 key.update(f.read())
         key.update(f"{detect_npu_version()} {npu_config.bf16_emulation}".encode())
+        # The code that lowers it, so that a change to it rebuilds.
+        here = os.path.dirname(__file__)
+        for f in ("superkernel.py", "superkernel_jit.py", "transform_inject.py"):
+            with open(os.path.join(here, f), "rb") as src:
+                key.update(src.read())
         proj = os.path.join(knobs.cache.dir, "npu_superkernel", key.hexdigest()[:32])
         sk, kinds = read(ttir, proj)
         done = os.path.join(proj, "built.json")
@@ -859,10 +978,7 @@ class Launcher:
             xclbin, header = sk.compile(
                 runtime_loop_tiling_sizes=(),
                 bf16_emulation=npu_config.bf16_emulation,
-                extra_args=(
-                    "--air-channel-multiplexing=L1",
-                    "--omit-ping-pong-transform=L1",
-                ),
+                **_aircc_options(sk.backend),
             )
             with open(done, "w") as f:
                 json.dump([xclbin, header], f)
