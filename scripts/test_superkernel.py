@@ -16,6 +16,10 @@ on the NPU and compares with numpy:
   multicore  a partition on two cores, its schedule given the core count
   steps      a wave of four spatials: the cores of one name run two phases,
              another partition's call between them
+  stream     a core puts blocks into a channel that another core gets
+  spmd       a kernel run as one program a core, program_id its core
+  bcast      one core's blocks broadcast to the two cores of another
+  merge      two cores put into a FIFO each, one core gets both
 
 Also checks the errors reading a superkernel reports. Needs an npu2 device
 for the runs; with no NPU only the IR checks run.
@@ -29,6 +33,7 @@ import sys
 import tempfile
 
 try:
+    import numpy as np
     import torch
     import triton
     import triton.language as tl
@@ -77,6 +82,61 @@ module attributes {transform.with_named_sequence} {
         (%arg1) : (!transform.any_op) -> ()
     %vh = transform.include @air_herd_mapping_and_vectorize
         failures(propagate) (%arg1) : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+"""
+
+# A kernel whole on each of its cores, for kernels that move their own data
+# (channels, program ids): every copy a DMA of the core.
+DIRECT = """
+// A kernel whole on one core: its body in a 1x1 herd, every buffer it
+// allocates in the core's L1, every copy a DMA of the core.
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly},
+      %cores_x: !transform.param<i64>, %cores_y: !transform.param<i64>) {
+    // A masked load's fill and box copy as tensor ops: the box gets a buffer
+    // of its own, so no DMA writes a buffer the core also fills.
+    %fr = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %fr1 = transform.air.raise_load_buffer_to_tensor %fr : (!transform.any_op) -> !transform.any_op
+    %f0 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %f0 {
+      transform.apply_patterns.linalg.tiling_canonicalization
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %f0 : !transform.any_op
+    %f1 = transform.air.fuse_elementwise_linalg %f0 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %f1 { transform.apply_patterns.canonicalization } : !transform.any_op
+    %te = transform.structured.match ops{["tensor.empty"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %te1 = transform.cast %te : !transform.any_op to !transform.op<"tensor.empty">
+    %te2 = transform.bufferization.empty_tensor_to_alloc_tensor %te1 : (!transform.op<"tensor.empty">) -> !transform.op<"bufferization.alloc_tensor">
+    transform.include @one_shot_bufferize failures(propagate) (%arg1) : (!transform.any_op) -> ()
+    // post_bufferize_cleanup, less eliminate_cascade_memcpy: a buffer each
+    // value stored, none written again while its DMA may still read it
+    %fb = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %fb {
+      transform.apply_patterns.linalg.tiling_canonicalization
+      transform.apply_patterns.scf.for_loop_canonicalization
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %fb : !transform.any_op
+    %lc = transform.structured.match ops{["linalg.copy"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %mc = transform.structured.linalg_copy_to_memref %lc : (!transform.any_op) -> !transform.any_op
+    %fb2 = transform.air.remove_uninitialized_copy %fb : (!transform.any_op) -> !transform.any_op
+    // (a one-trip parallel canonicalizes away: made only now, and taken to
+    // a herd at once)
+    %f2 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %f3 = transform.apply_registered_pass "air-wrap-func-with-parallel"
+        with options = { "loop-bounds" = "1,1" } to %f2
+        : (!transform.any_op) -> !transform.any_op
+    %p = transform.structured.match ops{["scf.parallel"]} in %f3 : (!transform.any_op) -> !transform.any_op
+    %h = transform.air.par_to_herd %p : (!transform.any_op) -> !transform.any_op
+    %h1 = transform.air.override_memref_memory_space %h <{memory_space = 2 : i32}> : (!transform.any_op) -> !transform.any_op
+    %cp = transform.structured.match ops{["memref.copy", "linalg.copy"]} in %h1 : (!transform.any_op) -> !transform.any_op
+    transform.foreach %cp : !transform.any_op {
+    ^bb0(%c: !transform.any_op):
+      %dm = transform.air.copy_to_dma %c : (!transform.any_op) -> !transform.any_op
+    }
     transform.yield
   }
 }
@@ -190,6 +250,76 @@ def steps(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.const
         npu.spatial([(add, (h0, X, g, D, DP))], [1], [S], names=["b"])
         npu.spatial([(scale, (X, W, h1, wave * 2 + 1, D, DP))], [1], [S], names=["s"])
         npu.spatial([(add, (g, h1, X, D, DP))], [1], [S], names=["a"])
+
+
+@triton.jit
+def src(X, CH, D: tl.constexpr, T: tl.constexpr):
+    for t in range(D // T):
+        npu.put(CH, tl.load(X + t * T + tl.arange(0, T)) * 2)
+
+
+@triton.jit
+def sink(CH, Y, D: tl.constexpr, T: tl.constexpr):
+    for t in range(D // T):
+        tl.store(Y + t * T + tl.arange(0, T), npu.get(CH, T) + 1)
+
+
+@triton.jit
+def stream(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
+    ch = npu.channel([T], tl.bfloat16)
+    for wave in range(NW):
+        npu.spatial([(src, (X, ch, D, T)), (sink, (ch, Y, D, T))], [1, 1], [S, S])
+
+
+@triton.jit
+def twice(X, Y, D: tl.constexpr):
+    p = tl.program_id(0)
+    x = tl.load(X + p * D + tl.arange(0, D))
+    tl.store(Y + p * D + tl.arange(0, D), x * 2)
+
+
+@triton.jit
+def spmd(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
+    for wave in range(NW):
+        npu.spatial([(twice, (X, Y, D))], [2], [S])
+
+
+@triton.jit
+def bc_sink(CH, Y, D: tl.constexpr, T: tl.constexpr):
+    p = tl.program_id(0)
+    for t in range(D // T):
+        y = npu.get(CH, T)
+        tl.store(Y + p * D + t * T + tl.arange(0, T), y + p.to(tl.bfloat16))
+
+
+@triton.jit
+def bcast(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
+    ch = npu.channel([T], tl.bfloat16, broadcast=True)
+    for wave in range(NW):
+        npu.spatial([(src, (X, ch, D, T)), (bc_sink, (ch, Y, D, T))], [1, 2], [S, S])
+
+
+@triton.jit
+def m_src(X, CH, D: tl.constexpr, T: tl.constexpr):
+    p = tl.program_id(0)
+    for t in range(D // T):
+        x = tl.load(X + p * D + t * T + tl.arange(0, T))
+        npu.put(CH, x * 2, index=p)
+
+
+@triton.jit
+def m_sink(CH, Y, D: tl.constexpr, T: tl.constexpr):
+    for t in range(D // T):
+        a = npu.get(CH, T, index=0)
+        b = npu.get(CH, T, index=1)
+        tl.store(Y + t * T + tl.arange(0, T), a + b)
+
+
+@triton.jit
+def merge(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
+    ch = npu.channel([T], tl.bfloat16, count=2)
+    for wave in range(NW):
+        npu.spatial([(m_src, (X, ch, D, T)), (m_sink, (ch, Y, D, T))], [2, 1], [S, S])
 
 
 # Superkernels that reading rejects.
@@ -345,6 +475,62 @@ CASES = {
 }
 
 
+def _bfx(x):
+    return torch.from_numpy(bf(x)).to(torch.bfloat16)
+
+
+# name: kernel, x and y lengths, y from x, what the module must show
+XD, XT = 1024, 256
+EXPLICIT = {
+    "stream": (
+        stream,
+        XD,
+        XD,
+        lambda x: bf(bf(2 * x) + 1),
+        ["air.channel @chan0 [1, 1]", "air.channel.put", "air.channel.get"],
+    ),
+    "spmd": (spmd, 2 * XD, 2 * XD, lambda x: bf(2 * x), ["in (%arg17=%c2"]),
+    "bcast": (
+        bcast,
+        XD,
+        2 * XD,
+        lambda x: np.concatenate([bf(bf(2 * x) + p) for p in range(2)]),
+        ["broadcast_shape = [2, 1]"],
+    ),
+    "merge": (
+        merge,
+        2 * XD,
+        XD,
+        lambda x: bf(bf(2 * x[:XD]) + bf(2 * x[XD:])),
+        ["air.channel @chan0 [2, 1]"],
+    ),
+}
+
+
+def run_explicit(name, script, has_npu, proj):
+    kernel, nx, ny, ref, shows = EXPLICIT[name]
+    rng = np.random.default_rng(1)
+    x0 = bf(rng.standard_normal(nx))
+    x = _bfx(x0)
+    y = torch.zeros(ny, dtype=torch.bfloat16)
+    kw = dict(NW=2, D=XD, T=XT, S=script)
+    text = module_text(kernel, (x, y), kw, proj)
+    for want in shows:
+        check(want in text, f"{name}: the module shows {want}")
+    if not has_npu:
+        return
+    from triton.backends.amd_triton_npu.driver_scope import driver_scope
+
+    with driver_scope("npu"):
+        kernel[(1,)](x, y, **kw)
+    got = y.to(torch.float32).numpy()
+    want = ref(x0)
+    # The cores round bf16 sums toward zero: one ulp of the result.
+    ulp = np.abs(want) * 2.0**-7 + 1e-6
+    ok = bool(np.all(np.abs(got - want) <= ulp))
+    check(ok, f"{name}: NPU result matches numpy to one ulp")
+
+
 def module_text(kernel, args, kwargs, proj):
     """The AIR module the superkernel `kernel` lowers to, as text."""
     from triton.backends.amd_triton_npu.config import config_context
@@ -450,8 +636,14 @@ def main():
         script = os.path.join(tmp, "elementwise.mlir")
         with open(script, "w") as f:
             f.write(ELEMENTWISE)
+        direct = os.path.join(tmp, "direct.mlir")
+        with open(direct, "w") as f:
+            f.write(DIRECT)
         with config_context(bf16_emulation=False):
             error_checks(script, os.path.join(tmp, "bad"))
+            for name in EXPLICIT:
+                print(f"{name}:", flush=True)
+                run_explicit(name, direct, has_npu, os.path.join(tmp, name))
             for name, (kernel, extra, kwargs, ref, n) in CASES.items():
                 print(f"{name}:", flush=True)
                 x = torch.empty(n, dtype=torch.bfloat16)

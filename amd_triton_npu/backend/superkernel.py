@@ -83,12 +83,41 @@ class Tensor:
         return f"{'onchip' if self.onchip else 'ddr'}({self.name})"
 
 
+class _TileId:
+    """A program id of a kernel that runs one program a core: the core's
+    index in its herd along `axis`."""
+
+    def __init__(self, axis):
+        self.axis = axis
+
+    def __repr__(self):
+        return f"program_id({self.axis})"
+
+
+_TILE = {a: _TileId(a) for a in range(3)}
+
+
+class _Channel:
+    """`count` FIFOs between cores, each a stream of blocks of `block`
+    elements of `dtype`. `n` is the size of the placeholder buffer that
+    stands for it until the copies through it become channel operations."""
+
+    def __init__(self, name, block, dtype, count, broadcast):
+        self.name, self.block, self.dtype = name, block, dtype
+        self.count, self.broadcast = count, broadcast
+        self.n = block * count
+
+    def __repr__(self):
+        return f"channel({self.name})"
+
+
 class _Call:
     """One call: its kernel's name, its compiled AIR module and how the
     module's func arguments bind to the superkernel's tensors and ints."""
 
-    def __init__(self, name, at, herd, air, binds, read, written):
+    def __init__(self, name, at, herd, air, binds, read, written, cores, spmd):
         self.name, self.at, self.herd, self.air = name, at, herd, air
+        self.cores, self.spmd = cores, spmd
         self.binds = binds  # per func argument: a Tensor, _Wave or _Scalar
         self.read = read  # the tensors the call reads
         self.written = written  # the tensors the call writes
@@ -129,12 +158,19 @@ class Superkernel:
         )
         self.tensors, self.calls = [], []
         self.scalars = []  # the func's int arguments after its buffers
+        self.channels = []
 
     def scalar(self, name):
         """A new int argument of the func, set by the host at each dispatch."""
         v = _Scalar(name)
         self.scalars.append(v)
         return v
+
+    def channel(self, block, dtype, count=1, broadcast=False):
+        """A new channel of `count` FIFOs of blocks of `block` elements."""
+        c = _Channel(f"chan{len(self.channels)}", block, dtype, count, broadcast)
+        self.channels.append(c)
+        return c
 
     def ddr(self, name, n, dtype):
         """A new buffer argument of the func, in DDR."""
@@ -165,12 +201,17 @@ class Superkernel:
         ttshared = _optimize_ttsharedir(_ttir_to_ttsharedir(ttir), {})
         with config_context(transform_tiling_script=schedule):
             m = _ttshared_to_air(ttshared, 1, 1, 1)
+        # A kernel that reads its program ids runs one program a core: its
+        # schedule compiles one program. Any other is split over its cores
+        # by its schedule.
+        spmd = any(isinstance(a, _TileId) for a in args)
+        want = (1, 1) if spmd else tuple(cores)
         for h in _ops_named(_entry(m), "air.herd"):
             shape = (_herd_width(h), _herd_height(h))
-            if shape != tuple(cores):
+            if shape != want:
                 raise ValueError(
                     f"{name}: its schedule makes a {shape[0]}x{shape[1]} herd "
-                    f"for {cores[0]}x{cores[1]} cores"
+                    f"for {want[0]}x{want[1]} cores"
                 )
         _bind_constants(m, args)
         kept = _drop_unused_scalars(_entry(m))
@@ -191,7 +232,11 @@ class Superkernel:
         for c2 in self.calls:
             if c2.herd == herd and c2.at != tuple(at):
                 raise ValueError(f"herd {herd} placed at {c2.at} and {at}")
-        self.calls.append(_Call(name, tuple(at), herd, str(m), binds, read, written))
+        self.calls.append(
+            _Call(
+                name, tuple(at), herd, str(m), binds, read, written, tuple(cores), spmd
+            )
+        )
 
     def _check_writers(self):
         """Every on-chip tensor a call reads is written by some call."""
@@ -230,9 +275,11 @@ class Superkernel:
 
     def module_text(self):
         """The AIR module of the whole dispatch, as text."""
+        from air.dialects import arith
         from air.ir import (
             BoolAttr,
             Context,
+            InsertionPoint,
             IntegerAttr,
             IntegerType,
             Location,
@@ -243,7 +290,7 @@ class Superkernel:
         onchip = [t for t in self.tensors if t.onchip]
         with Context(), Location.unknown():
             i32 = IntegerType.get_signless(32)
-            top = Module.parse(self._skeleton(bufs, onchip))
+            top = Module.parse(self._skeleton(bufs, onchip + self.channels))
             seg = _ops_named(_entry(top), "air.segment")[0]
             sblock = seg.regions[0].blocks[0]
             # The segment's arguments: the buffers, the wave, the scalars.
@@ -255,7 +302,7 @@ class Superkernel:
                 o for o in sblock.operations if o.operation.name == "memref.dealloc"
             )
             value = {id(t): sargs[i] for i, t in enumerate(bufs)}
-            for t, a in zip(onchip, allocs):
+            for t, a in zip(onchip + self.channels, allocs):
                 value[id(t)] = a.result
             for a in allocs:
                 # Not shrunk to its current uses: the copies that read and
@@ -266,8 +313,19 @@ class Superkernel:
                 value[id(v)] = sargs[len(bufs) + 1 + i]
             phased = {}  # on-chip tensor id -> (phase loop, "in" or "out", tensors)
             loops = {}  # phase loop key -> (loop, its yield)
+            tiles = {}
+            with InsertionPoint.at_block_begin(sblock):
+                for a, t in _TILE.items():
+                    # Stand-ins for the program ids until the herds are
+                    # sized.
+                    c = arith.ConstantOp(i32, IntegerAttr.get(i32, -1 - a))
+                    tiles[a] = c.result
+                    value[id(t)] = c.result
             for g in self._phases():
                 self._add_phase_group(top, g, end, value, wave, phased, loops)
+            spmd = {c.herd: c.cores for c in self.calls if c.spmd}
+            _bind_tile_ids(seg, tiles, spmd)
+            _lower_channels(top, seg, [(c, value[id(c)]) for c in self.channels])
             _hoist_ddr_reads(sblock, sargs[: len(bufs)], end)
             # A herd whose kernel took a DDR buffer directly now takes the
             # on-chip tensor's L2 buffer instead.
@@ -725,6 +783,169 @@ def _lower_edges(module, seg, edges, phased=None):
             hoisted[:] = [h for h in hoisted if h[0].operation != outer[0].operation]
             hoisted.append((outer[0], last))
         d.erase()
+
+
+def _lower_channels(module, seg, chans):
+    """Turn the herds' copies to and from each channel's placeholder buffer
+    into puts and gets of the channel, and drop the placeholders. A copy's
+    offset in the placeholder picks the FIFO."""
+    from air.dialects import arith
+    from air.dialects.air import ChannelGet, ChannelPut, channel as channel_decl
+    from air.ir import ArrayAttr, IndexType, InsertionPoint, IntegerAttr, IntegerType
+
+    idx = IndexType.get()
+    for c, holder in chans:
+        with InsertionPoint.at_block_begin(module.body):
+            decl = channel_decl(c.name, size=[c.count, 1])
+        getters = set()
+        for h in _ops_named(seg, "air.herd"):
+            body = h.regions[0].blocks[0]
+            first = len(body.arguments) - len(h.operands)
+            for i, v in enumerate(h.operands):
+                if v != holder:
+                    continue
+                for u in list(body.arguments[first + i].uses):
+                    d = u.owner
+                    if d.name != "air.dma_memcpy_nd":
+                        raise ValueError(f"{c}: used by {d.name}")
+                    put = d.opview.dst == body.arguments[first + i]
+                    side, other = ("dst", "src") if put else ("src", "dst")
+                    (off,), (size,), (stride,) = _dma_pattern(d, side)
+                    if size != c.block or stride != 1:
+                        raise ValueError(f"{c}: a block of {size}, not {c.block}")
+                    o, sz, st = _dma_pattern(d, other)
+                    if c.broadcast and not put:
+                        # Every core of the herd gets each block.
+                        getters.add((_herd_width(h), _herd_height(h)))
+                        with InsertionPoint(d):
+                            ChannelGet(
+                                c.name,
+                                getattr(d.opview, other),
+                                offsets=o,
+                                sizes=sz,
+                                strides=st,
+                                indices=list(body.arguments[:2]),
+                            )
+                        d.erase()
+                        continue
+                    with InsertionPoint(d):
+                        if isinstance(off, int):
+                            fifo = arith.ConstantOp(
+                                idx, IntegerAttr.get(idx, off // c.block)
+                            )
+                        else:
+                            n = arith.ConstantOp(idx, IntegerAttr.get(idx, c.block))
+                            fifo = arith.DivUIOp(off, n.result)
+                        zero = arith.ConstantOp(idx, IntegerAttr.get(idx, 0))
+                        ends = [fifo.result, zero.result]
+                        mem = getattr(d.opview, other)
+                        if put:
+                            ChannelPut(
+                                c.name,
+                                mem,
+                                offsets=o,
+                                sizes=sz,
+                                strides=st,
+                                indices=ends,
+                            )
+                        else:
+                            ChannelGet(
+                                c.name,
+                                mem,
+                                offsets=o,
+                                sizes=sz,
+                                strides=st,
+                                indices=ends,
+                            )
+                    d.erase()
+        if c.broadcast:
+            if len(getters) != 1 or c.count != 1:
+                raise ValueError(f"{c}: a broadcast goes to one herd, from one FIFO")
+            (shape,) = getters
+            decl.attributes["broadcast_shape"] = ArrayAttr.get(
+                [IntegerAttr.get(IntegerType.get_signless(64), n) for n in shape]
+            )
+        for h in _ops_named(seg, "air.herd"):
+            ops = list(h.operands)
+            if any(v == holder for v in ops):
+                _drop_herd_operands(h, [i for i, v in enumerate(ops) if v == holder])
+        for u in list(holder.uses):
+            if u.owner.name != "memref.dealloc":
+                raise ValueError(f"{c}: its placeholder is used by {u.owner.name}")
+            u.owner.erase()
+        holder.owner.erase()
+
+
+def _bind_tile_ids(seg, tiles, shapes):
+    """Give the herds that run one program a core the shape `shapes` names
+    for them, and their program ids, stand-ins `tiles` by axis, the core's
+    index in the herd. The stand-ins are then erased."""
+    from air.dialects import arith
+    from air.ir import InsertionPoint, IntegerType
+
+    i32 = IntegerType.get_signless(32)
+    for h in _ops_named(seg, "air.herd"):
+        ops = list(h.operands)
+        body = h.regions[0].blocks[0]
+        first = len(body.arguments) - len(ops)
+        drop = []
+        for i, v in enumerate(ops):
+            a = next((ax for ax, t in tiles.items() if t == v), None)
+            if a is None:
+                continue
+            if a > 1:
+                raise ValueError("a herd has two axes; program_id(2) is not one")
+            with InsertionPoint.at_block_begin(body):
+                c = arith.IndexCastOp(i32, body.arguments[a])
+            body.arguments[first + i].replace_all_uses_with(c.result)
+            drop.append(i)
+        name = str(h.attributes["sym_name"]).strip('"')
+        if name in shapes:
+            _drop_herd_operands(h, drop, shapes[name])
+        elif drop:
+            raise ValueError(f"herd {name} reads program ids but runs one program")
+    for t in tiles.values():
+        if list(t.uses):
+            raise ValueError("a program id is used outside a herd")
+        t.owner.erase()
+
+
+def _drop_herd_operands(h, drop, shape=None):
+    """Rebuild herd `h` without its operands at positions `drop`, whose block
+    arguments must be unused, and as `shape` (columns, rows) if given."""
+    from air.dialects import arith
+    from air.dialects.air import HerdOp
+    from air.ir import DenseI32ArrayAttr, IndexType, InsertionPoint, IntegerAttr
+
+    op = h.operation
+    deps, nsizes, _ = list(DenseI32ArrayAttr(op.attributes["operandSegmentSizes"]))
+    if deps:
+        raise ValueError("an async herd at this stage")
+    operands = list(op.operands)
+    keep = [i for i in range(nsizes, len(operands)) if i not in drop]
+    sizes = operands[:nsizes]
+    with InsertionPoint(op):
+        if shape is not None:
+            idx = IndexType.get()
+            sizes = [
+                arith.ConstantOp(idx, IntegerAttr.get(idx, n)).result for n in shape
+            ]
+        new = HerdOp(None, [], sizes, [operands[i] for i in keep])
+    for a in _attr_names(op):
+        if a != "operandSegmentSizes":
+            new.operation.attributes[a] = op.attributes[a]
+    old = op.regions[0].blocks[0]
+    first = len(old.arguments) - len(operands)
+    kept_args = list(old.arguments[: first + nsizes]) + [
+        old.arguments[first + i] for i in keep
+    ]
+    block = new.regions[0].blocks.append(*[a.type for a in kept_args])
+    for a, b in zip(kept_args, block.arguments):
+        a.replace_all_uses_with(b)
+    for o in list(old.operations):
+        o.operation.detach_from_parent()
+        block.append(o.operation)
+    op.erase()
 
 
 # Offset of the payload in a core's packet buffer; the packet header is

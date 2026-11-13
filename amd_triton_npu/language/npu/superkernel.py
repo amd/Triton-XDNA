@@ -47,7 +47,7 @@ new value does not recompile the dispatch).
 from triton._C.libtriton import ir
 from triton.language import core
 
-__all__ = ["allocate_l2", "spatial", "table"]
+__all__ = ["allocate_l2", "channel", "get", "put", "spatial", "table"]
 
 
 class _PartitionContext:
@@ -165,3 +165,60 @@ def table(values, index, _semantic=None, _generator=None):
         hit = _semantic.equal(index, _semantic.to_tensor(i))
         out = _semantic.where(hit, _semantic.to_tensor(values[i]), out)
     return out
+
+
+@core.builtin
+def channel(shape, dtype, count=1, broadcast=False, _semantic=None, _generator=None):
+    """A channel: `count` FIFOs that carry blocks of `shape` elements of
+    `dtype` from the partition that puts them to the partition that gets
+    them, with no buffer of their own in between. With `broadcast`, every
+    core of the getting partition gets each block."""
+    shape = core._unwrap_if_constexpr(shape)
+    n = 1
+    for d in [shape] if isinstance(shape, int) else _values(shape):
+        n *= d
+    count = core._unwrap_if_constexpr(count)
+    dtype = core._unwrap_if_constexpr(dtype)
+    b = _semantic.builder
+    ptr = core.pointer_type(dtype)
+    name = f"npu.channel.{_next_id(_generator, '_npu_channels')}"
+    module = _generator.module
+    decl = ir.builder(_generator.context).get_or_insert_function(
+        module, name, b.get_function_ty([], [ptr.to_ir(b)]), "private", None
+    )
+    module.push_back(decl)
+    decl.set_attr("npu.channel_elements", b.get_int32_attr(n))
+    decl.set_attr("npu.channel_count", b.get_int32_attr(count))
+    decl.set_attr(
+        "npu.channel_broadcast",
+        b.get_bool_attr(bool(core._unwrap_if_constexpr(broadcast))),
+    )
+    call = b.call(module.get_function(name), [])
+    return core.tensor(call.get_result(0), ptr)
+
+
+def _fifo(ch, n, index, _semantic):
+    """The addresses of FIFO `index` of channel `ch`, `n` elements a block."""
+    index = core._unwrap_if_constexpr(index)
+    offs = core.arange(0, n, _semantic=_semantic)
+    if isinstance(index, int):
+        base = ch.__add__(index * n, _semantic=_semantic)
+    else:
+        base = ch.__add__(index.__mul__(n, _semantic=_semantic), _semantic=_semantic)
+    return base.__add__(offs, _semantic=_semantic)
+
+
+@core.builtin
+def put(ch, value, index=0, _semantic=None):
+    """Send the 1-D block `value` down FIFO `index` of channel `ch`. Waits
+    while the FIFO is full."""
+    n = value.shape[0]
+    core.store(_fifo(ch, n, index, _semantic), value, _semantic=_semantic)
+
+
+@core.builtin
+def get(ch, n, index=0, _semantic=None):
+    """The next block of `n` elements from FIFO `index` of channel `ch`.
+    Waits for it."""
+    n = core._unwrap_if_constexpr(n)
+    return core.load(_fifo(ch, n, index, _semantic), volatile=True, _semantic=_semantic)

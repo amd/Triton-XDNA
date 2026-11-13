@@ -17,7 +17,16 @@ import os
 import subprocess
 import tempfile
 
-from .superkernel import Superkernel, Tensor, _Scalar, _Table, _Wave
+from .superkernel import (
+    _TILE,
+    Superkernel,
+    Tensor,
+    _Channel,
+    _Scalar,
+    _Table,
+    _TileId,
+    _Wave,
+)
 
 #: the core array npu2 places partitions on: columns, then the core rows
 _ARRAY = {"npu2": (8, range(2, 6))}
@@ -199,10 +208,33 @@ def _place(parts, npu):
     return corners
 
 
+def _program_ids_as_args(f):
+    """Replace kernel function `f`'s program ids by i32 arguments appended
+    to it. Returns the axes, in the order of the new arguments."""
+    from air.ir import FunctionType, IntegerType, Location, TypeAttr
+
+    block = f.regions[0].blocks[0]
+    pids = [o for o in _walk(f) if o.operation.name == "tt.get_program_id"]
+    axes = sorted({_attr(o, "axis") for o in pids})
+    if not axes:
+        return []
+    i32 = IntegerType.get_signless(32)
+    args = {a: block.add_argument(i32, Location.unknown()) for a in axes}
+    for o in pids:
+        o.results[0].replace_all_uses_with(args[_attr(o, "axis")])
+        o.operation.erase()
+    ft = FunctionType(TypeAttr(f.attributes["function_type"]).value)
+    f.attributes["function_type"] = TypeAttr.get(
+        FunctionType.get(list(ft.inputs) + [i32] * len(axes), list(ft.results))
+    )
+    return axes
+
+
 def _leaf_module(module, symbol, name):
     """The TTIR of the kernel `symbol` of `module` as a module of its own: a
     public function `name` with the functions it calls inlined, run through
-    the backend's TTIR passes like a kernel compiled alone."""
+    the backend's TTIR passes like a kernel compiled alone; and the axes of
+    the program ids it reads, which become arguments after its own."""
     import re
 
     from triton._C.libtriton import ir
@@ -219,6 +251,10 @@ def _leaf_module(module, symbol, name):
         for o in _walk(funcs[s]):
             if o.operation.name == "tt.call":
                 todo.append(_callee(o))
+    for s in order[1:]:
+        if any(o.operation.name == "tt.get_program_id" for o in _walk(funcs[s])):
+            raise ValueError(f"{name}: a function it calls reads a program id")
+    axes = _program_ids_as_args(funcs[symbol])
     texts = []
     for s in order:
         t = funcs[s].operation.get_asm(print_generic_op_form=True)
@@ -248,7 +284,7 @@ def _leaf_module(module, symbol, name):
         os.unlink(f.name)
     mod.context = ctx  # make_ttir's pass manager needs it, as in Triton's compile
     NPUBackend.make_ttir(mod, {}, None)
-    return str(mod)
+    return str(mod), axes
 
 
 def _walk(op):
@@ -288,7 +324,10 @@ def read(ttir, air_project_path):
             n = o.operation.name
             if o == loop or n == "tt.return":
                 continue
-            if n == "tt.call" and _attr(funcs[_callee(o)], "npu.l2_elements"):
+            decl = funcs[_callee(o)] if n == "tt.call" else None
+            if decl is not None and (
+                _attr(decl, "npu.l2_elements") or _attr(decl, "npu.channel_elements")
+            ):
                 continue
             if n.startswith("arith."):
                 env[o.result] = _evaluate(o, env, name)
@@ -311,9 +350,17 @@ def read(ttir, air_project_path):
             if o.operation.name == "tt.call":
                 decl = funcs[_callee(o)]
                 n = _attr(decl, "npu.l2_elements")
+                elt = str(o.results[0].type).split("<")[1].rstrip(">")
                 if n:
-                    elt = str(o.results[0].type).split("<")[1].rstrip(">")
                     env[o.results[0]] = sk.onchip(_callee(o), n, elt)
+                block = _attr(decl, "npu.channel_elements")
+                if block:
+                    env[o.results[0]] = sk.channel(
+                        block,
+                        elt,
+                        _attr(decl, "npu.channel_count"),
+                        bool(_attr(decl, "npu.channel_broadcast")),
+                    )
         lbody = loop.regions[0].blocks[0]
         env[lbody.arguments[0]] = _PerWave(waves)
 
@@ -366,14 +413,18 @@ def read(ttir, air_project_path):
                 kname = _kernel_name(sym)
                 if sym not in leaves:
                     leaves[sym] = _leaf_module(module, sym, kname)
+                leaf, axes = leaves[sym]
+                args = list(args) + [_TILE[a] for a in axes]
                 vals = []
                 for v in args:
                     if isinstance(v, _PerWave):
                         v = v.lowered()
-                    if not isinstance(v, (Tensor, _Scalar, _Wave, int, float)):
+                    if not isinstance(
+                        v, (Tensor, _Channel, _Scalar, _TileId, _Wave, int, float)
+                    ):
                         raise ValueError(f"{p['name']}: {kname} takes {v!r}")
                     vals.append(v)
-                sk.call(kname, leaves[sym], vals, at, p["name"], schedule, p["cores"])
+                sk.call(kname, leaf, vals, at, p["name"], schedule, p["cores"])
         return sk, kinds
 
 
