@@ -253,22 +253,23 @@ def steps(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.const
 
 
 @triton.jit
-def src(X, CH, D: tl.constexpr, T: tl.constexpr):
+def src(X, D: tl.constexpr, T: tl.constexpr):
     for t in range(D // T):
-        npu.put(CH, tl.load(X + t * T + tl.arange(0, T)) * 2)
+        npu.ChannelPut("toSink", tl.load(X + t * T + tl.arange(0, T)) * 2)
 
 
 @triton.jit
-def sink(CH, Y, D: tl.constexpr, T: tl.constexpr):
+def sink(Y, D: tl.constexpr, T: tl.constexpr):
     for t in range(D // T):
-        tl.store(Y + t * T + tl.arange(0, T), npu.get(CH, T) + 1)
+        y = npu.ChannelGet("toSink", [T], tl.bfloat16)
+        tl.store(Y + t * T + tl.arange(0, T), y + 1)
 
 
 @triton.jit
 def stream(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
-    ch = npu.channel([T], tl.bfloat16)
+    npu.Channel("toSink")
     for wave in range(NW):
-        npu.spatial([(src, (X, ch, D, T)), (sink, (ch, Y, D, T))], [1, 1], [S, S])
+        npu.spatial([(src, (X, D, T)), (sink, (Y, D, T))], [1, 1], [S, S])
 
 
 @triton.jit
@@ -285,41 +286,74 @@ def spmd(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constex
 
 
 @triton.jit
-def bc_sink(CH, Y, D: tl.constexpr, T: tl.constexpr):
+def bc_sink(Y, D: tl.constexpr, T: tl.constexpr):
     p = tl.program_id(0)
     for t in range(D // T):
-        y = npu.get(CH, T)
+        y = npu.ChannelGet("toSink", [T], tl.bfloat16, indices=[p, 0])
         tl.store(Y + p * D + t * T + tl.arange(0, T), y + p.to(tl.bfloat16))
 
 
 @triton.jit
-def bcast(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
-    ch = npu.channel([T], tl.bfloat16, broadcast=True)
-    for wave in range(NW):
-        npu.spatial([(src, (X, ch, D, T)), (bc_sink, (ch, Y, D, T))], [1, 2], [S, S])
+def bc_src(X, D: tl.constexpr, T: tl.constexpr):
+    for t in range(D // T):
+        npu.ChannelPut(
+            "toSink", tl.load(X + t * T + tl.arange(0, T)) * 2, indices=[0, 0]
+        )
 
 
 @triton.jit
-def m_src(X, CH, D: tl.constexpr, T: tl.constexpr):
+def bcast(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
+    npu.Channel("toSink", size=[1, 1], broadcast_shape=[2, 1])
+    for wave in range(NW):
+        npu.spatial([(bc_src, (X, D, T)), (bc_sink, (Y, D, T))], [1, 2], [S, S])
+
+
+@triton.jit
+def m_src(X, D: tl.constexpr, T: tl.constexpr):
     p = tl.program_id(0)
     for t in range(D // T):
         x = tl.load(X + p * D + t * T + tl.arange(0, T))
-        npu.put(CH, x * 2, index=p)
+        npu.ChannelPut("parts", x * 2, indices=[p])
 
 
 @triton.jit
-def m_sink(CH, Y, D: tl.constexpr, T: tl.constexpr):
+def m_sink(Y, D: tl.constexpr, T: tl.constexpr):
     for t in range(D // T):
-        a = npu.get(CH, T, index=0)
-        b = npu.get(CH, T, index=1)
+        a = npu.ChannelGet("parts", [T], tl.bfloat16, indices=[0])
+        b = npu.ChannelGet("parts", [T], tl.bfloat16, indices=[1])
         tl.store(Y + t * T + tl.arange(0, T), a + b)
 
 
 @triton.jit
 def merge(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
-    ch = npu.channel([T], tl.bfloat16, count=2)
+    npu.Channel("parts", size=[2])
     for wave in range(NW):
-        npu.spatial([(m_src, (X, ch, D, T)), (m_sink, (ch, Y, D, T))], [2, 1], [S, S])
+        npu.spatial([(m_src, (X, D, T)), (m_sink, (Y, D, T))], [2, 1], [S, S])
+
+
+@triton.jit
+def g_src(X, D: tl.constexpr, T: tl.constexpr):
+    i = tl.program_id(0)
+    j = tl.program_id(1)
+    for t in range(D // T):
+        x = tl.load(X + (i * 2 + j) * D + t * T + tl.arange(0, T))
+        npu.ChannelPut("cells", x * 2, indices=[0, i, j])
+
+
+@triton.jit
+def g_sink(Y, D: tl.constexpr, T: tl.constexpr):
+    i = tl.program_id(0)
+    j = tl.program_id(1)
+    for t in range(D // T):
+        y = npu.ChannelGet("cells", [T], tl.bfloat16, indices=[0, i, j])
+        tl.store(Y + (i * 2 + j) * D + t * T + tl.arange(0, T), y + 1)
+
+
+@triton.jit
+def grid(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr):
+    npu.Channel("cells", size=[1, 2, 2])
+    for wave in range(NW):
+        npu.spatial([(g_src, (X, D, T)), (g_sink, (Y, D, T))], [(2, 2), (2, 2)], [S, S])
 
 
 # Superkernels that reading rejects.
@@ -487,7 +521,7 @@ EXPLICIT = {
         XD,
         XD,
         lambda x: bf(bf(2 * x) + 1),
-        ["air.channel @chan0 [1, 1]", "air.channel.put", "air.channel.get"],
+        ["air.channel @toSink [1]", "air.channel.put", "air.channel.get"],
     ),
     "spmd": (spmd, 2 * XD, 2 * XD, lambda x: bf(2 * x), ["in (%arg17=%c2"]),
     "bcast": (
@@ -495,14 +529,21 @@ EXPLICIT = {
         XD,
         2 * XD,
         lambda x: np.concatenate([bf(bf(2 * x) + p) for p in range(2)]),
-        ["broadcast_shape = [2, 1]"],
+        ["air.channel @toSink [1, 1] {broadcast_shape = [2, 1]}"],
     ),
     "merge": (
         merge,
         2 * XD,
         XD,
         lambda x: bf(bf(2 * x[:XD]) + bf(2 * x[XD:])),
-        ["air.channel @chan0 [2, 1]"],
+        ["air.channel @parts [2]"],
+    ),
+    "grid": (
+        grid,
+        4 * XD,
+        4 * XD,
+        lambda x: bf(bf(2 * x) + 1),
+        ["air.channel @cells [1, 2, 2]", "@cells[%c0"],
     ),
 }
 

@@ -98,14 +98,15 @@ _TILE = {a: _TileId(a) for a in range(3)}
 
 
 class _Channel:
-    """`count` FIFOs between cores, each a stream of blocks of `block`
-    elements of `dtype`. `n` is the size of the placeholder buffer that
-    stands for it until the copies through it become channel operations."""
+    """An AIR channel: a bundle of FIFOs of shape `size` between cores.
+    `n` and `dtype` give the placeholder buffer that stands for it until the
+    copies through it become puts and gets."""
 
-    def __init__(self, name, block, dtype, count, broadcast):
-        self.name, self.block, self.dtype = name, block, dtype
-        self.count, self.broadcast = count, broadcast
-        self.n = block * count
+    def __init__(self, name, size, broadcast_shape, channel_type, buffer_resources):
+        self.name, self.size = name, tuple(size)
+        self.broadcast_shape, self.channel_type = broadcast_shape, channel_type
+        self.buffer_resources = buffer_resources
+        self.n, self.dtype = 1, "i8"
 
     def __repr__(self):
         return f"channel({self.name})"
@@ -166,9 +167,13 @@ class Superkernel:
         self.scalars.append(v)
         return v
 
-    def channel(self, block, dtype, count=1, broadcast=False):
-        """A new channel of `count` FIFOs of blocks of `block` elements."""
-        c = _Channel(f"chan{len(self.channels)}", block, dtype, count, broadcast)
+    def channel(
+        self, name, size, broadcast_shape=None, channel_type=None, buffer_resources=None
+    ):
+        """A new AIR channel named `name`."""
+        if any(c.name == name for c in self.channels):
+            raise ValueError(f"a channel named {name} exists")
+        c = _Channel(name, size, broadcast_shape, channel_type, buffer_resources)
         self.channels.append(c)
         return c
 
@@ -785,19 +790,110 @@ def _lower_edges(module, seg, edges, phased=None):
         d.erase()
 
 
-def _lower_channels(module, seg, chans):
-    """Turn the herds' copies to and from each channel's placeholder buffer
-    into puts and gets of the channel, and drop the placeholders. A copy's
-    offset in the placeholder picks the FIFO."""
+_RADIX = 256  # as in tl.extra.npu: a channel index's digits in its address
+
+_CASTS = (
+    "arith.index_cast",
+    "arith.index_castui",
+    "arith.extsi",
+    "arith.extui",
+    "arith.trunci",
+)
+
+
+def _linear(v):
+    """`v` as a constant plus a sum of values times constants: (constant,
+    [(value, factor)]), looking through additions, products with constants
+    and casts."""
+    from air.ir import IntegerAttr, OpResult
+
+    if isinstance(v, int):
+        return v, []
+    if isinstance(v, OpResult):
+        op, name = v.owner, v.owner.name
+        if name == "arith.constant":
+            return IntegerAttr(op.attributes["value"]).value, []
+        if name in _CASTS:
+            return _linear(op.operands[0])
+        if name in ("arith.addi", "arith.subi"):
+            c1, t1 = _linear(op.operands[0])
+            c2, t2 = _linear(op.operands[1])
+            sign = 1 if name == "arith.addi" else -1
+            return c1 + sign * c2, t1 + [(x, sign * k) for x, k in t2]
+        if name == "arith.muli":
+            c1, t1 = _linear(op.operands[0])
+            c2, t2 = _linear(op.operands[1])
+            if not t1:
+                return c1 * c2, [(x, c1 * k) for x, k in t2]
+            if not t2:
+                return c1 * c2, [(x, c2 * k) for x, k in t1]
+    return 0, [(v, 1)]
+
+
+def _channel_indices(c, off, n):
+    """The indices into channel `c` that a copy of `n` elements at offset
+    `off` of its placeholder stands for: the offset's digits of radix
+    _RADIX, each digit's place a multiple of `n`. Emitted before the copy."""
     from air.dialects import arith
-    from air.dialects.air import ChannelGet, ChannelPut, channel as channel_decl
-    from air.ir import ArrayAttr, IndexType, InsertionPoint, IntegerAttr, IntegerType
+    from air.ir import IndexType, IntegerAttr
 
     idx = IndexType.get()
+    rank = len(c.size)
+    places = [n * _RADIX ** (rank - 1 - k) for k in range(rank)]
+    const, terms = _linear(off)
+    per = [[] for _ in range(rank)]
+    for x, k in terms:
+        dim = next(
+            (d for d, p in enumerate(places) if k % p == 0 and 0 < k // p < _RADIX),
+            None,
+        )
+        if dim is None:
+            raise ValueError(f"{c}: an index the address does not encode: {off}")
+        per[dim].append((x, k // places[dim]))
+    if const % n:
+        raise ValueError(f"{c}: an offset of {const}, not a whole block of {n}")
+    q, digits = const // n, []
+    for _ in range(rank):
+        digits.insert(0, q % _RADIX)
+        q //= _RADIX
+    if q:
+        raise ValueError(f"{c}: more indices than its rank {rank}")
+    out = []
+    for terms_, digit in zip(per, digits):
+        v = None
+        for x, m in terms_:
+            if x.type != idx:
+                x = arith.IndexCastOp(idx, x).result
+            if m != 1:
+                x = arith.MulIOp(
+                    x, arith.ConstantOp(idx, IntegerAttr.get(idx, m)).result
+                ).result
+            v = x if v is None else arith.AddIOp(v, x).result
+        if v is None or digit:
+            d = arith.ConstantOp(idx, IntegerAttr.get(idx, digit)).result
+            v = d if v is None else arith.AddIOp(v, d).result
+        out.append(v)
+    return out
+
+
+def _lower_channels(module, seg, chans):
+    """Declare each channel and turn the herds' copies to and from its
+    placeholder buffer into its puts and gets; drop the placeholders."""
+    from air.dialects.air import ChannelGet, ChannelPut, channel as channel_decl
+    from air.ir import ArrayAttr, InsertionPoint, IntegerAttr, IntegerType
+
+    i64 = IntegerType.get_signless(64)
     for c, holder in chans:
         with InsertionPoint.at_block_begin(module.body):
-            decl = channel_decl(c.name, size=[c.count, 1])
-        getters = set()
+            decl = channel_decl(c.name, size=list(c.size), channel_type=c.channel_type)
+        if c.broadcast_shape is not None:
+            decl.attributes["broadcast_shape"] = ArrayAttr.get(
+                [IntegerAttr.get(i64, d) for d in c.broadcast_shape]
+            )
+        if c.buffer_resources is not None:
+            decl.attributes["buffer_resources"] = IntegerAttr.get(
+                i64, c.buffer_resources
+            )
         for h in _ops_named(seg, "air.herd"):
             body = h.regions[0].blocks[0]
             first = len(body.arguments) - len(h.operands)
@@ -810,61 +906,16 @@ def _lower_channels(module, seg, chans):
                         raise ValueError(f"{c}: used by {d.name}")
                     put = d.opview.dst == body.arguments[first + i]
                     side, other = ("dst", "src") if put else ("src", "dst")
-                    (off,), (size,), (stride,) = _dma_pattern(d, side)
-                    if size != c.block or stride != 1:
-                        raise ValueError(f"{c}: a block of {size}, not {c.block}")
+                    offs, sizes, strides = _dma_pattern(d, side)
+                    if len(offs) != 1 or strides[0] != 1:
+                        raise ValueError(f"{c}: a block that is not contiguous: {d}")
                     o, sz, st = _dma_pattern(d, other)
-                    if c.broadcast and not put:
-                        # Every core of the herd gets each block.
-                        getters.add((_herd_width(h), _herd_height(h)))
-                        with InsertionPoint(d):
-                            ChannelGet(
-                                c.name,
-                                getattr(d.opview, other),
-                                offsets=o,
-                                sizes=sz,
-                                strides=st,
-                                indices=list(body.arguments[:2]),
-                            )
-                        d.erase()
-                        continue
+                    mem = getattr(d.opview, other)
                     with InsertionPoint(d):
-                        if isinstance(off, int):
-                            fifo = arith.ConstantOp(
-                                idx, IntegerAttr.get(idx, off // c.block)
-                            )
-                        else:
-                            n = arith.ConstantOp(idx, IntegerAttr.get(idx, c.block))
-                            fifo = arith.DivUIOp(off, n.result)
-                        zero = arith.ConstantOp(idx, IntegerAttr.get(idx, 0))
-                        ends = [fifo.result, zero.result]
-                        mem = getattr(d.opview, other)
-                        if put:
-                            ChannelPut(
-                                c.name,
-                                mem,
-                                offsets=o,
-                                sizes=sz,
-                                strides=st,
-                                indices=ends,
-                            )
-                        else:
-                            ChannelGet(
-                                c.name,
-                                mem,
-                                offsets=o,
-                                sizes=sz,
-                                strides=st,
-                                indices=ends,
-                            )
+                        ends = _channel_indices(c, offs[0], sizes[0])
+                        op = ChannelPut if put else ChannelGet
+                        op(c.name, mem, offsets=o, sizes=sz, strides=st, indices=ends)
                     d.erase()
-        if c.broadcast:
-            if len(getters) != 1 or c.count != 1:
-                raise ValueError(f"{c}: a broadcast goes to one herd, from one FIFO")
-            (shape,) = getters
-            decl.attributes["broadcast_shape"] = ArrayAttr.get(
-                [IntegerAttr.get(IntegerType.get_signless(64), n) for n in shape]
-            )
         for h in _ops_named(seg, "air.herd"):
             ops = list(h.operands)
             if any(v == holder for v in ops):

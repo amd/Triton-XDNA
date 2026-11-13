@@ -230,6 +230,44 @@ def _program_ids_as_args(f):
     return axes
 
 
+def _channels_as_args(f):
+    """Replace kernel function `f`'s uses of channels by pointer arguments
+    appended to it, one per channel and element type. Returns the channels'
+    names, in the order of the new arguments."""
+    from air.ir import FunctionType, Location, TypeAttr
+
+    block = f.regions[0].blocks[0]
+    prefix = "npu.channel."
+    uses = []  # (name, value standing for the channel, ops to erase)
+    for o in _walk(f):
+        if o.operation.name != "tt.call" or not _callee(o).startswith(prefix):
+            continue
+        name = _callee(o)[len(prefix) :]
+        users = [u.owner for u in o.results[0].uses]
+        # The element type comes from the cast of the channel's i8 pointer.
+        if len(users) == 1 and users[0].name == "tt.bitcast":
+            uses.append((name, users[0].results[0], [users[0], o.operation]))
+        else:
+            uses.append((name, o.results[0], [o.operation]))
+    args, names, types = {}, [], []
+    for name, v, _ in uses:
+        key = (name, str(v.type))
+        if key not in args:
+            args[key] = block.add_argument(v.type, Location.unknown())
+            names.append(name)
+            types.append(v.type)
+    for name, v, ops in uses:
+        v.replace_all_uses_with(args[(name, str(v.type))])
+        for op in ops:
+            op.erase()
+    if names:
+        ft = FunctionType(TypeAttr(f.attributes["function_type"]).value)
+        f.attributes["function_type"] = TypeAttr.get(
+            FunctionType.get(list(ft.inputs) + types, list(ft.results))
+        )
+    return names
+
+
 def _leaf_module(module, symbol, name):
     """The TTIR of the kernel `symbol` of `module` as a module of its own: a
     public function `name` with the functions it calls inlined, run through
@@ -252,9 +290,15 @@ def _leaf_module(module, symbol, name):
             if o.operation.name == "tt.call":
                 todo.append(_callee(o))
     for s in order[1:]:
-        if any(o.operation.name == "tt.get_program_id" for o in _walk(funcs[s])):
-            raise ValueError(f"{name}: a function it calls reads a program id")
+        for o in _walk(funcs[s]):
+            if o.operation.name == "tt.get_program_id" or (
+                o.operation.name == "tt.call" and _callee(o).startswith("npu.channel.")
+            ):
+                raise ValueError(
+                    f"{name}: a function it calls reads a program id or a channel"
+                )
     axes = _program_ids_as_args(funcs[symbol])
+    chans = _channels_as_args(funcs[symbol])
     texts = []
     for s in order:
         t = funcs[s].operation.get_asm(print_generic_op_form=True)
@@ -284,7 +328,7 @@ def _leaf_module(module, symbol, name):
         os.unlink(f.name)
     mod.context = ctx  # make_ttir's pass manager needs it, as in Triton's compile
     NPUBackend.make_ttir(mod, {}, None)
-    return str(mod), axes
+    return str(mod), axes, chans
 
 
 def _walk(op):
@@ -325,9 +369,7 @@ def read(ttir, air_project_path):
             if o == loop or n == "tt.return":
                 continue
             decl = funcs[_callee(o)] if n == "tt.call" else None
-            if decl is not None and (
-                _attr(decl, "npu.l2_elements") or _attr(decl, "npu.channel_elements")
-            ):
+            if decl is not None and _attr(decl, "npu.l2_elements"):
                 continue
             if n.startswith("arith."):
                 env[o.result] = _evaluate(o, env, name)
@@ -346,6 +388,21 @@ def read(ttir, air_project_path):
                 env[a] = sk.ddr(f"a{i}", 0, elt)
             else:
                 env[a] = sk.scalar(f"r{i}")
+        chans = {}
+        for f in funcs.values():
+            size = _attr(f, "npu.channel_size")
+            if size is None:
+                continue
+            ints = lambda t: tuple(int(x) for x in t.split(","))  # noqa: E731
+            bshape = _attr(f, "npu.channel_broadcast_shape")
+            cname = _attr(f, "sym_name")[len("npu.channel.") :]
+            chans[cname] = sk.channel(
+                cname,
+                ints(size),
+                ints(bshape) if bshape else None,
+                _attr(f, "npu.channel_type"),
+                _attr(f, "npu.channel_buffer_resources"),
+            )
         for o in body.operations:
             if o.operation.name == "tt.call":
                 decl = funcs[_callee(o)]
@@ -353,14 +410,6 @@ def read(ttir, air_project_path):
                 elt = str(o.results[0].type).split("<")[1].rstrip(">")
                 if n:
                     env[o.results[0]] = sk.onchip(_callee(o), n, elt)
-                block = _attr(decl, "npu.channel_elements")
-                if block:
-                    env[o.results[0]] = sk.channel(
-                        block,
-                        elt,
-                        _attr(decl, "npu.channel_count"),
-                        bool(_attr(decl, "npu.channel_broadcast")),
-                    )
         lbody = loop.regions[0].blocks[0]
         env[lbody.arguments[0]] = _PerWave(waves)
 
@@ -413,8 +462,11 @@ def read(ttir, air_project_path):
                 kname = _kernel_name(sym)
                 if sym not in leaves:
                     leaves[sym] = _leaf_module(module, sym, kname)
-                leaf, axes = leaves[sym]
-                args = list(args) + [_TILE[a] for a in axes]
+                leaf, axes, used = leaves[sym]
+                missing = [n for n in used if n not in chans]
+                if missing:
+                    raise ValueError(f"{kname}: channel {missing[0]} is not declared")
+                args = list(args) + [_TILE[a] for a in axes] + [chans[n] for n in used]
                 vals = []
                 for v in args:
                     if isinstance(v, _PerWave):

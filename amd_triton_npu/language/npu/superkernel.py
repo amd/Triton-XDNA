@@ -47,7 +47,7 @@ new value does not recompile the dispatch).
 from triton._C.libtriton import ir
 from triton.language import core
 
-__all__ = ["allocate_l2", "channel", "get", "put", "spatial", "table"]
+__all__ = ["Channel", "ChannelGet", "ChannelPut", "allocate_l2", "spatial", "table"]
 
 
 class _PartitionContext:
@@ -167,58 +167,117 @@ def table(values, index, _semantic=None, _generator=None):
     return out
 
 
+#: the radix of a channel index's digits in the address that encodes it
+_RADIX = 256
+
+
+def _ints(v):
+    v = core._unwrap_if_constexpr(v)
+    return [v] if isinstance(v, int) else _values(v)
+
+
 @core.builtin
-def channel(shape, dtype, count=1, broadcast=False, _semantic=None, _generator=None):
-    """A channel: `count` FIFOs that carry blocks of `shape` elements of
-    `dtype` from the partition that puts them to the partition that gets
-    them, with no buffer of their own in between. With `broadcast`, every
-    core of the getting partition gets each block."""
-    shape = core._unwrap_if_constexpr(shape)
-    n = 1
-    for d in [shape] if isinstance(shape, int) else _values(shape):
-        n *= d
-    count = core._unwrap_if_constexpr(count)
-    dtype = core._unwrap_if_constexpr(dtype)
+def Channel(
+    sym_name,
+    size=(1,),
+    broadcast_shape=None,
+    channel_type=None,
+    buffer_resources=None,
+    _semantic=None,
+    _generator=None,
+):
+    """Declare the channel `sym_name`, as AIR's `Channel`: a bundle of FIFOs
+    of shape `size`, of any rank, that carry blocks between cores with no
+    buffer of their own in between. `broadcast_shape`, of the bundle's rank,
+    is the shape of cores that get each block put at one index;
+    `channel_type` is AIR's ("npu_dma_packet", "npu_cascade", ...);
+    `buffer_resources` the FIFO's depth. Declared in the superkernel, outside
+    the loop over the waves; its kernels use it by name."""
+    name = core._unwrap_if_constexpr(sym_name)
+    size = _ints(size)
+    if any(d >= _RADIX for d in size):
+        raise ValueError(f"channel {name}: each extent of {size} below {_RADIX}")
     b = _semantic.builder
-    ptr = core.pointer_type(dtype)
-    name = f"npu.channel.{_next_id(_generator, '_npu_channels')}"
     module = _generator.module
+    symbol = f"npu.channel.{name}"
+    if module.has_function(symbol):
+        raise ValueError(f"channel {name} is declared twice")
     decl = ir.builder(_generator.context).get_or_insert_function(
-        module, name, b.get_function_ty([], [ptr.to_ir(b)]), "private", None
+        module,
+        symbol,
+        b.get_function_ty([], [b.get_ptr_ty(b.get_int8_ty(), "global")]),
+        "private",
+        None,
     )
     module.push_back(decl)
-    decl.set_attr("npu.channel_elements", b.get_int32_attr(n))
-    decl.set_attr("npu.channel_count", b.get_int32_attr(count))
-    decl.set_attr(
-        "npu.channel_broadcast",
-        b.get_bool_attr(bool(core._unwrap_if_constexpr(broadcast))),
+    text = lambda v: b.get_string_attr(",".join(map(str, v)))  # noqa: E731
+    decl.set_attr("npu.channel_size", text(size))
+    broadcast_shape = core._unwrap_if_constexpr(broadcast_shape)
+    if broadcast_shape is not None:
+        broadcast_shape = _ints(broadcast_shape)
+        if len(broadcast_shape) != len(size):
+            raise ValueError(f"channel {name}: broadcast_shape is not of size's rank")
+        decl.set_attr("npu.channel_broadcast_shape", text(broadcast_shape))
+    channel_type = core._unwrap_if_constexpr(channel_type)
+    if channel_type is not None:
+        decl.set_attr("npu.channel_type", b.get_string_attr(channel_type))
+    buffer_resources = core._unwrap_if_constexpr(buffer_resources)
+    if buffer_resources is not None:
+        decl.set_attr(
+            "npu.channel_buffer_resources", b.get_int32_attr(buffer_resources)
+        )
+
+
+def _fifo(chan_name, n, dtype, indices, _semantic, _generator):
+    """The addresses of a block of `n` elements of `dtype` at `indices` of
+    channel `chan_name`. The indices go into the address as digits of radix
+    _RADIX, each digit's place a multiple of the block, in 64 bits."""
+    name = core._unwrap_if_constexpr(chan_name)
+    module = _generator.module
+    symbol = f"npu.channel.{name}"
+    if not module.has_function(symbol):
+        raise ValueError(f"channel {name} is not declared")
+    b = _semantic.builder
+    call = b.call(module.get_function(symbol), [])
+    ptr = core.tensor(call.get_result(0), core.pointer_type(core.int8))
+    ptr = ptr.to(core.pointer_type(dtype), bitcast=True, _semantic=_semantic)
+    indices = core._unwrap_if_constexpr(indices)
+    indices = (
+        list(indices) if isinstance(indices, (tuple, list, core.tuple)) else [indices]
     )
-    call = b.call(module.get_function(name), [])
-    return core.tensor(call.get_result(0), ptr)
-
-
-def _fifo(ch, n, index, _semantic):
-    """The addresses of FIFO `index` of channel `ch`, `n` elements a block."""
-    index = core._unwrap_if_constexpr(index)
-    offs = core.arange(0, n, _semantic=_semantic)
-    if isinstance(index, int):
-        base = ch.__add__(index * n, _semantic=_semantic)
-    else:
-        base = ch.__add__(index.__mul__(n, _semantic=_semantic), _semantic=_semantic)
-    return base.__add__(offs, _semantic=_semantic)
-
-
-@core.builtin
-def put(ch, value, index=0, _semantic=None):
-    """Send the 1-D block `value` down FIFO `index` of channel `ch`. Waits
-    while the FIFO is full."""
-    n = value.shape[0]
-    core.store(_fifo(ch, n, index, _semantic), value, _semantic=_semantic)
+    const, off = 0, None
+    for k, v in enumerate(indices):
+        v = core._unwrap_if_constexpr(v)
+        place = n * _RADIX ** (len(indices) - 1 - k)
+        if isinstance(v, int):
+            if not 0 <= v < _RADIX:
+                raise ValueError(f"channel {name}: index {v} not in [0, {_RADIX})")
+            const += v * place
+            continue
+        term = v.to(core.int64, _semantic=_semantic).__mul__(place, _semantic=_semantic)
+        off = term if off is None else off.__add__(term, _semantic=_semantic)
+    if off is not None:
+        ptr = ptr.__add__(off, _semantic=_semantic)
+    if const:
+        ptr = ptr.__add__(const, _semantic=_semantic)
+    return ptr.__add__(core.arange(0, n, _semantic=_semantic), _semantic=_semantic)
 
 
 @core.builtin
-def get(ch, n, index=0, _semantic=None):
-    """The next block of `n` elements from FIFO `index` of channel `ch`.
-    Waits for it."""
-    n = core._unwrap_if_constexpr(n)
-    return core.load(_fifo(ch, n, index, _semantic), volatile=True, _semantic=_semantic)
+def ChannelPut(chan_name, src, indices=(), _semantic=None, _generator=None):
+    """Put the 1-D block `src` into channel `chan_name` at `indices`, as
+    AIR's `ChannelPut`. Waits while the FIFO is full."""
+    addr = _fifo(chan_name, src.shape[0], src.dtype, indices, _semantic, _generator)
+    core.store(addr, src, _semantic=_semantic)
+
+
+@core.builtin
+def ChannelGet(chan_name, shape, dtype, indices=(), _semantic=None, _generator=None):
+    """The next block of `shape` (1-D) elements of `dtype` from channel
+    `chan_name` at `indices`, as AIR's `ChannelGet`. Waits for it."""
+    n = _ints(shape)
+    if len(n) != 1:
+        raise ValueError("ChannelGet: a 1-D block")
+    dtype = core._unwrap_if_constexpr(dtype)
+    addr = _fifo(chan_name, n[0], dtype, indices, _semantic, _generator)
+    return core.load(addr, volatile=True, _semantic=_semantic)
