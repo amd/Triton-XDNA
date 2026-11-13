@@ -26,8 +26,11 @@ on the NPU and compares with numpy:
   feed       the host puts DDR blocks into a channel a core gets, and gets
              the core's results back into DDR
   neighbours two neighbouring cores share an L1 buffer of the segment
-  q4gemv     a core gets q4nx weight blocks into a buffer of its own and
-             reads them in parts: 32 rows of a GEMV, as the decode's
+  q4gemv     a core gets q4 weight blocks into a buffer of its own and
+             reads them in parts: 32 rows of a GEMV, in vectors
+  proj16     a GEMV on 16 cores: x broadcast through a memtile, weight
+             streams through the cores' memtiles, rows gathered back
+             through them
 
 Also checks the errors reading a superkernel reports. Needs an npu2 device
 for the runs; with no NPU only the IR checks run.
@@ -147,6 +150,118 @@ module attributes {transform.with_named_sequence} {
     ^bb0(%c: !transform.any_op):
       %dm = transform.air.copy_to_dma %c : (!transform.any_op) -> !transform.any_op
     }
+    transform.yield
+  }
+}
+"""
+
+# The same with the core's compute in vectors.
+VECTOR = """
+
+// DIRECT, with the core's compute in vectors: each 1-D op 32 elements at a
+// time, each 2-D op a row at a time.
+module attributes {transform.with_named_sequence} {
+  // A 2-D linalg op, to be computed a row at a time.
+  transform.named_sequence @match_rank2(%op: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %op ["linalg.generic", "linalg.fill", "linalg.copy"] : !transform.any_op
+    %r = transform.match.structured failures(propagate) %op : (!transform.any_op) -> !transform.param<i64> {
+    ^bb0(%s: !transform.any_op):
+      %rank = transform.match.structured.rank %s : (!transform.any_op) -> !transform.param<i64>
+      transform.match.structured.yield %rank : !transform.param<i64>
+    }
+    %c2 = transform.param.constant 2 : i64 -> !transform.param<i64>
+    transform.match.param.cmpi eq %r, %c2 : !transform.param<i64>
+    transform.yield %op : !transform.any_op
+  }
+  // A 1-D linalg op, to be computed 32 elements at a time.
+  transform.named_sequence @match_rank1(%op: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %op ["linalg.generic", "linalg.fill", "linalg.copy"] : !transform.any_op
+    %r = transform.match.structured failures(propagate) %op : (!transform.any_op) -> !transform.param<i64> {
+    ^bb0(%s: !transform.any_op):
+      %rank = transform.match.structured.rank %s : (!transform.any_op) -> !transform.param<i64>
+      transform.match.structured.yield %rank : !transform.param<i64>
+    }
+    %c1 = transform.param.constant 1 : i64 -> !transform.param<i64>
+    transform.match.param.cmpi eq %r, %c1 : !transform.param<i64>
+    transform.yield %op : !transform.any_op
+  }
+  transform.named_sequence @tile_32(%op: !transform.any_op {transform.consumed}) {
+    %t, %l = transform.structured.tile_using_for %op tile_sizes [32] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.yield
+  }
+  transform.named_sequence @tile_rows(%op: !transform.any_op {transform.consumed}) {
+    %t, %l = transform.structured.tile_using_for %op tile_sizes [1, 0] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.yield
+  }
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly},
+      %cores_x: !transform.param<i64>, %cores_y: !transform.param<i64>) {
+    // A masked load's fill and box copy as tensor ops: the box gets a buffer
+    // of its own, so no DMA writes a buffer the core also fills.
+    %fr = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %fr1 = transform.air.raise_load_buffer_to_tensor %fr : (!transform.any_op) -> !transform.any_op
+    %f0 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %f0 {
+      transform.apply_patterns.linalg.tiling_canonicalization
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %f0 : !transform.any_op
+    %f1 = transform.air.fuse_elementwise_linalg %f0 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %f1 { transform.apply_patterns.canonicalization } : !transform.any_op
+    // reductions as generics, the elementwise ops before them fused in
+    %rd = transform.structured.match ops{["linalg.reduce"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %rdg = transform.structured.generalize %rd : (!transform.any_op) -> !transform.any_op
+    %fz = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %fz1 = transform.air.fuse_elementwise_linalg %fz : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %fz1 { transform.apply_patterns.canonicalization } : !transform.any_op
+    %te = transform.structured.match ops{["tensor.empty"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %te1 = transform.cast %te : !transform.any_op to !transform.op<"tensor.empty">
+    %te2 = transform.bufferization.empty_tensor_to_alloc_tensor %te1 : (!transform.op<"tensor.empty">) -> !transform.op<"bufferization.alloc_tensor">
+    %fbz = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %fbz1 = transform.bufferization.one_shot_bufferize %fbz <{allow_return_allocs_from_loops = true}> : (!transform.any_op) -> !transform.any_op
+    // post_bufferize_cleanup, less eliminate_cascade_memcpy: a buffer each
+    // value stored, none written again while its DMA may still read it
+    %fb = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %fb {
+      transform.apply_patterns.linalg.tiling_canonicalization
+      transform.apply_patterns.scf.for_loop_canonicalization
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %fb : !transform.any_op
+    %lc = transform.structured.match ops{["linalg.copy"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %mc = transform.structured.linalg_copy_to_memref %lc : (!transform.any_op) -> !transform.any_op
+    %fb2 = transform.air.remove_uninitialized_copy %fb : (!transform.any_op) -> !transform.any_op
+    // (a one-trip parallel canonicalizes away: made only now, and taken to
+    // a herd at once)
+    %f2 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %f3 = transform.apply_registered_pass "air-wrap-func-with-parallel"
+        with options = { "loop-bounds" = "1,1" } to %f2
+        : (!transform.any_op) -> !transform.any_op
+    %p = transform.structured.match ops{["scf.parallel"]} in %f3 : (!transform.any_op) -> !transform.any_op
+    %h = transform.air.par_to_herd %p : (!transform.any_op) -> !transform.any_op
+    %h1 = transform.air.override_memref_memory_space %h <{memory_space = 2 : i32}> : (!transform.any_op) -> !transform.any_op
+    // copies between two of the core's buffers stay with the core, as
+    // vectors
+    %mcp = transform.structured.match ops{["memref.copy"]} in %h1 : (!transform.any_op) -> !transform.any_op
+    %lcp = transform.air.convert_memref_copy_to_linalg_copy %mcp : (!transform.any_op) -> !transform.any_op
+    %cp = transform.structured.match ops{["memref.copy", "linalg.copy"]} in %h1 : (!transform.any_op) -> !transform.any_op
+    transform.foreach %cp : !transform.any_op {
+    ^bb0(%c: !transform.any_op):
+      %dm = transform.air.copy_to_dma %c : (!transform.any_op) -> !transform.any_op
+    }
+    %h1q = transform.foreach_match in %h1 @match_rank2 -> @tile_rows, @match_rank1 -> @tile_32 : (!transform.any_op) -> !transform.any_op
+    %h1r = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %h1r {
+      transform.apply_patterns.linalg.tiling_canonicalization
+      transform.apply_patterns.scf.for_loop_canonicalization
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    %vg = transform.structured.match ops{["linalg.generic", "linalg.fill", "linalg.copy"]} in %h1r : (!transform.any_op) -> !transform.any_op
+    transform.foreach %vg : !transform.any_op {
+    ^bb0(%v: !transform.any_op):
+      transform.structured.vectorize %v : !transform.any_op
+    }
+    %hc = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.include @post_vectorize_reduce_cleanup failures(propagate) (%hc) : (!transform.any_op) -> ()
     transform.yield
   }
 }
@@ -437,25 +552,46 @@ def neighbours(
 
 
 @triton.jit
-def q4_group(xb, w, acc, g):
-    """Group g (32 columns) of a q4nx block at w (2560 int16: scales, mins,
-    then the 4-bit values as [half][column][row in half]) times the x at
-    xb, added to the 32 rows' sums at acc."""
+def q4_group(xq, w, acc, t, sx, g):
+    """Group g (32 columns) of a q4 block at w (2560 int16: scales [8][32]
+    and mins [8][32] as bf16, then per group 8 words a row, word j of a row
+    holding its columns 4 j .. 4 j + 3 at bits 0, 4, 8 and 12) times x, added
+    to the 32 rows' sums at acc. xq [4][256] holds x times 2^(-4 s) for s =
+    0 .. 3, sx each group's sum of x; t is a buffer for the group's sums."""
     r = tl.arange(0, 32)
-    xg = tl.load(xb + g * 32 + r).to(tl.float32)
+    tl.store(t + r, tl.zeros([32], tl.float32))
+    for j in range(8):
+        v = tl.load(w + 512 + g * 256 + j * 32 + r)
+        tj = tl.load(t + r)
+        for s in tl.static_range(4):
+            # Column 4 j + s times 2^(4 s), exactly, as bf16. The top nibble
+            # is masked with bit 15 flipped, so that the masked word keeps
+            # its sign as an int16, and the flip added back.
+            if s == 3:
+                q = ((v ^ -32768) & -4096).to(tl.bfloat16) + 32768.0
+            else:
+                q = (v & (15 << (4 * s))).to(tl.bfloat16)
+            xs = tl.load(xq + s * 256 + g * 32 + j * 4 + s)
+            tj += q.to(tl.float32) * tl.full([32], xs, tl.bfloat16).to(tl.float32)
+        tl.store(t + r, tj)
+    part = tl.load(t + r).to(tl.bfloat16).to(tl.float32)
+    red = tl.full([32], tl.load(sx + g).to(tl.bfloat16), tl.bfloat16).to(tl.float32)
     scale = tl.load(w + g * 32 + r).to(tl.bfloat16, bitcast=True).to(tl.float32)
     mn = tl.load(w + 256 + g * 32 + r).to(tl.bfloat16, bitcast=True).to(tl.float32)
-    h = tl.arange(0, 2)[:, None, None]
-    c = tl.arange(0, 32)[None, :, None]
-    k = tl.arange(0, 4)[None, None, :]
-    v = tl.load(w + 512 + h * 1024 + (g * 32 + c) * 4 + k).to(tl.int32)
-    # Mask before shifting: the cores' shifts round what they shift out.
-    sh = (tl.arange(0, 4) * 4)[None, None, None, :]
-    nib = (v[:, :, :, None] & (15 << sh)) >> sh
-    q = tl.reshape(tl.permute(tl.reshape(nib, [2, 32, 16]), (1, 0, 2)), [32, 32])
-    part = tl.sum(q.to(tl.float32) * xg[:, None], axis=0).to(tl.bfloat16)
-    red = tl.sum(xg).to(tl.bfloat16).to(tl.float32)
-    tl.store(acc + r, tl.load(acc + r) + part.to(tl.float32) * scale + mn * red)
+    tl.store(acc + r, tl.load(acc + r) + part * scale + mn * red)
+
+
+@triton.jit
+def q4_block(xb, w, acc, xq, t, sx):
+    """A q4 block at w times the 256 x at xb, added to acc."""
+    k = tl.arange(0, 256)
+    xs = tl.reshape(tl.load(xb + k), [8, 32]).to(tl.float32)
+    tl.store(sx + tl.arange(0, 8), tl.sum(xs, axis=1))
+    for s in tl.static_range(4):
+        xs4 = tl.load(xb + k).to(tl.float32) * (1.0 / (1 << (4 * s)))
+        tl.store(xq + s * 256 + k, xs4.to(tl.bfloat16))
+    for g in range(8):
+        q4_group(xq, w, acc, t, sx, g)
 
 
 @triton.jit
@@ -463,13 +599,15 @@ def gemv_core(NB: tl.constexpr):
     w = air.alloc([2560], tl.int16, memory_space=air.L1)
     xb = air.alloc([256], tl.bfloat16, memory_space=air.L1)
     acc = air.alloc([32], tl.float32, memory_space=air.L1)
+    xq = air.alloc([1024], tl.bfloat16, memory_space=air.L1)
+    t = air.alloc([32], tl.float32, memory_space=air.L1)
+    sx = air.alloc([8], tl.float32, memory_space=air.L1)
     r = tl.arange(0, 32)
     tl.store(acc + r, tl.zeros([32], tl.float32))
     for j in range(NB):
         air.ChannelGet("inX", xb, sizes=[256])
         air.ChannelGet("inW", w, sizes=[2560])
-        for g in range(8):
-            q4_group(xb, w, acc, g)
+        q4_block(xb, w, acc, xq, t, sx)
     air.ChannelPut("outY", tl.load(acc + r).to(tl.bfloat16))
 
 
@@ -478,9 +616,9 @@ def q4gemv(
     X, Y, W, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr
 ):
     air.backend(
-        omit_pingpong="L1",
         use_lock_race_condition_fix_v2=True,
         merge_contiguous_feeds=False,
+        stack_size=4096,
     )
     air.Channel("inX")
     air.Channel("inW")
@@ -491,6 +629,91 @@ def q4gemv(
             air.ChannelPut("inW", W, offsets=[j * 2560], sizes=[2560])
         air.herd(gemv_core, (D // T,), 1, S, name="gemv")
         air.ChannelGet("outY", Y, offsets=[0], sizes=[32])
+
+
+@triton.jit
+def proj_core(CX0: tl.constexpr, I2: tl.constexpr, J2: tl.constexpr):
+    """Rows i 512 + cx 128 + cy 32 + [0, 32) of round i, over 2 J2 blocks of
+    256 columns; core (cx, cy) of the 4x4 cores of two herds."""
+    cx = CX0 + tl.program_id(0)
+    cy = tl.program_id(1)
+    w = air.alloc([2560], tl.int16, memory_space=air.L1)
+    xb = air.alloc([256], tl.bfloat16, memory_space=air.L1)
+    acc = air.alloc([32], tl.float32, memory_space=air.L1)
+    xq = air.alloc([1024], tl.bfloat16, memory_space=air.L1)
+    t = air.alloc([32], tl.float32, memory_space=air.L1)
+    sx = air.alloc([8], tl.float32, memory_space=air.L1)
+    r = tl.arange(0, 32)
+    for i in range(I2):
+        tl.store(acc + r, tl.zeros([32], tl.float32))
+        for j in range(2 * J2):
+            air.ChannelGet("inX", xb, indices=[cx, cy], sizes=[256])
+            air.ChannelGet("wL2ToL1", w, indices=[cx, cy], sizes=[2560])
+            q4_block(xb, w, acc, xq, t, sx)
+        air.ChannelPut("outA", tl.load(acc + r).to(tl.bfloat16), indices=[cx, cy])
+
+
+@triton.jit
+def proj16(X, Y, W, I2: tl.constexpr, J2: tl.constexpr, S: tl.constexpr):
+    """y = W x on 16 cores, 512 rows a round: x lands in memtile 3 and is
+    broadcast to every core; each of 8 weight streams fills a memtile's
+    buffer with a block for each of two cores; each column's memtile
+    gathers its 4 cores' rows and memtile 2 the 4 columns'."""
+    air.backend(
+        use_lock_race_condition_fix_v2=True,
+        merge_contiguous_feeds=False,
+        stack_size=4096,
+    )
+    air.Channel("xnorm")
+    air.Channel("inX", size=[1, 1], broadcast_shape=[4, 4])
+    air.Channel("inW", size=[4, 2])
+    air.Channel("wL2ToL1", size=[4, 4])
+    air.Channel("outA", size=[4, 4], channel_type="npu_dma_packet")
+    air.Channel("toMain", size=[4], channel_type="npu_dma_packet")
+    air.Channel("outY")
+    NF: tl.constexpr = I2 * 2 * J2  # fills of each weight stream
+    for i in range(I2):
+        air.ChannelPut("xnorm", X, offsets=[0], sizes=[512 * J2])
+    for x in tl.static_range(4):
+        for k in tl.static_range(2):
+            base = (x * 2 + k) * NF * 5120
+            air.ChannelPut("inW", W, indices=[x, k], offsets=[base], sizes=[NF * 5120])
+    for n in range(I2 * J2):
+        xl = air.alloc([512], tl.bfloat16, memory_space=air.L2, memtile_col=3)
+        air.ChannelGet("xnorm", xl, offsets=[0], sizes=[512])
+        for h in tl.static_range(2):
+            air.ChannelPut("inX", xl, indices=[0, 0], offsets=[h * 256], sizes=[256])
+    for x in tl.static_range(4):
+        for k in tl.static_range(2):
+            for n in range(NF):
+                # in the memtile under the cores: columns 0, 1, 6 and 7
+                wf = air.alloc(
+                    [5120], tl.int16, memory_space=air.L2, memtile_col=x + (x // 2) * 4
+                )
+                air.ChannelGet("inW", wf, indices=[x, k], offsets=[0], sizes=[5120])
+                for c in tl.static_range(2):
+                    air.ChannelPut(
+                        "wL2ToL1",
+                        wf,
+                        indices=[x, 2 * k + c],
+                        offsets=[c * 2560],
+                        sizes=[2560],
+                    )
+    air.herd(proj_core, (0, I2, J2), (2, 4), S, name="proj_blk0", at=(0, 2))
+    air.herd(proj_core, (2, I2, J2), (2, 4), S, name="proj_blk1", at=(6, 2))
+    for i in range(I2):
+        for x in tl.static_range(4):
+            g = air.alloc(
+                [128], tl.bfloat16, memory_space=air.L2, memtile_col=x + (x // 2) * 4
+            )
+            for y in tl.static_range(4):
+                air.ChannelGet("outA", g, indices=[x, y], offsets=[y * 32], sizes=[32])
+            air.ChannelPut("toMain", g, indices=[x], offsets=[0], sizes=[128])
+        m = air.alloc([512], tl.bfloat16, memory_space=air.L2, memtile_col=2)
+        for x in tl.static_range(4):
+            air.ChannelGet("toMain", m, indices=[x], offsets=[x * 128], sizes=[128])
+        air.ChannelPut("outY", m, offsets=[0], sizes=[512])
+    air.ChannelGet("outY", Y, offsets=[0], sizes=[I2 * 512])
 
 
 # Superkernels that reading rejects.
@@ -696,15 +919,16 @@ EXPLICIT = {
 
 def q4_pack(q, scale, mn):
     """q [32 rows, 256 columns] of 0..15 and scale, mn [8 groups, 32 rows]:
-    the 2560 int16 of a q4nx block."""
+    the 2560 int16 of a q4 block, as q4_group reads it."""
     s16 = lambda a: (bf(a).view(np.uint32) >> 16).astype(np.uint16)  # noqa: E731
     out = np.zeros(2560, np.uint16)
     out[:256], out[256:512] = s16(scale).reshape(-1), s16(mn).reshape(-1)
-    nib = np.zeros(8192, np.uint8)
-    for r in range(32):
-        h, rr = divmod(r, 16)
-        nib[h * 4096 + np.arange(256) * 16 + rr] = q[r]
-    out[512:] = (nib[0::2] | (nib[1::2] << 4)).astype(np.uint8).view(np.uint16)
+    words = np.zeros((8, 8, 32), np.uint16)  # [group][j][row]
+    for g in range(8):
+        for j in range(8):
+            for s in range(4):
+                words[g, j] |= q[:, g * 32 + 4 * j + s].astype(np.uint16) << (4 * s)
+    out[512:] = words.reshape(-1)
     return out.view(np.int16)
 
 
@@ -750,6 +974,62 @@ def run_q4gemv(script, has_npu, proj):
     check(
         bool(np.all(np.abs(got - want) <= ulp)),
         "q4gemv: NPU result matches numpy to one ulp",
+    )
+
+
+def run_proj16(script, has_npu, proj):
+    i2, j2 = 2, 1
+    rng = np.random.default_rng(3)
+    x0 = bf(rng.standard_normal(512 * j2))
+    nrb, ncb = i2 * 16, 2 * j2
+    blk = [
+        [
+            (
+                rng.integers(0, 16, (32, 256)),
+                bf(rng.uniform(0.01, 0.1, (8, 32))),
+                bf(rng.uniform(-0.5, 0, (8, 32))),
+            )
+            for _ in range(ncb)
+        ]
+        for _ in range(nrb)
+    ]
+    want = np.concatenate(
+        [
+            bf(sum(q4_ref(x0[j * 256 : (j + 1) * 256], *blk[b][j]) for j in range(ncb)))
+            for b in range(nrb)
+        ]
+    )
+    # Stream (x, k): per round i and column block j, the blocks of cores
+    # (x, 2 k) and (x, 2 k + 1), whose rows are i 512 + x 128 + cy 32.
+    order = [
+        (i * 16 + x * 4 + 2 * k + c, j)
+        for x in range(4)
+        for k in range(2)
+        for i in range(i2)
+        for j in range(ncb)
+        for c in range(2)
+    ]
+    W = torch.from_numpy(np.concatenate([q4_pack(*blk[b][j]) for b, j in order]))
+    x = _bfx(x0)
+    y = torch.zeros(i2 * 512, dtype=torch.bfloat16)
+    kw = dict(I2=i2, J2=j2, S=script)
+    text = module_text(proj16, (x, y, W), kw, proj)
+    check(
+        "air.channel @inX [1, 1] {broadcast_shape = [4, 4]}" in text
+        and "air.herd @proj_blk1" in text,
+        "proj16: x broadcast to two 2x4 herds",
+    )
+    if not has_npu:
+        return
+    from triton.backends.amd_triton_npu.driver_scope import driver_scope
+
+    with driver_scope("npu"):
+        proj16[(1,)](x, y, W, **kw)
+    got = y.to(torch.float32).numpy()
+    ulp = np.abs(want) * 2.0**-7 + 1e-6
+    check(
+        bool(np.all(np.abs(got - want) <= ulp)),
+        "proj16: NPU result matches numpy to one ulp",
     )
 
 
@@ -894,13 +1174,18 @@ def main():
         direct = os.path.join(tmp, "direct.mlir")
         with open(direct, "w") as f:
             f.write(DIRECT)
+        vector = os.path.join(tmp, "vector.mlir")
+        with open(vector, "w") as f:
+            f.write(VECTOR)
         with config_context(bf16_emulation=False):
             error_checks(script, direct, os.path.join(tmp, "bad"))
             for name in EXPLICIT:
                 print(f"{name}:", flush=True)
                 run_explicit(name, direct, has_npu, os.path.join(tmp, name))
             print("q4gemv:", flush=True)
-            run_q4gemv(direct, has_npu, os.path.join(tmp, "q4gemv"))
+            run_q4gemv(vector, has_npu, os.path.join(tmp, "q4gemv"))
+            print("proj16:", flush=True)
+            run_proj16(vector, has_npu, os.path.join(tmp, "proj16"))
             for name, (kernel, extra, kwargs, ref, n) in CASES.items():
                 print(f"{name}:", flush=True)
                 x = torch.empty(n, dtype=torch.bfloat16)

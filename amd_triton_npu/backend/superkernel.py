@@ -232,6 +232,7 @@ class Superkernel:
         with the transform script at path `schedule` into `cores` (columns,
         rows) cores."""
         ttshared = _optimize_ttsharedir(_ttir_to_ttsharedir(ttir), {})
+        ttshared = _allocate_locals(ttshared, args)
         with config_context(transform_tiling_script=schedule):
             m = _ttshared_to_air(ttshared, 1, 1, 1)
         # A kernel that reads its program ids runs one program a core: its
@@ -391,8 +392,15 @@ class Superkernel:
             homes = [
                 v for _, v in _lower_locals(seg, [(b, value[id(b)]) for b in owns])
             ]
+            # and those the kernels allocate themselves, before their schedule
+            homes += [
+                o.results[0]
+                for o in _ops_named(seg, "memref.alloc")
+                if "air.local" in o.attributes
+            ]
             shared = [value[id(t)] for t in onchip if t.space == 2]
             _in_place(seg, homes, shared)
+            _forward_private_vectors(seg)
             _hoist_ddr_reads(sblock, sargs[: len(bufs)], end)
             # A herd whose kernel took a DDR buffer directly now takes the
             # on-chip tensor's L2 buffer instead.
@@ -1065,6 +1073,41 @@ def _lower_locals(seg, owns):
 _VIEWS = ("memref.reinterpret_cast", "memref.subview", "memref.cast")
 
 
+def _allocate_locals(ttshared, args):
+    """Have kernel function `ttshared` allocate its own L1 buffers (the
+    arguments `args` gives as _Local) in its body, so that its schedule
+    places them with its other buffers. Each allocation is tagged with its
+    buffer's symbol."""
+    from air.dialects import memref
+    from air.ir import Context, InsertionPoint, Location, MemRefType, Module
+    from air.ir import StringAttr, Type
+
+    own = [(i, a) for i, a in enumerate(args) if isinstance(a, _Local)]
+    if not own:
+        return ttshared
+    with Context() as ctx, Location.unknown():
+        ctx.allow_unregistered_dialects = True
+        m = Module.parse(ttshared)
+        f = next(
+            o
+            for o in m.body.operations
+            if o.operation.name == "func.func" and len(o.regions[0].blocks)
+        )
+        block = f.regions[0].blocks[0]
+        for i, b in own:
+            with InsertionPoint.at_block_begin(block):
+                a = memref.AllocOp(MemRefType.get([b.n], Type.parse(b.dtype)), [], [])
+            a.attributes["air.local"] = StringAttr.get(b.symbol)
+            arg = block.arguments[i]
+            for u in list(arg.uses):
+                if u.owner.name != "memref.reinterpret_cast":
+                    raise ValueError(
+                        f"an L1 buffer of the kernel used by {u.owner.name}"
+                    )
+            arg.replace_all_uses_with(a.result)
+        return str(m)
+
+
 def _respace_views(v):
     """Give the views of buffer `v` (`memref.reinterpret_cast` and the
     like, which triton-shared makes of a kernel's arguments) `v`'s memory
@@ -1105,6 +1148,8 @@ def _in_place(seg, homes, shared):
             for i, v in enumerate(h.operands)
             if any(v == x for x in shared)
         ]
+        for c in _l1_copies(h, mine):
+            _copy_in_place(*c)
         for d in _ops_named(h, "air.dma_memcpy_nd"):
             dst, src = d.opview.dst, d.opview.src
             side = next(
@@ -1162,6 +1207,238 @@ def _in_place(seg, homes, shared):
             d.erase()
 
 
+def _home_of(v, mine):
+    """The buffer of `mine` that `v` is a view of (through
+    `memref.reinterpret_cast` and `memref.subview`), and the view's static
+    element offset into it (None where it is not static); else None."""
+    from air.ir import OpResult
+
+    off = 0
+    while isinstance(v, OpResult) and v.owner.name in (
+        "memref.reinterpret_cast",
+        "memref.subview",
+    ):
+        op = v.owner.opview
+        so = list(op.static_offsets)
+        if v.owner.name == "memref.subview":
+            st = _strides_of(op.source.type)
+            if off is not None and st is not None and all(o >= 0 for o in so):
+                off += sum(o * k for o, k in zip(so, st))
+            else:
+                off = None
+        elif off is not None and so[0] >= 0:
+            off += so[0]
+        else:
+            off = None
+        v = op.source
+    if any(v == x for x in mine):
+        return v, off
+    return None
+
+
+def _strides_of(t):
+    """A memref type's static strides, or None."""
+    from air.ir import MemRefType
+
+    st, _ = MemRefType(t).get_strides_and_offset()
+    return None if any(k < 0 for k in st) else st
+
+
+def _l1_copies(h, mine):
+    """The copies in herd `h` between a channel's buffer of the core (an
+    alloc whose other users are `air.channel` ops) and a view of one of the
+    L1 buffers `mine`: `memref.copy` ops, or a whole-buffer
+    `vector.transfer_read` written whole by a `vector.transfer_write`. Each
+    as (ops to erase, the channel's buffer, the view)."""
+    from air.ir import MemRefType, OpResult
+
+    def channel_buffer(v):
+        if not (isinstance(v, OpResult) and v.owner.name == "memref.alloc"):
+            return False
+        users = [u.owner for u in v.uses]
+        return any(u.name.startswith("air.channel.") for u in users) and all(
+            u.name.startswith("air.channel.")
+            or u.name in ("memref.dealloc", "memref.copy", "memref.subview")
+            or u.name in ("vector.transfer_read", "vector.transfer_write")
+            for u in users
+        )
+
+    out = []
+    for loop in _ops_named(h, "scf.for"):
+        c = _tiled_copy(loop)
+        if c is None:
+            continue
+        src, dst, n = c
+        for tmp, view in ((src, dst), (dst, src)):
+            if (
+                channel_buffer(tmp)
+                and MemRefType(tmp.type).shape == [n]
+                and _home_of(view, mine)
+            ):
+                out.append(([loop], tmp, _prefix(view, n)))
+    for c in _ops_named(h, "memref.copy"):
+        src, dst = c.operands[0], c.operands[1]
+        for tmp, view in ((src, dst), (dst, src)):
+            if channel_buffer(tmp) and _home_of(view, mine):
+                out.append(([c], tmp, view))
+    for r in _ops_named(h, "vector.transfer_read"):
+        res = r.results[0]
+        users = [u.owner for u in res.uses]
+        if len(users) != 1 or users[0].name != "vector.transfer_write":
+            continue
+        w = users[0]
+        src, dst = r.operands[0], w.operands[1]
+        for tmp, view in ((src, dst), (dst, src)):
+            if channel_buffer(tmp) and _home_of(view, mine):
+                out.append(([w, r], tmp, view))
+    return out
+
+
+def _forward_private_vectors(seg):
+    """In the herds, a buffer of the core that one vector write fills whole
+    and vector reads then read whole, in the same block: the reads take the
+    written vector, and the buffer goes."""
+    from air.ir import MemRefType, VectorType
+
+    for h in _ops_named(seg, "air.herd"):
+        for a in _ops_named(h, "memref.alloc"):
+            buf = a.results[0]
+            t = MemRefType(buf.type)
+            users = [u.owner.operation for u in buf.uses]
+            writes = [u for u in users if u.name == "vector.transfer_write"]
+            reads = [u for u in users if u.name == "vector.transfer_read"]
+            if len(writes) != 1 or not reads:
+                continue
+            if any(
+                u.name
+                not in (
+                    "vector.transfer_write",
+                    "vector.transfer_read",
+                    "memref.dealloc",
+                )
+                for u in users
+            ):
+                continue
+            w = writes[0]
+            val = w.operands[0]
+            if VectorType(val.type).shape != t.shape or w.operands[1] != buf:
+                continue
+            if not all(
+                r.block == w.block
+                and w.is_before_in_block(r)
+                and r.results[0].type == val.type
+                and r.operands[0] == buf
+                and all(_const(i) == 0 for i in r.operands[1:-1])
+                for r in reads
+            ):
+                continue
+            if not all(_const(i) == 0 for i in w.operands[2:]):
+                continue
+            for r in reads:
+                r.results[0].replace_all_uses_with(val)
+                r.erase()
+            w.erase()
+            for u in list(buf.uses):
+                u.owner.erase()
+            a.erase()
+
+
+def _tiled_copy(loop):
+    """(source, destination, n) where `loop` copies the first n elements of
+    a 1-D buffer into another, a vector at a time: `scf.for` from 0 to n
+    whose body reads a subview of one at the induction variable and writes
+    it to the same subview of the other; else None."""
+    from air.ir import MemRefType
+
+    body = loop.regions[0].blocks[0]
+    ops = [o for o in body.operations if o.operation.name != "scf.yield"]
+    names = [o.operation.name for o in ops]
+    if sorted(names) != sorted(
+        [
+            "memref.subview",
+            "memref.subview",
+            "vector.transfer_read",
+            "vector.transfer_write",
+        ]
+    ):
+        return None
+    iv = body.arguments[0]
+    read = next(o for o in ops if o.operation.name == "vector.transfer_read")
+    write = next(o for o in ops if o.operation.name == "vector.transfer_write")
+    if write.operands[0] != read.results[0]:
+        return None
+    ends = []
+    for v in (read.operands[0], write.operands[1]):
+        sv = v.owner
+        if sv.name != "memref.subview" or list(sv.opview.offsets) != [iv]:
+            return None
+        if list(sv.opview.static_strides) != [1]:
+            return None
+        ends.append(sv.opview.source)
+    lb, ub = loop.operands[0], loop.operands[1]
+    n = [MemRefType(e.type).shape for e in ends]
+    if _const(lb) != 0 or any(len(x) != 1 or x[0] < _const(ub) for x in n):
+        return None
+    return ends[0], ends[1], _const(ub)
+
+
+def _prefix(view, n):
+    """The first `n` elements of 1-D `view`: itself, or a subview of it."""
+    from air.dialects import memref
+    from air.ir import InsertionPoint, MemRefType, StridedLayoutAttr
+
+    t = MemRefType(view.type)
+    if t.shape == [n]:
+        return view
+    st, off = t.get_strides_and_offset()
+    rt = MemRefType.get(
+        [n],
+        t.element_type,
+        layout=StridedLayoutAttr.get(off, st),
+        memory_space=t.memory_space,
+    )
+    with InsertionPoint.after(view.owner):
+        return memref.SubViewOp(rt, view, [], [], [], [0], [n], [1]).result
+
+
+def _copy_in_place(ops, tmp, view):
+    """Have the channel ops on buffer `tmp` move the data to or from `view`
+    itself (or the whole buffer it views), and drop the copy `ops`."""
+    from air.ir import MemRefType
+
+    for o in ops:
+        o.erase()
+    home, off = _home_of(view, _roots(view))
+    ht, vt = MemRefType(home.type), MemRefType(view.type)
+    st = _strides_of(view.type)
+    whole = (
+        off == 0
+        and st is not None
+        and list(vt.shape) == list(ht.shape)
+        and _contiguous(list(vt.shape), st)
+    )
+    target = home if whole else view
+    # The view, and what it is computed from, before the channel ops.
+    _move_before(target, tmp.owner)
+    for u in list(tmp.uses):
+        if u.owner.name == "memref.dealloc":
+            u.owner.erase()
+    tmp.replace_all_uses_with(target)
+    tmp.owner.erase()
+
+
+def _roots(v):
+    """The buffer at the root of view `v`."""
+    from air.ir import OpResult
+
+    while isinstance(v, OpResult) and v.owner.name in (
+        "memref.reinterpret_cast",
+        "memref.subview",
+    ):
+        v = v.owner.opview.source
+    return [v]
+
+
 def _view(home, offs, sizes, strides, like):
     """A view of the part of buffer `home` at `offs` with `sizes` and
     `strides`, of the element type and memory space of `like`."""
@@ -1212,14 +1489,16 @@ def _contiguous(sizes, strides):
 
 
 def _move_before(v, anchor):
-    """Move the arithmetic that computes `v`, where it follows `anchor` in
-    the same block, before `anchor`."""
+    """Move the arithmetic and views that compute `v`, where they follow
+    `anchor` in the same block, before `anchor`."""
     from air.ir import OpResult
 
     if not isinstance(v, OpResult):
         return
     op = v.owner.operation
-    if op.block != anchor.operation.block or not op.name.startswith("arith."):
+    if op.block != anchor.operation.block or not (
+        op.name.startswith("arith.") or op.name in _VIEWS
+    ):
         return
     for x in op.operands:
         _move_before(x, anchor)
