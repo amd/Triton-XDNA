@@ -267,6 +267,9 @@ def _torch_hip_path(torch) -> str | None:
 def _hip_check(rc: int, what: str) -> None:
     """Raise if a HIP call failed, naming the call and the error symbol."""
     if rc != 0:
+        # HIP also keeps the failure as its last error. Cleared, or the next
+        # call torch makes reports it as its own.
+        _hip().hipGetLastError()
         # hipGetErrorName returns NULL for codes it does not know, so decoding
         # unconditionally would replace the real error with an AttributeError.
         raw = _hip().hipGetErrorName(rc)
@@ -1477,6 +1480,7 @@ class SharedBuffer:
     __slots__ = (
         "_attachments",
         "_primary",
+        "_device",
         "_host_ptr",
         "_nbytes",
         "shape",
@@ -1518,6 +1522,7 @@ class SharedBuffer:
         # stay callable after any of it.
         self._attachments = {}
         self._primary = None
+        self._device: DeviceSpec | None = None
         self._host_ptr: int | None = None
         self._torch_view: weakref.ref[Tensor] | None = None
         self._numpy_view: np.ndarray | None = None
@@ -1574,6 +1579,9 @@ class SharedBuffer:
         peers = frozenset(_parse_spec(s)[0] for s in secondaries)
         _check_device_mix({primary_kind, *peers})
 
+        named = _BACKENDS[primary_kind](primary_handle)
+        self._device = named.spec
+
         # Pages retired by an earlier buffer of this size, mapped into these
         # same devices, are already everything the work below would produce.
         pool_key = _pool_key(self._nbytes, (primary_kind, primary_handle), secondaries)
@@ -1585,12 +1593,27 @@ class SharedBuffer:
             self._pool_key = pool_key
             return
 
-        primary_att = _BACKENDS[primary_kind](primary_handle)
-        self._host_ptr = primary_att.allocate(self._nbytes, peers)
-        self._primary = primary_att
-        self._attachments[primary_att.key] = primary_att
+        # An NPU buffer the iGPU also maps gets its pages from HIP, and the NPU
+        # maps them as a secondary (XRT as a userptr BO, HSA by import). HIP
+        # cannot pin the NPU's pages where the driver maps them VM_PFNMAP;
+        # HIP's own pages have no such limit. ``device`` still reports the NPU.
+        hip = [s for s in secondaries if _parse_spec(s)[0] == _HipAttachment.kind]
+        if primary_kind != _HipAttachment.kind and hip:
+            owner = _make_attachment(hip[0])
+            owner_peers = frozenset(
+                {
+                    primary_kind,
+                    *(_parse_spec(s)[0] for s in secondaries if s is not hip[0]),
+                }
+            )
+            rest = [device, *(s for s in secondaries if s is not hip[0])]
+        else:
+            owner, owner_peers, rest = named, peers, secondaries
+        self._host_ptr = owner.allocate(self._nbytes, owner_peers)
+        self._primary = owner
+        self._attachments[owner.key] = owner
         try:
-            for secondary in secondaries:
+            for secondary in rest:
                 self.share_with(secondary)
         except Exception:
             # A half-shared buffer is not something the caller can use or
@@ -1619,6 +1642,17 @@ class SharedBuffer:
             {attachment.kind, *(a.kind for a in self._attachments.values())}
         )
         assert self._primary is not None  # a live buffer always has one
+        if (
+            attachment.kind == _HipAttachment.kind
+            and self._primary.kind != _HipAttachment.kind
+        ):
+            # HIP may not be able to pin these pages (see __init__), and a
+            # buffer cannot move to other pages once it holds data.
+            raise SharedBufferError(
+                f"the iGPU can only share a buffer whose pages came from "
+                f"{self._primary.kind} if it is named in share= when the buffer "
+                "is created"
+            )
         attachment.attach(self._host_ptr, self._nbytes, self._primary)
         # Recorded before the announcements below, which can fail: an
         # attachment that has mapped the pages but is not in the dict is one
@@ -1662,9 +1696,10 @@ class SharedBuffer:
 
     @property
     def device(self) -> DeviceSpec:
-        """The device the pages were allocated on, as a spec you can pass back.
+        """The device the buffer was asked for, as a spec you can pass back.
 
-        ``devices`` is the whole set; this is the one that owns the memory.
+        ``devices`` is the whole set. This one usually owns the memory too; an
+        NPU buffer the iGPU also maps does not (see ``__init__``).
 
         Not the torch device, which is the one place a buffer answers a tensor
         question differently from the tensor: ``buf.device`` is ``'xrt:0'``
@@ -1677,12 +1712,17 @@ class SharedBuffer:
         """
         if self._primary is None:
             raise SharedBufferError("buffer is closed")
-        return self._primary.spec
+        assert self._device is not None  # set with the primary
+        return self._device
 
     @property
     def devices(self) -> tuple[DeviceSpec, ...]:
-        """Every device this buffer is mapped into, primary first."""
-        return tuple(a.spec for a in self._attachments.values())
+        """Every device this buffer is mapped into, ``device`` first."""
+        specs = [a.spec for a in self._attachments.values()]
+        if self._device in specs:
+            specs.remove(self._device)
+            specs.insert(0, self._device)
+        return tuple(specs)
 
     def _one_of_kind(self, cls: type[_A]) -> _A:
         """The single attachment of one runtime.
@@ -2116,6 +2156,7 @@ class SharedBuffer:
         # every point: this buffer, then the _Pages, then the pool or nothing.
         self._attachments = {}
         self._primary = None
+        self._device = None
         self._host_ptr = None
         _POOL.retire(None if escaped else self._pool_key, pages)
 

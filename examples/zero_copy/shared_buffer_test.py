@@ -892,35 +892,42 @@ def test_hip_pages_need_naming_the_npu_early(buffers: _Buffers) -> None:
 # Sharing after construction
 # ---------------------------------------------------------------------------
 def test_share_with(buffers: _Buffers) -> None:
-    """share_with adds a device to a live buffer, in both directions."""
+    """share_with adds a device to a live buffer where it can, and refuses with
+    the fix named where it cannot."""
     print("\n-- share_with --")
-    from triton.backends.amd_triton_npu.shared import kDLCPU, kDLROCM
+    from triton.backends.amd_triton_npu.shared import kDLCPU
 
+    # The iGPU cannot be added to NPU pages later; the error has to say to
+    # name it at construction, since that is where the fix goes.
     buf = buffers.new((16, 8), torch.float32, NPU)
     check("starts CPU-flavoured", buf.__dlpack_device__() == (kDLCPU, 0))
     cpu_view = buf.torch()
     cpu_view.fill_(1.5)
+    check_raises(
+        "share_with(hip) on NPU pages is refused with the fix named",
+        SharedBufferError,
+        lambda: buf.share_with(HIP),
+    )
+    check(
+        "the buffer is unharmed",
+        buf.is_shared_with(NPU)
+        and not buf.is_shared_with(HIP)
+        and float(buf.torch().max()) == 1.5,
+    )
+    check("share_with an attached device is a no-op", buf.share_with(NPU) is buf)
+    check("no duplicate attachment", len(buf.devices) == 1)
 
-    check("share_with returns self", buf.share_with(HIP) is buf)
-    check("now shared with HIP", buf.is_shared_with(HIP))
-    check("now iGPU-flavoured", buf.__dlpack_device__() == (kDLROCM, 0))
-
-    # The cached view had to be dropped: it described the same pages as host
-    # memory, and handing it back would send iGPU work to a CPU tensor.
-    gpu_view = buf.torch()
-    check("torch view was re-derived", gpu_view.is_cuda)
-    check("and still sees what the CPU view wrote", float(gpu_view.max()) == 1.5)
-
-    check("share_with is idempotent", buf.share_with(HIP).is_shared_with(HIP))
-    check("no duplicate attachment", len(buf.devices) == 2)
-
-    # ...and the other way round, for the runtime that can take pages it did
-    # not allocate (see test_hip_pages_need_naming_the_npu_early for the one
-    # that cannot).
+    # The other way round, for the runtime that can take pages it did not
+    # allocate (see test_hip_pages_need_naming_the_npu_early for the one that
+    # cannot).
     if RUNTIME == "xrt":
         rev = buffers.new((16, 8), torch.float32, HIP)
-        rev.share_with(NPU)
+        rev.torch().fill_(2.5)
+        check("share_with returns self", rev.share_with(NPU) is rev)
         check("HIP buffer can gain an XRT device", rev.bo is not None)
+        check("and still holds what the iGPU wrote", float(rev.numpy().max()) == 2.5)
+        check("share_with is idempotent", rev.share_with(NPU).is_shared_with(NPU))
+        check("no duplicate attachment", len(rev.devices) == 2)
     else:
         skip("late share_with(hsa)", "covered as a refusal instead")
 
