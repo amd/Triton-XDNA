@@ -923,6 +923,7 @@ def test_share_with(buffers: _Buffers) -> None:
     if RUNTIME == "xrt":
         rev = buffers.new((16, 8), torch.float32, HIP)
         rev.torch().fill_(2.5)
+        torch.cuda.synchronize()
         check("share_with returns self", rev.share_with(NPU) is rev)
         check("HIP buffer can gain an XRT device", rev.bo is not None)
         check("and still holds what the iGPU wrote", float(rev.numpy().max()) == 2.5)
