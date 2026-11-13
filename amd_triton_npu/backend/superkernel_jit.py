@@ -109,13 +109,19 @@ _CASTS = ("arith.extsi", "arith.extui", "arith.trunci", "arith.index_cast")
 
 
 def _evaluate(op, env, what):
-    """The value of the one result of scalar int op `op`, given its operands'
-    values in `env`: an int, a _PerWave, or the operand's own value."""
-    from air.ir import IntegerAttr
+    """The value of the one result of scalar op `op`, given its operands'
+    values in `env`: a constant, a _PerWave, or the operand's own value.
+    Only ints are computed with."""
+    from air.ir import FloatAttr, IntegerAttr
 
     name = op.operation.name
     if name == "arith.constant":
-        return IntegerAttr(op.attributes["value"]).value
+        v = op.attributes["value"]
+        if isinstance(v, FloatAttr):
+            return v.value
+        if str(v.type) == "i1":
+            return bool(IntegerAttr(v).value)
+        return IntegerAttr(v).value
     args = [env.get(v) for v in op.operands]
     for a in args:
         if not isinstance(a, (int, _PerWave)):
@@ -322,16 +328,34 @@ def read(ttir, air_project_path):
             if n != "tt.call" or _attr(funcs[_callee(o)], "npu.partition") is None:
                 raise ValueError(f"{name}: {n} in the wave loop outside npu.spatial")
             parts.append((o, funcs[_callee(o)]))
-        if len({_attr(f, "npu.step") for _, f in parts}) > 1:
-            raise ValueError(f"{name}: a wave runs one npu.spatial")
         if not parts:
             raise ValueError(f"{name}: the wave loop runs no npu.spatial")
 
+        # Partitions of one name, in any of the wave's spatials, run in turn
+        # on the same cores.
         settings = [_settings(f) for _, f in parts]
-        corners = _place(
-            settings,
-            detect_npu_version() if any(p["at"] is None for p in settings) else None,
+        herds = {}
+        for p in settings:
+            h = herds.setdefault(p["name"], dict(p))
+            if p["cores"] != h["cores"]:
+                raise ValueError(
+                    f"partition {p['name']} is given {h['cores']} and {p['cores']} cores"
+                )
+            if p["at"] is not None and h["at"] not in (None, p["at"]):
+                raise ValueError(
+                    f"partition {p['name']} is placed at {h['at']} and {p['at']}"
+                )
+            h["at"] = h["at"] or p["at"]
+        places = _place(
+            list(herds.values()),
+            (
+                detect_npu_version()
+                if any(h["at"] is None for h in herds.values())
+                else None
+            ),
         )
+        corner = dict(zip(herds, places))
+        corners = [corner[p["name"]] for p in settings]
 
         sched_dir = os.path.join(sk.proj, "schedules")
         os.makedirs(sched_dir, exist_ok=True)
@@ -346,7 +370,7 @@ def read(ttir, air_project_path):
                 for v in args:
                     if isinstance(v, _PerWave):
                         v = v.lowered()
-                    if not isinstance(v, (Tensor, _Scalar, _Wave, int)):
+                    if not isinstance(v, (Tensor, _Scalar, _Wave, int, float)):
                         raise ValueError(f"{p['name']}: {kname} takes {v!r}")
                     vals.append(v)
                 sk.call(kname, leaves[sym], vals, at, p["name"], schedule, p["cores"])

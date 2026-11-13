@@ -23,7 +23,13 @@ their numbers and in the on-chip buffers they write become one loop over
 phases. Partitions exchange data through L2 buffers from `allocate_l2`: a
 buffer read in a wave must be written by some partition in that wave, which
 the cores wait for. DDR buffers, the pointer arguments, are updated in place;
-a partition sees the DDR writes of the partitions listed before it.
+a partition sees the DDR writes of the partitions before it.
+
+A wave may call `spatial` several times. The calls take effect in program
+order, which is the order of the DDR writes the partitions see and of the
+transfers the dispatch issues; L2 buffers synchronize by themselves.
+Partitions of one name, within a call or across calls, run in turn on the
+same cores.
 
 `cores[i]` is partition i's core count, an int or (columns, rows). It drives
 the partition's schedule: `schedules[i]` is the path of a transform script
@@ -120,7 +126,7 @@ def spatial(
         if not isinstance(schedules[i], str):
             raise ValueError(f"spatial: schedules[{i}] must be a path")
         corner = None if at[i] is None else tuple(_values(at[i]))
-        name = names[i] or f"{fn.__name__}_{i}"
+        name = names[i] or f"{fn.__name__}_{step}_{i}"
         ctx = _PartitionContext(step, i, cores[i], schedules[i], corner, name)
         _generator.call_JitFunction(fn, list(args), kwargs={}, caller_context=ctx)
 

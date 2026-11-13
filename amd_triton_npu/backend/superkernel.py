@@ -159,7 +159,7 @@ class Superkernel:
     def call(self, name, ttir, args, at, herd, schedule, cores):
         """Add a call to the wave: the kernel `name` with TTIR `ttir` (one
         public function), on `args` (per argument of that function: a Tensor,
-        _Wave, _Scalar or int), on the herd `herd` with corner `at`, compiled
+        _Wave, _Scalar or number), on the herd `herd` with corner `at`, compiled
         with the transform script at path `schedule` into `cores` (columns,
         rows) cores."""
         ttshared = _optimize_ttsharedir(_ttir_to_ttsharedir(ttir), {})
@@ -172,7 +172,7 @@ class Superkernel:
                     f"{name}: its schedule makes a {shape[0]}x{shape[1]} herd "
                     f"for {cores[0]}x{cores[1]} cores"
                 )
-        _bind_plain_ints(m, args)
+        _bind_constants(m, args)
         kept = _drop_unused_scalars(_entry(m))
         # The func's arguments are the kernel's, then the grid's ints, which
         # triton-shared adds; `kept` says which survived.
@@ -513,18 +513,24 @@ def _herd_height(h):
     return _const(h.operands[1])
 
 
-def _bind_plain_ints(m, args):
-    """Replace the func's arguments that `args` gives as ints by constants."""
+def _bind_constants(m, args):
+    """Replace the func's arguments that `args` gives as numbers by
+    constants."""
     from air.dialects import arith
-    from air.ir import InsertionPoint, IntegerAttr, Location
+    from air.ir import FloatAttr, InsertionPoint, IntegerAttr, Location
 
     block = _entry(m).regions[0].blocks[0]
     with m.context, Location.unknown(m.context):
         ip = InsertionPoint.at_block_begin(block)
         for a, v in zip(block.arguments, args):
-            if isinstance(v, int) and not isinstance(v, bool):
-                c = arith.ConstantOp(a.type, IntegerAttr.get(a.type, v), ip=ip)
-                a.replace_all_uses_with(c.result)
+            if isinstance(v, float):
+                attr = FloatAttr.get(a.type, v)
+            elif isinstance(v, int):
+                attr = IntegerAttr.get(a.type, int(v))
+            else:
+                continue
+            c = arith.ConstantOp(a.type, attr, ip=ip)
+            a.replace_all_uses_with(c.result)
 
 
 def _retype_herd_args(seg):

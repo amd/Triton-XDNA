@@ -14,6 +14,8 @@ on the NPU and compares with numpy:
   table      an int per wave from `npu.table`, and an int argument set by
              the host
   multicore  a partition on two cores, its schedule given the core count
+  steps      a wave of four spatials: the cores of one name run two phases,
+             another partition's call between them
 
 Also checks the errors reading a superkernel reports. Needs an npu2 device
 for the runs; with no NPU only the IR checks run.
@@ -178,6 +180,18 @@ def multicore(
         )
 
 
+@triton.jit
+def steps(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
+    h0 = npu.allocate_l2([D], tl.bfloat16)
+    h1 = npu.allocate_l2([D], tl.bfloat16)
+    g = npu.allocate_l2([D], tl.bfloat16)
+    for wave in range(NW):
+        npu.spatial([(scale, (X, W, h0, wave * 2, D, DP))], [1], [S], names=["s"])
+        npu.spatial([(add, (h0, X, g, D, DP))], [1], [S], names=["b"])
+        npu.spatial([(scale, (X, W, h1, wave * 2 + 1, D, DP))], [1], [S], names=["s"])
+        npu.spatial([(add, (g, h1, X, D, DP))], [1], [S], names=["a"])
+
+
 # Superkernels that reading rejects.
 
 
@@ -200,10 +214,10 @@ def overlap(X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.conste
 
 
 @triton.jit
-def two_steps(X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
+def two_shapes(X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr):
     for wave in range(NW):
-        npu.spatial([(add, (X, X, X, D, DP))], cores=[1], schedules=[S])
-        npu.spatial([(add, (X, X, X, D, DP))], cores=[1], schedules=[S])
+        npu.spatial([(add, (X, X, X, D, DP))], [1], [S], names=["a"])
+        npu.spatial([(add, (X, X, X, D, DP))], [2], [S], names=["a"])
 
 
 @triton.jit
@@ -308,6 +322,13 @@ def ref_table(x, w, k):
     return x
 
 
+def ref_steps(x, w):
+    w = w.reshape(-1, x.size)
+    for l in range(WAVES):
+        x = bf(bf(bf(x * w[2 * l]) + x) + bf(x * w[2 * l + 1]))
+    return x
+
+
 def ref_multicore(x, w):
     w = w.reshape(-1, x.size)
     for l in range(WAVES):
@@ -320,6 +341,7 @@ CASES = {
     "phases": (phases, (), {}, ref_phases, D),
     "table": (table, (2,), {"ROWS": ROWS}, ref_table, D),
     "multicore": (multicore, (), {}, ref_multicore, D2),
+    "steps": (steps, (), {}, ref_steps, D),
 }
 
 
@@ -353,6 +375,8 @@ def ir_checks(name, text):
     if name == "table":
         check("i32" in func, "table: k is an argument of the func")
         check("arith.select" in text, "table: per-wave values selected")
+    if name == "steps":
+        check("air.disable_ping_pong" in text, "steps: a phase loop for s")
     if name == "multicore":
         sizes = re.findall(r"air\.herd @(\w+) .*? in \(%\w+=(%\w+)", text)
         two = [h for h, s in sizes if re.search(rf"{s} = arith.constant 2 :", text)]
@@ -365,7 +389,7 @@ def error_checks(script, proj):
     bad = [
         ("unwritten", unwritten, (x,), "which no call writes"),
         ("overlap", overlap, (x,), "overlaps"),
-        ("two spatials", two_steps, (x,), "one npu.spatial"),
+        ("two shapes", two_shapes, (x,), "is given"),
         ("wave and scalar", wave_and_scalar, (x, x, 3), "only ints from constants"),
         ("phased inputs", phased_inputs, (x,), "not supported"),
         ("phase order", phase_order, (x, x), "listed between the phases"),
