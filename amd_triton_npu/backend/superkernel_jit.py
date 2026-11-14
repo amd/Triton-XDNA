@@ -834,13 +834,18 @@ class _SegmentWriter:
         ch = _attr(decl, "air.dma_channel")
         if ch not in self.chans:
             raise ValueError(f"channel {ch} is not declared")
-        ints = lambda t: [int(x) for x in t.split(",")]  # noqa: E731
-        sizes, strides = ints(_attr(decl, "air.dma_sizes")), ints(
-            _attr(decl, "air.dma_strides")
-        )
+        sizes = _attr(decl, "air.dma_sizes").split(",")
+        strides = [int(x) for x in _attr(decl, "air.dma_strides").split(",")]
         k = _attr(decl, "air.dma_indices")
         ops = list(o.operands)
-        buf, offs, idx = ops[0], ops[1 : 1 + len(sizes)], ops[1 + len(sizes) :]
+        nd = sizes.count("?")
+        buf, offs = ops[0], ops[1 : 1 + len(sizes)]
+        dyn, idx = (
+            iter(ops[1 + len(sizes) : 1 + len(sizes) + nd]),
+            ops[1 + len(sizes) + nd :],
+        )
+        # a size known at run time: the transfer's, as an index value
+        sizes = [self.index(next(dyn)) if x == "?" else x for x in sizes]
         if len(idx) != k:
             raise ValueError(f"channel {ch}: {len(idx)} indices, not {k}")
         b = self.ref(buf)

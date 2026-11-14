@@ -432,7 +432,15 @@ def _dma(
         )
     if dest is not None:
         raise ValueError(f"{kind} {name}: dest on a put of the segment or the host")
-    operands = [buf] + [i32(v) for v in offsets] + [i32(v) for v in indices]
+    # a size known at run time: an operand, "?" in the attribute
+    dyn = [v for v in sizes if not isinstance(v, int)]
+    sizes = [v if isinstance(v, int) else "?" for v in sizes]
+    operands = (
+        [buf]
+        + [i32(v) for v in offsets]
+        + [i32(v) for v in dyn]
+        + [i32(v) for v in indices]
+    )
     module = _generator.module
     symbol = _fresh_symbol(module, "air.dma.")
     decl = ir.builder(_generator.context).get_or_insert_function(
