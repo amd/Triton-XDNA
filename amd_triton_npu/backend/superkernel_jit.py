@@ -1046,3 +1046,59 @@ class Launcher:
                 sync_from(bos[i])
                 raw = t.view(-1).view(torch.uint8).numpy()
                 raw[:] = np.frombuffer(bos[i].map(), np.uint8, raw.nbytes)
+
+    def resident(self, *values):
+        """The launch with its buffers kept on the device, for repeated runs.
+        `values` are the kernel's non-constexpr arguments, as at a launch that
+        has built it. Returns a `Resident`."""
+        if self.built is None:
+            raise RuntimeError("resident: launch the kernel once first")
+        return Resident(self, values)
+
+
+class Resident:
+    """A superkernel's dispatch on buffers that stay on the device.
+    `tensors[i]` is the i-th buffer argument as a tensor on its buffer
+    object's memory (written in place by the host and the device).
+    `run(*scalars, to=..., back=...)` syncs the buffers `to` to the device,
+    runs with the scalar arguments, then syncs `back` (default: every buffer
+    the kernel writes) to the host."""
+
+    def __init__(self, launcher, values):
+        import torch
+
+        from .npu_runner import sync_to
+
+        name, kinds, xclbin, header, written = launcher.built
+        bufs = [v for v, k in zip(values, kinds) if k == "buffer"]
+        rt = [int(v) for v, k in zip(values, kinds) if k == "scalar"]
+        if launcher.device is None:
+            from .npu_runner import Device
+
+            launcher.device = Device(xclbin, len(bufs), header)
+        dev = launcher.device
+        self.written = [i for i, w in enumerate(written) if w]
+        self.bos, self.tensors = {}, []
+        for i, t in enumerate(bufs):
+            if not t.is_contiguous():
+                raise ValueError(f"{name}: buffer argument {i} is not contiguous")
+            nbytes = t.numel() * t.element_size()
+            bo = dev.bo(nbytes, i)
+            v = torch.frombuffer(bo.map(), dtype=t.dtype, count=t.numel())
+            v = v.view(t.shape)
+            v.copy_(t)
+            sync_to(bo)
+            self.bos[i] = bo
+            self.tensors.append(v)
+        self.launch = dev.launch(name, self.bos, rt=rt)
+
+    def run(self, *rt, to=(), back=None):
+        from .npu_runner import sync_from, sync_to
+
+        for i in to:
+            sync_to(self.bos[i])
+        self.launch.set_rt(*(int(v) for v in rt))
+        self.launch.start()
+        self.launch.wait()
+        for i in self.written if back is None else back:
+            sync_from(self.bos[i])
