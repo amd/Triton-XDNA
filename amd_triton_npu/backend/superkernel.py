@@ -1372,7 +1372,8 @@ def _l1_copies(h, mine):
         for tmp, view in ((src, dst), (dst, src)):
             if channel_buffer(tmp) and _home_of(view, mine):
                 out.append(([w, r], tmp, view))
-    return out
+    # A buffer copied more than once is not just a channel's: it keeps them.
+    return [c for c in out if sum(c[1] == d[1] for d in out) == 1]
 
 
 def _fold_constant_casts(op, seg):
