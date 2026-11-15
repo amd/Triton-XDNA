@@ -3006,6 +3006,11 @@ class NPULauncher(object):
         PDI+insts or full ELF via HSA/ROCR); it is bound by ``NPUDriver`` when
         it constructs the launcher.
         """
+        if getattr(metadata, "npu_superkernel", False):
+            from .superkernel_jit import Launcher
+
+            self.launch = Launcher(src, metadata)
+            return
         constants, signature = extract_signature_and_constants(src)
         if runtime == "hsa":
             # HSA consumes a packed hsaco (xclbin/PDI+insts or full ELF) and

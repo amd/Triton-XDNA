@@ -1,7 +1,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Checks for `arg_access.written_args` on kernels compiled by triton-cpu.
+"""Checks for `arg_access.written_args` and `read_args` on kernels compiled
+by triton-cpu.
 
 Needs no NPU: the analysis reads TTIR, which every backend produces.
 """
@@ -12,7 +13,7 @@ import numpy as np
 import triton
 import triton.language as tl
 
-from triton.backends.amd_triton_npu.arg_access import written_args
+from triton.backends.amd_triton_npu.arg_access import read_args, written_args
 from triton.backends.amd_triton_npu.driver_scope import driver_scope
 
 failures = []
@@ -89,9 +90,15 @@ def after_loop(X, Y, Z, n, B: tl.constexpr):
     tl.store(p + i, tl.load(X + i))
 
 
-def names(kernel, ck):
+@triton.jit
+def in_place(X, Y, B: tl.constexpr):
+    i = tl.arange(0, B)
+    tl.store(X + i, tl.load(X + i) + tl.load(Y + i))
+
+
+def names(kernel, ck, analysis=written_args):
     ps = [p.name for p in kernel.params if not p.is_constexpr]
-    w = written_args(ck.asm["ttir"], ps)
+    w = analysis(ck.asm["ttir"], ps)
     return None if w is None else sorted(w)
 
 
@@ -111,6 +118,16 @@ def main():
         for kernel, args, want in cases:
             got = names(kernel, kernel.warmup(*args, B=16, grid=(1,)))
             check(got == want, f"{kernel.fn.__name__}: {got} (want {want})")
+        reads = [
+            (copy, (Ptr(f), Ptr(f)), ["X"]),
+            (gather, (Ptr(f), Ptr(idx), Ptr(f)), ["IDX", "T"]),
+            (accumulate, (Ptr(f), Ptr(f)), ["ACC", "X"]),
+            (in_place, (Ptr(f), Ptr(f)), ["X", "Y"]),
+        ]
+        for kernel, args, want in reads:
+            ck = kernel.warmup(*args, B=16, grid=(1,))
+            got = names(kernel, ck, read_args)
+            check(got == want, f"{kernel.fn.__name__} reads: {got} (want {want})")
     if failures:
         print(f"FAIL: {len(failures)} check(s)")
         return 1

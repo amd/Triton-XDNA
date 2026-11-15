@@ -1,10 +1,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Which pointer arguments a compiled Triton kernel writes.
+"""Which pointer arguments a compiled Triton kernel writes, or reads.
 
 Read from the kernel's TTIR, where helper functions are inlined: each store
-and atomic is traced back from its address through pointer-typed values
+and atomic (each load and atomic, for reads) is traced back from its address
+through pointer-typed values
 (`tt.addptr`'s base, `tt.splat`, `tt.broadcast`, ...) to the kernel's
 arguments. An address that cannot be traced that way, such as a pointer
 carried through a loop or chosen by a branch (the result of an op with
@@ -16,6 +17,8 @@ import tempfile
 
 #: ops whose operand 0 is the address written
 _WRITES = ("tt.store", "tt.atomic_rmw", "tt.atomic_cas", "tt.descriptor_store")
+#: ops whose operand 0 is the address read
+_READS = ("tt.load", "tt.atomic_rmw", "tt.atomic_cas", "tt.descriptor_load")
 
 
 def _is_ptr(value):
@@ -26,6 +29,16 @@ def written_args(ttir, names):
     """The kernel arguments it writes through, by name, or None if some
     write's address could not be traced. `names` are the TTIR entry
     function's arguments: the kernel's non-constexpr parameters, in order."""
+    return _accessed_args(ttir, names, _WRITES)
+
+
+def read_args(ttir, names):
+    """The kernel arguments it reads through, by name, or None if some
+    read's address could not be traced. `names` as for `written_args`."""
+    return _accessed_args(ttir, names, _READS)
+
+
+def _accessed_args(ttir, names, ops):
     from triton._C.libtriton import ir
 
     ctx = ir.context()
@@ -41,17 +54,17 @@ def written_args(ttir, names):
     if fn.get_num_args() != len(names):
         return None
     args = {fn.args(i).id(): names[i] for i in range(fn.get_num_args())}
-    producer, writes = {}, []
+    producer, accesses = {}, []
 
     def visit(op):
         for i in range(op.get_num_results()):
             producer[op.get_result(i).id()] = op
-        if op.get_name() in _WRITES:
-            writes.append(op.get_operand(0))
+        if op.get_name() in ops:
+            accesses.append(op.get_operand(0))
 
     mod.walk(visit)
     out = set()
-    for addr in writes:
+    for addr in accesses:
         todo, seen = [addr], set()
         while todo:
             v = todo.pop()

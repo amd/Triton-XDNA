@@ -99,6 +99,18 @@ def _optimize_ttsharedir(ttsharedir: str, metadata):
     return ttsharedir
 
 
+def _superkernel_ttir(mod, metadata):
+    """A superkernel's TTIR (see `tl.extra.npu.spatial`), or None for any
+    other kernel. It is kept as TTIR: its launcher compiles each of its
+    kernels on its own."""
+    text = str(mod)
+    if "npu.partition" not in text:
+        return None
+    metadata["name"] = mod.get_entry_func_name()
+    metadata["npu_superkernel"] = True
+    return text
+
+
 def _llir_to_bin(llir: str, metadata):
     pattern = r"define void @(\w+)\(.+"
     matches = re.findall(pattern, llir)
@@ -230,9 +242,9 @@ class NPUBackend(BaseBackend):
             stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(
                 src, metadata, options
             )
-        stages["ttsharedir"] = lambda src, metadata: _optimize_ttsharedir(
-            _ttir_to_ttsharedir(src), metadata
-        )
+        stages["ttsharedir"] = lambda src, metadata: _superkernel_ttir(
+            src, metadata
+        ) or _optimize_ttsharedir(_ttir_to_ttsharedir(src), metadata)
 
     @functools.lru_cache()
     def hash(self):

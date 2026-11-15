@@ -263,9 +263,9 @@ def _entry(m):
     )
 
 
-def _pin_l2(herds):
+def _pin_l2(herds, keep=False):
     """Keep each L2 buffer whole in the memtile of the column of the herds it
-    is passed to."""
+    is passed to. With `keep`, a buffer already placed stays where it is."""
     from air.ir import IntegerAttr, IntegerType, MemRefType, OpResult, UnitAttr
 
     i32 = IntegerType.get_signless(32)
@@ -282,6 +282,8 @@ def _pin_l2(herds):
                 "air.memtile_col" in attrs
                 and IntegerAttr(attrs["air.memtile_col"]).value != x
             ):
+                if keep:
+                    continue
                 raise ValueError("an L2 buffer is passed to herds of two columns")
             attrs["air.memtile_col"] = IntegerAttr.get(i32, x)
             v.owner.attributes["air.no_split"] = UnitAttr.get()
