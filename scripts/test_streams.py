@@ -1,9 +1,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""`streams.lower_streams`: a herd's DDR transfers lowered as shim channels,
-memtile rings and channels to the cores, as a hand-written fused prefill
-device spells them.
+"""`streams.lower_streams`: a herd's DDR transfers lowered to shim channels,
+memtile rings and core channels.
 
 A 2x2 herd reads A per row (broadcast along it), B per column (its tiles a
 stride apart, so one linear shim put per tile) and writes C per core
@@ -147,7 +146,7 @@ def test_shim_pattern():
 
 
 def test_fits():
-    # the reference GEMM's: A's row repeated per round, a B run, C's column
+    # a GEMM's: A's row repeated per round, a B run, C's column
     assert _fits([11, 147456], [0, 1], 1)
     assert _fits([81920], [1], 2)
     assert _fits([11, 128, 64], [384, 4224, 1], 2)

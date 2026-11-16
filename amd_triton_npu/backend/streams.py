@@ -1,35 +1,30 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""DDR streams: a herd's transfers between DDR and its cores' local memory,
-lowered as a shim channel, a memtile ring and a channel to the cores.
+"""DDR streams: lower a herd's transfers between DDR and its cores' local
+memory to channels.
 
-A schedule can leave a herd's cores reading their operands straight from DDR
-and writing their results straight to it (air.dma_memcpy_nd between an L3
-view and an L1 buffer, in the herd). Each such transfer becomes
+A schedule can leave a herd's cores reading operands from DDR and writing
+results to it directly (air.dma_memcpy_nd between an L3 view and an L1
+buffer inside the herd). `lower_streams` turns each such transfer into
 
     shim --(<s>_ddr)--> memtile ring --(<s>_l1)--> cores       (reads)
     cores --(<s>_l1)--> memtile buffer --(<s>_ddr)--> shim     (writes)
 
-as a hand-written fused prefill device spells it: the cores get or put on the
-channel where the transfer was, in their program order; the memtile program
-has no loop, its buffers a fixed ring the descriptors cycle through; the shim
-moves each stream with one access pattern, found by walking the op's loops at
-the op's sizes (or, for a read of contiguous runs, one linear transfer per
-run). Both ends of a stream see the same sequence: what the walk can't
-evaluate exactly, it rejects.
+The cores get or put on the core channel where the transfer was. The memtile
+program has no loop; its buffers form a fixed ring. The shim side gets its
+access patterns by walking the op's loops at the op's sizes, and IR the walk
+cannot evaluate exactly is rejected.
 
-The launch keeps its shim ops in the order given, each its own task, and the
-host waits for a channel's task before it starts the one two after it. So the
-channels whose tasks are never waited for go first (a read channel of one
-task, a write channel of up to two), then the others' tasks in the order the
-cores take them.
+A stream is the transfers on one DDR argument, in one direction, that depend
+on the same herd coordinates. A read that depends only on the row is
+broadcast to that row's cores, one that depends only on the column to that
+column's cores. A write is gathered per column into one memtile buffer.
 
-The transfers of one stream are those on one DDR argument, in one direction,
-that depend on the same herd coordinates: a read that depends only on the row
-is broadcast along it to the row's cores, one that depends only on the column
-to the column's cores. A write is gathered per column: the memtile collects
-the rows' tiles and sends them on as one.
+The launch keeps the shim ops in the order emitted, one task each, and a
+channel's later tasks may wait for its earlier ones. Channels whose tasks
+never wait (a read channel with one task, a write channel with at most two)
+go first; the remaining tasks follow in the order the cores consume them.
 """
 
 from .superkernel import _const, _eval, _ops_named, _space
@@ -459,7 +454,7 @@ def _tasks(base, sizes, strides, eb):
     strides) and the index of its first element in the pattern's order."""
     if _fits(sizes, strides, eb) or len(sizes) == 1:
         if not _fits(sizes, strides, eb):
-            # one dim that is no BD: an element at a time would be absurd
+            # a single dim that no BD can describe
             raise ValueError(f"a transfer of {sizes} {strides} that no BD can make")
         return [(_offsets(base, sizes, strides), 0)]
     n = 1
@@ -489,12 +484,11 @@ def _shim_pattern(seq):
 
 def _shim_ops(seq, eb):
     """The shim ops of a sequence of transfers (elements of `eb` bytes), each
-    with the place in the cores' program of its first transfer. If each
-    transfer is one contiguous run, and the runs they make advance through the
-    argument, one op per run (runs that meet are one), its start in the
-    offset, as air-FLM's B: a linear transfer uses no BD stride field, which
-    the runs' stride would overflow for a long K. Otherwise one op, split
-    into the BDs it needs."""
+    with the place in the cores' program of its first transfer. When every
+    transfer is one contiguous run and the runs advance through the argument,
+    one linear op per run (runs that touch are merged), so no BD stride field
+    has to hold the distance between runs. Otherwise one op, split into as
+    many BDs as it needs."""
     base, sz, st = _shim_pattern(seq)
     n = 1
     for c in seq[0][1]:
@@ -563,7 +557,7 @@ def _lower_streams(module, name):
     seg, launch = segs[0], launches[0]
     streams = _collect(seg)
     if len({s.herd[0] for s in streams}) > 1:
-        # their cores would run side by side, but the shim's order is one
+        # such herds run concurrently, but the shim ops are emitted in one order
         raise ValueError("herds of different names move DDR data")
     i32 = IntegerType.get_signless(32)
     sblock = seg.regions[0].blocks[0]
@@ -574,8 +568,7 @@ def _lower_streams(module, name):
         o for o in launch.regions[0].blocks[0].operations if o.operation == seg
     )
     l2 = IntegerAttr.get(i32, 1)
-    # aircc keeps the shim ops below in their order, one task each, paced per
-    # channel (air-FLM's launches carry this too)
+    # keep the shim ops in the order emitted, one task each, paced per channel
     launch.attributes["air.preserve_shim_dma_order"] = UnitAttr.get()
     once = []  # the shim ops of channels of one task: (k, op, channel, ...)
     paced = []  # the others: (place, k, ...)
@@ -671,7 +664,7 @@ def _lower_streams(module, name):
         ddr = _launch_value(launch, s.arg)
         if s.read:
             # memtile: a ring of two buffers per instance, in the memtile of
-            # its column (a row's: the row's number)
+            # its column (for a row's stream, the column with the row's number)
             puts = []
             for j, inst in enumerate(insts):
                 with InsertionPoint(first):
