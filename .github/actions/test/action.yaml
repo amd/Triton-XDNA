@@ -295,6 +295,10 @@ runs:
           # AIR module a superkernel lowers to, and its results against numpy.
           python3 scripts/test_superkernel.py
 
+          # enable_fp_fusion marks float ops `contract`, for kernels and for
+          # a superkernel's kernels.
+          python3 scripts/test_fp_fusion.py
+
           # One-op NPUChain re-dispatch (the LLM projection and attention chains).
           python3 scripts/test_npu_chain_single_op.py
 

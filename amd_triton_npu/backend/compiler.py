@@ -90,6 +90,30 @@ def _ttir_to_ttsharedir(mod):
         return Path(dst_path).read_text()
 
 
+def _allow_fp_contraction(ttsharedir: str) -> str:
+    """`ttsharedir` with its float multiplies, adds and subtracts marked
+    `contract` (`enable_fp_fusion`): the AIE lowering may then fuse a multiply
+    into the add that takes it."""
+    from air.ir import Attribute, Context, Module, WalkResult
+
+    with Context():
+        module = Module.parse(ttsharedir)
+
+        def mark(op):
+            if op.name in ("arith.mulf", "arith.addf", "arith.subf"):
+                flags = {"contract"}
+                if "fastmath" in op.attributes:
+                    old = str(op.attributes["fastmath"])
+                    flags |= set(old[old.index("<") + 1 : -1].split(",")) - {"none"}
+                op.attributes["fastmath"] = Attribute.parse(
+                    f"#arith.fastmath<{','.join(sorted(flags))}>"
+                )
+            return WalkResult.ADVANCE
+
+        module.operation.walk(mark)
+        return module.operation.get_asm(enable_debug_info=True)
+
+
 def _optimize_ttsharedir(ttsharedir: str, metadata):
     pattern = r"func.func @(\w+)\(.+"
     matches = re.findall(pattern, ttsharedir)
@@ -136,7 +160,7 @@ class NPUOptions:
     warp_size: int = 32  # TODO: Update to reflect NPU arch.
     backend_name: str = "npu"
     enable_warp_specialization: bool = False
-    enable_fp_fusion: bool = False
+    enable_fp_fusion: bool = True
     extern_libs = None
     cluster_dims: tuple = (1, 1, 1)
     shared: bool = False
@@ -242,9 +266,16 @@ class NPUBackend(BaseBackend):
             stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(
                 src, metadata, options
             )
+
+        def ttsharedir(src, metadata):
+            text = _ttir_to_ttsharedir(src)
+            if options.enable_fp_fusion:
+                text = _allow_fp_contraction(text)
+            return _optimize_ttsharedir(text, metadata)
+
         stages["ttsharedir"] = lambda src, metadata: _superkernel_ttir(
             src, metadata
-        ) or _optimize_ttsharedir(_ttir_to_ttsharedir(src), metadata)
+        ) or ttsharedir(src, metadata)
 
     @functools.lru_cache()
     def hash(self):

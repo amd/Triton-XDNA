@@ -26,7 +26,11 @@ import os
 import re
 
 from .arg_access import read_args, written_args
-from .compiler import _optimize_ttsharedir, _ttir_to_ttsharedir
+from .compiler import (
+    _allow_fp_contraction,
+    _optimize_ttsharedir,
+    _ttir_to_ttsharedir,
+)
 from .config import config_context
 from .driver import _aircc_compile, _ttshared_to_air, detect_npu_version
 from .fused_device import (
@@ -186,12 +190,13 @@ class Superkernel:
     """A dispatch named `name` that runs `waves` waves of its calls. Build
     artifacts go to `air_project_path`."""
 
-    def __init__(self, name, air_project_path, waves):
+    def __init__(self, name, air_project_path, waves, fp_fusion=False):
         self.name, self.proj, self.waves = (
             name,
             os.path.abspath(air_project_path),
             waves,
         )
+        self.fp_fusion = fp_fusion  # enable_fp_fusion: compile with contraction
         self.tensors, self.calls = [], []
         self.scalars = []  # the func's int arguments after its buffers
         self.channels = []
@@ -255,7 +260,10 @@ class Superkernel:
         _Wave, _Scalar or number), on the herd `herd` with corner `at`, compiled
         with the transform script at path `schedule` into `cores` (columns,
         rows) cores."""
-        ttshared = _optimize_ttsharedir(_ttir_to_ttsharedir(ttir), {})
+        ttshared = _ttir_to_ttsharedir(ttir)
+        if self.fp_fusion:
+            ttshared = _allow_fp_contraction(ttshared)
+        ttshared = _optimize_ttsharedir(ttshared, {})
         ttshared = _allocate_locals(ttshared, args)
         with config_context(transform_tiling_script=schedule):
             m = _ttshared_to_air(ttshared, 1, 1, 1)

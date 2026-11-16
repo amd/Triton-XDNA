@@ -388,9 +388,10 @@ def _walk(op):
     return out
 
 
-def read(ttir, air_project_path):
+def read(ttir, air_project_path, fp_fusion=False):
     """The `Superkernel` of the superkernel whose TTIR is `ttir`, and the
-    kind of each argument of its function: "buffer" or "scalar"."""
+    kind of each argument of its function: "buffer" or "scalar". Its kernels
+    are compiled with contraction if `fp_fusion`."""
     from air.ir import Context, Location, Module
 
     from .driver import detect_npu_version
@@ -455,7 +456,7 @@ def read(ttir, air_project_path):
                     f"{name}: the loop over the waves needs a constexpr trip count"
                 )
             waves = list(range(lb, ub, step))
-        sk = Superkernel(name, air_project_path, len(waves))
+        sk = Superkernel(name, air_project_path, len(waves), fp_fusion)
         if "air.backend" in funcs:
             f = funcs["air.backend"]
             prefix = "air.backend."
@@ -967,6 +968,7 @@ class Launcher:
 
     def __init__(self, src, metadata):
         self.signature = list(src.signature.values())
+        self.fp_fusion = bool(getattr(metadata, "enable_fp_fusion", False))
         self.built = None
         self.device = None
 
@@ -983,14 +985,16 @@ class Launcher:
         for path in sorted(set(re.findall(r'air\.schedule = "([^"]*)"', ttir))):
             with open(path, "rb") as f:
                 key.update(f.read())
-        key.update(f"{detect_npu_version()} {npu_config.bf16_emulation}".encode())
+        key.update(
+            f"{detect_npu_version()} {npu_config.bf16_emulation} {self.fp_fusion}".encode()
+        )
         # The code that lowers it, so that a change to it rebuilds.
         here = os.path.dirname(__file__)
         for f in ("superkernel.py", "superkernel_jit.py", "transform_inject.py"):
             with open(os.path.join(here, f), "rb") as src:
                 key.update(src.read())
         proj = os.path.join(knobs.cache.dir, "npu_superkernel", key.hexdigest()[:32])
-        sk, kinds = read(ttir, proj)
+        sk, kinds = read(ttir, proj, self.fp_fusion)
         done = os.path.join(proj, "built.json")
         if os.path.exists(done):
             with open(done) as f:

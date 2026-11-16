@@ -1140,7 +1140,7 @@ def module_text(kernel, args, kwargs, proj):
         c = kernel.warmup(*args, grid=(1,), **kwargs)
     ttir = c.asm["ttsharedir"]
     ttir = ttir.decode() if isinstance(ttir, bytes) else ttir
-    return read(ttir, proj)[0].module_text()
+    return read(ttir, proj, c.metadata.enable_fp_fusion)[0].module_text()
 
 
 def ir_checks(name, text):
