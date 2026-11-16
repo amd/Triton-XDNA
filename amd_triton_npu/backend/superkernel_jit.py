@@ -990,7 +990,7 @@ class Launcher:
         self.signature = list(src.signature.values())
         self.fp_fusion = bool(getattr(metadata, "enable_fp_fusion", False))
         self.built = None
-        self.device = None
+        self.device = self._run = None
 
     def _build(self, ttir):
         import json
@@ -1041,24 +1041,34 @@ class Launcher:
         return sk.name, kinds, xclbin, header, written
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):
-        import numpy as np
-        import torch
-
+        from . import driver
         from .config import npu_config
-        from .npu_runner import Device, sync_from, sync_to
 
         if self.built is None:
             ttir = function.decode() if isinstance(function, bytes) else function
             self.built = self._build(ttir)
-        name, kinds, xclbin, header, written = self.built
         if npu_config.compile_only:
             return
         # Triton passes the launch metadata and hooks, then every argument.
         values = [a for a, t in zip(args[4:], self.signature) if t != "constexpr"]
+        # The hw_context is held between launches, in the same rationed pool
+        # as the ELF launchers' sessions.
+        driver._launch_with_session(self._key(), self, values)
+
+    def _key(self):
+        return ("superkernel", id(self))
+
+    def launch(self, values):
+        import numpy as np
+        import torch
+
+        from .npu_runner import sync_from, sync_to
+
+        name, kinds, xclbin, header, written = self.built
         bufs = [v for v, k in zip(values, kinds) if k == "buffer"]
         rt = [int(v) for v, k in zip(values, kinds) if k == "scalar"]
         if self.device is None:
-            self.device = Device(xclbin, len(bufs), header)
+            self.device = _open_device(xclbin, len(bufs), header)
         bos = {}
         for i, t in enumerate(bufs):
             if not t.is_contiguous():
@@ -1067,7 +1077,17 @@ class Launcher:
             bos[i] = self.device.bo(raw.nbytes, i)
             np.frombuffer(bos[i].map(), np.uint8, raw.nbytes)[:] = raw
             sync_to(bos[i])
-        run = self.device.launch(name, bos, rt=rt)
+        run = self._run
+        if run is not None:
+            for i, b in bos.items():
+                run.set_bo(i, b)
+            try:
+                run.set_rt(*rt)
+            except ValueError:  # these scalars give a stream of another length
+                self.device.launches.remove(run)
+                run = None
+        if run is None:
+            run = self._run = self.device.launch(name, bos, rt=rt)
         run.start()
         run.wait()
         for i, t in enumerate(bufs):
@@ -1076,13 +1096,44 @@ class Launcher:
                 raw = t.view(-1).view(torch.uint8).numpy()
                 raw[:] = np.frombuffer(bos[i].map(), np.uint8, raw.nbytes)
 
+    def release_session(self):
+        """Give the hw_context back; the next launch opens another."""
+        if self.device is not None:
+            self.device.close()
+        self.device = self._run = None
+
     def resident(self, *values):
         """The launch with its buffers kept on the device, for repeated runs.
         `values` are the kernel's non-constexpr arguments, as at a launch that
-        has built it. Returns a `Resident`."""
+        has built it. Returns a `Resident`, which takes over this launcher's
+        hw_context and keeps it until it is dropped."""
+        from . import driver
+
         if self.built is None:
             raise RuntimeError("resident: launch the kernel once first")
-        return Resident(self, values)
+        driver._live_sessions.pop(self._key(), None)
+        device = self.device
+        if device is not None and self._run is not None:
+            device.launches.remove(self._run)
+        self.device = self._run = None
+        return Resident(self.built, values, device)
+
+
+def _open_device(xclbin, nargs, header):
+    """A `Device` on `xclbin`. If the device has no hw_context to give, the
+    ones this process can reopen later are given back and it is tried once
+    more."""
+    from . import driver
+    from .npu_runner import Device
+
+    try:
+        return Device(xclbin, nargs, header)
+    except RuntimeError as e:
+        if driver._NO_HWCTX not in str(e):
+            raise
+    driver.release_external_contexts()
+    driver._release_all_sessions()
+    return Device(xclbin, nargs, header)
 
 
 class Resident:
@@ -1093,19 +1144,16 @@ class Resident:
     runs with the scalar arguments, then syncs `back` (default: every buffer
     the kernel writes) to the host."""
 
-    def __init__(self, launcher, values):
+    def __init__(self, built, values, device=None):
         import torch
 
         from .npu_runner import sync_to
 
-        name, kinds, xclbin, header, written = launcher.built
+        name, kinds, xclbin, header, written = built
         bufs = [v for v, k in zip(values, kinds) if k == "buffer"]
         rt = [int(v) for v, k in zip(values, kinds) if k == "scalar"]
-        if launcher.device is None:
-            from .npu_runner import Device
-
-            launcher.device = Device(xclbin, len(bufs), header)
-        dev = launcher.device
+        dev = device or _open_device(xclbin, len(bufs), header)
+        self.device = dev
         self.written = [i for i, w in enumerate(written) if w]
         self.bos, self.tensors = {}, []
         for i, t in enumerate(bufs):

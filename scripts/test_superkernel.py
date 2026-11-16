@@ -1340,6 +1340,26 @@ def run(name, kernel, extra, kw, ref, n):
     check(err < 2e-2, f"{name}: NPU result matches numpy (max rel err {err:.2e})")
 
 
+def reopen(script):
+    """Each launched superkernel keeps its hw_context, but no more are held
+    than the backend's limit; one whose context was given back opens another
+    at its next launch."""
+    from triton.backends.amd_triton_npu import driver
+    from triton.backends.amd_triton_npu.driver_scope import driver_scope
+
+    print("reopen:", flush=True)
+    held = [k for k in driver._live_sessions if k[0] == "superkernel"]
+    check(
+        0 < len(held) <= driver._MAX_LIVE_SESSIONS,
+        f"reopen: {len(held)} hw_contexts held, at most {driver._MAX_LIVE_SESSIONS}",
+    )
+    driver._release_all_sessions()
+    kernel, extra, kwargs, ref, n = CASES["chain"]
+    kw = dict(NW=WAVES, D=n, DP=1 << (n - 1).bit_length(), S=script, **kwargs)
+    with driver_scope("npu"):
+        run("reopen: chain", kernel, extra, kw, ref, n)
+
+
 def main():
     try:
         import pyxrt
@@ -1385,6 +1405,8 @@ def main():
                 if has_npu:
                     with driver_scope("npu"):
                         run(name, kernel, extra, kw, ref, n)
+            if has_npu:
+                reopen(script)
     if failures:
         print(f"{failures} check(s) failed")
         sys.exit(1)
