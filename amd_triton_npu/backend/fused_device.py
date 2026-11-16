@@ -49,6 +49,7 @@ class FusedDevice:
         key=None,
         pin_l2=False,
         multiplex=(),
+        streams=False,
     ):
         """Add `kernel` at `args` as op `name`.
 
@@ -62,6 +63,10 @@ class FusedDevice:
             (one-column kernels only), away from other ops' memtiles.
         multiplex: memory spaces ("L1", "L2", "L3") whose channels aircc
             time-multiplexes for this op.
+        streams: the cores move their operands and results straight to and
+            from DDR; each such transfer becomes a shim channel, a memtile
+            ring and a channel to the cores (`streams.lower_streams`). Ops of
+            one key share the channels.
         """
         g = tuple(grid) + (1,) * (3 - len(grid))
         with driver_scope("npu"), config_context(compile_only=True):
@@ -71,6 +76,11 @@ class FusedDevice:
         # The op's ints, bound in the launch: the herds take them as RTPs, so
         # every shape of a kernel has the same segment body.
         _bind_ints(m, kernel, args, keep=runtime)
+        key = key or kernel.fn.__name__
+        if streams:
+            from .streams import lower_streams
+
+            lower_streams(m, f"{key}_s")
         kept = _drop_unused_scalars(_entry(m))
         self.signatures[name] = _signature(
             kernel, g, args, constexprs, slot, runtime, kept, c
@@ -79,7 +89,6 @@ class FusedDevice:
             _shift_buffers(m, slot)
         if multiplex:
             _set_multiplexing(m, multiplex)
-        key = key or kernel.fn.__name__
         if pin_l2:
             self.pinned.add(key)
         self.ops.append((name, key, str(m)))
@@ -141,6 +150,15 @@ class FusedDevice:
         at, x = {}, self.cols[key]
         for n, w in widths.items():
             at[n], x = x, x + w
+        # a stream's memtile buffers go in the memtile of their herd column
+        i32 = IntegerType.get_signless(32)
+        for a in _ops_named(module.operation, "memref.alloc"):
+            if "npu.stream_col" in a.attributes:
+                col = IntegerAttr(a.attributes["npu.stream_col"]).value
+                herd = str(a.attributes["npu.stream_herd"])
+                a.attributes["air.memtile_col"] = IntegerAttr.get(i32, at[herd] + col)
+                del a.attributes["npu.stream_col"]
+                del a.attributes["npu.stream_herd"]
         for h in herds:
             n = str(h.operation.attributes["sym_name"])
             h.operation.attributes["x_loc"] = IntegerAttr.get(i64, at[n])
