@@ -35,12 +35,15 @@ BACKEND  ?= npu
 # Empty uses the model's DEFAULT_OPS.
 OPS      ?=
 N_TOKENS ?= 200
+# Decode: npu (mlir-air's fused decode), gpu (Triton on the iGPU), or
+# superkernel (Triton, one NPU dispatch a token) where the model has one.
+DECODE   ?= npu
 MODEL    ?=
 SYSTEM   ?=
 
 MODEL_ARG  := $(if $(MODEL),--model "$(MODEL)",)
 SYSTEM_ARG := $(if $(SYSTEM),--system "$(SYSTEM)",)
-COMMON     := --prefill-engine $(ENGINE) \
+COMMON     := --prefill-engine $(ENGINE) --decode $(DECODE) \
 	$(if $(filter triton,$(ENGINE)),--backend $(BACKEND) $(if $(OPS),--ops $(OPS))) \
 	$(MODEL_ARG)
 DECODE_L_ARG := $(if $(DECODE_L),--max-context-length $(DECODE_L))
@@ -85,6 +88,7 @@ help:
 	@echo "  RUNTIME=xrt|hsa       Dispatch runtime (default: xrt)"
 	@echo "  DECODE_ELF=1          (xrt) mlir-air's full-ELF decode instead of the xclbin"
 	@echo "  ENGINE=triton|auto    Prefill engine (default: triton; auto = fused where available)"
+	@echo "  DECODE=npu|gpu|superkernel Decode (default: npu, mlir-air's)"
 	@echo "  BACKEND=npu|hetero|cpu Where the Triton prefill's operators run (default: npu)"
 	@echo "  OPS=all|matmul,...    Which operators go to the NPU (default: the model's)"
 	$(if $(CHAT),@echo "  SYSTEM=\"...\"          System prompt for chat")

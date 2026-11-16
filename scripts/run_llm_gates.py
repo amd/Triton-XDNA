@@ -82,6 +82,7 @@ PR_CASES = {
         "triton-gpu",
         "igpu-gpu",
         "decode-vs-prefill",
+        "superkernel",
     },
 }
 
@@ -229,6 +230,17 @@ def plan(ex, spec, fused):
                 SHARED,
                 SHOW_IGPU,
                 npu_decode=True,
+            )
+        )
+    if spec.superkernel_decoder:
+        # The Triton prefill and this repo's superkernel decode, gated on the
+        # same continuation. Triton builds the decode: no mlir-air build.
+        cases.append(
+            Case(
+                "superkernel",
+                entry + ["--prefill-engine", "triton", "--decode", "superkernel"] + gen,
+                d,
+                HIDE_IGPU,
             )
         )
     if spec.engine == "fused_decode":

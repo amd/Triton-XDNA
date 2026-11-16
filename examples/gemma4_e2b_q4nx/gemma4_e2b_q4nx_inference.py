@@ -37,6 +37,12 @@ records it.
 `registry.ModelSpec.engine` says so and `tl.extra.npu.fused_decode` takes it as
 an argument.
 
+It also has a second decode, this repo's own: `--decode superkernel` runs
+`superkernel_decode/`, the same 35 layers and LM head in one dispatch a token,
+written in Triton as a superkernel (`tl.extra.air`) on air-FLM's dataflow. It
+stands in for mlir-air's `FusedDecoder` under mlir-air's `generate()`, and
+needs no `make compile-decode`: Triton compiles it on its first token.
+
 Its driver takes the same `kv_arrays` handoff Qwen3's and Gemma3's do: no
 handoff parameter, so the harness substitutes the one prefill function it
 calls. On this model that handoff is a pair of LISTS rather than stacked

@@ -109,6 +109,13 @@ class ModelSpec:
     #: environment, where the shared engine takes them from its model table.
     #: The op owns that split; see `tl.extra.npu.DecodeEngine`.
     engine: str = "fused_decode"
+    #: `--decode superkernel`: this repo's decode of the model, written in
+    #: Triton as one superkernel, as `"module:Class"` importable from the
+    #: example's directory. The class stands in for the driver's
+    #: `FusedDecoder` (constructor `(model=, max_L=)`, `seed_kv`, `dispatch`,
+    #: `close`), so mlir-air's `generate()` drives it unchanged. Empty where
+    #: there is none.
+    superkernel_decoder: str = ""
 
     def decode_config(self, context_length, dynseq=None):
         """This spec as a `tl.extra.npu.DecodeConfig`.
@@ -450,6 +457,7 @@ GEMMA4_E2B = ModelSpec(
     # per-token patching hsaco dispatch has no counterpart for; the HSA decode
     # runs only the shared engine's scratchpad ELF (see hsa_decode.py).
     supports_hsa=False,
+    superkernel_decoder="superkernel_decode:SuperkernelDecoder",
 )
 
 
