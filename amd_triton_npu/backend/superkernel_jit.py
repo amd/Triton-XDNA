@@ -514,6 +514,19 @@ def read(ttir, air_project_path, fp_fusion=False):
                 continue
             if loop is None and len(o.results) and o.results[0] in env:
                 continue  # a buffer of the function's body, made above
+            if n == "tt.call" and _callee(o).startswith("air.alloc."):
+                # A buffer of the wave's body: one for all waves, as those of
+                # the function's body, which herds and segment code share.
+                decl = funcs[_callee(o)]
+                elt = str(o.results[0].type).split("<")[1].rstrip(">")
+                env[o.results[0]] = sk.onchip(
+                    _callee(o),
+                    _attr(decl, "air.alloc_elements"),
+                    elt,
+                    _attr(decl, "air.memory_space"),
+                    _attr(decl, "air.memtile_col"),
+                )
+                continue
             if n == "tt.call" and (
                 _callee(o).startswith("air.channel.") or _callee(o) == "air.backend"
             ):
@@ -644,7 +657,7 @@ class _SegmentWriter:
         self.names, self.types = {}, {}
         self.args, self.binds, self.lines = [], [], []
         self.exports = []  # (name, local name, type)
-        self.writes = []  # the DDR tensors its gets fill
+        self.writes = []  # the tensors its gets fill
         self.n = 0
 
     def fresh(self):
@@ -653,9 +666,16 @@ class _SegmentWriter:
 
     def ref(self, v):
         """The local name of TTIR value `v`, an argument if from outside."""
+        from air.ir import OpResult
+
         if v in self.names:
             return self.names[v]
         if isinstance(self.env.get(v), ValueError):
+            # Arithmetic on run-time scalars from earlier in the wave (or
+            # hoisted before it): computed again here.
+            if isinstance(v, OpResult) and v.owner.name.startswith("arith."):
+                self.block([v.owner])
+                return self.names[v]
             raise self.env[v]
         name = f"%a{len(self.args)}"
         if v in self.exported:
@@ -865,7 +885,7 @@ class _SegmentWriter:
         i_ = [self.index(v) for v in idx]
         op = "air.channel.put" if _attr(decl, "air.dma_put") else "air.channel.get"
         target = self.env.get(buf)
-        if op == "air.channel.get" and isinstance(target, Tensor) and not target.onchip:
+        if op == "air.channel.get" and isinstance(target, Tensor):
             self.writes.append(target)
         self.lines.append(
             f"{op} @{ch}[{', '.join(i_)}] ({b}[{', '.join(o_)}] "

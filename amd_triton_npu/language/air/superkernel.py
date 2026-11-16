@@ -42,6 +42,8 @@ are set by the host at each launch (mark them `do_not_specialize` so that a
 new value does not recompile the dispatch).
 """
 
+import contextvars
+
 from triton._C.libtriton import ir
 from triton.language import core
 
@@ -124,11 +126,12 @@ def _fresh_symbol(module, prefix):
 
 # How deep code generation is in herds: their code is the cores'; code
 # outside them, in the superkernel or a function it calls, the segment's.
-_HERD = [0]
+# Per thread of compilation.
+_HERD = contextvars.ContextVar("air_herd_depth", default=0)
 
 
 def _in_herd():
-    return _HERD[0] > 0
+    return _HERD.get() > 0
 
 
 @core.builtin
@@ -144,13 +147,13 @@ def herd(fn, args, size, schedule, name=None, at=None, _semantic=None, _generato
     corner = None if at is None else tuple(_values(at))
     name = core._unwrap_if_constexpr(name) or f"{fn.__name__}_{step}"
     ctx = _PartitionContext(step, 0, _shape(size), schedule, corner, name)
-    _HERD[0] += 1
+    token = _HERD.set(_HERD.get() + 1)
     try:
         _generator.call_JitFunction(
             fn, list(_values(args)), kwargs={}, caller_context=ctx
         )
     finally:
-        _HERD[0] -= 1
+        _HERD.reset(token)
 
 
 @core.builtin

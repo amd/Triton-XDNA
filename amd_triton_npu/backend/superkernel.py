@@ -309,11 +309,17 @@ class Superkernel:
         self.items.append(("segment", seg))
 
     def _check_writers(self):
-        """Every on-chip tensor a call reads is written by some call."""
+        """Every on-chip tensor a call reads is written by some call or by
+        segment code."""
+        segs = [g for k, g in self.items if k == "segment"]
         for c in self.calls:
             for t in c.read:
-                if t.onchip and not any(t in x.written for x in self.calls):
-                    raise ValueError(f"{c.name} reads {t}, which no call writes")
+                if (
+                    t.onchip
+                    and not any(t in x.written for x in self.calls)
+                    and not any(t in g.writes for g in segs)
+                ):
+                    raise ValueError(f"{c.name} reads {t}, which nothing writes")
 
     def _phases(self):
         """The calls grouped into phases. Calls of one kernel at one shape on
@@ -992,7 +998,11 @@ def _channel_indices(c, off, n):
     per = [[] for _ in range(rank)]
     for x, k in terms:
         dim = next(
-            (d for d, p in enumerate(places) if k % p == 0 and 0 < k // p < _RADIX),
+            (
+                d
+                for d, p in enumerate(places)
+                if k % p == 0 and 0 < abs(k // p) < _RADIX
+            ),
             None,
         )
         if dim is None:
@@ -1332,6 +1342,25 @@ def _strides_of(t):
     return None if any(k < 0 for k in st) else st
 
 
+def _whole_transfer(op, buf):
+    """Whether vector transfer `op` reads or writes all of buffer `buf`, in
+    order: no mask, every index 0, the vector of the buffer's shape, and the
+    identity permutation."""
+    from air.ir import AffineMap, AffineMapAttr, MemRefType, VectorType
+
+    v = op.opview
+    vtype = op.results[0].type if op.name == "vector.transfer_read" else None
+    vtype = VectorType(vtype or v.valueToStore.type)
+    shape = MemRefType(buf.type).shape
+    return (
+        v.mask is None
+        and v.base == buf
+        and vtype.shape == shape
+        and all(_const(i) == 0 for i in v.indices)
+        and v.permutation_map == AffineMapAttr.get(AffineMap.get_identity(len(shape)))
+    )
+
+
 def _l1_copies(h, mine):
     """The copies in herd `h` between a channel's buffer of the core (an
     alloc whose other users are `air.channel` ops) and a view of one of the
@@ -1377,6 +1406,8 @@ def _l1_copies(h, mine):
             continue
         w = users[0]
         src, dst = r.operands[0], w.operands[1]
+        if not (_whole_transfer(r, src) and _whole_transfer(w, dst)):
+            continue
         for tmp, view in ((src, dst), (dst, src)):
             if channel_buffer(tmp) and _home_of(view, mine):
                 out.append(([w, r], tmp, view))
@@ -1401,7 +1432,7 @@ def _fold_constant_casts(op, seg):
     for c in _ops_named(op, "arith.index_cast"):
         src = c.operands[0]
         d = getattr(src.owner, "name", None)
-        if d != "arith.constant":
+        if d != "arith.constant" or not isinstance(c.results[0].type, IndexType):
             continue
         v = IntegerAttr(src.owner.attributes["value"]).value
         with InsertionPoint(c):
@@ -1469,12 +1500,11 @@ def _forward_private_vectors(seg):
                 r.block == w.block
                 and w.is_before_in_block(r)
                 and r.results[0].type == val.type
-                and r.operands[0] == buf
-                and all(_const(i) == 0 for i in r.operands[1:-1])
+                and _whole_transfer(r, buf)
                 for r in reads
             ):
                 continue
-            if not all(_const(i) == 0 for i in w.operands[2:]):
+            if not _whole_transfer(w, buf):
                 continue
             for r in reads:
                 r.results[0].replace_all_uses_with(val)

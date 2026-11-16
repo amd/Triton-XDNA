@@ -26,6 +26,12 @@ on the NPU and compares with numpy:
   feed       the host puts DDR blocks into a channel a core gets, and gets
              the core's results back into DDR
   neighbours two neighbouring cores share an L1 buffer of the segment
+  reversed   two cores put into each other's FIFO (index 1 - program_id)
+  wave_alloc an L2 buffer allocated in the wave loop, written by one herd
+             and read by another
+  segment_fill segment code fills an L2 buffer from DDR that a herd reads
+  late_offset a get into DDR at an offset computed before the wave loop
+             from an int argument
   q4gemv     a core gets q4 weight blocks into a buffer of its own and
              reads them in parts: 32 rows of a GEMV, in vectors
   proj16     a GEMV on 16 cores: x broadcast through a memtile, weight
@@ -464,6 +470,32 @@ def merge(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.conste
 
 
 @triton.jit
+def m_src_rev(X, D: tl.constexpr, T: tl.constexpr):
+    p = tl.program_id(0)
+    for t in range(D // T):
+        x = tl.load(X + p * D + t * T + tl.arange(0, T))
+        air.ChannelPut("parts", x * 2, indices=[1 - p])
+
+
+@triton.jit
+def m_sink_sub(Y, D: tl.constexpr, T: tl.constexpr):
+    for t in range(D // T):
+        a = air.ChannelGet("parts", [T], tl.bfloat16, indices=[0])
+        b = air.ChannelGet("parts", [T], tl.bfloat16, indices=[1])
+        tl.store(Y + t * T + tl.arange(0, T), a - b)
+
+
+@triton.jit
+def reversed_(
+    X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr
+):
+    air.Channel("parts", size=[2])
+    for wave in range(NW):
+        air.herd(m_src_rev, (X, D, T), 2, S)
+        air.herd(m_sink_sub, (Y, D, T), 1, S)
+
+
+@triton.jit
 def g_src(X, D: tl.constexpr, T: tl.constexpr):
     i = tl.program_id(0)
     j = tl.program_id(1)
@@ -558,6 +590,43 @@ def wr(X, Sh, D: tl.constexpr):
 @triton.jit
 def rd(Sh, Y, D: tl.constexpr):
     tl.store(Y + tl.arange(0, D), tl.load(Sh + tl.arange(0, D)) + 1)
+
+
+@triton.jit
+def wave_alloc(
+    X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr
+):
+    for wave in range(NW):
+        h = air.alloc([D], tl.bfloat16, memory_space=air.L2)
+        air.herd(wr, (X, h, D), 1, S, name="wr")
+        air.herd(rd, (h, Y, D), 1, S, name="rd")
+
+
+@triton.jit
+def segment_fill(
+    X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr
+):
+    air.Channel("inp")
+    h = air.alloc([D], tl.bfloat16, memory_space=air.L2)
+    for wave in range(NW):
+        air.ChannelPut("inp", X, offsets=[0], sizes=[D])
+        air.ChannelGet("inp", h, offsets=[0], sizes=[D])
+        air.herd(rd, (h, Y, D), 1, S, name="rd")
+
+
+@triton.jit(do_not_specialize=["k"])
+def late_offset(
+    X, Y, k, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr
+):
+    air.Channel("inp")
+    air.Channel("out")
+    base = k * T
+    for wave in range(NW):
+        for t in range(D // T):
+            air.ChannelPut("inp", X, offsets=[t * T], sizes=[T])
+        air.herd(dbl, (D, T), 1, S, name="dbl")
+        for t in range(D // T):
+            air.ChannelGet("out", Y, offsets=[base + t * T], sizes=[T])
 
 
 @triton.jit
@@ -948,6 +1017,13 @@ EXPLICIT = {
         lambda x: bf(bf(2 * x[:XD]) + bf(2 * x[XD:])),
         ["air.channel @parts [2]"],
     ),
+    "reversed": (
+        reversed_,
+        2 * XD,
+        XD,
+        lambda x: bf(bf(2 * x[XD:]) - bf(2 * x[:XD])),
+        ["air.channel @parts [2]"],
+    ),
     "gather": (
         gather,
         2 * XT,
@@ -956,7 +1032,7 @@ EXPLICIT = {
         [
             "air.channel.get  @halves[",
             "air.channel.put  @whole[] (%alloc",
-            "{air.memtile_col = 3 : i32}",
+            "air.memtile_col = 3 : i32",
         ],
     ),
     "neighbours": (
@@ -965,6 +1041,20 @@ EXPLICIT = {
         XD,
         lambda x: bf(bf(2 * x) + 1),
         ["memref<1024xbf16, 2 : i32>, memref<*xbf16>"],
+    ),
+    "wave_alloc": (
+        wave_alloc,
+        XD,
+        XD,
+        lambda x: bf(bf(2 * x) + 1),
+        ["memref<1024xbf16, 1 : i32>"],
+    ),
+    "segment_fill": (
+        segment_fill,
+        XD,
+        XD,
+        lambda x: bf(x + 1),
+        ["air.channel.get  @inp[] (%alloc"],
     ),
     "feed": (
         feed,
@@ -1003,6 +1093,29 @@ def q4_ref(x, q, scale, mn):
     xg = x.reshape(8, 32)
     part = bf(np.einsum("gcr,gc->gr", q.T.reshape(8, 32, 32).astype(np.float32), xg))
     return (part * scale + mn * bf(xg.sum(1))[:, None]).sum(0)
+
+
+def run_late_offset(script, has_npu, proj):
+    k = 1
+    rng = np.random.default_rng(4)
+    x0 = bf(rng.standard_normal(XD))
+    x = _bfx(x0)
+    y = torch.zeros(XD + XT, dtype=torch.bfloat16)
+    kw = dict(NW=2, D=XD, T=XT, S=script)
+    text = module_text(late_offset, (x, y, k), kw, proj)
+    check("air.channel.get  @out[] (%arg" in text, "late_offset: the gets go to DDR")
+    if not has_npu:
+        return
+    from triton.backends.amd_triton_npu.driver_scope import driver_scope
+
+    with driver_scope("npu"):
+        late_offset[(1,)](x, y, k, **kw)
+    got = y.to(torch.float32).numpy()
+    want = np.concatenate([np.zeros(XT), bf(2 * x0)])
+    check(
+        bool(np.array_equal(got, want)),
+        "late_offset: NPU result at the run-time offset k * T",
+    )
 
 
 def run_q4gemv(script, has_npu, proj):
@@ -1172,7 +1285,7 @@ def error_checks(script, direct, proj):
     x = torch.empty(D, dtype=torch.bfloat16)
     common = dict(NW=WAVES, D=D, DP=DP, S=script)
     bad = [
-        ("unwritten", unwritten, (x,), "which no call writes"),
+        ("unwritten", unwritten, (x,), "which nothing writes"),
         ("overlap", overlap, (x,), "overlaps"),
         ("two shapes", two_shapes, (x,), "is given"),
         ("wave and scalar", wave_and_scalar, (x, x, 3), "only ints from constants"),
@@ -1255,6 +1368,8 @@ def main():
             for name in EXPLICIT:
                 print(f"{name}:", flush=True)
                 run_explicit(name, direct, has_npu, os.path.join(tmp, name))
+            print("late_offset:", flush=True)
+            run_late_offset(direct, has_npu, os.path.join(tmp, "late_offset"))
             print("q4gemv:", flush=True)
             run_q4gemv(vector, has_npu, os.path.join(tmp, "q4gemv"))
             print("proj16:", flush=True)
