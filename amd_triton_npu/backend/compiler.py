@@ -90,28 +90,23 @@ def _ttir_to_ttsharedir(mod):
         return Path(dst_path).read_text()
 
 
+# `%r = arith.mulf %a, %b [fastmath<flags>] : type`, as printed.
+_FP_OP = re.compile(r"(arith\.(?:mulf|addf|subf) [^:\n]*?)(?: fastmath<([a-z,]+)>)? :")
+
+
 def _allow_fp_contraction(ttsharedir: str) -> str:
     """`ttsharedir` with its float multiplies, adds and subtracts marked
     `contract` (`enable_fp_fusion`): the AIE lowering may then fuse a multiply
-    into the add that takes it."""
-    from air.ir import Attribute, Context, Module, WalkResult
+    into the add that takes it.
 
-    with Context():
-        module = Module.parse(ttsharedir)
+    Done on the text: the module may hold triton-shared's types and
+    attributes (tptr), which only triton-shared's tools can parse."""
 
-        def mark(op):
-            if op.name in ("arith.mulf", "arith.addf", "arith.subf"):
-                flags = {"contract"}
-                if "fastmath" in op.attributes:
-                    old = str(op.attributes["fastmath"])
-                    flags |= set(old[old.index("<") + 1 : -1].split(",")) - {"none"}
-                op.attributes["fastmath"] = Attribute.parse(
-                    f"#arith.fastmath<{','.join(sorted(flags))}>"
-                )
-            return WalkResult.ADVANCE
+    def mark(m):
+        flags = set((m.group(2) or "").split(",")) - {"", "none"} | {"contract"}
+        return f"{m.group(1)} fastmath<{','.join(sorted(flags))}> :"
 
-        module.operation.walk(mark)
-        return module.operation.get_asm(enable_debug_info=True)
+    return _FP_OP.sub(mark, ttsharedir)
 
 
 def _optimize_ttsharedir(ttsharedir: str, metadata):

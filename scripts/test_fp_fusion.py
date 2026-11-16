@@ -4,8 +4,9 @@
 """`enable_fp_fusion` (on unless set off): a kernel compiled with it has its
 float multiplies, adds and subtracts marked `contract`, which lets mlir-aie
 fuse a multiply into the add that takes it; without it they carry no such
-flag. Checked on the ttsharedir of a kernel, and on the AIR module of a
-superkernel, whose kernels are compiled when it is first launched.
+flag. Checked on the ttsharedir of a kernel, also of one holding
+triton-shared's tptr, and on the AIR module of a superkernel, whose kernels
+are compiled when it is first launched.
 
 Needs no NPU.
 
@@ -46,6 +47,13 @@ def arith_superkernel(X, W, Y, Z, D: tl.constexpr, DP: tl.constexpr, S: tl.const
         air.herd(T.sub, (X, Y, Z, D, DP, False), 1, S, name="sub")
 
 
+@triton.jit
+def ptr_select(X, Y, F, D: tl.constexpr):
+    r = tl.arange(0, D)
+    p = tl.where(tl.load(F) > 0, X, Y)
+    tl.store(Y + r, tl.load(p + r) * 2.0 + 1.0)
+
+
 def contracted(text):
     """Whether every float multiply, add and subtract of `text` is marked
     contract, and whether any is."""
@@ -58,9 +66,30 @@ def contracted(text):
     return bool(ops) and all(marked), any(marked)
 
 
+def flags_kept():
+    """Flags an op already has stay, with `contract` added."""
+    from triton.backends.amd_triton_npu.compiler import _allow_fp_contraction
+
+    text = (
+        "%0 = arith.mulf %a, %b fastmath<fast> : vector<16xbf16>\n"
+        "%1 = arith.addf %0, %c fastmath<none> : bf16\n"
+        "%2 = arith.subf %1, %d : f32 loc(#loc3)\n"
+        "%3 = arith.divf %2, %e : f32\n"
+    )
+    want = (
+        "%0 = arith.mulf %a, %b fastmath<contract,fast> : vector<16xbf16>\n"
+        "%1 = arith.addf %0, %c fastmath<contract> : bf16\n"
+        "%2 = arith.subf %1, %d fastmath<contract> : f32 loc(#loc3)\n"
+        "%3 = arith.divf %2, %e : f32\n"
+    )
+    T.check(_allow_fp_contraction(text) == want, "flags an op has are kept")
+
+
 def main():
     from triton.backends.amd_triton_npu.config import config_context
     from triton.backends.amd_triton_npu.driver_scope import driver_scope
+
+    flags_kept()
 
     os.environ.setdefault("AMD_TRITON_NPU_TARGET", "npu2")
     x, w, y, z = (torch.zeros(DP, dtype=torch.bfloat16) for _ in range(4))
@@ -95,6 +124,17 @@ def main():
                 + ("every" if fusion else "no")
                 + " float op marked contract",
             )
+    # triton-shared leaves tptr in the ttsharedir of a kernel that selects
+    # between pointers; no parser outside triton-shared's tools reads it.
+    with driver_scope("npu"), config_context(compile_only=True):
+        c = ptr_select.warmup(x, y, w, D=DP, grid=(1,))
+    text = c.asm["ttsharedir"]
+    text = text.decode() if isinstance(text, bytes) else text
+    every, _ = contracted(text)
+    T.check(
+        "tptr" in text and every,
+        "a kernel whose ttsharedir holds tptr: every float op marked contract",
+    )
     if T.failures:
         print(f"{T.failures} check(s) failed")
         sys.exit(1)
