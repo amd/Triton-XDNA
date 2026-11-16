@@ -21,8 +21,9 @@ evaluate exactly, it rejects.
 
 The launch keeps its shim ops in the order given, each its own task, and the
 host waits for a channel's task before it starts the one two after it. So the
-channels of one task go first (their tasks are never waited for), then the
-others' tasks in the order the cores take them.
+channels whose tasks are never waited for go first (a read channel of one
+task, a write channel of up to two), then the others' tasks in the order the
+cores take them.
 
 The transfers of one stream are those on one DDR argument, in one direction,
 that depend on the same herd coordinates: a read that depends only on the row
@@ -306,6 +307,8 @@ def _collect(seg):
             read, ddr = t
             if d.results and list(d.results[0].uses):
                 raise ValueError(f"a transfer whose token is used: {d}")
+            if list(d.opview.async_dependencies):
+                raise ValueError(f"a transfer that waits for tokens: {d}")
             if nx is None or ny is None:
                 raise ValueError("a herd of non-constant size moves DDR data")
             arg = _root(ddr)
@@ -565,6 +568,7 @@ def _lower_streams(module, name):
     i32 = IntegerType.get_signless(32)
     sblock = seg.regions[0].blocks[0]
     first = list(sblock.operations)[0]
+    dead = []  # the DDR views only the transfers used, erased at the end
     term = list(sblock.operations)[-1]
     seg_op = next(
         o for o in launch.regions[0].blocks[0].operations if o.operation == seg
@@ -592,7 +596,9 @@ def _lower_streams(module, name):
             raise ValueError(f"stream {nm}: a write must depend on both coordinates")
         # the cores of one instance must see one sequence
         per = {}
-        for (inst, core), seq in s.seq.items():
+        for core in ((cx, cy) for cx in range(nx) for cy in range(ny)):
+            inst = tuple(core[d] for d in s.dims)
+            seq = s.seq.get((inst, core), [])
             if inst in per and per[inst] != seq:
                 raise ValueError(f"stream {nm}: the cores of one broadcast differ")
             per.setdefault(inst, seq)
@@ -655,15 +661,13 @@ def _lower_streams(module, name):
                 )
             ddr = getattr(d.opview, "src" if s.read else "dst")
             d.erase()
-            # and the DDR views only it used
-            while (
+            # and the DDR views only it used (with the views they are of)
+            if (
                 isinstance(ddr, OpResult)
                 and ddr.owner.name in _VIEWS
                 and not list(ddr.uses)
             ):
-                view = ddr.owner
-                ddr = view.operands[0]
-                view.erase()
+                dead.append(ddr.owner)
         ddr = _launch_value(launch, s.arg)
         if s.read:
             # memtile: a ring of two buffers per instance, in the memtile of
@@ -731,11 +735,19 @@ def _lower_streams(module, name):
                         )
                     _, sz, st, place = rows[0][t]
                     seq.append((bases[0], [ny] + list(sz), [dy] + list(st), place))
-                # (the shim's writes are not paced: they go with the first)
-                for p, _ in _shim_ops(seq, eb) if seq else []:
-                    once.append((k, ChannelGet, f"{nm}_ddr", ddr, p, x))
-    # the channels of one task first, stream by stream; then the paced ones in
-    # the order the cores take them, a round's instances in turn
+                # a channel's writes of up to two tasks are never waited for
+                # before the end: they go first; more are paced
+                gets = _shim_ops(seq, eb) if seq else []
+                if len(gets) <= 2:
+                    once += [(k, ChannelGet, f"{nm}_ddr", ddr, p, x) for p, _ in gets]
+                else:
+                    paced += [
+                        (place, k, x, ChannelGet, f"{nm}_ddr", ddr, p)
+                        for p, place in gets
+                    ]
+    # the channels whose tasks are never waited for first, stream by stream;
+    # then the paced ones in the order the cores take them, a round's
+    # instances in turn
     ops = [(op, ch, ddr, p, j) for _, op, ch, ddr, p, j in once]
     ops += [
         (op, ch, ddr, p, j)
@@ -744,4 +756,15 @@ def _lower_streams(module, name):
     for op, ch, ddr, (o, sz, st), j in ops:
         with InsertionPoint(seg_op):
             op(ch, ddr, offsets=o, sizes=sz, strides=st, indices=[j])
+    for view in dead:
+        src = view.operands[0]
+        view.erase()
+        while (
+            isinstance(src, OpResult)
+            and src.owner.name in _VIEWS
+            and not list(src.uses)
+        ):
+            view = src.owner
+            src = view.operands[0]
+            view.erase()
     return streams

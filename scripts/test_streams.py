@@ -112,6 +112,27 @@ def test_eval_integer_semantics():
         vals = [_eval(o.result, []) for o in ops if len(o.results)]
     _, _, d, e, _, b, _, n = vals
     assert (d, e, b, n) == ((1 << 31) - 1, (1 << 32) - 1, 1, 44), vals
+    # a value is its type's bits: casts truncate and sign-extend, and an
+    # unsigned result compares as those bits
+    text = """
+    func.func @f() {
+      %big = arith.constant 4294967296 : index
+      %t32 = arith.index_cast %big : index to i32
+      %t = arith.constant true
+      %s = arith.extsi %t : i1 to i32
+      %m = arith.constant -1 : i32
+      %one = arith.constant 1 : i32
+      %q = arith.divui %m, %one : i32
+      %eq = arith.cmpi eq, %q, %m : i32
+      %neg = arith.cmpi slt, %q, %one : i32
+      return
+    }"""
+    with Context():
+        m = Module.parse(text)
+        ops = list(m.body.operations[0].regions[0].blocks[0].operations)
+        vals = [_eval(o.result, []) for o in ops if len(o.results)]
+    _, t32, _, s, _, _, q, eq, neg = vals
+    assert (t32, s, q, eq, neg) == (0, -1, -1, True, True), vals
 
 
 def _seq(bases, sizes, strides):
@@ -616,6 +637,8 @@ RECAST = HEAD + """
 
 def test_view_of_a_view():
     text, _ = _lower(RECAST)
+    # both views go with the transfer
+    assert "offset: 512" not in text[text.index("air.herd") :]
     assert _moved(text, "s0_ddr") == {
         y: list(range(16 * y, 16 * y + 16)) for y in range(2)
     }
@@ -748,6 +771,61 @@ ASYNC = HEAD + """
 def test_transfer_waited_for():
     with _raises("token is used"):
         _lower(ASYNC)
+
+
+# A transfer that waits for another op's token.
+WAITS = HEAD + """
+          %o = arith.muli %y, %c16 : index
+          %t = air.wait_all async
+          air.dma_memcpy_nd [%t] (%la[] [] [], %fa[%o] [%c16] [%one])
+              : (memref<16xbf16, 2>, memref<1024xbf16>)
+""" + TAIL
+
+
+def test_transfer_that_waits():
+    with _raises("waits for tokens"):
+        _lower(WAITS)
+
+
+# A row's read that only the first column's cores make.
+FIRST_COLUMN = HEAD + """
+          %o = arith.muli %y, %c16 : index
+          %x0 = arith.cmpi eq, %x, %c0 : index
+          scf.if %x0 {
+            air.dma_memcpy_nd (%la[] [] [], %fa[%o] [%c16] [%one])
+                : (memref<16xbf16, 2>, memref<1024xbf16>)
+          }
+""" + TAIL
+
+
+def test_broadcast_to_cores_that_dont_read():
+    with _raises("broadcast differ"):
+        _lower(FIRST_COLUMN)
+
+
+# Each core writes three tiles, 256 apart: three tasks a column, paced in
+# the cores' order, the columns in turn.
+THREE_WRITES = HEAD + """
+          %fc = memref.reinterpret_cast %hc to offset: [0], sizes: [1024], strides: [1]
+              : memref<*xf32> to memref<1024xf32>
+          %c3 = arith.constant 3 : index
+          %c256 = arith.constant 256 : index
+          scf.for %k = %c0 to %c3 step %one {
+            %xo = arith.muli %x, %c16 : index
+            %yo = arith.muli %y, %c8 : index
+            %ko = arith.muli %k, %c256 : index
+            %xy = arith.addi %xo, %yo : index
+            %o = arith.addi %xy, %ko : index
+            air.dma_memcpy_nd (%fc[%o] [%c8] [%one], %lc[] [] [])
+                : (memref<1024xf32>, memref<8xf32, 2>)
+          }
+""" + TAIL
+
+
+def test_paced_writes():
+    text, _ = _lower(THREE_WRITES)
+    ops = [(i, o[-1]) for _, _, i, o, _, _ in _shim_ops(text)]
+    assert ops == [(x, 16 * x + 256 * k) for k in range(3) for x in range(2)], ops
 
 
 def test_herds_of_different_names():

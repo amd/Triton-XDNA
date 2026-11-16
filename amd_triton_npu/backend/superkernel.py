@@ -2040,11 +2040,10 @@ def _eval(v, env, resolve=None):
         raise ValueError(f"can't evaluate {v}")
     op = v.owner
     name = op.name
-    if name == "arith.constant":
-        return IntegerAttr(op.attributes["value"]).value
-    a = [_eval(o, env, resolve) for o in op.operands]
 
-    def width(x):  # bits of value x's type; index is 64
+    # An integer is held as the signed value of its type's bits (index: 64);
+    # unsigned ops look at the unsigned view of their operands.
+    def width(x):
         from air.ir import IntegerType
 
         try:
@@ -2052,20 +2051,22 @@ def _eval(v, env, resolve=None):
         except ValueError:
             return 64
 
-    def u(x, w):  # x as an unsigned w-bit value
+    def u(x, w):  # the unsigned view of w bits
         return x % (1 << w)
 
-    def signed(x, w):  # x as a signed w-bit value
+    def signed(x, w):  # the signed value of w bits
         x = u(x, w)
-        return x - (1 << w) if w > 1 and x >> (w - 1) else x
+        return x - (1 << w) if x >> (w - 1) else x
 
+    w = width(op.result) if len(op.results) == 1 else 64
+    if name == "arith.constant":
+        return signed(IntegerAttr(op.attributes["value"]).value, w)
+    a = [_eval(o, env, resolve) for o in op.operands]
     w0 = width(op.operands[0]) if len(op.operands) else 64
-    if name in ("arith.index_cast", "arith.extsi"):
-        return signed(a[0], w0)
+    if name in ("arith.index_cast", "arith.extsi", "arith.trunci"):
+        return signed(a[0], w)
     if name in ("arith.index_castui", "arith.extui"):
-        return u(a[0], w0)
-    if name == "arith.trunci":
-        return signed(a[0], width(op.result))
+        return signed(u(a[0], w0), w)
 
     def trunc_div(x, y):  # rounds toward zero, as the hardware
         q = abs(x) // abs(y)
@@ -2084,7 +2085,7 @@ def _eval(v, env, resolve=None):
         "arith.minsi": lambda: min(a[0], a[1]),
     }
     if name in ops:
-        return ops[name]()
+        return signed(ops[name](), w)
     if name == "arith.select":
         return a[1] if a[0] else a[2]
     if name == "arith.cmpi":
