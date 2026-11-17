@@ -495,6 +495,13 @@ def main(argv=None) -> int:
         "copies vs shared buffers"
     )
     print("=" * 64)
+    # Before torch.cuda.is_available(): under XRT the driver holds the NPU,
+    # which ROCm would otherwise take on its first GPU call.
+    try:
+        triton.runtime.driver.set_active(NPUDriver(args.runtime))
+    except RuntimeError as e:
+        print(f"  SKIP: the {args.runtime} runtime is unavailable: {e}")
+        return SKIP_EXIT_CODE
     # Checked before the first iGPU allocation below, since that is the point
     # where an absent device stops being a question and starts being a
     # traceback. A host with no iGPU has declined this benchmark, not failed
@@ -513,9 +520,9 @@ def main(argv=None) -> int:
     )
     print(f"  iters    : {args.iters} (plus {args.warmup} warmup)")
 
-    # Availability is probed here and only here: binding the driver and
-    # allocating one shared element are what fail on a host without this
-    # runtime, and everything after is the thing being measured.
+    # Availability is probed here and only here: allocating one shared element
+    # is what fails on a host without this runtime, and everything after is
+    # the thing being measured.
     #
     # Deliberately narrow, because SharedBufferError is a RuntimeError and so
     # is almost everything a Triton compile or an NPU dispatch raises. Wrapping
@@ -524,7 +531,6 @@ def main(argv=None) -> int:
     # run" rather than as a failure. shared_buffer_test.py scopes its own probe
     # the same way, for the same reason.
     try:
-        triton.runtime.driver.set_active(NPUDriver(args.runtime))
         shared.empty(
             1, dtype=torch.float32, device=f"{args.runtime}:0", share="hip:0"
         ).close()
