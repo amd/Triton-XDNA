@@ -262,6 +262,8 @@ runs:
         # The host side of the NPU prefills, as Triton kernels on triton-cpu,
         # against numpy at Gemma4-E2B's shapes. No NPU, no weights.
         ( cd examples/llm_q4nx && python3 test_host_kernels.py )
+        # ... and the dense models' (Llama, Qwen3, Phi-4, Gemma3) steps.
+        ( cd examples/llm_q4nx && python3 test_dense_host_kernels.py )
 
         if [ "$DEVICE" = "aie2p" ]; then
           # Which decode artifact the example asks mlir-air for. Needs no NPU,

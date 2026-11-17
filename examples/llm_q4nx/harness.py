@@ -758,7 +758,16 @@ def fused_prefill_cls(cfg, prefill_cls, config, triton=False):
     """
     import triton.language as tl
 
-    if triton:
+    if triton and config.dense:
+        # mlir-air's dense device, built from Triton.
+        from dense_fused_prefill import _dense, fused_prefill_class
+        from dense_triton_fused import triton_fused_prefill
+
+        desc = _dense()[1].MODELS[config.dense]
+        built = triton_fused_prefill(config.model, desc, config.max_len)
+        tag = "triton-fused-prefill"
+        cls = fused_prefill_class(prefill_cls, config.dense, triton=True)
+    elif triton:
         # The same device with its GEMMs and LM head compiled from Triton.
         from gemma4_fused_prefill import Gemma4TritonFusedPrefill as cls
         from gemma4_triton_fused import triton_fused_prefill
@@ -853,8 +862,9 @@ def build_parser(doc, backends=("cpu", "npu", "hetero")):
         "one-device chunked NPU prefill (tl.extra.npu.fused_prefill), handing "
         "its KV to the decode the way the Triton prefill does; --backend, "
         "--ops and --profile do not apply to it and are refused. "
-        "triton-fused (Gemma4): a one-device chunked prefill whose ops "
-        "all come from Triton (gemma4_triton_fused), run by Triton-XDNA "
+        "triton-fused: a one-device chunked prefill whose ops all come from "
+        "Triton (gemma4_triton_fused for Gemma4, dense_triton_fused for the "
+        "models mlir-air's dense fused prefill runs), run by Triton-XDNA "
         "with its host math as Triton kernels on the CPU. igpu: the "
         "whole prefill in Triton on the iGPU, writing the KV cache in the "
         "layout both decodes read. auto "
@@ -994,10 +1004,6 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             raise SystemExit(
                 f"--prefill-engine {args.prefill_engine}: mlir-air has no fused "
                 f"prefill for {cfg.MODEL_NAME}."
-            )
-        if args.prefill_engine == "triton-fused" and fused.dense:
-            raise SystemExit(
-                "--prefill-engine triton-fused is built for Gemma4 models only."
             )
         if getattr(args, "interactive", False):
             raise SystemExit(
