@@ -1115,6 +1115,17 @@ def _hold_xrt_device() -> None:
             logger.debug("could not open the NPU for XRT up front: %s", e)
 
 
+def _release_xrt_device_hold() -> None:
+    """Drop the hold so ROCR can open the node for HSA.
+
+    XRT closes the node only when nothing else in the process uses the device;
+    live XRT sessions and buffers keep it open.
+    """
+    global _xrt_device_hold
+    with _xrt_device_hold_lock:
+        _xrt_device_hold = None
+
+
 def _npu_busy_hint(error: BaseException) -> str:
     """Explain an EBUSY from opening the NPU, or return "" for any other error.
 
@@ -3292,9 +3303,11 @@ class NPUDriver(DriverBase):
         # Do this once, up front, so every later XRT consumer in the process
         # sees a sane environment (see _neutralize_hostile_xilinx_xrt).
         _neutralize_hostile_xilinx_xrt()
+        # See _hold_xrt_device. Under HSA, ROCR opens the node itself.
         if runtime == "xrt":
-            # See _hold_xrt_device. Under HSA, ROCR opens the node itself.
             _hold_xrt_device()
+        else:
+            _release_xrt_device_hold()
         self.utils = NPUUtils()
         # Triton instantiates the launcher as ``launcher_cls(src, metadata)`` and
         # never passes the driver, so bind the chosen runtime here.
