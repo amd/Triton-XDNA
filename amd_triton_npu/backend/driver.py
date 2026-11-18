@@ -1087,6 +1087,103 @@ NPU_MODELS = {
 NPU_AGENT_NAMES = {"aie2": "npu1", "aie2p": "npu2"}
 
 
+# amdxdna allows one open of an NPU device node per process; a second open in
+# the same process fails with EBUSY. XRT shares one open across the process,
+# but ROCR opens the node for its AIE agent on the first GPU call and keeps it,
+# after which XRT cannot open the NPU. NPUDriver("xrt") opens the device up
+# front and holds it, so creating the driver before any GPU use avoids this.
+_xrt_device_hold = None
+_xrt_device_hold_lock = threading.Lock()
+
+
+def _hold_xrt_device() -> None:
+    """Open XRT device 0 and keep it open for the life of the process.
+
+    Best effort: if this fails, the first real open reports the error.
+    """
+    global _xrt_device_hold
+    if not sys.platform.startswith("linux"):
+        return
+    with _xrt_device_hold_lock:
+        if _xrt_device_hold is not None:
+            return
+        try:
+            import pyxrt
+
+            _xrt_device_hold = pyxrt.device(0)
+        except Exception as e:
+            logger.debug("could not open the NPU for XRT up front: %s", e)
+
+
+def _release_xrt_device_hold() -> None:
+    """Drop the hold so ROCR can open the node for HSA.
+
+    XRT closes the node only when nothing else in the process uses the device;
+    live XRT sessions and buffers keep it open.
+    """
+    global _xrt_device_hold
+    with _xrt_device_hold_lock:
+        _xrt_device_hold = None
+
+
+def _npu_busy_hint(error: BaseException) -> str:
+    """Explain an EBUSY from opening the NPU, or return "" for any other error.
+
+    Only when this process already has an NPU node open; names ROCR as the
+    holder if it is loaded.
+    """
+    text = str(error)
+    if "err=-16" not in text and "resource busy" not in text.lower():
+        return ""
+    nodes = set()
+    try:
+        fds = os.listdir("/proc/self/fd")
+    except OSError:
+        return ""
+    for fd in fds:
+        try:
+            path = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:  # closed since the listing
+            continue
+        if path.startswith("/dev/accel/"):
+            nodes.add(path)
+    nodes = sorted(nodes)
+    if not nodes:
+        return ""
+    try:
+        with open("/proc/self/maps") as f:
+            rocr = next(
+                (line.split()[-1] for line in f if "libhsa-runtime64" in line), None
+            )
+    except OSError:
+        rocr = None
+    holder = (
+        f"the ROCm runtime ({rocr}), which opens it for its AIE agent the "
+        "first time the GPU is used (torch.cuda.is_available(), a GPU tensor, "
+        "hipInit)"
+        if rocr
+        else "a library other than XRT"
+    )
+    return (
+        f"{', '.join(nodes)} is already open in this process, by {holder}. "
+        "The amdxdna driver allows one open per process, so XRT cannot open "
+        "the NPU here. Create the NPU driver before the first GPU call "
+        "(NPUDriver() then holds the device for XRT), or dispatch through "
+        'ROCm with NPUDriver("hsa").'
+    )
+
+
+def _explain_npu_busy(error: BaseException) -> BaseException:
+    """``error`` with _npu_busy_hint() appended, or ``error`` itself if none."""
+    hint = _npu_busy_hint(error)
+    if not hint:
+        return error
+    try:
+        return type(error)(f"{error}\n{hint}")
+    except Exception:
+        return RuntimeError(f"{error}\n{hint}")
+
+
 @functools.lru_cache(maxsize=1)
 def _pyxrt_device_name() -> str:
     """Return the device name XRT reports for device 0.
@@ -2447,6 +2544,16 @@ _NO_HWCTX = "CREATE_HWCTX"
 
 def _launch_with_session(key, mod, *launch_args):
     """Launch ``mod``, keeping the number of live XRT sessions bounded."""
+    try:
+        return _launch_bounded(key, mod, *launch_args)
+    except RuntimeError as e:
+        explained = _explain_npu_busy(e)
+        if explained is e:
+            raise
+        raise explained from e
+
+
+def _launch_bounded(key, mod, *launch_args):
     _note_session(key, mod)
     try:
         return mod.launch(*launch_args)
@@ -3196,6 +3303,11 @@ class NPUDriver(DriverBase):
         # Do this once, up front, so every later XRT consumer in the process
         # sees a sane environment (see _neutralize_hostile_xilinx_xrt).
         _neutralize_hostile_xilinx_xrt()
+        # See _hold_xrt_device. Under HSA, ROCR opens the node itself.
+        if runtime == "xrt":
+            _hold_xrt_device()
+        else:
+            _release_xrt_device_hold()
         self.utils = NPUUtils()
         # Triton instantiates the launcher as ``launcher_cls(src, metadata)`` and
         # never passes the driver, so bind the chosen runtime here.

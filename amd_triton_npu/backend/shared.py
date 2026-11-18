@@ -635,7 +635,15 @@ class _XrtAttachment(_Attachment):
         # shared_buffer_test.py pins down.
         if handle is None or isinstance(handle, int):
             self._index: int | None = 0 if handle is None else handle
-            device = pyxrt.device(self._index)
+            try:
+                device = pyxrt.device(self._index)
+            except RuntimeError as e:
+                from .driver import _npu_busy_hint
+
+                hint = _npu_busy_hint(e)
+                if not hint:
+                    raise
+                raise SharedBufferError(f"{e}\n{hint}") from e
         else:
             self._index = None
             device = handle
