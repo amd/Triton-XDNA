@@ -673,6 +673,25 @@ def neighbours(
 
 
 @triton.jit
+def snd(Sh, D: tl.constexpr):
+    air.ChannelPut("out", Sh, offsets=[0], sizes=[D])
+
+
+@triton.jit
+def send_shared(
+    X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constexpr
+):
+    # A herd sends its neighbour's L1 buffer through a channel: compiled
+    # alone, its kernel copies the buffer into one of its own and sends that.
+    air.Channel("out")
+    sh = air.alloc([D], tl.bfloat16, memory_space=air.L1)
+    for wave in range(NW):
+        air.herd(wr, (X, sh, D), 1, S, name="wr", at=(2, 2))
+        air.herd(snd, (sh, D), 1, S, name="snd", at=(3, 2))
+        air.ChannelGet("out", Y, offsets=[0], sizes=[D])
+
+
+@triton.jit
 def q4_group(xq, w, acc, t, sx, g):
     """Group g (32 columns) of a q4 block at w (2560 int16: scales [8][32]
     and mins [8][32] as bf16, then per group 8 words a row, word j of a row
@@ -1075,6 +1094,15 @@ EXPLICIT = {
         XD,
         lambda x: bf(bf(2 * x) + 1),
         ["memref<1024xbf16, 2 : i32>, memref<*xbf16>"],
+    ),
+    # The copies between a herd's buffer and its neighbour's stay, for aircc
+    # to make the cores': no DMA of one core may touch another's memory.
+    "send_shared": (
+        send_shared,
+        XD,
+        XD,
+        lambda x: bf(2 * x),
+        ["memref<1024xbf16, 2 : i32>, memref<1024xbf16, 2 : i32>)"],
     ),
     "wave_alloc": (
         wave_alloc,
