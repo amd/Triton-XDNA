@@ -302,7 +302,8 @@ EXAMPLES = [
             "Gemma3's block plus per-layer embeddings, layers that differ in "
             "shape from each other, and twenty that carry no KV cache of "
             "their own. Its decode runs on mlir-air's per-layer-embedding "
-            "engine rather than the shared one."
+            "engine rather than the shared one, or with --decode superkernel "
+            "as one Triton superkernel dispatch a token."
         ),
     },
     {

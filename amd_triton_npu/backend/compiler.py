@@ -90,6 +90,25 @@ def _ttir_to_ttsharedir(mod):
         return Path(dst_path).read_text()
 
 
+# `%r = arith.mulf %a, %b [fastmath<flags>] : type`, as printed.
+_FP_OP = re.compile(r"(arith\.(?:mulf|addf|subf) [^:\n]*?)(?: fastmath<([a-z,]+)>)? :")
+
+
+def _allow_fp_contraction(ttsharedir: str) -> str:
+    """`ttsharedir` with its float multiplies, adds and subtracts marked
+    `contract` (`enable_fp_fusion`): the AIE lowering may then fuse a multiply
+    into the add that takes it.
+
+    Done on the text: the module may hold triton-shared's types and
+    attributes (tptr), which only triton-shared's tools can parse."""
+
+    def mark(m):
+        flags = set((m.group(2) or "").split(",")) - {"", "none"} | {"contract"}
+        return f"{m.group(1)} fastmath<{','.join(sorted(flags))}> :"
+
+    return _FP_OP.sub(mark, ttsharedir)
+
+
 def _optimize_ttsharedir(ttsharedir: str, metadata):
     pattern = r"func.func @(\w+)\(.+"
     matches = re.findall(pattern, ttsharedir)
@@ -100,11 +119,11 @@ def _optimize_ttsharedir(ttsharedir: str, metadata):
 
 
 def _superkernel_ttir(mod, metadata):
-    """A superkernel's TTIR (see `tl.extra.npu.spatial`), or None for any
+    """A superkernel's TTIR (see `tl.extra.air`), or None for any
     other kernel. It is kept as TTIR: its launcher compiles each of its
     kernels on its own."""
     text = str(mod)
-    if "npu.partition" not in text:
+    if "air.herd" not in text:
         return None
     metadata["name"] = mod.get_entry_func_name()
     metadata["npu_superkernel"] = True
@@ -136,7 +155,7 @@ class NPUOptions:
     warp_size: int = 32  # TODO: Update to reflect NPU arch.
     backend_name: str = "npu"
     enable_warp_specialization: bool = False
-    enable_fp_fusion: bool = False
+    enable_fp_fusion: bool = True
     extern_libs = None
     cluster_dims: tuple = (1, 1, 1)
     shared: bool = False
@@ -242,9 +261,16 @@ class NPUBackend(BaseBackend):
             stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(
                 src, metadata, options
             )
+
+        def ttsharedir(src, metadata):
+            text = _ttir_to_ttsharedir(src)
+            if options.enable_fp_fusion:
+                text = _allow_fp_contraction(text)
+            return _optimize_ttsharedir(text, metadata)
+
         stages["ttsharedir"] = lambda src, metadata: _superkernel_ttir(
             src, metadata
-        ) or _optimize_ttsharedir(_ttir_to_ttsharedir(src), metadata)
+        ) or ttsharedir(src, metadata)
 
     @functools.lru_cache()
     def hash(self):

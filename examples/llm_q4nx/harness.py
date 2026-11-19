@@ -629,7 +629,13 @@ def generate_via_kv_arrays(air, spec, cfg, args, ids, prefiller, first, ttft):
     """
     import inspect
 
-    K, V = _install_shared_kv(air, prefiller)
+    # The prefill's own layout is mlir-air's decode's: another decoder takes
+    # the arrays.
+    K, V = (
+        (None, None)
+        if args.decode == "superkernel"
+        else _install_shared_kv(air, prefiller)
+    )
     if K is None:
         # No shared layout for this model: build the handoff arrays as before.
         K, V = prefiller.kv_stack()
@@ -838,11 +844,13 @@ def build_parser(doc, backends=("cpu", "npu", "hetero")):
     ap = argparse.ArgumentParser(description=doc)
     ap.add_argument(
         "--decode",
-        choices=("npu", "gpu"),
+        choices=("npu", "gpu", "superkernel"),
         default="npu",
         help="npu: mlir-air's fused decode, all layers in one dispatch. gpu: "
         "Triton on the iGPU, token by token, reading the KV cache in place "
-        "whichever engine prefilled it.",
+        "whichever engine prefilled it. superkernel: this repo's decode in "
+        "Triton, all layers in one superkernel dispatch, where the model has "
+        "one (registry.ModelSpec.superkernel_decoder).",
     )
     ap.add_argument(
         "--prefill-engine",
@@ -940,6 +948,22 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             "--prefill-engine igpu cannot be combined with --interactive: the "
             "interactive session is mlir-air's and hosts the Triton prefill only."
         )
+    if args.decode == "superkernel":
+        if not spec.superkernel_decoder:
+            raise SystemExit(
+                f"{cfg.MODEL_NAME} has no superkernel decode (registry.ModelSpec."
+                f"superkernel_decoder); use --decode npu."
+            )
+        if getattr(args, "interactive", False):
+            raise SystemExit(
+                "--decode superkernel cannot be combined with --interactive: "
+                "the interactive session is mlir-air's, with its own decoder."
+            )
+        if os.environ.get("AMD_TRITON_NPU_RUNTIME") == "hsa":
+            raise SystemExit(
+                "--decode superkernel dispatches through XRT; it cannot run "
+                "with AMD_TRITON_NPU_RUNTIME=hsa."
+            )
 
     # The HSA runtime needs an AIE-capable ROCR in the process, and torch's HIP
     # runs on the ROCR it ships with. One process holds one ROCR, so under HSA
@@ -1059,7 +1083,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         else air_inference_module(spec)
     )
 
-    if air is not None:
+    if air is not None and args.decode != "superkernel":
         # One model's artifacts under another's name decode to fluent nonsense
         # rather than failing, so check before the decoder loads them.
         decode_build.check_stamp(spec)
@@ -1084,6 +1108,16 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
                 engine=spec.engine,
                 model=spec.name,
             ),
+        )
+
+    # The superkernel decode stands in for the driver's decoder class the
+    # same way, so that the driver's own generate() runs it.
+    if args.decode == "superkernel":
+        mod, cls = spec.superkernel_decoder.split(":")
+        setattr(
+            air,
+            spec.decoder_class or "FusedDecoder",
+            getattr(importlib.import_module(mod), cls),
         )
 
     if args.interactive:

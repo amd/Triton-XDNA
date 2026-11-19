@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""The AIR module of a superkernel (see `tl.extra.npu.spatial`): several
+"""The AIR module of a superkernel (see `tl.extra.air.spatial`): several
 kernels in one NPU dispatch that loops over waves.
 
 `superkernel_jit` reads a superkernel's TTIR into a `Superkernel`: its
@@ -26,7 +26,11 @@ import os
 import re
 
 from .arg_access import read_args, written_args
-from .compiler import _optimize_ttsharedir, _ttir_to_ttsharedir
+from .compiler import (
+    _allow_fp_contraction,
+    _optimize_ttsharedir,
+    _ttir_to_ttsharedir,
+)
 from .config import config_context
 from .driver import _aircc_compile, _ttshared_to_air, detect_npu_version
 from .fused_device import (
@@ -76,19 +80,84 @@ class Tensor:
     """A flat tensor of `n` elements of `dtype`, an MLIR element type such as
     "bf16"."""
 
-    def __init__(self, name, n, dtype, onchip):
+    def __init__(self, name, n, dtype, onchip, space=1, col=None):
         self.name, self.n, self.dtype, self.onchip = name, n, dtype, onchip
+        self.space = space  # an on-chip tensor's memory space: 1 L2, 2 L1
+        self.col = col  # an L2 tensor's memtile column, if pinned
 
     def __repr__(self):
         return f"{'onchip' if self.onchip else 'ddr'}({self.name})"
+
+
+class _TileId:
+    """A program id of a kernel that runs one program a core: the core's
+    index in its herd along `axis`."""
+
+    def __init__(self, axis):
+        self.axis = axis
+
+    def __repr__(self):
+        return f"program_id({self.axis})"
+
+
+_TILE = {a: _TileId(a) for a in range(3)}
+
+
+class _Local:
+    """An L1 buffer of each core of the herds whose kernel allocates it, of
+    `n` elements of `dtype`. Stands as a placeholder buffer of the segment
+    until the herds get buffers of their own."""
+
+    def __init__(self, n, dtype, symbol):
+        self.n, self.dtype, self.space = n, dtype, 2
+        self.symbol = symbol  # the function that stands for it in the TTIR
+
+    def __repr__(self):
+        return f"local({self.n}x{self.dtype})"
+
+
+class _Channel:
+    """An AIR channel: a bundle of FIFOs of shape `size` between cores.
+    `n` and `dtype` give the placeholder buffer that stands for it until the
+    copies through it become puts and gets."""
+
+    def __init__(
+        self,
+        name,
+        size,
+        broadcast_shape,
+        channel_type,
+        buffer_resources,
+        tile_dma_channel=None,
+    ):
+        self.name, self.size = name, tuple(size)
+        self.broadcast_shape, self.channel_type = broadcast_shape, channel_type
+        self.buffer_resources = buffer_resources
+        self.tile_dma_channel = tile_dma_channel
+        self.n, self.dtype = 1, "i8"
+
+    def __repr__(self):
+        return f"channel({self.name})"
+
+
+class _Segment:
+    """Code of the segment between herds: the text of a func whose arguments
+    are the values it uses from outside (`binds`, each an int, a _Wave, a
+    _Scalar, an on-chip Tensor or the name of a buffer an earlier segment
+    code exports) and whose results are the buffers it exports by name."""
+
+    def __init__(self, text, binds, exports, where="segment"):
+        self.text, self.binds, self.exports = text, binds, exports
+        self.where = where  # "segment", or "launch" for the DDR transfers
 
 
 class _Call:
     """One call: its kernel's name, its compiled AIR module and how the
     module's func arguments bind to the superkernel's tensors and ints."""
 
-    def __init__(self, name, at, herd, air, binds, read, written):
+    def __init__(self, name, at, herd, air, binds, read, written, cores, spmd):
         self.name, self.at, self.herd, self.air = name, at, herd, air
+        self.cores, self.spmd = cores, spmd
         self.binds = binds  # per func argument: a Tensor, _Wave or _Scalar
         self.read = read  # the tensors the call reads
         self.written = written  # the tensors the call writes
@@ -121,14 +190,18 @@ class Superkernel:
     """A dispatch named `name` that runs `waves` waves of its calls. Build
     artifacts go to `air_project_path`."""
 
-    def __init__(self, name, air_project_path, waves):
+    def __init__(self, name, air_project_path, waves, fp_fusion=False):
         self.name, self.proj, self.waves = (
             name,
             os.path.abspath(air_project_path),
             waves,
         )
+        self.fp_fusion = fp_fusion  # enable_fp_fusion: compile with contraction
         self.tensors, self.calls = [], []
         self.scalars = []  # the func's int arguments after its buffers
+        self.channels = []
+        self.items = []  # ("call", _Call) and ("segment", _Segment), in order
+        self.backend = None  # air.backend's options, if given
 
     def scalar(self, name):
         """A new int argument of the func, set by the host at each dispatch."""
@@ -136,18 +209,43 @@ class Superkernel:
         self.scalars.append(v)
         return v
 
+    def channel(
+        self,
+        name,
+        size,
+        broadcast_shape=None,
+        channel_type=None,
+        buffer_resources=None,
+        tile_dma_channel=None,
+    ):
+        """A new AIR channel named `name`."""
+        if any(c.name == name for c in self.channels):
+            raise ValueError(f"a channel named {name} exists")
+        c = _Channel(
+            name,
+            size,
+            broadcast_shape,
+            channel_type,
+            buffer_resources,
+            tile_dma_channel,
+        )
+        self.channels.append(c)
+        return c
+
     def ddr(self, name, n, dtype):
         """A new buffer argument of the func, in DDR."""
         return self._tensor(name, n, dtype, False)
 
-    def onchip(self, name, n, dtype):
-        """A new tensor kept on chip in one L2 buffer."""
-        return self._tensor(name, n, dtype, True)
+    def onchip(self, name, n, dtype, space=1, col=None):
+        """A new tensor kept on chip in one buffer of the segment, in L2 (in
+        the memtile of column `col`, if given) or, for neighbouring cores, L1
+        (`space` 2)."""
+        return self._tensor(name, n, dtype, True, space, col)
 
-    def _tensor(self, name, n, dtype, onchip):
+    def _tensor(self, name, n, dtype, onchip, space=1, col=None):
         if any(t.name == name for t in self.tensors):
             raise ValueError(f"a tensor named {name} exists")
-        t = Tensor(name, n, dtype, onchip)
+        t = Tensor(name, n, dtype, onchip, space, col)
         self.tensors.append(t)
         return t
 
@@ -162,15 +260,24 @@ class Superkernel:
         _Wave, _Scalar or number), on the herd `herd` with corner `at`, compiled
         with the transform script at path `schedule` into `cores` (columns,
         rows) cores."""
-        ttshared = _optimize_ttsharedir(_ttir_to_ttsharedir(ttir), {})
+        ttshared = _ttir_to_ttsharedir(ttir)
+        if self.fp_fusion:
+            ttshared = _allow_fp_contraction(ttshared)
+        ttshared = _optimize_ttsharedir(ttshared, {})
+        ttshared = _allocate_locals(ttshared, args)
         with config_context(transform_tiling_script=schedule):
             m = _ttshared_to_air(ttshared, 1, 1, 1)
+        # A kernel that reads its program ids runs one program a core: its
+        # schedule compiles one program. Any other is split over its cores
+        # by its schedule.
+        spmd = any(isinstance(a, _TileId) for a in args)
+        want = (1, 1) if spmd else tuple(cores)
         for h in _ops_named(_entry(m), "air.herd"):
             shape = (_herd_width(h), _herd_height(h))
-            if shape != tuple(cores):
+            if shape != want:
                 raise ValueError(
                     f"{name}: its schedule makes a {shape[0]}x{shape[1]} herd "
-                    f"for {cores[0]}x{cores[1]} cores"
+                    f"for {want[0]}x{want[1]} cores"
                 )
         _bind_constants(m, args)
         kept = _drop_unused_scalars(_entry(m))
@@ -191,14 +298,28 @@ class Superkernel:
         for c2 in self.calls:
             if c2.herd == herd and c2.at != tuple(at):
                 raise ValueError(f"herd {herd} placed at {c2.at} and {at}")
-        self.calls.append(_Call(name, tuple(at), herd, str(m), binds, read, written))
+        call = _Call(
+            name, tuple(at), herd, str(m), binds, read, written, tuple(cores), spmd
+        )
+        self.calls.append(call)
+        self.items.append(("call", call))
+
+    def segment(self, seg):
+        """Add segment code, a `_Segment`, to the wave after the calls so far."""
+        self.items.append(("segment", seg))
 
     def _check_writers(self):
-        """Every on-chip tensor a call reads is written by some call."""
+        """Every on-chip tensor a call reads is written by some call or by
+        segment code."""
+        segs = [g for k, g in self.items if k == "segment"]
         for c in self.calls:
             for t in c.read:
-                if t.onchip and not any(t in x.written for x in self.calls):
-                    raise ValueError(f"{c.name} reads {t}, which no call writes")
+                if (
+                    t.onchip
+                    and not any(t in x.written for x in self.calls)
+                    and not any(t in g.writes for g in segs)
+                ):
+                    raise ValueError(f"{c.name} reads {t}, which nothing writes")
 
     def _phases(self):
         """The calls grouped into phases. Calls of one kernel at one shape on
@@ -230,9 +351,11 @@ class Superkernel:
 
     def module_text(self):
         """The AIR module of the whole dispatch, as text."""
+        from air.dialects import arith, memref
         from air.ir import (
             BoolAttr,
             Context,
+            InsertionPoint,
             IntegerAttr,
             IntegerType,
             Location,
@@ -243,7 +366,11 @@ class Superkernel:
         onchip = [t for t in self.tensors if t.onchip]
         with Context(), Location.unknown():
             i32 = IntegerType.get_signless(32)
-            top = Module.parse(self._skeleton(bufs, onchip))
+            owns = []  # the kernels' own L1 buffers
+            for c in self.calls:
+                owns += [b for b in c.binds if isinstance(b, _Local) and b not in owns]
+            holders = onchip + self.channels + owns
+            top = Module.parse(self._skeleton(bufs, holders))
             seg = _ops_named(_entry(top), "air.segment")[0]
             sblock = seg.regions[0].blocks[0]
             # The segment's arguments: the buffers, the wave, the scalars.
@@ -255,19 +382,67 @@ class Superkernel:
                 o for o in sblock.operations if o.operation.name == "memref.dealloc"
             )
             value = {id(t): sargs[i] for i, t in enumerate(bufs)}
-            for t, a in zip(onchip, allocs):
+            for t, a in zip(holders, allocs):
                 value[id(t)] = a.result
             for a in allocs:
                 # Not shrunk to its current uses: the copies that read and
                 # write it are only made later.
                 a.attributes["air.shrinkage"] = BoolAttr.get(False)
+            for t, a in zip(holders, allocs):
+                if getattr(t, "col", None) is not None:
+                    a.attributes["air.memtile_col"] = IntegerAttr.get(i32, t.col)
             wave = sargs[len(bufs)]
             for i, v in enumerate(self.scalars):
                 value[id(v)] = sargs[len(bufs) + 1 + i]
             phased = {}  # on-chip tensor id -> (phase loop, "in" or "out", tensors)
             loops = {}  # phase loop key -> (loop, its yield)
-            for g in self._phases():
-                self._add_phase_group(top, g, end, value, wave, phased, loops)
+            tiles = {}
+            with InsertionPoint.at_block_begin(sblock):
+                for a, t in _TILE.items():
+                    # Stand-ins for the program ids until the herds are
+                    # sized.
+                    c = arith.ConstantOp(i32, IntegerAttr.get(i32, -1 - a))
+                    tiles[a] = c.result
+                    value[id(t)] = c.result
+            groups = self._phases()
+            first = {id(g[0]): g for g in groups}
+            made = {}  # a segment's exported buffers, by name
+            # The launch's arguments: the buffers, the wave, the scalars.
+            launch = seg.operation.parent
+            nargs = len(bufs) + 1 + len(self.scalars)
+            largs = list(launch.regions[0].blocks[0].arguments)[-nargs:]
+            lvalue = {id(t): largs[i] for i, t in enumerate(bufs)}
+            for i, v in enumerate(self.scalars):
+                lvalue[id(v)] = largs[len(bufs) + 1 + i]
+            lwave = largs[len(bufs)]
+            for kind, item in self.items:
+                if kind == "segment" and item.where == "launch":
+                    _emit_segment(top, item, seg, lvalue, lwave, {}, self.channels)
+                elif kind == "segment":
+                    _emit_segment(top, item, end, value, wave, made, self.channels)
+                elif id(item) in first:
+                    self._add_phase_group(
+                        top, first[id(item)], end, value, wave, phased, loops
+                    )
+            with InsertionPoint(end):
+                for v in made.values():
+                    memref.DeallocOp(v)
+            spmd = {c.herd: c.cores for c in self.calls if c.spmd}
+            _bind_tile_ids(seg, tiles, spmd)
+            _lower_channels(top, seg, [(c, value[id(c)]) for c in self.channels])
+            homes = [
+                v for _, v in _lower_locals(seg, [(b, value[id(b)]) for b in owns])
+            ]
+            # and those the kernels allocate themselves, before their schedule
+            homes += [
+                o.results[0]
+                for o in _ops_named(seg, "memref.alloc")
+                if "air.local" in o.attributes
+            ]
+            shared = [value[id(t)] for t in onchip if t.space == 2]
+            _in_place(seg, homes, shared)
+            _forward_private_vectors(seg)
+            _scalar_transfers(seg)
             _hoist_ddr_reads(sblock, sargs[: len(bufs)], end)
             # A herd whose kernel took a DDR buffer directly now takes the
             # on-chip tensor's L2 buffer instead.
@@ -289,6 +464,7 @@ class Superkernel:
             _lower_edges(top, seg, edge_buffers, by_buffer)
             for n, d in enumerate(_ops_named(seg, "air.dma_memcpy_nd")):
                 d.attributes["id"] = IntegerAttr.get(i32, n + 1)
+            _fold_constant_casts(top.operation, seg)
             return str(top)
 
     def _add_phase_group(self, top, g, end, value, wave, phased, loops):
@@ -438,7 +614,7 @@ class Superkernel:
             + ["%sw=%bw"]
             + [f"%sr{i}=%br{i}" for i in range(ns)]
         )
-        l2 = [f"memref<{t.n}x{t.dtype}, 1 : i32>" for t in edges]
+        l2 = [f"memref<{t.n}x{t.dtype}, {getattr(t, 'space', 1)} : i32>" for t in edges]
         alloc = "".join(
             f"        %e{i} = memref.alloc() : {t}\n" for i, t in enumerate(l2)
         )
@@ -473,6 +649,7 @@ module {{
         bf16_emulation=None,
         extra_args=(),
         stack_size=2048,
+        feed_args=("--unroll-feed-loops", "--merge-contiguous-feeds"),
     ):
         """Compile with aircc. Returns the xclbin path and the path of the
         generated TXN header."""
@@ -496,8 +673,7 @@ module {{
                 # queue short.
                 extra_args=[
                     "--emit-txn-cpp",
-                    "--unroll-feed-loops",
-                    "--merge-contiguous-feeds",
+                    *feed_args,
                     *extra_args,
                 ],
                 runtime_loop_tiling_sizes=runtime_loop_tiling_sizes,
@@ -506,6 +682,46 @@ module {{
             os.chdir(cwd)
         header = os.path.join(self.proj, "air_project", f"npu.{self.name}.air.txn.h")
         return out["bin_path"], header
+
+
+def _emit_segment(top, sg, end, value, wave, made, channels):
+    """Put segment code `sg` before `end`, its arguments bound."""
+    from air.dialects import arith
+    from air.ir import InsertionPoint, IntegerAttr, IntegerType, Module
+
+    decls = "".join(
+        f"air.channel @{c.name} [{', '.join(map(str, c.size))}]\n" for c in channels
+    )
+    m = Module.parse(decls + sg.text)
+    f = next(o for o in m.body.operations if o.operation.name == "func.func")
+    block = f.regions[0].blocks[0]
+    i32 = IntegerType.get_signless(32)
+    const32 = lambda v: arith.ConstantOp(
+        i32, IntegerAttr.get(i32, v)
+    ).result  # noqa: E731
+    with InsertionPoint(end):
+        for a, b in zip(block.arguments, sg.binds):
+            if isinstance(b, str):
+                v = made[b]
+            elif isinstance(b, bool):
+                v = arith.ConstantOp(a.type, IntegerAttr.get(a.type, int(b))).result
+            elif isinstance(b, int):
+                v = arith.ConstantOp(a.type, IntegerAttr.get(a.type, b)).result
+            elif isinstance(b, _Wave):
+                v = _wave_value([b], wave, None, const32)
+                if str(a.type) == "i1":
+                    v = arith.cmpi(arith.CmpIPredicate.ne, v, const32(0))
+                elif str(a.type) != "i32":
+                    v = arith.extsi(a.type, v)
+            else:
+                v = value[id(b)]
+            a.replace_all_uses_with(v)
+    ops = list(block.operations)
+    ret = ops[-1]
+    for name, v in zip(sg.exports, ret.operands):
+        made[name] = v
+    for o in ops[:-1]:
+        o.operation.move_before(end)
 
 
 def _herd_height(h):
@@ -725,6 +941,822 @@ def _lower_edges(module, seg, edges, phased=None):
             hoisted[:] = [h for h in hoisted if h[0].operation != outer[0].operation]
             hoisted.append((outer[0], last))
         d.erase()
+
+
+_RADIX = 256  # as in tl.extra.air: a channel index's digits in its address
+
+_CASTS = (
+    "arith.index_cast",
+    "arith.index_castui",
+    "arith.extsi",
+    "arith.extui",
+    "arith.trunci",
+)
+
+
+def _linear(v):
+    """`v` as a constant plus a sum of values times constants: (constant,
+    [(value, factor)]), looking through additions, products with constants
+    and casts."""
+    from air.ir import IntegerAttr, OpResult
+
+    if isinstance(v, int):
+        return v, []
+    if isinstance(v, OpResult):
+        op, name = v.owner, v.owner.name
+        if name == "arith.constant":
+            return IntegerAttr(op.attributes["value"]).value, []
+        if name in _CASTS:
+            return _linear(op.operands[0])
+        if name in ("arith.addi", "arith.subi"):
+            c1, t1 = _linear(op.operands[0])
+            c2, t2 = _linear(op.operands[1])
+            sign = 1 if name == "arith.addi" else -1
+            return c1 + sign * c2, t1 + [(x, sign * k) for x, k in t2]
+        if name == "arith.muli":
+            c1, t1 = _linear(op.operands[0])
+            c2, t2 = _linear(op.operands[1])
+            if not t1:
+                return c1 * c2, [(x, c1 * k) for x, k in t2]
+            if not t2:
+                return c1 * c2, [(x, c2 * k) for x, k in t1]
+    return 0, [(v, 1)]
+
+
+def _channel_indices(c, off, n):
+    """The indices into channel `c` that a copy of `n` elements at offset
+    `off` of its placeholder stands for: the offset's digits of radix
+    _RADIX, each digit's place a multiple of `n`; and a put's dest, the
+    digit above them less one, or None. Emitted before the copy."""
+    from air.dialects import arith
+    from air.ir import IndexType, IntegerAttr
+
+    idx = IndexType.get()
+    rank = len(c.size) + 1
+    places = [n * _RADIX ** (rank - 1 - k) for k in range(rank)]
+    const, terms = _linear(off)
+    per = [[] for _ in range(rank)]
+    for x, k in terms:
+        dim = next(
+            (
+                d
+                for d, p in enumerate(places)
+                if k % p == 0 and 0 < abs(k // p) < _RADIX
+            ),
+            None,
+        )
+        if dim is None:
+            raise ValueError(f"{c}: an index the address does not encode: {off}")
+        per[dim].append((x, k // places[dim]))
+    if const % n:
+        raise ValueError(f"{c}: an offset of {const}, not a whole block of {n}")
+    q, digits = const // n, []
+    for _ in range(rank):
+        digits.insert(0, q % _RADIX)
+        q //= _RADIX
+    if q:
+        raise ValueError(f"{c}: more indices than its rank {rank - 1}")
+    out = []
+    for terms_, digit in zip(per, digits):
+        v = None
+        for x, m in terms_:
+            if x.type != idx:
+                x = arith.IndexCastOp(idx, x).result
+            if m != 1:
+                x = arith.MulIOp(
+                    x, arith.ConstantOp(idx, IntegerAttr.get(idx, m)).result
+                ).result
+            v = x if v is None else arith.AddIOp(v, x).result
+        if v is None or digit:
+            d = arith.ConstantOp(idx, IntegerAttr.get(idx, digit)).result
+            v = d if v is None else arith.AddIOp(v, d).result
+        out.append(v)
+    dest = None
+    if per[0] or digits[0]:
+        one = arith.ConstantOp(idx, IntegerAttr.get(idx, 1)).result
+        dest = arith.SubIOp(out[0], one).result
+    return out[1:], dest
+
+
+def _lower_channels(module, seg, chans):
+    """Declare each channel and turn the herds' copies to and from its
+    placeholder buffer into its puts and gets; drop the placeholders."""
+    from air.dialects.air import ChannelGet, ChannelPut, channel as channel_decl
+    from air.ir import ArrayAttr, InsertionPoint, IntegerAttr, IntegerType
+
+    i64 = IntegerType.get_signless(64)
+    for c, holder in chans:
+        with InsertionPoint.at_block_begin(module.body):
+            decl = channel_decl(c.name, size=list(c.size), channel_type=c.channel_type)
+        if c.broadcast_shape is not None:
+            decl.attributes["broadcast_shape"] = ArrayAttr.get(
+                [IntegerAttr.get(i64, d) for d in c.broadcast_shape]
+            )
+        if c.buffer_resources is not None:
+            decl.attributes["buffer_resources"] = IntegerAttr.get(
+                i64, c.buffer_resources
+            )
+        if c.tile_dma_channel is not None:
+            decl.attributes["air.tile_dma_channel"] = IntegerAttr.get(
+                i64, c.tile_dma_channel
+            )
+        for h in _ops_named(seg, "air.herd"):
+            body = h.regions[0].blocks[0]
+            first = len(body.arguments) - len(h.operands)
+            for i, v in enumerate(h.operands):
+                if v != holder:
+                    continue
+                for u in list(body.arguments[first + i].uses):
+                    d = u.owner
+                    if d.name != "air.dma_memcpy_nd":
+                        raise ValueError(f"{c}: used by {d.name}")
+                    put = d.opview.dst == body.arguments[first + i]
+                    side, other = ("dst", "src") if put else ("src", "dst")
+                    offs, sizes, strides = _dma_pattern(d, side)
+                    if len(offs) != 1 or strides[0] != 1:
+                        raise ValueError(f"{c}: a block that is not contiguous: {d}")
+                    o, sz, st = _dma_pattern(d, other)
+                    mem = getattr(d.opview, other)
+                    with InsertionPoint(d):
+                        ends, dest = _channel_indices(c, offs[0], sizes[0])
+                        if put:
+                            ChannelPut(
+                                c.name,
+                                mem,
+                                offsets=o,
+                                sizes=sz,
+                                strides=st,
+                                indices=ends,
+                                dest=dest,
+                            )
+                        else:
+                            if dest is not None:
+                                raise ValueError(f"{c}: a get with a dest: {d}")
+                            ChannelGet(
+                                c.name,
+                                mem,
+                                offsets=o,
+                                sizes=sz,
+                                strides=st,
+                                indices=ends,
+                            )
+                    d.erase()
+        for h in _ops_named(seg, "air.herd"):
+            ops = list(h.operands)
+            if any(v == holder for v in ops):
+                _drop_herd_operands(h, [i for i, v in enumerate(ops) if v == holder])
+        for u in list(holder.uses):
+            if u.owner.name != "memref.dealloc":
+                raise ValueError(f"{c}: its placeholder is used by {u.owner.name}")
+            u.owner.erase()
+        holder.owner.erase()
+
+
+def _lower_locals(seg, owns):
+    """Give each herd that takes a kernel's own L1 buffer (placeholders
+    `owns`) a buffer of its own, in its body. Returns those buffers, each
+    with the symbol of the kernel's allocation."""
+    from air.dialects import memref
+    from air.ir import InsertionPoint, IntegerAttr, IntegerType, MemRefType, Type
+
+    homes = []
+    i32 = IntegerType.get_signless(32)
+    for b, holder in owns:
+        t = MemRefType.get(
+            [b.n], Type.parse(b.dtype), memory_space=IntegerAttr.get(i32, 2)
+        )
+        for h in _ops_named(seg, "air.herd"):
+            ops = list(h.operands)
+            drop = [i for i, v in enumerate(ops) if v == holder]
+            if not drop:
+                continue
+            body = h.regions[0].blocks[0]
+            first = len(body.arguments) - len(ops)
+            for i in drop:
+                with InsertionPoint.at_block_begin(body):
+                    mine = memref.AllocOp(t, [], [])
+                body.arguments[first + i].replace_all_uses_with(mine.result)
+                _respace_views(mine.result)
+                homes.append((b.symbol, mine.result))
+            _drop_herd_operands(h, drop)
+        for u in list(holder.uses):
+            u.owner.erase()
+        holder.owner.erase()
+    return homes
+
+
+_VIEWS = ("memref.reinterpret_cast", "memref.subview", "memref.cast", "memref.view")
+
+
+def _allocate_locals(ttshared, args):
+    """Have kernel function `ttshared` allocate its own L1 buffers (the
+    arguments `args` gives as _Local) in its body, so that its schedule
+    places them with its other buffers. Each allocation is tagged with its
+    buffer's symbol. A kernel may read an int8 buffer as another type
+    (a pointer cast, which triton-shared leaves as an unrealized cast): that
+    use becomes a `memref.view` of the bytes."""
+    from air.dialects import arith, memref
+    from air.ir import Context, IndexType, InsertionPoint, IntegerAttr, Location
+    from air.ir import MemRefType, Module, StringAttr, Type, UnrankedMemRefType
+
+    own = [(i, a) for i, a in enumerate(args) if isinstance(a, _Local)]
+    if not own:
+        return ttshared
+    with Context() as ctx, Location.unknown():
+        ctx.allow_unregistered_dialects = True
+        m = Module.parse(ttshared)
+        f = next(
+            o
+            for o in m.body.operations
+            if o.operation.name == "func.func" and len(o.regions[0].blocks)
+        )
+        block = f.regions[0].blocks[0]
+        for i, b in own:
+            with InsertionPoint.at_block_begin(block):
+                a = memref.AllocOp(MemRefType.get([b.n], Type.parse(b.dtype)), [], [])
+            a.attributes["air.local"] = StringAttr.get(b.symbol)
+            arg = block.arguments[i]
+            for u in list(arg.uses):
+                op = u.owner
+                if op.name == "memref.reinterpret_cast":
+                    continue
+                if op.name != "builtin.unrealized_conversion_cast":
+                    raise ValueError(f"an L1 buffer of the kernel used by {op.name}")
+                if b.dtype != "i8":
+                    raise ValueError(
+                        "a kernel reads an L1 buffer as another type only if the "
+                        "buffer is int8"
+                    )
+                to = UnrankedMemRefType(op.results[0].type)
+                width = to.element_type.width // 8
+                with InsertionPoint(op):
+                    zero = arith.ConstantOp(
+                        IndexType.get(), IntegerAttr.get(IndexType.get(), 0)
+                    )
+                    view = memref.ViewOp(
+                        MemRefType.get([b.n // width], to.element_type),
+                        a.result,
+                        zero,
+                        [],
+                    )
+                    cast = memref.CastOp(op.results[0].type, view.result)
+                op.results[0].replace_all_uses_with(cast.result)
+                op.erase()
+            arg.replace_all_uses_with(a.result)
+        return str(m)
+
+
+def _respace_views(v):
+    """Give the views of buffer `v` (`memref.reinterpret_cast` and the
+    like, which triton-shared makes of a kernel's arguments) `v`'s memory
+    space."""
+    from air.ir import MemRefType
+
+    space = MemRefType(v.type).memory_space
+    for u in list(v.uses):
+        op = u.owner
+        if op.name not in _VIEWS:
+            continue
+        r = op.results[0]
+        t = MemRefType(r.type)
+        r.set_type(
+            MemRefType.get(
+                list(t.shape), t.element_type, layout=t.layout, memory_space=space
+            )
+        )
+        _respace_views(r)
+
+
+def _in_place(seg, homes, shared):
+    """Have the herds use their L1 buffers in place: their own (`homes`) and
+    the segment's shared L1 buffers (`shared`). A kernel compiled alone
+    copies between such a buffer and a buffer of its own, which a DMA of
+    the core cannot do. Where that buffer only takes a channel's get or
+    feeds its put, the get or put moves to the part of the L1 buffer and the
+    copy goes; otherwise the core copies."""
+    from air.dialects import linalg
+    from air.ir import InsertionPoint, MemRefType, OpResult
+
+    for h in _ops_named(seg, "air.herd"):
+        body = h.regions[0].blocks[0]
+        first = len(body.arguments) - len(h.operands)
+        mine = [x for x in homes if _within(x.owner, h)]
+        mine += [
+            body.arguments[first + i]
+            for i, v in enumerate(h.operands)
+            if any(v == x for x in shared)
+        ]
+        for c in _l1_copies(h, mine):
+            _copy_in_place(*c)
+        for d in _ops_named(h, "air.dma_memcpy_nd"):
+            dst, src = d.opview.dst, d.opview.src
+            side = next(
+                (
+                    k
+                    for k, v in (("dst", dst), ("src", src))
+                    if any(v == x for x in mine)
+                ),
+                None,
+            )
+            if side is None:
+                continue
+            home = dst if side == "dst" else src
+            tmp = src if side == "dst" else dst
+            if not (isinstance(tmp, OpResult) and tmp.owner.name == "memref.alloc"):
+                raise ValueError(f"a copy between a core's L1 buffer and {tmp}: {d}")
+            offs, sizes, strides = _dma_pattern(d, side)
+            tt = MemRefType(tmp.type)
+            if not sizes:
+                sizes, strides, offs = list(tt.shape), [1], [0]
+            others = [
+                u.owner
+                for u in tmp.uses
+                if u.owner != d.operation and u.owner.name != "memref.dealloc"
+            ]
+            fills = [o for o in others if o.name == "linalg.fill"]
+            transfers = [o for o in others if o.name.startswith("air.channel.")]
+            if others and len(fills) + len(transfers) == len(others) and transfers:
+                # The channel moves the data to or from the L1 buffer itself.
+                for o in offs:
+                    if not isinstance(o, int):
+                        _move_before(o, tmp.owner)
+                with InsertionPoint(tmp.owner):
+                    view = _view(home, offs, sizes, strides, tt)
+                for f in fills:
+                    f.erase()
+                alloc = tmp.owner
+                d.erase()
+                for u in list(tmp.uses):
+                    if u.owner.name == "memref.dealloc":
+                        u.owner.erase()
+                tmp.replace_all_uses_with(view)
+                alloc.erase()
+                continue
+            if list(tt.shape) != list(sizes):
+                raise ValueError(
+                    f"a copy of part of an L1 buffer into another shape: {d}"
+                )
+            with InsertionPoint(d):
+                view = _view(home, offs, sizes, strides, tt)
+                if side == "dst":
+                    linalg.copy(tmp, outs=[view])
+                else:
+                    linalg.copy(view, outs=[tmp])
+            d.erase()
+
+
+def _home_of(v, mine):
+    """The buffer of `mine` that `v` is a view of (through
+    `memref.reinterpret_cast` and `memref.subview`), and the view's static
+    element offset into it (None where it is not static); else None."""
+    from air.ir import OpResult
+
+    off = 0
+    while isinstance(v, OpResult) and v.owner.name in (
+        "memref.reinterpret_cast",
+        "memref.subview",
+    ):
+        op = v.owner.opview
+        so = list(op.static_offsets)
+        if v.owner.name == "memref.subview":
+            st = _strides_of(op.source.type)
+            if off is not None and st is not None and all(o >= 0 for o in so):
+                off += sum(o * k for o, k in zip(so, st))
+            else:
+                off = None
+        elif off is not None and so[0] >= 0:
+            off += so[0]
+        else:
+            off = None
+        v = op.source
+    if any(v == x for x in mine):
+        return v, off
+    return None
+
+
+def _strides_of(t):
+    """A memref type's static strides, or None."""
+    from air.ir import MemRefType
+
+    st, _ = MemRefType(t).get_strides_and_offset()
+    return None if any(k < 0 for k in st) else st
+
+
+def _whole_transfer(op, buf):
+    """Whether vector transfer `op` reads or writes all of buffer `buf`, in
+    order: no mask, every index 0, the vector of the buffer's shape, and the
+    identity permutation."""
+    from air.ir import AffineMap, AffineMapAttr, MemRefType, VectorType
+
+    v = op.opview
+    vtype = op.results[0].type if op.name == "vector.transfer_read" else None
+    vtype = VectorType(vtype or v.valueToStore.type)
+    shape = MemRefType(buf.type).shape
+    return (
+        v.mask is None
+        and v.base == buf
+        and vtype.shape == shape
+        and all(_const(i) == 0 for i in v.indices)
+        and v.permutation_map == AffineMapAttr.get(AffineMap.get_identity(len(shape)))
+    )
+
+
+def _l1_copies(h, mine):
+    """The copies in herd `h` between a channel's buffer of the core (an
+    alloc whose other users are `air.channel` ops) and a view of one of the
+    L1 buffers `mine`: `memref.copy` ops, or a whole-buffer
+    `vector.transfer_read` written whole by a `vector.transfer_write`. Each
+    as (ops to erase, the channel's buffer, the view)."""
+    from air.ir import MemRefType, OpResult
+
+    def channel_buffer(v):
+        if not (isinstance(v, OpResult) and v.owner.name == "memref.alloc"):
+            return False
+        users = [u.owner for u in v.uses]
+        return any(u.name.startswith("air.channel.") for u in users) and all(
+            u.name.startswith("air.channel.")
+            or u.name in ("memref.dealloc", "memref.copy", "linalg.copy")
+            or u.name == "memref.subview"
+            or u.name in ("vector.transfer_read", "vector.transfer_write")
+            for u in users
+        )
+
+    out = []
+    for loop in _ops_named(h, "scf.for"):
+        c = _tiled_copy(loop)
+        if c is None:
+            continue
+        src, dst, n = c
+        for tmp, view in ((src, dst), (dst, src)):
+            if (
+                channel_buffer(tmp)
+                and MemRefType(tmp.type).shape == [n]
+                and _home_of(view, mine)
+            ):
+                out.append(([loop], tmp, _prefix(view, n)))
+    for c in _ops_named(h, "memref.copy") + _ops_named(h, "linalg.copy"):
+        src, dst = c.operands[0], c.operands[1]
+        for tmp, view in ((src, dst), (dst, src)):
+            if channel_buffer(tmp) and _home_of(view, mine):
+                out.append(([c], tmp, view))
+    for r in _ops_named(h, "vector.transfer_read"):
+        res = r.results[0]
+        users = [u.owner for u in res.uses]
+        if len(users) != 1 or users[0].name != "vector.transfer_write":
+            continue
+        w = users[0]
+        src, dst = r.operands[0], w.operands[1]
+        if not (_whole_transfer(r, src) and _whole_transfer(w, dst)):
+            continue
+        for tmp, view in ((src, dst), (dst, src)):
+            if channel_buffer(tmp) and _home_of(view, mine):
+                out.append(([w, r], tmp, view))
+    # A buffer copied more than once is not just a channel's: it keeps them.
+    return [c for c in out if sum(c[1] == d[1] for d in out) == 1]
+
+
+def _fold_constant_casts(op, seg):
+    """Index casts of integer constants in `op`, as index constants, and
+    unused casts in segment `seg` dropped: AIR reads loop bounds and offsets
+    as constants only when they are, and a loop of the segment that only
+    re-sends a buffer as one re-sent buffer only when its body holds nothing
+    else that reads the loop's index. (The host's loops keep theirs: a
+    transfer of the host is not re-sent.)"""
+    from air.dialects import arith
+    from air.ir import IndexType, InsertionPoint, IntegerAttr
+
+    idx = IndexType.get()
+    for c in _ops_named(seg, "arith.index_cast"):
+        if not list(c.results[0].uses):
+            c.erase()
+    for c in _ops_named(op, "arith.index_cast"):
+        src = c.operands[0]
+        d = getattr(src.owner, "name", None)
+        if d != "arith.constant" or not isinstance(c.results[0].type, IndexType):
+            continue
+        v = IntegerAttr(src.owner.attributes["value"]).value
+        with InsertionPoint(c):
+            k = arith.ConstantOp(idx, IntegerAttr.get(idx, v)).result
+        c.results[0].replace_all_uses_with(k)
+        c.erase()
+
+
+def _scalar_transfers(seg):
+    """In the herds, vector reads and writes of a 0-d buffer (a reduction's
+    scalar result) as a scalar load and store."""
+    from air.dialects import memref, vector
+    from air.ir import InsertionPoint, MemRefType, VectorType
+
+    for h in _ops_named(seg, "air.herd"):
+        for r in _ops_named(h, "vector.transfer_read"):
+            src = r.operands[0]
+            if MemRefType(src.type).rank != 0:
+                continue
+            with InsertionPoint(r):
+                v = memref.LoadOp(src, []).result
+                b = vector.BroadcastOp(VectorType(r.results[0].type), v).result
+            r.results[0].replace_all_uses_with(b)
+            r.erase()
+        for w in _ops_named(h, "vector.transfer_write"):
+            dst = w.operands[1]
+            if MemRefType(dst.type).rank != 0:
+                continue
+            with InsertionPoint(w):
+                v = vector.ExtractOp(w.operands[0], [], []).result
+                memref.StoreOp(v, dst, [])
+            w.erase()
+
+
+def _forward_private_vectors(seg):
+    """In the herds, a buffer of the core that one vector write fills whole
+    and vector reads then read whole, in the same block: the reads take the
+    written vector, and the buffer goes."""
+    from air.ir import MemRefType, VectorType
+
+    for h in _ops_named(seg, "air.herd"):
+        for a in _ops_named(h, "memref.alloc"):
+            buf = a.results[0]
+            t = MemRefType(buf.type)
+            users = [u.owner.operation for u in buf.uses]
+            writes = [u for u in users if u.name == "vector.transfer_write"]
+            reads = [u for u in users if u.name == "vector.transfer_read"]
+            if len(writes) != 1 or not reads:
+                continue
+            if any(
+                u.name
+                not in (
+                    "vector.transfer_write",
+                    "vector.transfer_read",
+                    "memref.dealloc",
+                )
+                for u in users
+            ):
+                continue
+            w = writes[0]
+            val = w.operands[0]
+            if VectorType(val.type).shape != t.shape or w.operands[1] != buf:
+                continue
+            if not all(
+                r.block == w.block
+                and w.is_before_in_block(r)
+                and r.results[0].type == val.type
+                and _whole_transfer(r, buf)
+                for r in reads
+            ):
+                continue
+            if not _whole_transfer(w, buf):
+                continue
+            for r in reads:
+                r.results[0].replace_all_uses_with(val)
+                r.erase()
+            w.erase()
+            for u in list(buf.uses):
+                u.owner.erase()
+            a.erase()
+
+
+def _tiled_copy(loop):
+    """(source, destination, n) where `loop` copies the first n elements of
+    a 1-D buffer into another, a vector at a time: `scf.for` from 0 to n
+    whose body reads a subview of one at the induction variable and writes
+    it to the same subview of the other; else None."""
+    from air.ir import MemRefType
+
+    body = loop.regions[0].blocks[0]
+    ops = [o for o in body.operations if o.operation.name != "scf.yield"]
+    names = [o.operation.name for o in ops]
+    if sorted(names) != sorted(
+        [
+            "memref.subview",
+            "memref.subview",
+            "vector.transfer_read",
+            "vector.transfer_write",
+        ]
+    ):
+        return None
+    iv = body.arguments[0]
+    read = next(o for o in ops if o.operation.name == "vector.transfer_read")
+    write = next(o for o in ops if o.operation.name == "vector.transfer_write")
+    if write.operands[0] != read.results[0]:
+        return None
+    ends = []
+    for v in (read.operands[0], write.operands[1]):
+        sv = v.owner
+        if sv.name != "memref.subview" or list(sv.opview.offsets) != [iv]:
+            return None
+        if list(sv.opview.static_strides) != [1]:
+            return None
+        ends.append(sv.opview.source)
+    lb, ub = loop.operands[0], loop.operands[1]
+    n = [MemRefType(e.type).shape for e in ends]
+    if _const(lb) != 0 or any(len(x) != 1 or x[0] < _const(ub) for x in n):
+        return None
+    return ends[0], ends[1], _const(ub)
+
+
+def _prefix(view, n):
+    """The first `n` elements of 1-D `view`: itself, or a subview of it."""
+    from air.dialects import memref
+    from air.ir import InsertionPoint, MemRefType, StridedLayoutAttr
+
+    t = MemRefType(view.type)
+    if t.shape == [n]:
+        return view
+    st, off = t.get_strides_and_offset()
+    rt = MemRefType.get(
+        [n],
+        t.element_type,
+        layout=StridedLayoutAttr.get(off, st),
+        memory_space=t.memory_space,
+    )
+    with InsertionPoint.after(view.owner):
+        return memref.SubViewOp(rt, view, [], [], [], [0], [n], [1]).result
+
+
+def _copy_in_place(ops, tmp, view):
+    """Have the channel ops on buffer `tmp` move the data to or from `view`
+    itself (or the whole buffer it views), and drop the copy `ops`."""
+    from air.ir import MemRefType
+
+    for o in ops:
+        o.erase()
+    home, off = _home_of(view, _roots(view))
+    ht, vt = MemRefType(home.type), MemRefType(view.type)
+    st = _strides_of(view.type)
+    whole = (
+        off == 0
+        and st is not None
+        and list(vt.shape) == list(ht.shape)
+        and _contiguous(list(vt.shape), st)
+    )
+    target = home if whole else view
+    # The view, and what it is computed from, before the channel ops.
+    _move_before(target, tmp.owner)
+    for u in list(tmp.uses):
+        if u.owner.name == "memref.dealloc":
+            u.owner.erase()
+    tmp.replace_all_uses_with(target)
+    tmp.owner.erase()
+
+
+def _roots(v):
+    """The buffer at the root of view `v`."""
+    from air.ir import OpResult
+
+    while isinstance(v, OpResult) and v.owner.name in (
+        "memref.reinterpret_cast",
+        "memref.subview",
+    ):
+        v = v.owner.opview.source
+    return [v]
+
+
+def _view(home, offs, sizes, strides, like):
+    """A view of the part of buffer `home` at `offs` with `sizes` and
+    `strides`, of the element type and memory space of `like`."""
+    from air.dialects import arith, memref
+    from air.ir import (
+        IndexType,
+        IntegerAttr,
+        MemRefType,
+        ShapedType,
+        StridedLayoutAttr,
+    )
+
+    t = home.type if isinstance(home.type, MemRefType) else None
+    if (
+        t is not None
+        and t
+        == MemRefType.get(list(sizes), t.element_type, memory_space=t.memory_space)
+        and all(o == 0 for o in offs)
+        and _contiguous(sizes, strides)
+    ):
+        # The whole buffer: itself, so that AIR's locks on the buffer cover
+        # the transfer.
+        return home
+    idx = IndexType.get()
+    dyn = ShapedType.get_dynamic_stride_or_offset()
+    const = sum(o * s for o, s in zip(offs, strides) if isinstance(o, int))
+    at = arith.ConstantOp(idx, IntegerAttr.get(idx, const)).result
+    for o, st in zip(offs, strides):
+        if not isinstance(o, int):
+            k = arith.ConstantOp(idx, IntegerAttr.get(idx, st)).result
+            at = arith.AddIOp(at, arith.MulIOp(o, k).result).result
+    layout = StridedLayoutAttr.get(dyn, list(strides))
+    vt = MemRefType.get(
+        list(sizes), like.element_type, layout=layout, memory_space=like.memory_space
+    )
+    return memref.ReinterpretCastOp(
+        vt, home, [at], [], [], [dyn], list(sizes), list(strides)
+    ).result
+
+
+def _contiguous(sizes, strides):
+    want = 1
+    for n, st in reversed(list(zip(sizes, strides))):
+        if st != want:
+            return False
+        want *= n
+    return True
+
+
+def _move_before(v, anchor):
+    """Move the arithmetic and views that compute `v`, where they follow
+    `anchor` in the same block, before `anchor`."""
+    from air.ir import OpResult
+
+    if not isinstance(v, OpResult):
+        return
+    op = v.owner.operation
+    if op.block != anchor.operation.block or not (
+        op.name.startswith("arith.") or op.name in _VIEWS
+    ):
+        return
+    for x in op.operands:
+        _move_before(x, anchor)
+    if anchor.operation.is_before_in_block(op):
+        op.move_before(anchor.operation)
+
+
+def _within(op, h):
+    p = op.parent
+    while p is not None:
+        if p == h.operation:
+            return True
+        p = p.parent
+    return False
+
+
+def _bind_tile_ids(seg, tiles, shapes):
+    """Give the herds that run one program a core the shape `shapes` names
+    for them, and their program ids, stand-ins `tiles` by axis, the core's
+    index in the herd. The stand-ins are then erased."""
+    from air.dialects import arith
+    from air.ir import InsertionPoint, IntegerType
+
+    i32 = IntegerType.get_signless(32)
+    for h in _ops_named(seg, "air.herd"):
+        ops = list(h.operands)
+        body = h.regions[0].blocks[0]
+        first = len(body.arguments) - len(ops)
+        drop = []
+        for i, v in enumerate(ops):
+            a = next((ax for ax, t in tiles.items() if t == v), None)
+            if a is None:
+                continue
+            if a > 1:
+                raise ValueError("a herd has two axes; program_id(2) is not one")
+            with InsertionPoint.at_block_begin(body):
+                c = arith.IndexCastOp(i32, body.arguments[a])
+            body.arguments[first + i].replace_all_uses_with(c.result)
+            drop.append(i)
+        name = str(h.attributes["sym_name"]).strip('"')
+        if name in shapes:
+            _drop_herd_operands(h, drop, shapes[name])
+        elif drop:
+            raise ValueError(f"herd {name} reads program ids but runs one program")
+    for t in tiles.values():
+        if list(t.uses):
+            raise ValueError("a program id is used outside a herd")
+        t.owner.erase()
+
+
+def _drop_herd_operands(h, drop, shape=None):
+    """Rebuild herd `h` without its operands at positions `drop`, whose block
+    arguments must be unused, and as `shape` (columns, rows) if given."""
+    from air.dialects import arith
+    from air.dialects.air import HerdOp
+    from air.ir import DenseI32ArrayAttr, IndexType, InsertionPoint, IntegerAttr
+
+    op = h.operation
+    deps, nsizes, _ = list(DenseI32ArrayAttr(op.attributes["operandSegmentSizes"]))
+    if deps:
+        raise ValueError("an async herd at this stage")
+    operands = list(op.operands)
+    keep = [i for i in range(nsizes, len(operands)) if i not in drop]
+    sizes = operands[:nsizes]
+    with InsertionPoint(op):
+        if shape is not None:
+            idx = IndexType.get()
+            sizes = [
+                arith.ConstantOp(idx, IntegerAttr.get(idx, n)).result for n in shape
+            ]
+        new = HerdOp(None, [], sizes, [operands[i] for i in keep])
+    for a in _attr_names(op):
+        if a != "operandSegmentSizes":
+            new.operation.attributes[a] = op.attributes[a]
+    old = op.regions[0].blocks[0]
+    first = len(old.arguments) - len(operands)
+    kept_args = list(old.arguments[: first + nsizes]) + [
+        old.arguments[first + i] for i in keep
+    ]
+    block = new.regions[0].blocks.append(*[a.type for a in kept_args])
+    for a, b in zip(kept_args, block.arguments):
+        a.replace_all_uses_with(b)
+    for o in list(old.operations):
+        o.operation.detach_from_parent()
+        block.append(o.operation)
+    op.erase()
 
 
 # Offset of the payload in a core's packet buffer; the packet header is
