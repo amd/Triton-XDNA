@@ -388,6 +388,39 @@ def steps(X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.const
 
 
 @triton.jit
+def scale_at(X, W, Y, row, at, D: tl.constexpr, DP: tl.constexpr):
+    i = tl.arange(0, DP)
+    m = i < D
+    x = tl.load(X + i, mask=m)
+    tl.store(Y + at + i, x * tl.load(W + row * D + i, mask=m), mask=m)
+
+
+@triton.jit
+def add_halves(H, Z, D: tl.constexpr, DP: tl.constexpr):
+    i = tl.arange(0, DP)
+    m = i < D
+    tl.store(Z + i, tl.load(H + i, mask=m) + tl.load(H + D + i, mask=m), mask=m)
+
+
+@triton.jit
+def scale_halves(X, W, H, wave, D: tl.constexpr, DP: tl.constexpr):
+    for p in tl.static_range(2):
+        scale_at(X, W, H, wave * 2 + p, p * D, D, DP)
+
+
+@triton.jit
+def two_halves(
+    X, W, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
+):
+    # The two phases of one herd write the two halves of one on-chip tensor:
+    # where they land moves with the phase loop.
+    h = air.alloc([2 * D], tl.bfloat16, memory_space=air.L2)
+    for wave in range(NW):
+        air.herd(scale_halves, (X, W, h, wave, D, DP), 1, S)
+        air.herd(add_halves, (h, X, D, DP), 1, S)
+
+
+@triton.jit
 def src(X, D: tl.constexpr, T: tl.constexpr):
     for t in range(D // T):
         air.ChannelPut("toSink", tl.load(X + t * T + tl.arange(0, T)) * 2)
@@ -985,6 +1018,7 @@ CASES = {
     "table": (table, (2,), {"ROWS": ROWS}, ref_table, D),
     "multicore": (multicore, (), {}, ref_multicore, D2),
     "steps": (steps, (), {}, ref_steps, D),
+    "two_halves": (two_halves, (), {}, ref_phases, D),
 }
 
 
@@ -1284,6 +1318,8 @@ def ir_checks(name, text):
         check("arith.select" in text, "table: per-wave values selected")
     if name == "steps":
         check("air.disable_ping_pong" in text, "steps: a phase loop for s")
+    if name == "two_halves":
+        check("air.disable_ping_pong" in text, "two_halves: a phase loop")
     if name == "multicore":
         sizes = re.findall(r"air\.herd @(\w+) .*? in \(%\w+=(%\w+)", text)
         two = [h for h, s in sizes if re.search(rf"{s} = arith.constant 2 :", text)]
