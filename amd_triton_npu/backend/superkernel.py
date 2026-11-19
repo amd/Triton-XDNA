@@ -859,19 +859,16 @@ def _is_whole(op, side, n):
 def _lower_edges(module, seg, edges, phased=None):
     """Lower the L2-to-L2 copies to and from the on-chip tensors' buffers
     (`edges`). A reader's copy of a whole edge buffer is dropped, the reader
-    using the edge buffer directly. A copy whose destination moves with a
-    loop around cores becomes a channel with its get taken out of the loop.
-    Other copies stay, for aircc's air-dma-to-channel.
+    using the edge buffer directly. Other copies stay, for aircc's
+    air-dma-to-channel.
 
     `phased` maps an edge buffer id to (phase loop, "out", the buffer of each
     phase): a phase loop's output, sent by packet to the buffer its phase
     writes."""
-    from air.dialects.air import ChannelPut, channel as channel_decl
-    from air.ir import InsertionPoint, MemRefType
+    from air.ir import MemRefType
 
     phased = phased or {}
-    n, names = 0, []
-    hoisted = []  # (loop, the last copy taken out after it)
+    n = 0
 
     def inside(op, loop):
         p = op.parent
@@ -900,13 +897,12 @@ def _lower_edges(module, seg, edges, phased=None):
             dst.replace_all_uses_with(src)
             alloc.erase()
             continue
-        so, ss, st = _dma_pattern(d, "src")
-        do, ds, dt = _dma_pattern(d, "dst")
         pdst = phased.get(_edge_key(dst, edges))
         if pdst and pdst[1] == "out" and inside(d, pdst[0]):
             # A phase's output goes by packet to its phase's buffer.
             loop, _, per = pdst
-            if not _core_packet_out(module, loop, d, per, (do, ds, dt), f"out{n}"):
+            pattern = _dma_pattern(d, "dst")
+            if not _core_packet_out(module, loop, d, per, pattern, f"out{n}"):
                 raise ValueError(f"unsupported phase output: {d}")
             n += 1
             continue
@@ -918,37 +914,6 @@ def _lower_edges(module, seg, edges, phased=None):
                 "a copy into an on-chip tensor reads its writer's buffer at a "
                 f"place that moves with a loop around cores: {d}"
             )
-        outer = _placing_loops(d, "dst")
-        if not outer:
-            continue  # aircc's air-dma-to-channel makes it a put and a get
-        # The edge's end is a memtile DMA with fixed descriptors. Where a loop
-        # moves it, it is taken out into a loop of its own over the same trips,
-        # which aircc lowers to a ring of descriptors. The writer's end stays
-        # with the writes that fill its buffer. Copies of the same region of a
-        # writer's buffer into the same edge share a channel.
-        where = tuple(_static(v) for v in so)
-        key = (src, dst, where)
-        name = next(
-            (nm for k, nm in names if k[0] == src and k[1] == dst and k[2] == where),
-            None,
-        )
-        if name is None:
-            name = f"edge{n}"
-            n += 1
-            names.append((key, name))
-            with InsertionPoint.at_block_begin(module.body):
-                channel_decl(name, size=[1, 1])
-        with InsertionPoint(d):
-            ChannelPut(name, src, offsets=so, sizes=ss, strides=st, indices=[0, 0])
-        anchor = next(
-            (c for lp, c in hoisted if lp.operation == outer[0].operation), None
-        )
-        at = _after(anchor) if anchor is not None else _after(outer[0])
-        with InsertionPoint(at):
-            last = _get_loop(name, dst, (do, ds, dt), list(_trips(outer)))
-        hoisted[:] = [h for h in hoisted if h[0].operation != outer[0].operation]
-        hoisted.append((outer[0], last))
-        d.erase()
 
 
 _RADIX = 256  # as in tl.extra.air: a channel index's digits in its address
@@ -1954,23 +1919,6 @@ def _placing_loops(d, side):
     return []
 
 
-def _trips(loops, env=()):
-    """Yield every trip of loop nest `loops` as [(iv, value), ...], outer
-    index slowest. Bounds may depend on the indices of outer loops."""
-    env = list(env)
-    if not loops:
-        yield env
-        return
-    loop = loops[0]
-    try:
-        lo, hi, st = (_eval(v, env) for v in list(loop.operands)[:3])
-    except ValueError:
-        raise ValueError("an on-chip tensor is placed by a loop of unknown trip count")
-    iv = loop.regions[0].blocks[0].arguments[0]
-    for x in range(lo, hi, st):
-        yield from _trips(loops[1:], env + [(iv, x)])
-
-
 def _after(op):
     """The operation after `op` in its block."""
     block_ops = op.operation.block.operations
@@ -2061,75 +2009,6 @@ def _affine(e, dims, syms):
         if isinstance(e, cls):
             return f(_affine(e.lhs, dims, syms), _affine(e.rhs, dims, syms))
     raise ValueError(f"can't evaluate {e}")
-
-
-def _static(v):
-    """`v` as a hashable key: its value if constant, else its text."""
-    try:
-        return _eval(v, [])
-    except ValueError:
-        return str(v)
-
-
-def _get_loop(name, dst, pattern, trips):
-    """Emit one channel get into `dst` per trip in `trips`: an scf.for with affine offsets when the offsets move
-    linearly and sizes and strides are constant, otherwise one op per trip.
-    Returns the last op emitted."""
-    from air.dialects import arith
-    from air.dialects.affine import apply as affine_apply
-    from air.dialects.air import ChannelGet
-    from air.dialects.scf import for_, yield_
-    from air.ir import AffineConstantExpr, AffineDimExpr, AffineMap
-
-    vals = [[[_eval(v, env) for v in part] for part in pattern] for env in trips]
-    first = vals[0]
-    offs = []
-    for k in range(len(first[0])):
-        a = first[0][k]
-        b = vals[1][0][k] - a if len(vals) > 1 else 0
-        offs.append((a, b))
-    linear = all(
-        v[0][k] == a + b * t
-        for t, v in enumerate(vals)
-        for k, (a, b) in enumerate(offs)
-    ) and all(v[1] == first[1] and v[2] == first[2] for v in vals)
-    if not linear or len(vals) < 2:
-        last = None
-        for v in vals:
-            last = ChannelGet(
-                name, dst, offsets=v[0], sizes=v[1], strides=v[2], indices=[0, 0]
-            )
-        return last
-    c = arith.ConstantOp.create_index
-    for t in for_(c(0), c(len(vals)), c(1)):
-        o = [
-            (
-                a
-                if not b
-                else affine_apply(
-                    AffineMap.get(
-                        1,
-                        0,
-                        [
-                            AffineDimExpr.get(0) * AffineConstantExpr.get(b)
-                            + AffineConstantExpr.get(a)
-                        ],
-                    ),
-                    [t],
-                )
-            )
-            for a, b in offs
-        ]
-        ChannelGet(
-            name,
-            dst,
-            offsets=o,
-            sizes=first[1],
-            strides=first[2],
-            indices=[0, 0],
-        )
-        yield_([])
-    return t.owner.owner
 
 
 def _wave_value(per_phase, wave, ph, const32):
