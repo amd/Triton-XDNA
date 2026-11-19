@@ -1220,9 +1220,9 @@ def _in_place(seg, homes, shared):
     copies between such a buffer and a buffer of its own by DMA, which a
     core's DMA cannot do. Where that buffer only takes a channel's get or
     feeds its put, the get or put moves to the part of the L1 buffer and the
-    copy goes; otherwise the core copies. (A kernel's channel loads into its
-    own L1 buffers are forwarded before its schedule, by _forward_copies.)"""
-    from air.dialects import linalg
+    copy goes; otherwise the copy stays, and aircc's air-dma-to-channel has
+    the core make it. (A kernel's channel loads into its own L1 buffers are
+    forwarded before its schedule, by _forward_copies.)"""
     from air.ir import InsertionPoint, MemRefType, OpResult
 
     for h in _ops_named(seg, "air.herd"):
@@ -1277,18 +1277,6 @@ def _in_place(seg, homes, shared):
                         u.owner.erase()
                 tmp.replace_all_uses_with(view)
                 alloc.erase()
-                continue
-            if list(tt.shape) != list(sizes):
-                raise ValueError(
-                    f"a copy of part of an L1 buffer into another shape: {d}"
-                )
-            with InsertionPoint(d):
-                view = _view(home, offs, sizes, strides, tt)
-                if side == "dst":
-                    linalg.copy(tmp, outs=[view])
-                else:
-                    linalg.copy(view, outs=[tmp])
-            d.erase()
 
 
 def _whole_transfer(op, buf):
