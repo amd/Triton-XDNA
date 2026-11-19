@@ -63,28 +63,33 @@ def alloc(module, n):
     return S._ops_named(herd_of(module), "memref.alloc")[n].results[0]
 
 
-def in_place():
-    whole = """
-      %tmp = memref.alloc() : memref<32xbf16, 2>
-      air.channel.get @c[] (%tmp[] [] []) : (memref<32xbf16, 2>)
-      %home = memref.alloc() : memref<32xbf16, 2>
-      %v = vector.transfer_read %tmp[%c0], %pad {in_bounds = [true]} : memref<32xbf16, 2>, vector<32xbf16>
-      vector.transfer_write %v, %home[%c0] {in_bounds = [true]} : vector<32xbf16>, memref<32xbf16, 2>
+def forward_copies():
+    # A block loaded from a channel's address and stored into the kernel's own
+    # buffer unchanged, as triton-shared lowers it.
+    text = """
+func.func @k(%chan: memref<*xbf16>, %own: memref<*xbf16>) {
+  %c0 = arith.constant 0 : index
+  %src = memref.reinterpret_cast %chan to offset: [%c0], sizes: [256], strides: [1] : memref<*xbf16> to memref<256xbf16, strided<[1], offset: ?>>
+  %dst = memref.reinterpret_cast %own to offset: [0], sizes: [256], strides: [1] : memref<*xbf16> to memref<256xbf16, strided<[1]>>
+  %buf = memref.alloc() : memref<256xbf16>
+  memref.copy %src, %buf : memref<256xbf16, strided<[1], offset: ?>> to memref<256xbf16>
+  %t = bufferization.to_tensor %buf restrict writable : memref<256xbf16> to tensor<256xbf16>
+  bufferization.materialize_in_destination %t in writable %dst : (tensor<256xbf16>, memref<256xbf16, strided<[1]>>) -> ()
+  return
+}
 """
-    part = """
-      %tmp = memref.alloc() : memref<256xbf16, 2>
-      air.channel.get @c[] (%tmp[] [] []) : (memref<256xbf16, 2>)
-      %home = memref.alloc() : memref<32xbf16, 2>
-      %v = vector.transfer_read %tmp[%c32], %pad {in_bounds = [true]} : memref<256xbf16, 2>, vector<32xbf16>
-      vector.transfer_write %v, %home[%c0] {in_bounds = [true]} : vector<32xbf16>, memref<32xbf16, 2>
-"""
-    for body, want, what in (
-        (whole, 1, "a whole copy is removed"),
-        (part, 0, "a copy of 32 elements at 32 of 256 is kept"),
-    ):
-        m = Module.parse(herd_module(body))
-        got = S._l1_copies(herd_of(m), [alloc(m, 1)])
-        check(len(got) == want, f"in place: {what}")
+    own = S._Local(256, "bf16", "air.local.0")
+    got = S._forward_copies(text, ["chan", own])
+    check(
+        got.count("memref.copy") == 1
+        and "materialize_in_destination" not in got
+        and "memref.alloc" not in got,
+        "forward copies: a channel load stored into the kernel's buffer is one copy",
+    )
+    check(
+        S._forward_copies(text, ["chan", "ddr"]) == text,
+        "forward copies: a kernel without buffers of its own is left as it is",
+    )
 
 
 def forwarding():
@@ -161,7 +166,7 @@ def herd_depth():
 def main():
     with Context() as ctx, Location.unknown():
         ctx.allow_unregistered_dialects = True
-        in_place()
+        forward_copies()
         forwarding()
         index_casts()
     herd_depth()

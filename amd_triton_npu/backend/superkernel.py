@@ -1217,10 +1217,11 @@ def _forward_copies(ttshared, args):
 def _in_place(seg, homes, shared):
     """Have the herds use their L1 buffers in place: their own (`homes`) and
     the segment's shared L1 buffers (`shared`). A kernel compiled alone
-    copies between such a buffer and a buffer of its own, which a DMA of
-    the core cannot do. Where that buffer only takes a channel's get or
+    copies between such a buffer and a buffer of its own by DMA, which a
+    core's DMA cannot do. Where that buffer only takes a channel's get or
     feeds its put, the get or put moves to the part of the L1 buffer and the
-    copy goes; otherwise the core copies."""
+    copy goes; otherwise the core copies. (A kernel's channel loads into its
+    own L1 buffers are forwarded before its schedule, by _forward_copies.)"""
     from air.dialects import linalg
     from air.ir import InsertionPoint, MemRefType, OpResult
 
@@ -1233,8 +1234,6 @@ def _in_place(seg, homes, shared):
             for i, v in enumerate(h.operands)
             if any(v == x for x in shared)
         ]
-        for c in _l1_copies(h, mine):
-            _copy_in_place(*c)
         for d in _ops_named(h, "air.dma_memcpy_nd"):
             dst, src = d.opview.dst, d.opview.src
             side = next(
@@ -1292,43 +1291,6 @@ def _in_place(seg, homes, shared):
             d.erase()
 
 
-def _home_of(v, mine):
-    """The buffer of `mine` that `v` is a view of (through
-    `memref.reinterpret_cast` and `memref.subview`), and the view's static
-    element offset into it (None where it is not static); else None."""
-    from air.ir import OpResult
-
-    off = 0
-    while isinstance(v, OpResult) and v.owner.name in (
-        "memref.reinterpret_cast",
-        "memref.subview",
-    ):
-        op = v.owner.opview
-        so = list(op.static_offsets)
-        if v.owner.name == "memref.subview":
-            st = _strides_of(op.source.type)
-            if off is not None and st is not None and all(o >= 0 for o in so):
-                off += sum(o * k for o, k in zip(so, st))
-            else:
-                off = None
-        elif off is not None and so[0] >= 0:
-            off += so[0]
-        else:
-            off = None
-        v = op.source
-    if any(v == x for x in mine):
-        return v, off
-    return None
-
-
-def _strides_of(t):
-    """A memref type's static strides, or None."""
-    from air.ir import MemRefType
-
-    st, _ = MemRefType(t).get_strides_and_offset()
-    return None if any(k < 0 for k in st) else st
-
-
 def _whole_transfer(op, buf):
     """Whether vector transfer `op` reads or writes all of buffer `buf`, in
     order: no mask, every index 0, the vector of the buffer's shape, and the
@@ -1346,60 +1308,6 @@ def _whole_transfer(op, buf):
         and all(_const(i) == 0 for i in v.indices)
         and v.permutation_map == AffineMapAttr.get(AffineMap.get_identity(len(shape)))
     )
-
-
-def _l1_copies(h, mine):
-    """The copies in herd `h` between a channel's buffer of the core (an
-    alloc whose other users are `air.channel` ops) and a view of one of the
-    L1 buffers `mine`: `memref.copy` ops, or a whole-buffer
-    `vector.transfer_read` written whole by a `vector.transfer_write`. Each
-    as (ops to erase, the channel's buffer, the view)."""
-    from air.ir import MemRefType, OpResult
-
-    def channel_buffer(v):
-        if not (isinstance(v, OpResult) and v.owner.name == "memref.alloc"):
-            return False
-        users = [u.owner for u in v.uses]
-        return any(u.name.startswith("air.channel.") for u in users) and all(
-            u.name.startswith("air.channel.")
-            or u.name in ("memref.dealloc", "memref.copy", "linalg.copy")
-            or u.name == "memref.subview"
-            or u.name in ("vector.transfer_read", "vector.transfer_write")
-            for u in users
-        )
-
-    out = []
-    for loop in _ops_named(h, "scf.for"):
-        c = _tiled_copy(loop)
-        if c is None:
-            continue
-        src, dst, n = c
-        for tmp, view in ((src, dst), (dst, src)):
-            if (
-                channel_buffer(tmp)
-                and MemRefType(tmp.type).shape == [n]
-                and _home_of(view, mine)
-            ):
-                out.append(([loop], tmp, _prefix(view, n)))
-    for c in _ops_named(h, "memref.copy") + _ops_named(h, "linalg.copy"):
-        src, dst = c.operands[0], c.operands[1]
-        for tmp, view in ((src, dst), (dst, src)):
-            if channel_buffer(tmp) and _home_of(view, mine):
-                out.append(([c], tmp, view))
-    for r in _ops_named(h, "vector.transfer_read"):
-        res = r.results[0]
-        users = [u.owner for u in res.uses]
-        if len(users) != 1 or users[0].name != "vector.transfer_write":
-            continue
-        w = users[0]
-        src, dst = r.operands[0], w.operands[1]
-        if not (_whole_transfer(r, src) and _whole_transfer(w, dst)):
-            continue
-        for tmp, view in ((src, dst), (dst, src)):
-            if channel_buffer(tmp) and _home_of(view, mine):
-                out.append(([w, r], tmp, view))
-    # A buffer copied more than once is not just a channel's: it keeps them.
-    return [c for c in out if sum(c[1] == d[1] for d in out) == 1]
 
 
 def _fold_constant_casts(op, seg):
@@ -1474,102 +1382,6 @@ def _forward_private_vectors(seg):
             for u in list(buf.uses):
                 u.owner.erase()
             a.erase()
-
-
-def _tiled_copy(loop):
-    """(source, destination, n) where `loop` copies the first n elements of
-    a 1-D buffer into another, a vector at a time: `scf.for` from 0 to n
-    whose body reads a subview of one at the induction variable and writes
-    it to the same subview of the other; else None."""
-    from air.ir import MemRefType
-
-    body = loop.regions[0].blocks[0]
-    ops = [o for o in body.operations if o.operation.name != "scf.yield"]
-    names = [o.operation.name for o in ops]
-    if sorted(names) != sorted(
-        [
-            "memref.subview",
-            "memref.subview",
-            "vector.transfer_read",
-            "vector.transfer_write",
-        ]
-    ):
-        return None
-    iv = body.arguments[0]
-    read = next(o for o in ops if o.operation.name == "vector.transfer_read")
-    write = next(o for o in ops if o.operation.name == "vector.transfer_write")
-    if write.operands[0] != read.results[0]:
-        return None
-    ends = []
-    for v in (read.operands[0], write.operands[1]):
-        sv = v.owner
-        if sv.name != "memref.subview" or list(sv.opview.offsets) != [iv]:
-            return None
-        if list(sv.opview.static_strides) != [1]:
-            return None
-        ends.append(sv.opview.source)
-    lb, ub = loop.operands[0], loop.operands[1]
-    n = [MemRefType(e.type).shape for e in ends]
-    if _const(lb) != 0 or any(len(x) != 1 or x[0] < _const(ub) for x in n):
-        return None
-    return ends[0], ends[1], _const(ub)
-
-
-def _prefix(view, n):
-    """The first `n` elements of 1-D `view`: itself, or a subview of it."""
-    from air.dialects import memref
-    from air.ir import InsertionPoint, MemRefType, StridedLayoutAttr
-
-    t = MemRefType(view.type)
-    if t.shape == [n]:
-        return view
-    st, off = t.get_strides_and_offset()
-    rt = MemRefType.get(
-        [n],
-        t.element_type,
-        layout=StridedLayoutAttr.get(off, st),
-        memory_space=t.memory_space,
-    )
-    with InsertionPoint.after(view.owner):
-        return memref.SubViewOp(rt, view, [], [], [], [0], [n], [1]).result
-
-
-def _copy_in_place(ops, tmp, view):
-    """Have the channel ops on buffer `tmp` move the data to or from `view`
-    itself (or the whole buffer it views), and drop the copy `ops`."""
-    from air.ir import MemRefType
-
-    for o in ops:
-        o.erase()
-    home, off = _home_of(view, _roots(view))
-    ht, vt = MemRefType(home.type), MemRefType(view.type)
-    st = _strides_of(view.type)
-    whole = (
-        off == 0
-        and st is not None
-        and list(vt.shape) == list(ht.shape)
-        and _contiguous(list(vt.shape), st)
-    )
-    target = home if whole else view
-    # The view, and what it is computed from, before the channel ops.
-    _move_before(target, tmp.owner)
-    for u in list(tmp.uses):
-        if u.owner.name == "memref.dealloc":
-            u.owner.erase()
-    tmp.replace_all_uses_with(target)
-    tmp.owner.erase()
-
-
-def _roots(v):
-    """The buffer at the root of view `v`."""
-    from air.ir import OpResult
-
-    while isinstance(v, OpResult) and v.owner.name in (
-        "memref.reinterpret_cast",
-        "memref.subview",
-    ):
-        v = v.owner.opview.source
-    return [v]
 
 
 def _view(home, offs, sizes, strides, like):
