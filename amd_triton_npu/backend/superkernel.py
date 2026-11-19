@@ -2094,7 +2094,7 @@ def _eval(v, env, resolve=None):
         if pred >= 6:  # ult, ule, ugt, uge
             x, y = u(x, w0), u(y, w0)
         cmp = [x == y, x != y, x < y, x <= y, x > y, x >= y]
-        return (cmp + cmp[2:])[pred]
+        return signed((cmp + cmp[2:])[pred], 1)
     if name == "affine.apply":
         m = AffineMapAttr(op.attributes["map"]).value
         return _affine(m.results[0], a[: m.n_dims], a[m.n_dims :])

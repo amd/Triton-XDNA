@@ -90,7 +90,7 @@ def test_eval_integer_semantics():
         vals = [_eval(o.result, []) for o in ops if len(o.results)]
     _, _, d, r, f, lt, slt, mx, mn, _, _, q = vals
     assert (d, r, f) == (-3, -1, -4), vals
-    assert (lt, slt) == (False, True), vals
+    assert (lt, slt) == (0, -1), vals
     assert (mx, mn) == (2, -7), vals
     assert q == 9007199254740993, vals
     text = """
@@ -131,7 +131,25 @@ def test_eval_integer_semantics():
         ops = list(m.body.operations[0].regions[0].blocks[0].operations)
         vals = [_eval(o.result, []) for o in ops if len(o.results)]
     _, t32, _, s, _, _, q, eq, neg = vals
-    assert (t32, s, q, eq, neg) == (0, -1, -1, True, True), vals
+    assert (t32, s, q, eq, neg) == (0, -1, -1, -1, -1), vals
+    # a compare's result is an i1 like a constant one
+    text = """
+    func.func @f() {
+      %a = arith.constant 3 : i32
+      %b = arith.constant 5 : i32
+      %lt = arith.cmpi slt, %a, %b : i32
+      %s = arith.extsi %lt : i1 to i32
+      %z = arith.extui %lt : i1 to i32
+      %t = arith.constant true
+      %same = arith.cmpi eq, %lt, %t : i1
+      return
+    }"""
+    with Context():
+        m = Module.parse(text)
+        ops = list(m.body.operations[0].regions[0].blocks[0].operations)
+        vals = [_eval(o.result, []) for o in ops if len(o.results)]
+    _, _, lt, s, z, _, same = vals
+    assert (lt, s, z, same) == (-1, -1, 1, -1), vals
 
 
 def _seq(bases, sizes, strides):
@@ -464,6 +482,41 @@ ROWS = HEAD + """
           air.dma_memcpy_nd (%fc[%o, %c0] [%two, %c4] [%st, %one], %lc[] [] [])
               : (memref<1024xf32>, memref<8xf32, 2>)
 """ + TAIL
+
+
+# Fewer offsets than sizes: AIR takes the missing ones as leading zeros, so
+# %yo is the offset along the inner dimension.
+SHORT_OFFSETS = HEAD + """
+          %yo = arith.muli %y, %c4 : index
+          air.dma_memcpy_nd (%la[] [] [], %fa[%yo] [%c4, %c4] [%c64, %one])
+              : (memref<16xbf16, 2>, memref<1024xbf16>)
+""" + TAIL
+
+
+def test_short_offsets():
+    text, _ = _lower(SHORT_OFFSETS)
+    assert _moved(text, "s0_ddr") == {
+        y: [4 * y + 64 * i + j for i in range(4) for j in range(4)] for y in range(2)
+    }
+
+
+# Each core reads its tile of C and writes it back.
+IN_PLACE = HEAD + """
+          %fc = memref.reinterpret_cast %hc to offset: [0], sizes: [1024], strides: [1]
+              : memref<*xf32> to memref<1024xf32>
+          %xo = arith.muli %x, %c64 : index
+          %yo = arith.muli %y, %c16 : index
+          %o = arith.addi %xo, %yo : index
+          air.dma_memcpy_nd (%lc[] [] [], %fc[%o] [%c8] [%one])
+              : (memref<8xf32, 2>, memref<1024xf32>)
+          air.dma_memcpy_nd (%fc[%o] [%c8] [%one], %lc[] [] [])
+              : (memref<1024xf32>, memref<8xf32, 2>)
+""" + TAIL
+
+
+def test_read_and_write_one_buffer():
+    with _raises("both read and written"):
+        _lower(IN_PLACE)
 
 
 def test_rows_of_different_shapes():

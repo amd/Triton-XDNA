@@ -171,6 +171,8 @@ def _dma_side(d, side, env):
         t = getattr(d.opview, side).type
         sizes, strides = _static(list(MemRefType(t).shape), "sizes"), _strides_of(t)
         offs = [0] * len(sizes)
+    # missing offsets are the leading ones, as AIR reads them
+    offs = [0] * (len(sizes) - len(offs)) + offs
     return sum(o * s for o, s in zip(offs, strides)), sizes, strides
 
 
@@ -556,6 +558,11 @@ def _lower_streams(module, name):
         raise ValueError("streams need one launch of one segment")
     seg, launch = segs[0], launches[0]
     streams = _collect(seg)
+    # the shim issues each stream's tasks on its own, so a write is not
+    # ordered before a later read of the same buffer
+    reads = {s.arg.arg_number for s in streams if s.read}
+    if any(not s.read and s.arg.arg_number in reads for s in streams):
+        raise ValueError("a DDR buffer both read and written by streams")
     if len({s.herd[0] for s in streams}) > 1:
         # such herds run concurrently, but the shim ops are emitted in one order
         raise ValueError("herds of different names move DDR data")
