@@ -218,20 +218,26 @@ def _place(parts, npu):
     return corners
 
 
-def _program_ids_as_args(f):
-    """Replace kernel function `f`'s program ids by i32 arguments appended
-    to it. Returns the axes, in the order of the new arguments."""
+def _herd_ids_as_args(f):
+    """Replace kernel function `f`'s herd ids (`air.herd_id`) by i32 arguments
+    appended to it. Returns the axes, in the order of the new arguments."""
     from air.ir import FunctionType, IntegerType, Location, TypeAttr
 
     block = f.regions[0].blocks[0]
-    pids = [o for o in _walk(f) if o.operation.name == "tt.get_program_id"]
-    axes = sorted({_attr(o, "axis") for o in pids})
+    prefix = "air.herd_id."
+    ids = [
+        o
+        for o in _walk(f)
+        if o.operation.name == "tt.call" and _callee(o).startswith(prefix)
+    ]
+    axis = {o: int(_callee(o)[len(prefix) :]) for o in ids}
+    axes = sorted(set(axis.values()))
     if not axes:
         return []
     i32 = IntegerType.get_signless(32)
     args = {a: block.add_argument(i32, Location.unknown()) for a in axes}
-    for o in pids:
-        o.results[0].replace_all_uses_with(args[_attr(o, "axis")])
+    for o in ids:
+        o.results[0].replace_all_uses_with(args[axis[o]])
         o.operation.erase()
     ft = FunctionType(TypeAttr(f.attributes["function_type"]).value)
     f.attributes["function_type"] = TypeAttr.get(
@@ -317,7 +323,7 @@ def _leaf_module(module, symbol, name):
     """The TTIR of the kernel `symbol` of `module` as a module of its own: a
     public function `name` with the functions it calls inlined, run through
     the backend's TTIR passes like a kernel compiled alone; and the axes of
-    the program ids it reads, which become arguments after its own."""
+    the herd ids it reads, which become arguments after its own."""
     import re
 
     from triton._C.libtriton import ir
@@ -334,15 +340,21 @@ def _leaf_module(module, symbol, name):
         for o in _walk(funcs[s]):
             if o.operation.name == "tt.call":
                 todo.append(_callee(o))
+    for s in order:
+        if any(o.operation.name == "tt.get_program_id" for o in _walk(funcs[s])):
+            raise ValueError(
+                f"{name}: tl.program_id is the superkernel's, not a core's; a "
+                "core's index in its herd is air.herd_id"
+            )
     for s in order[1:]:
         for o in _walk(funcs[s]):
-            if o.operation.name == "tt.get_program_id" or (
-                o.operation.name == "tt.call" and _callee(o).startswith("air.channel.")
+            if o.operation.name == "tt.call" and _callee(o).startswith(
+                ("air.channel.", "air.herd_id.")
             ):
                 raise ValueError(
-                    f"{name}: a function it calls reads a program id or a channel"
+                    f"{name}: a function it calls reads a herd id or a channel"
                 )
-    axes = _program_ids_as_args(funcs[symbol])
+    axes = _herd_ids_as_args(funcs[symbol])
     chans = _channels_as_args(funcs[symbol])
     own = _locals_as_args(funcs[symbol], funcs)
     texts = []

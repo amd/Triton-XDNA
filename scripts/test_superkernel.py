@@ -17,7 +17,7 @@ on the NPU and compares with numpy:
   steps      a wave of four herds: the cores of one name run two phases,
              another herd's call between them
   stream     a core puts blocks into a channel that another core gets
-  spmd       a kernel run as one program a core, program_id its core
+  spmd       a kernel run as one program a core, air.herd_id its core
   bcast      one core's blocks broadcast to the two cores of another
   merge      two cores put into a FIFO each, one core gets both
   grid       a rank-3 channel between two 2x2 herds
@@ -26,7 +26,7 @@ on the NPU and compares with numpy:
   feed       the host puts DDR blocks into a channel a core gets, and gets
              the core's results back into DDR
   neighbours two neighbouring cores share an L1 buffer of the segment
-  reversed   two cores put into each other's FIFO (index 1 - program_id)
+  reversed   two cores put into each other's FIFO (index 1 - herd_id)
   wave_alloc an L2 buffer allocated in the wave loop, written by one herd
              and read by another
   segment_fill segment code fills an L2 buffer from DDR that a herd reads
@@ -443,7 +443,7 @@ def stream(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.const
 
 @triton.jit
 def twice(X, Y, D: tl.constexpr):
-    p = tl.program_id(0)
+    p = air.herd_id(0)
     x = tl.load(X + p * D + tl.arange(0, D))
     tl.store(Y + p * D + tl.arange(0, D), x * 2)
 
@@ -456,7 +456,7 @@ def spmd(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constex
 
 @triton.jit
 def bc_sink(Y, D: tl.constexpr, T: tl.constexpr):
-    p = tl.program_id(0)
+    p = air.herd_id(0)
     for t in range(D // T):
         y = air.ChannelGet("toSink", [T], tl.bfloat16, indices=[p, 0])
         tl.store(Y + p * D + t * T + tl.arange(0, T), y + p.to(tl.bfloat16))
@@ -480,7 +480,7 @@ def bcast(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.conste
 
 @triton.jit
 def m_src(X, D: tl.constexpr, T: tl.constexpr):
-    p = tl.program_id(0)
+    p = air.herd_id(0)
     for t in range(D // T):
         x = tl.load(X + p * D + t * T + tl.arange(0, T))
         air.ChannelPut("parts", x * 2, indices=[p])
@@ -504,7 +504,7 @@ def merge(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.conste
 
 @triton.jit
 def m_src_rev(X, D: tl.constexpr, T: tl.constexpr):
-    p = tl.program_id(0)
+    p = air.herd_id(0)
     for t in range(D // T):
         x = tl.load(X + p * D + t * T + tl.arange(0, T))
         air.ChannelPut("parts", x * 2, indices=[1 - p])
@@ -530,8 +530,8 @@ def reversed_(
 
 @triton.jit
 def g_src(X, D: tl.constexpr, T: tl.constexpr):
-    i = tl.program_id(0)
-    j = tl.program_id(1)
+    i = air.herd_id(0)
+    j = air.herd_id(1)
     for t in range(D // T):
         x = tl.load(X + (i * 2 + j) * D + t * T + tl.arange(0, T))
         air.ChannelPut("cells", x * 2, indices=[0, i, j])
@@ -539,8 +539,8 @@ def g_src(X, D: tl.constexpr, T: tl.constexpr):
 
 @triton.jit
 def g_sink(Y, D: tl.constexpr, T: tl.constexpr):
-    i = tl.program_id(0)
-    j = tl.program_id(1)
+    i = air.herd_id(0)
+    j = air.herd_id(1)
     for t in range(D // T):
         y = air.ChannelGet("cells", [T], tl.bfloat16, indices=[0, i, j])
         tl.store(Y + (i * 2 + j) * D + t * T + tl.arange(0, T), y + 1)
@@ -556,7 +556,7 @@ def grid(X, Y, NW: tl.constexpr, D: tl.constexpr, T: tl.constexpr, S: tl.constex
 
 @triton.jit
 def half(X, D: tl.constexpr, T: tl.constexpr):
-    p = tl.program_id(0)
+    p = air.herd_id(0)
     air.ChannelPut("halves", tl.load(X + p * T + tl.arange(0, T)) * 2, indices=[p])
 
 
@@ -780,8 +780,8 @@ def proj_core(CX0: tl.constexpr, I2: tl.constexpr, J2: tl.constexpr):
     """Rows i 512 + cx 128 + cy 32 + [0, 32) of round i, over 2 J2 blocks of
     256 columns, sent to consumer i % 3; core (cx, cy) of the 4x4 cores of
     two herds."""
-    cx = CX0 + tl.program_id(0)
-    cy = tl.program_id(1)
+    cx = CX0 + air.herd_id(0)
+    cy = air.herd_id(1)
     w = air.alloc([2560], tl.int16, memory_space=air.L1)
     xb = air.alloc([256], tl.bfloat16, memory_space=air.L1)
     acc = air.alloc([32], tl.float32, memory_space=air.L1)
@@ -904,6 +904,31 @@ def proj16(X, Y, W, I2: tl.constexpr, J2: tl.constexpr, S: tl.constexpr):
 
 
 # Superkernels that reading rejects.
+
+
+@triton.jit
+def pid_kernel(X, D: tl.constexpr, DP: tl.constexpr):
+    i = tl.arange(0, DP)
+    m = i < D
+    p = tl.program_id(0)
+    tl.store(X + p * D + i, tl.load(X + i, mask=m), mask=m)
+
+
+@triton.jit
+def program_id_in_herd(
+    X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
+):
+    for wave in range(NW):
+        air.herd(pid_kernel, (X, D, DP), 2, S)
+
+
+@triton.jit
+def herd_id_outside(
+    X, NW: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, S: tl.constexpr
+):
+    p = air.herd_id(0)
+    for wave in range(NW):
+        air.herd(scale, (X, X, X, p, D, DP), 1, S)
 
 
 @triton.jit
@@ -1365,6 +1390,7 @@ def error_checks(script, direct, proj):
         ("phased inputs", phased_inputs, (x,), "not supported"),
         ("phase order", phase_order, (x, x), "listed between the phases"),
         ("phase wiring", wiring, (x, x), "differ"),
+        ("program id in a herd", program_id_in_herd, (x,), "air.herd_id"),
     ]
     explicit = dict(NW=2, D=XD, T=XT)
     y = torch.empty(2 * XT, dtype=torch.bfloat16)
@@ -1375,6 +1401,14 @@ def error_checks(script, direct, proj):
         check(False, "dynamic segment indices: no error")
     except ValueError as e:
         check("constant indices" in str(e), f"dynamic segment indices: {e}")
+    try:
+        module_text(herd_id_outside, (x,), common, os.path.join(proj, "outside"))
+        check(False, "herd id outside a herd: no error")
+    except Exception as e:  # raised as Triton compiles the superkernel
+        check(
+            "only in a herd's kernel" in str(e),
+            "herd id outside a herd: air.herd_id only in a herd's kernel",
+        )
     for what, kernel, args, want in bad:
         try:
             module_text(kernel, args, common, os.path.join(proj, what))

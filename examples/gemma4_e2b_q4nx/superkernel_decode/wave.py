@@ -93,8 +93,8 @@ def proj_core(arm, CX0: tl.constexpr):
     """A projection core of the 4x4: each round of a phase, its 32 rows' q4
     products with x, the x of every block streamed, the weights only of the
     blocks the arm's layer has; then the rows on to the phase's consumer."""
-    cx = CX0 + tl.program_id(0)
-    cy = tl.program_id(1)
+    cx = CX0 + air.herd_id(0)
+    cy = air.herd_id(1)
     # x and weights ping-pong, as air-FLM's: the DMA fills one buffer while
     # the core reads the other
     w0 = air.alloc([2560], tl.int16, memory_space=air.L1)

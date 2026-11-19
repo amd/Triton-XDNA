@@ -90,17 +90,17 @@ class Tensor:
 
 
 class _TileId:
-    """A program id of a kernel that runs one program a core: the core's
-    index in its herd along `axis`."""
+    """A herd id (`air.herd_id`) of a kernel that runs one program a core:
+    the core's index in its herd along `axis`."""
 
     def __init__(self, axis):
         self.axis = axis
 
     def __repr__(self):
-        return f"program_id({self.axis})"
+        return f"herd_id({self.axis})"
 
 
-_TILE = {a: _TileId(a) for a in range(3)}
+_TILE = {a: _TileId(a) for a in range(2)}
 
 
 class _Local:
@@ -268,7 +268,7 @@ class Superkernel:
         ttshared = _forward_copies(ttshared, args)
         with config_context(transform_tiling_script=schedule):
             m = _ttshared_to_air(ttshared, 1, 1, 1)
-        # A kernel that reads its program ids runs one program a core: its
+        # A kernel that reads its herd ids runs one program a core: its
         # schedule compiles one program. Any other is split over its cores
         # by its schedule.
         spmd = any(isinstance(a, _TileId) for a in args)
@@ -402,8 +402,7 @@ class Superkernel:
             tiles = {}
             with InsertionPoint.at_block_begin(sblock):
                 for a, t in _TILE.items():
-                    # Stand-ins for the program ids until the herds are
-                    # sized.
+                    # Stand-ins for the herd ids until the herds are sized.
                     c = arith.ConstantOp(i32, IntegerAttr.get(i32, -1 - a))
                     tiles[a] = c.result
                     value[id(t)] = c.result
@@ -1292,7 +1291,7 @@ def _forward_private_vectors(seg):
 
 def _bind_tile_ids(seg, tiles, shapes):
     """Give the herds that run one program a core the shape `shapes` names
-    for them, and their program ids, stand-ins `tiles` by axis, the core's
+    for them, and their herd ids, stand-ins `tiles` by axis, the core's
     index in the herd. The stand-ins are then erased."""
     from air.dialects import arith
     from air.ir import InsertionPoint, IntegerType
@@ -1307,8 +1306,6 @@ def _bind_tile_ids(seg, tiles, shapes):
             a = next((ax for ax, t in tiles.items() if t == v), None)
             if a is None:
                 continue
-            if a > 1:
-                raise ValueError("a herd has two axes; program_id(2) is not one")
             with InsertionPoint.at_block_begin(body):
                 c = arith.IndexCastOp(i32, body.arguments[a])
             body.arguments[first + i].replace_all_uses_with(c.result)
@@ -1317,10 +1314,10 @@ def _bind_tile_ids(seg, tiles, shapes):
         if name in shapes:
             _drop_herd_operands(h, drop, shapes[name])
         elif drop:
-            raise ValueError(f"herd {name} reads program ids but runs one program")
+            raise ValueError(f"herd {name} reads herd ids but runs one program")
     for t in tiles.values():
         if list(t.uses):
-            raise ValueError("a program id is used outside a herd")
+            raise ValueError("a herd id is used outside a herd")
         t.owner.erase()
 
 
