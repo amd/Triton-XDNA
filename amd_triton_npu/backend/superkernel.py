@@ -361,6 +361,7 @@ class Superkernel:
             Location,
             Module,
         )
+        from air.compiler.util import run_transform
         from air.passmanager import PassManager
 
         bufs = self.buffers
@@ -443,7 +444,7 @@ class Superkernel:
             shared = [value[id(t)] for t in onchip if t.space == 2]
             _in_place(seg, homes, shared)
             _forward_private_vectors(seg)
-            _scalar_transfers(seg)
+            run_transform(Module.parse(_SIZE1_TO_SCALAR), top)
             _hoist_ddr_reads(sblock, sargs[: len(bufs)], end)
             # A herd whose kernel took a DDR buffer directly now takes the
             # on-chip tensor's L2 buffer instead.
@@ -684,6 +685,21 @@ module {{
             os.chdir(cwd)
         header = os.path.join(self.proj, "air_project", f"npu.{self.name}.air.txn.h")
         return out["bin_path"], header
+
+
+# In the herds, size-1 vectors, such as a 0-d buffer's (a reduction's scalar
+# result), as scalars.
+_SIZE1_TO_SCALAR = """
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%m: !transform.any_op {transform.readonly}) {
+    %h = transform.structured.match ops{["air.herd"]} in %m
+        : (!transform.any_op) -> !transform.any_op
+    %r = transform.air.convert_size1_vector_to_scalar %h
+        : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+"""
 
 
 def _emit_segment(top, sg, end, value, wave, made, channels):
@@ -1441,32 +1457,6 @@ def _fold_constant_casts(op, seg):
             k = arith.ConstantOp(idx, IntegerAttr.get(idx, v)).result
         c.results[0].replace_all_uses_with(k)
         c.erase()
-
-
-def _scalar_transfers(seg):
-    """In the herds, vector reads and writes of a 0-d buffer (a reduction's
-    scalar result) as a scalar load and store."""
-    from air.dialects import memref, vector
-    from air.ir import InsertionPoint, MemRefType, VectorType
-
-    for h in _ops_named(seg, "air.herd"):
-        for r in _ops_named(h, "vector.transfer_read"):
-            src = r.operands[0]
-            if MemRefType(src.type).rank != 0:
-                continue
-            with InsertionPoint(r):
-                v = memref.LoadOp(src, []).result
-                b = vector.BroadcastOp(VectorType(r.results[0].type), v).result
-            r.results[0].replace_all_uses_with(b)
-            r.erase()
-        for w in _ops_named(h, "vector.transfer_write"):
-            dst = w.operands[1]
-            if MemRefType(dst.type).rank != 0:
-                continue
-            with InsertionPoint(w):
-                v = vector.ExtractOp(w.operands[0], [], []).result
-                memref.StoreOp(v, dst, [])
-            w.erase()
 
 
 def _forward_private_vectors(seg):
