@@ -361,6 +361,7 @@ class Superkernel:
             Location,
             Module,
         )
+        from air.passmanager import PassManager
 
         bufs = self.buffers
         onchip = [t for t in self.tensors if t.onchip]
@@ -462,8 +463,9 @@ class Superkernel:
                     per = [value[id(x)] for x in per]
                     by_buffer[_edge_key(value[id(t)], edge_buffers)] = (loop, kind, per)
             _lower_edges(top, seg, edge_buffers, by_buffer)
-            for n, d in enumerate(_ops_named(seg, "air.dma_memcpy_nd")):
-                d.attributes["id"] = IntegerAttr.get(i32, n + 1)
+            PassManager.parse(
+                "builtin.module(func.func(air-renumber-dma{mode=segment}))"
+            ).run(top.operation)
             _fold_constant_casts(top.operation, seg)
             return str(top)
 
