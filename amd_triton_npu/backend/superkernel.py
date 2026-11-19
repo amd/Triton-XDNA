@@ -433,7 +433,6 @@ class Superkernel:
             _bind_tile_ids(seg, tiles, spmd)
             _lower_channels(top, seg, [(c, value[id(c)]) for c in self.channels])
             _lower_locals(seg, [(b, value[id(b)]) for b in owns])
-            _forward_private_vectors(seg)
             run_transform(Module.parse(_HERDS), top)
             _hoist_ddr_reads(sblock, sargs[: len(bufs)], end)
             # A one-column herd's own L2 buffers go in its column's memtile.
@@ -674,17 +673,20 @@ module {{
         return out["bin_path"], header
 
 
-# In the herds, after merging: block arguments and views take their buffers'
-# types (an on-chip tensor's L2 buffer where a kernel took a DDR buffer, a
-# core's own L1 buffer where it took a placeholder), and size-1 vectors, such
-# as a 0-d buffer's (a reduction's scalar result), become scalars. Each step
-# rewrites the herds only: folding constants elsewhere would change how aircc
-# reads the segment's loops.
+# In the herds, after merging: a vector a core writes to a buffer and reads
+# back is used without the buffer, and buffers nothing reads go; block
+# arguments and views take their buffers' types (an on-chip tensor's L2
+# buffer where a kernel took a DDR buffer, a core's own L1 buffer where it
+# took a placeholder); and size-1 vectors, such as a 0-d buffer's (a
+# reduction's scalar result), become scalars. Each step rewrites the herds
+# only: folding constants elsewhere would change how aircc reads the
+# segment's loops.
 _HERDS = """
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%m: !transform.any_op {transform.readonly}) {
     %h = transform.structured.match ops{["air.herd"]} in %m
         : (!transform.any_op) -> !transform.any_op
+    transform.memref.erase_dead_alloc_and_stores %h : (!transform.any_op) -> ()
     %typed = transform.air.override_memref_memory_space %h <{memory_space = 2 : i32}>
         : (!transform.any_op) -> !transform.any_op
     %r = transform.air.convert_size1_vector_to_scalar %typed
@@ -1196,25 +1198,6 @@ def _forward_copies(ttshared, args):
         return str(m)
 
 
-def _whole_transfer(op, buf):
-    """Whether vector transfer `op` reads or writes all of buffer `buf`, in
-    order: no mask, every index 0, the vector of the buffer's shape, and the
-    identity permutation."""
-    from air.ir import AffineMap, AffineMapAttr, MemRefType, VectorType
-
-    v = op.opview
-    vtype = op.results[0].type if op.name == "vector.transfer_read" else None
-    vtype = VectorType(vtype or v.valueToStore.type)
-    shape = MemRefType(buf.type).shape
-    return (
-        v.mask is None
-        and v.base == buf
-        and vtype.shape == shape
-        and all(_const(i) == 0 for i in v.indices)
-        and v.permutation_map == AffineMapAttr.get(AffineMap.get_identity(len(shape)))
-    )
-
-
 def _fold_constant_casts(op, seg):
     """Index casts of integer constants in `op`, as index constants, and
     unused casts in segment `seg` dropped: AIR reads loop bounds and offsets
@@ -1239,54 +1222,6 @@ def _fold_constant_casts(op, seg):
             k = arith.ConstantOp(idx, IntegerAttr.get(idx, v)).result
         c.results[0].replace_all_uses_with(k)
         c.erase()
-
-
-def _forward_private_vectors(seg):
-    """In the herds, a buffer of the core that one vector write fills whole
-    and vector reads then read whole, in the same block: the reads take the
-    written vector, and the buffer goes."""
-    from air.ir import MemRefType, VectorType
-
-    for h in _ops_named(seg, "air.herd"):
-        for a in _ops_named(h, "memref.alloc"):
-            buf = a.results[0]
-            t = MemRefType(buf.type)
-            users = [u.owner.operation for u in buf.uses]
-            writes = [u for u in users if u.name == "vector.transfer_write"]
-            reads = [u for u in users if u.name == "vector.transfer_read"]
-            if len(writes) != 1 or not reads:
-                continue
-            if any(
-                u.name
-                not in (
-                    "vector.transfer_write",
-                    "vector.transfer_read",
-                    "memref.dealloc",
-                )
-                for u in users
-            ):
-                continue
-            w = writes[0]
-            val = w.operands[0]
-            if VectorType(val.type).shape != t.shape or w.operands[1] != buf:
-                continue
-            if not all(
-                r.block == w.block
-                and w.is_before_in_block(r)
-                and r.results[0].type == val.type
-                and _whole_transfer(r, buf)
-                for r in reads
-            ):
-                continue
-            if not _whole_transfer(w, buf):
-                continue
-            for r in reads:
-                r.results[0].replace_all_uses_with(val)
-                r.erase()
-            w.erase()
-            for u in list(buf.uses):
-                u.owner.erase()
-            a.erase()
 
 
 def _bind_tile_ids(seg, tiles, shapes):

@@ -3,13 +3,13 @@
 # SPDX-License-Identifier: MIT
 """Rewrites of a superkernel's AIR module, on small modules written by hand:
 
-  in place      a core's copy between a channel's buffer and an L1 buffer is
-                removed only when it copies the whole of both, in order
-  forwarding    a vector a core writes to its own buffer replaces only reads
-                of the whole buffer, in the same order
-  index casts   a constant cast to index becomes an index constant; a cast
-                from index keeps its type
-  herd depth    whether code is a herd's is kept per thread of compilation
+  forward copies  a block loaded from a channel and stored unchanged into
+                  the kernel's own buffer is one copy
+  forwarding      a vector a core writes to a buffer replaces reads of it in
+                  the same order; a buffer sent on a channel stays
+  index casts     a constant cast to index becomes an index constant; a cast
+                  from index keeps its type
+  herd depth      whether code is a herd's is kept per thread of compilation
 
 Needs no NPU.
 
@@ -93,13 +93,23 @@ func.func @k(%chan: memref<*xbf16>, %own: memref<*xbf16>) {
 
 
 def forwarding():
-    body = """
+    from air.compiler.util import run_transform
+
+    def herds(body):
+        m = Module.parse(herd_module("      %f0 = arith.constant 0.0 : f32\n" + body))
+        run_transform(Module.parse(S._HERDS), m)
+        return m
+
+    write = """
       %buf = memref.alloc() : memref<8x8xf32, 2>
       %cst = arith.constant dense<1.0> : vector<8x8xf32>
       vector.transfer_write %cst, %buf[%c0, %c0] {{in_bounds = [true, true]}} : vector<8x8xf32>, memref<8x8xf32, 2>
+"""
+    read = """
       %r = vector.transfer_read %buf[%c0, %c0], %f0 {{in_bounds = [true, true]{map}}} : memref<8x8xf32, 2>, vector<8x8xf32>
       %out = memref.alloc() : memref<8x8xf32, 2>
       vector.transfer_write %r, %out[%c0, %c0] {{in_bounds = [true, true]}} : vector<8x8xf32>, memref<8x8xf32, 2>
+      air.channel.put @c[%c0] (%out[] [] []) : (memref<8x8xf32, 2>)
 """
     for perm, want, what in (
         ("", True, "a read of the whole buffer takes the written vector"),
@@ -109,13 +119,22 @@ def forwarding():
             "a transposed read keeps reading the buffer",
         ),
     ):
-        text = herd_module(
-            "      %f0 = arith.constant 0.0 : f32\n" + body.format(map=perm)
-        )
-        m = Module.parse(text)
-        S._forward_private_vectors(m.operation)
-        reads = S._ops_named(herd_of(m), "vector.transfer_read")
+        m = herds((write + read).format(map=perm))
+        h = herd_of(m)
+        reads = S._ops_named(h, "vector.transfer_read")
         check((not reads) == want, f"forwarding: {what}")
+        check(
+            len(S._ops_named(h, "air.channel.put")) == 1,
+            f"forwarding: the sent buffer stays ({what})",
+        )
+    send = "      air.channel.put @c[%c0] (%buf[] [] []) : (memref<8x8xf32, 2>)\n"
+    m = herds(write.format() + send)
+    h = herd_of(m)
+    check(
+        len(S._ops_named(h, "vector.transfer_write")) == 1
+        and len(S._ops_named(h, "air.channel.put")) == 1,
+        "forwarding: a buffer the core fills and sends stays, with its write",
+    )
 
 
 def index_casts():
