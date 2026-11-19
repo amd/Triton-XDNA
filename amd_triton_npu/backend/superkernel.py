@@ -265,6 +265,7 @@ class Superkernel:
             ttshared = _allow_fp_contraction(ttshared)
         ttshared = _optimize_ttsharedir(ttshared, {})
         ttshared = _allocate_locals(ttshared, args)
+        ttshared = _forward_copies(ttshared, args)
         with config_context(transform_tiling_script=schedule):
             m = _ttshared_to_air(ttshared, 1, 1, 1)
         # A kernel that reads its program ids runs one program a core: its
@@ -1175,6 +1176,41 @@ def _allocate_locals(ttshared, args):
                 op.results[0].replace_all_uses_with(cast.result)
                 op.erase()
             arg.replace_all_uses_with(a.result)
+        return str(m)
+
+
+# A block a kernel loads from a channel and stores into its own L1 buffer
+# unchanged takes one copy, so that the channel's DMA writes the buffer: the
+# load's buffer is raised as AIR's schedules do, then forwarded.
+_FORWARD_COPIES = """
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%m: !transform.any_op {transform.readonly}) {
+    %f = transform.structured.match ops{["func.func"]} in %m
+        : (!transform.any_op) -> !transform.any_op
+    %raised = transform.air.raise_load_buffer_to_tensor %f
+        : (!transform.any_op) -> !transform.any_op
+    %folded = transform.air.fold_extract_slice_of_insert_slice %raised
+        : (!transform.any_op) -> !transform.any_op
+    %r = transform.air.forward_copy_into_destination %folded
+        : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+"""
+
+
+def _forward_copies(ttshared, args):
+    """Kernel function `ttshared` with its loads stored unchanged into its own
+    L1 buffers (the arguments `args` gives as _Local) made single copies."""
+    from air.compiler.util import run_transform
+    from air.ir import Context, Location, Module
+
+    if not any(isinstance(a, _Local) for a in args):
+        return ttshared
+    with Context() as ctx, Location.unknown():
+        ctx.allow_unregistered_dialects = True
+        m = Module.parse(ttshared)
+        run_transform(Module.parse(_FORWARD_COPIES), m)
         return str(m)
 
 
