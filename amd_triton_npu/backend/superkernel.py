@@ -859,12 +859,14 @@ def _is_whole(op, side, n):
 def _lower_edges(module, seg, edges, phased=None):
     """Lower the L2-to-L2 copies to and from the on-chip tensors' buffers
     (`edges`). A reader's copy of a whole edge buffer is dropped, the reader
-    using the edge buffer directly. Every other copy becomes a channel.
+    using the edge buffer directly. A copy whose destination moves with a
+    loop around cores becomes a channel with its get taken out of the loop.
+    Other copies stay, for aircc's air-dma-to-channel.
 
     `phased` maps an edge buffer id to (phase loop, "out", the buffer of each
     phase): a phase loop's output, sent by packet to the buffer its phase
     writes."""
-    from air.dialects.air import ChannelGet, ChannelPut, channel as channel_decl
+    from air.dialects.air import ChannelPut, channel as channel_decl
     from air.ir import InsertionPoint, MemRefType
 
     phased = phased or {}
@@ -898,20 +900,6 @@ def _lower_edges(module, seg, edges, phased=None):
             dst.replace_all_uses_with(src)
             alloc.erase()
             continue
-        # Copies of the same region of a writer's buffer into the same edge
-        # share a channel.
-        where = tuple(_static(v) for v in _dma_pattern(d, "src")[0])
-        key = (src, dst, where)
-        name = next(
-            (nm for k, nm in names if k[0] == src and k[1] == dst and k[2] == where),
-            None,
-        )
-        if name is None:
-            name = f"edge{n}"
-            n += 1
-            names.append((key, name))
-            with InsertionPoint.at_block_begin(module.body):
-                channel_decl(name, size=[1, 1])
         so, ss, st = _dma_pattern(d, "src")
         do, ds, dt = _dma_pattern(d, "dst")
         pdst = phased.get(_edge_key(dst, edges))
@@ -930,25 +918,36 @@ def _lower_edges(module, seg, edges, phased=None):
                 "a copy into an on-chip tensor reads its writer's buffer at a "
                 f"place that moves with a loop around cores: {d}"
             )
-        with InsertionPoint(d):
-            ChannelPut(name, src, offsets=so, sizes=ss, strides=st, indices=[0, 0])
         outer = _placing_loops(d, "dst")
         if not outer:
-            with InsertionPoint(d):
-                ChannelGet(name, dst, offsets=do, sizes=ds, strides=dt, indices=[0, 0])
-        else:
-            # The edge's end is a memtile DMA with fixed descriptors. Where a
-            # loop moves it, it is taken out into a loop of its own over the
-            # same trips, which aircc lowers to a ring of descriptors. The
-            # writer's end stays with the writes that fill its buffer.
-            anchor = next(
-                (c for lp, c in hoisted if lp.operation == outer[0].operation), None
-            )
-            at = _after(anchor) if anchor is not None else _after(outer[0])
-            with InsertionPoint(at):
-                last = _get_loop(name, dst, (do, ds, dt), list(_trips(outer)))
-            hoisted[:] = [h for h in hoisted if h[0].operation != outer[0].operation]
-            hoisted.append((outer[0], last))
+            continue  # aircc's air-dma-to-channel makes it a put and a get
+        # The edge's end is a memtile DMA with fixed descriptors. Where a loop
+        # moves it, it is taken out into a loop of its own over the same trips,
+        # which aircc lowers to a ring of descriptors. The writer's end stays
+        # with the writes that fill its buffer. Copies of the same region of a
+        # writer's buffer into the same edge share a channel.
+        where = tuple(_static(v) for v in so)
+        key = (src, dst, where)
+        name = next(
+            (nm for k, nm in names if k[0] == src and k[1] == dst and k[2] == where),
+            None,
+        )
+        if name is None:
+            name = f"edge{n}"
+            n += 1
+            names.append((key, name))
+            with InsertionPoint.at_block_begin(module.body):
+                channel_decl(name, size=[1, 1])
+        with InsertionPoint(d):
+            ChannelPut(name, src, offsets=so, sizes=ss, strides=st, indices=[0, 0])
+        anchor = next(
+            (c for lp, c in hoisted if lp.operation == outer[0].operation), None
+        )
+        at = _after(anchor) if anchor is not None else _after(outer[0])
+        with InsertionPoint(at):
+            last = _get_loop(name, dst, (do, ds, dt), list(_trips(outer)))
+        hoisted[:] = [h for h in hoisted if h[0].operation != outer[0].operation]
+        hoisted.append((outer[0], last))
         d.erase()
 
 

@@ -1265,7 +1265,16 @@ def ir_checks(name, text):
         rf"{re.escape(loop[1])} = arith.constant (\d+) : index", text
     )
     check(bool(trips) and int(trips[1]) == WAVES, f"{name}: a loop over the waves")
-    check("air.channel @" in text, f"{name}: L2 buffers moved by channels")
+    # Copies between two L2 buffers are left to aircc's air-dma-to-channel.
+    l2_copy = re.search(
+        r"air\.dma_memcpy_nd[^\n]*: \(memref<[^\n]*, 1( : i32)?>, "
+        r"memref<[^\n]*, 1( : i32)?>\)",
+        text,
+    )
+    check(
+        "air.channel @" in text or bool(l2_copy),
+        f"{name}: L2 buffers moved by channels or L2-to-L2 copies",
+    )
     check(func.count("memref<*xbf16>") == 2, f"{name}: only X and W are buffers")
     if name == "phases":
         check("air.disable_ping_pong" in text, "phases: a phase loop")
