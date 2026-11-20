@@ -30,9 +30,6 @@ from .superkernel import (
     _Wave,
 )
 
-#: the core array npu2 places herds on: columns, then the core rows
-_ARRAY = {"npu2": (8, range(2, 6))}
-
 
 def _generic(ttir):
     """`ttir` in MLIR's generic form, which parses without Triton's dialects."""
@@ -167,55 +164,17 @@ def _evaluate(op, env, what):
     return _PerWave(int(f(*xs)) for xs in zip(*per))
 
 
-def _array(npu):
-    if npu not in _ARRAY:
-        raise ValueError(
-            f"superkernels place herds on npu2 only; give `at` for every "
-            f"herd on {npu}"
-        )
-    return _ARRAY[npu]
-
-
-def _place(parts, npu):
-    """The corner of each herd: its own `at`, or the first free spot
-    for its cores, row by row from the bottom."""
-    cols, rows = None, None
+def _check_pins(herds):
+    """Raise if the cores two herds are placed on by `at` overlap."""
     taken = set()
-
-    def cells(at, cores):
-        return {
-            (at[0] + c, at[1] + r) for c in range(cores[0]) for r in range(cores[1])
-        }
-
-    corners = []
-    for p in parts:
-        if p["at"] is not None:
-            got = cells(p["at"], p["cores"])
-            if got & taken:
-                raise ValueError(f"herd {p['name']} at {p['at']} overlaps another")
-            taken |= got
-    for p in parts:
-        if p["at"] is not None:
-            corners.append(p["at"])
+    for p in herds:
+        if p["at"] is None:
             continue
-        if cols is None:
-            cols, rows = _array(npu)
-        spot = next(
-            (
-                (c, r)
-                for r in rows
-                for c in range(cols)
-                if c + p["cores"][0] <= cols
-                and r + p["cores"][1] <= rows[-1] + 1
-                and not cells((c, r), p["cores"]) & taken
-            ),
-            None,
-        )
-        if spot is None:
-            raise ValueError(f"no room on the array for herd {p['name']}")
-        taken |= cells(spot, p["cores"])
-        corners.append(spot)
-    return corners
+        (x, y), (w, h) = p["at"], p["cores"]
+        got = {(x + c, y + r) for c in range(w) for r in range(h)}
+        if got & taken:
+            raise ValueError(f"herd {p['name']} at {p['at']} overlaps another")
+        taken |= got
 
 
 def _herd_ids_as_args(f):
@@ -406,8 +365,6 @@ def read(ttir, air_project_path, fp_fusion=False):
     are compiled with contraction if `fp_fusion`."""
     from air.ir import Context, Location, Module
 
-    from .driver import detect_npu_version
-
     with Context() as ctx, Location.unknown():
         ctx.allow_unregistered_dialects = True
         module = Module.parse(_generic(ttir))
@@ -579,16 +536,8 @@ def read(ttir, air_project_path, fp_fusion=False):
                     f"herd {p['name']} is placed at {h['at']} and {p['at']}"
                 )
             h["at"] = h["at"] or p["at"]
-        places = _place(
-            list(herds.values()),
-            (
-                detect_npu_version()
-                if any(h["at"] is None for h in herds.values())
-                else None
-            ),
-        )
-        corner = dict(zip(herds, places))
-        corners = [corner[p["name"]] for p in settings]
+        _check_pins(herds.values())
+        corners = [herds[p["name"]]["at"] for p in settings]
 
         sched_dir = os.path.join(sk.proj, "schedules")
         os.makedirs(sched_dir, exist_ok=True)

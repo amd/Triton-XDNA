@@ -34,8 +34,8 @@ core's column and row in the herd, as AIR's `air.herd tile (%x, %y)`.
 kernel may not read it. Any other kernel is split over its cores by its
 `schedule`: the path of a transform script whose `@__transform_main` takes,
 after the payload, one `!transform.param<i64>` per core dimension, for use
-as `num_threads`. Herds are placed on the array in order unless `at` gives
-the (column, row) of a herd's corner.
+as `num_threads`. `at` gives the (column, row) of a herd's corner; AIR's
+placer places the herds without it.
 
 The loop over the waves must have a constexpr trip count. Ints computed from
 the wave index, such as `wave * 2 + 1` or `air.table(values, wave)`, are

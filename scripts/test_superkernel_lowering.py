@@ -7,6 +7,8 @@
                   the kernel's own buffer is one copy
   forwarding      a vector a core writes to a buffer replaces reads of it in
                   the same order; a buffer sent on a channel stays
+  placement       herds without `at` go where AIR's placer puts them, around
+                  the pinned ones; herds that do not fit are an error
   index casts     a constant cast to index becomes an index constant; a cast
                   from index keeps its type
   herd depth      whether code is a herd's is kept per thread of compilation
@@ -20,7 +22,7 @@ import sys
 import threading
 
 try:
-    from air.ir import Context, Location, Module
+    from air.ir import Context, IntegerAttr, Location, Module
     from triton.backends.amd_triton_npu import superkernel as S
     from triton.language.extra.air import superkernel as L
 except ImportError as e:
@@ -137,6 +139,61 @@ def forwarding():
     )
 
 
+def placement():
+    def seg_module(herds):
+        body = "".join(f"""
+        air.herd @{name} tile (%tx, %ty) in (%sx=%c{w}, %sy=%c1){attrs} {{
+        }}""" for name, w, attrs in herds)
+        return f"""
+module {{
+  func.func @f() {{
+    air.launch () in () {{
+      air.segment @seg attributes {{x_loc = 0 : i64, y_loc = 2 : i64}} {{
+        %c1 = arith.constant 1 : index
+        %c2 = arith.constant 2 : index
+        %c8 = arith.constant 8 : index{body}
+      }}
+    }}
+    return
+  }}
+}}
+"""
+
+    def places(m):
+        return {
+            str(h.attributes["sym_name"]).strip('"'): (
+                IntegerAttr(h.attributes["x_loc"]).value,
+                IntegerAttr(h.attributes["y_loc"]).value,
+            )
+            for h in S._ops_named(m.operation, "air.herd")
+        }
+
+    pinned = " attributes {x_loc = 0 : i64, y_loc = 2 : i64}"
+    m = Module.parse(seg_module([("p", 2, pinned), ("q", 2, "")]))
+    seg = S._ops_named(m.operation, "air.segment")[0]
+    S._place_herds(m, seg, "npu2")
+    got = places(m)
+    check(
+        got["p"] == (0, 2)
+        and got["q"][1] in range(2, 6)
+        and got["q"][0] + 2 <= 8
+        and got["q"] not in ((0, 2), (1, 2)),
+        f"placement: a herd without `at` goes beside the pinned one ({got})",
+    )
+    m = Module.parse(seg_module([("p", 2, pinned)]))
+    seg = S._ops_named(m.operation, "air.segment")[0]
+    S._place_herds(m, seg, "npu1")
+    check(places(m) == {"p": (0, 2)}, "placement: pinned herds need no array")
+    m = Module.parse(seg_module([(f"h{i}", 8, "") for i in range(5)]))
+    seg = S._ops_named(m.operation, "air.segment")[0]
+    try:
+        S._place_herds(m, seg, "npu2")
+        failed = False
+    except Exception:
+        failed = True
+    check(failed, "placement: herds that do not fit are an error")
+
+
 def index_casts():
     text = """
 module {
@@ -187,6 +244,7 @@ def main():
         ctx.allow_unregistered_dialects = True
         forward_copies()
         forwarding()
+        placement()
         index_casts()
     herd_depth()
     if failures:

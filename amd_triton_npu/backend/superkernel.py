@@ -296,12 +296,11 @@ class Superkernel:
         tensors = [(n, a) for n, a in zip(names, args) if isinstance(a, Tensor)]
         written = [a for n, a in tensors if n in w]
         read = [a for n, a in tensors if n in r]
+        at = None if at is None else tuple(at)
         for c2 in self.calls:
-            if c2.herd == herd and c2.at != tuple(at):
+            if c2.herd == herd and c2.at != at:
                 raise ValueError(f"herd {herd} placed at {c2.at} and {at}")
-        call = _Call(
-            name, tuple(at), herd, str(m), binds, read, written, tuple(cores), spmd
-        )
+        call = _Call(name, at, herd, str(m), binds, read, written, tuple(cores), spmd)
         self.calls.append(call)
         self.items.append(("call", call))
 
@@ -435,6 +434,7 @@ class Superkernel:
             _lower_locals(seg, [(b, value[id(b)]) for b in owns])
             run_transform(Module.parse(_HERDS), top)
             _hoist_ddr_reads(sblock, sargs[: len(bufs)], end)
+            _place_herds(top, seg)
             # A one-column herd's own L2 buffers go in its column's memtile.
             # On-chip tensors keep their placement, since herds in several
             # columns may read them.
@@ -572,8 +572,9 @@ class Superkernel:
                 herds = [op.operation] + herds
             for h in herds:
                 h.attributes["sym_name"] = StringAttr.get(c.herd)
-                h.attributes["x_loc"] = IntegerAttr.get(i64, c.at[0])
-                h.attributes["y_loc"] = IntegerAttr.get(i64, c.at[1])
+                if c.at is not None:
+                    h.attributes["x_loc"] = IntegerAttr.get(i64, c.at[0])
+                    h.attributes["y_loc"] = IntegerAttr.get(i64, c.at[1])
         if diffs:
             with InsertionPoint.at_block_begin(loop.body):
                 _apply_phase_numbers(diffs, ph)
@@ -695,6 +696,31 @@ module attributes {transform.with_named_sequence} {
   }
 }
 """
+
+
+#: the core array AIR places herds on, per NPU: columns, first core row,
+#: core rows
+_ARRAY = {"npu2": (8, 2, 4)}
+
+
+def _place_herds(top, seg, npu=None):
+    """Place the herds of segment `seg` that `at` does not, with AIR's
+    placer, on the array of `npu` (by default, this machine's)."""
+    from air.passmanager import PassManager
+
+    if all("x_loc" in h.attributes for h in _ops_named(seg, "air.herd")):
+        return
+    npu = npu or detect_npu_version()
+    if npu not in _ARRAY:
+        raise ValueError(
+            f"superkernels place herds on npu2 only; give `at` for every "
+            f"herd on {npu}"
+        )
+    cols, row, rows = _ARRAY[npu]
+    PassManager.parse(
+        f"builtin.module(air-place-herds{{num-rows={rows} num-cols={cols} "
+        f"row-anchor={row} col-anchor=0}})"
+    ).run(top.operation)
 
 
 def _emit_segment(top, sg, end, value, wave, made, channels):
