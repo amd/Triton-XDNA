@@ -882,6 +882,9 @@ def _aircc_options(opts):
         feeds.append("--unroll-feed-loops")
     if opts.get("merge_contiguous_feeds", "True") == "True":
         feeds.append("--merge-contiguous-feeds")
+    for tool in ("opt", "llc"):
+        for a in filter(None, opts.get(f"{tool}_args", "").split("\n")):
+            args.append(f"-X{tool}={a}")
     if int(opts.get("trace_size") or 0) > 0:
         args.append(f"--trace-size={opts['trace_size']}")
         args.append(f"--trace-offset={opts.get('trace_offset', 0)}")
