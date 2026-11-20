@@ -1213,14 +1213,33 @@ def _forward_copies(ttshared, args):
     """Kernel function `ttshared` with its loads stored unchanged into its own
     L1 buffers (the arguments `args` gives as _Local) made single copies."""
     from air.compiler.util import run_transform
-    from air.ir import Context, Location, Module
+    from air.ir import ArrayAttr, Context, DictAttr, Location, Module, UnitAttr
 
     if not any(isinstance(a, _Local) for a in args):
         return ttshared
     with Context() as ctx, Location.unknown():
         ctx.allow_unregistered_dialects = True
         m = Module.parse(ttshared)
+        # A core's own buffer, and the placeholder that stands for a channel,
+        # overlap no other argument, which forwarding a copy needs to know.
+        # The mark goes again afterwards.
+        f = _entry(m)
+        n = len(f.regions[0].blocks[0].arguments)
+        had = "arg_attrs" in f.attributes
+        before = f.attributes["arg_attrs"] if had else None
+        old = list(ArrayAttr(before)) if had else [DictAttr.get()] * n
+        marked = []
+        for i, d in enumerate(old):
+            d = {a.name: a.attr for a in DictAttr(d)}
+            if i < len(args) and isinstance(args[i], (_Local, _Channel)):
+                d["llvm.noalias"] = UnitAttr.get()
+            marked.append(DictAttr.get(d))
+        f.attributes["arg_attrs"] = ArrayAttr.get(marked)
         run_transform(Module.parse(_FORWARD_COPIES), m)
+        if had:
+            f.attributes["arg_attrs"] = before
+        else:
+            del f.attributes["arg_attrs"]
         return str(m)
 
 
