@@ -1586,50 +1586,78 @@ def _after(op):
     raise ValueError("no operation after the loop")
 
 
-def _eval(v, env):
+def _eval(v, env, resolve=None):
     """Evaluate index computation `v`, with loop index values from `env`.
+    `resolve`, if given, evaluates a block argument `env` does not bind.
     Raises ValueError for anything that is not constant under `env`."""
-    from air.ir import AffineMapAttr, IntegerAttr, OpResult
+    from air.ir import AffineMapAttr, BlockArgument, IntegerAttr, OpResult
 
     if isinstance(v, int):
         return v
     for iv, x in env:
         if v == iv:
             return x
+    if resolve is not None and isinstance(v, BlockArgument):
+        return resolve(v, env)
     if not isinstance(v, OpResult):
         raise ValueError(f"can't evaluate {v}")
     op = v.owner
     name = op.name
+
+    # An integer is held as the signed value of its type's bits (index: 64);
+    # unsigned ops look at the unsigned view of their operands.
+    def width(x):
+        from air.ir import IntegerType
+
+        try:
+            return IntegerType(x.type).width
+        except ValueError:
+            return 64
+
+    def u(x, w):  # the unsigned view of w bits
+        return x % (1 << w)
+
+    def signed(x, w):  # the signed value of w bits
+        x = u(x, w)
+        return x - (1 << w) if x >> (w - 1) else x
+
+    w = width(op.result) if len(op.results) == 1 else 64
     if name == "arith.constant":
-        return IntegerAttr(op.attributes["value"]).value
-    a = [_eval(o, env) for o in op.operands]
-    if name in (
-        "arith.index_cast",
-        "arith.index_castui",
-        "arith.extsi",
-        "arith.extui",
-        "arith.trunci",
-    ):
-        return a[0]
+        return signed(IntegerAttr(op.attributes["value"]).value, w)
+    a = [_eval(o, env, resolve) for o in op.operands]
+    w0 = width(op.operands[0]) if len(op.operands) else 64
+    if name in ("arith.index_cast", "arith.extsi", "arith.trunci"):
+        return signed(a[0], w)
+    if name in ("arith.index_castui", "arith.extui"):
+        return signed(u(a[0], w0), w)
+
+    def trunc_div(x, y):  # rounds toward zero, as the hardware
+        q = abs(x) // abs(y)
+        return q if (x < 0) == (y < 0) else -q
+
     ops = {
         "arith.addi": lambda: a[0] + a[1],
         "arith.subi": lambda: a[0] - a[1],
         "arith.muli": lambda: a[0] * a[1],
-        "arith.divsi": lambda: int(a[0] / a[1]),
-        "arith.divui": lambda: a[0] // a[1],
+        "arith.divsi": lambda: trunc_div(a[0], a[1]),
+        "arith.divui": lambda: u(a[0], w0) // u(a[1], w0),
         "arith.floordivsi": lambda: a[0] // a[1],
-        "arith.remsi": lambda: a[0] % a[1],
-        "arith.remui": lambda: a[0] % a[1],
+        "arith.remsi": lambda: a[0] - a[1] * trunc_div(a[0], a[1]),
+        "arith.remui": lambda: u(a[0], w0) % u(a[1], w0),
+        "arith.maxsi": lambda: max(a[0], a[1]),
+        "arith.minsi": lambda: min(a[0], a[1]),
     }
     if name in ops:
-        return ops[name]()
+        return signed(ops[name](), w)
     if name == "arith.select":
         return a[1] if a[0] else a[2]
     if name == "arith.cmpi":
         pred = IntegerAttr(op.attributes["predicate"]).value
         x, y = a
+        if pred >= 6:  # ult, ule, ugt, uge
+            x, y = u(x, w0), u(y, w0)
         cmp = [x == y, x != y, x < y, x <= y, x > y, x >= y]
-        return (cmp + cmp[2:])[pred]
+        return signed((cmp + cmp[2:])[pred], 1)
     if name == "affine.apply":
         m = AffineMapAttr(op.attributes["map"]).value
         return _affine(m.results[0], a[: m.n_dims], a[m.n_dims :])

@@ -255,6 +255,10 @@ runs:
         # weights.
         python3 scripts/test_fused_device.py
 
+        # A herd's DDR transfers lowered as shim channels, memtile rings and
+        # channels to the cores (fused_device's streams=True). No NPU.
+        python3 scripts/test_streams.py
+
         # Which pointer arguments a kernel writes, read from its TTIR: what a
         # fused device's calls sync back. No NPU.
         python3 scripts/test_arg_access.py

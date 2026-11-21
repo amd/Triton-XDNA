@@ -263,6 +263,40 @@ def test_module_text_pads_pins_and_places():
         assert len(set(cols)) == 2
 
 
+def test_stream_buffers_in_their_herds_memtiles():
+    # a stream's memtile buffer goes in the memtile of its herd's column: the
+    # op's second herd here, after a herd of one column
+    op = _op(1, cols=2).replace(
+        "      %l2 = memref.alloc()",
+        "      air.herd @p tile (%px, %py) in (%qx=%c1s, %qy=%c1s) {\n      }\n"
+        '      %r = memref.alloc() {npu.stream_col = 1 : i32, npu.stream_herd = "h"}'
+        " : memref<16xbf16, 1>\n"
+        "      memref.dealloc %r : memref<16xbf16, 1>\n"
+        "      %l2 = memref.alloc()",
+    )
+    dev = _dev(("z", "kz", _op(1)), ("a", "ka", op))
+    with Context():
+        m = Module.parse(dev.module_text())
+        f = next(
+            f
+            for f in _ops_named(m.operation, "func.func")
+            if str(f.attributes["sym_name"]) == '"a"'
+        )
+        x = {
+            str(h.attributes["sym_name"]): int(str(h.attributes["x_loc"]).split(":")[0])
+            for h in _ops_named(f, "air.herd")
+        }
+        r = next(
+            a
+            for a in _ops_named(f, "memref.alloc")
+            if "air.memtile_col" in a.attributes and "air.no_split" not in a.attributes
+        )
+        col = int(str(r.attributes["air.memtile_col"]).split(":")[0])
+        assert x['"ka_p"'] < x['"ka_h"'] and col == x['"ka_h"'] + 1, (x, col)
+        assert "npu.stream_col" not in r.attributes
+        assert "npu.stream_herd" not in r.attributes
+
+
 def test_pin_l2_needs_one_column():
     dev = _dev(("a", "ka", _op(2, cols=2)))
     dev.pinned.add("ka")
