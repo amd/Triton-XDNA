@@ -256,7 +256,7 @@ module attributes {transform.with_named_sequence} {
         transform.annotate %herd3 "epilogue_herd" : !transform.any_op
 
         %herds = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-        %vectorized_herds = transform.air.herd_vectorize %herds : (!transform.any_op) -> !transform.any_op
+        %vectorized_herds = transform.structured.vectorize_children_and_apply_patterns %herds : (!transform.any_op) -> !transform.any_op
         %ep_herd2 = transform.structured.match ops{["air.herd"]} attributes{epilogue_herd} in %arg1 : (!transform.any_op) -> !transform.any_op
         transform.apply_patterns to %ep_herd2 { transform.apply_patterns.memref.fold_memref_alias_ops } : !transform.any_op
         %epiloops = transform.structured.match ops{["scf.for"]} attributes{epi_loops} in %arg1 : (!transform.any_op) -> !transform.any_op
