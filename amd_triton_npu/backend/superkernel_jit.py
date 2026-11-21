@@ -30,9 +30,6 @@ from .superkernel import (
     _Wave,
 )
 
-#: the core array npu2 places herds on: columns, then the core rows
-_ARRAY = {"npu2": (8, range(2, 6))}
-
 
 def _generic(ttir):
     """`ttir` in MLIR's generic form, which parses without Triton's dialects."""
@@ -167,71 +164,39 @@ def _evaluate(op, env, what):
     return _PerWave(int(f(*xs)) for xs in zip(*per))
 
 
-def _array(npu):
-    if npu not in _ARRAY:
-        raise ValueError(
-            f"superkernels place herds on npu2 only; give `at` for every "
-            f"herd on {npu}"
-        )
-    return _ARRAY[npu]
-
-
-def _place(parts, npu):
-    """The corner of each herd: its own `at`, or the first free spot
-    for its cores, row by row from the bottom."""
-    cols, rows = None, None
+def _check_pins(herds):
+    """Raise if the cores two herds are placed on by `at` overlap."""
     taken = set()
-
-    def cells(at, cores):
-        return {
-            (at[0] + c, at[1] + r) for c in range(cores[0]) for r in range(cores[1])
-        }
-
-    corners = []
-    for p in parts:
-        if p["at"] is not None:
-            got = cells(p["at"], p["cores"])
-            if got & taken:
-                raise ValueError(f"herd {p['name']} at {p['at']} overlaps another")
-            taken |= got
-    for p in parts:
-        if p["at"] is not None:
-            corners.append(p["at"])
+    for p in herds:
+        if p["at"] is None:
             continue
-        if cols is None:
-            cols, rows = _array(npu)
-        spot = next(
-            (
-                (c, r)
-                for r in rows
-                for c in range(cols)
-                if c + p["cores"][0] <= cols
-                and r + p["cores"][1] <= rows[-1] + 1
-                and not cells((c, r), p["cores"]) & taken
-            ),
-            None,
-        )
-        if spot is None:
-            raise ValueError(f"no room on the array for herd {p['name']}")
-        taken |= cells(spot, p["cores"])
-        corners.append(spot)
-    return corners
+        (x, y), (w, h) = p["at"], p["cores"]
+        got = {(x + c, y + r) for c in range(w) for r in range(h)}
+        if got & taken:
+            raise ValueError(f"herd {p['name']} at {p['at']} overlaps another")
+        taken |= got
 
 
-def _program_ids_as_args(f):
-    """Replace kernel function `f`'s program ids by i32 arguments appended
-    to it. Returns the axes, in the order of the new arguments."""
+def _herd_ids_as_args(f):
+    """Replace kernel function `f`'s herd ids (`air.herd_id`) by i32 arguments
+    appended to it. Returns the axes, in the order of the new arguments."""
     from air.ir import FunctionType, IntegerType, Location, TypeAttr
 
     block = f.regions[0].blocks[0]
-    pids = [o for o in _walk(f) if o.operation.name == "tt.get_program_id"]
-    axes = sorted({_attr(o, "axis") for o in pids})
+    prefix = "air.herd_id."
+    ids = [
+        o
+        for o in _walk(f)
+        if o.operation.name == "tt.call" and _callee(o).startswith(prefix)
+    ]
+    axis = {o: int(_callee(o)[len(prefix) :]) for o in ids}
+    axes = sorted(set(axis.values()))
     if not axes:
         return []
     i32 = IntegerType.get_signless(32)
     args = {a: block.add_argument(i32, Location.unknown()) for a in axes}
-    for o in pids:
-        o.results[0].replace_all_uses_with(args[_attr(o, "axis")])
+    for o in ids:
+        o.results[0].replace_all_uses_with(args[axis[o]])
         o.operation.erase()
     ft = FunctionType(TypeAttr(f.attributes["function_type"]).value)
     f.attributes["function_type"] = TypeAttr.get(
@@ -317,7 +282,7 @@ def _leaf_module(module, symbol, name):
     """The TTIR of the kernel `symbol` of `module` as a module of its own: a
     public function `name` with the functions it calls inlined, run through
     the backend's TTIR passes like a kernel compiled alone; and the axes of
-    the program ids it reads, which become arguments after its own."""
+    the herd ids it reads, which become arguments after its own."""
     import re
 
     from triton._C.libtriton import ir
@@ -334,15 +299,21 @@ def _leaf_module(module, symbol, name):
         for o in _walk(funcs[s]):
             if o.operation.name == "tt.call":
                 todo.append(_callee(o))
+    for s in order:
+        if any(o.operation.name == "tt.get_program_id" for o in _walk(funcs[s])):
+            raise ValueError(
+                f"{name}: tl.program_id is the superkernel's, not a core's; a "
+                "core's index in its herd is air.herd_id"
+            )
     for s in order[1:]:
         for o in _walk(funcs[s]):
-            if o.operation.name == "tt.get_program_id" or (
-                o.operation.name == "tt.call" and _callee(o).startswith("air.channel.")
+            if o.operation.name == "tt.call" and _callee(o).startswith(
+                ("air.channel.", "air.herd_id.")
             ):
                 raise ValueError(
-                    f"{name}: a function it calls reads a program id or a channel"
+                    f"{name}: a function it calls reads a herd id or a channel"
                 )
-    axes = _program_ids_as_args(funcs[symbol])
+    axes = _herd_ids_as_args(funcs[symbol])
     chans = _channels_as_args(funcs[symbol])
     own = _locals_as_args(funcs[symbol], funcs)
     texts = []
@@ -393,8 +364,6 @@ def read(ttir, air_project_path, fp_fusion=False):
     kind of each argument of its function: "buffer" or "scalar". Its kernels
     are compiled with contraction if `fp_fusion`."""
     from air.ir import Context, Location, Module
-
-    from .driver import detect_npu_version
 
     with Context() as ctx, Location.unknown():
         ctx.allow_unregistered_dialects = True
@@ -567,16 +536,8 @@ def read(ttir, air_project_path, fp_fusion=False):
                     f"herd {p['name']} is placed at {h['at']} and {p['at']}"
                 )
             h["at"] = h["at"] or p["at"]
-        places = _place(
-            list(herds.values()),
-            (
-                detect_npu_version()
-                if any(h["at"] is None for h in herds.values())
-                else None
-            ),
-        )
-        corner = dict(zip(herds, places))
-        corners = [corner[p["name"]] for p in settings]
+        _check_pins(herds.values())
+        corners = [herds[p["name"]]["at"] for p in settings]
 
         sched_dir = os.path.join(sk.proj, "schedules")
         os.makedirs(sched_dir, exist_ok=True)

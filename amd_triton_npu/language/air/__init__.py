@@ -17,6 +17,7 @@ from .superkernel import (
     alloc,
     backend,
     herd,
+    herd_id,
     table,
 )
 
@@ -29,5 +30,6 @@ __all__ = [
     "alloc",
     "backend",
     "herd",
+    "herd_id",
     "table",
 ]

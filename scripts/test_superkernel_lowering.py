@@ -3,13 +3,15 @@
 # SPDX-License-Identifier: MIT
 """Rewrites of a superkernel's AIR module, on small modules written by hand:
 
-  in place      a core's copy between a channel's buffer and an L1 buffer is
-                removed only when it copies the whole of both, in order
-  forwarding    a vector a core writes to its own buffer replaces only reads
-                of the whole buffer, in the same order
-  index casts   a constant cast to index becomes an index constant; a cast
-                from index keeps its type
-  herd depth    whether code is a herd's is kept per thread of compilation
+  forward copies  a block loaded from a channel and stored unchanged into
+                  the kernel's own buffer is one copy
+  forwarding      a vector a core writes to a buffer replaces reads of it in
+                  the same order; a buffer sent on a channel stays
+  placement       herds without `at` go where AIR's placer puts them, around
+                  the pinned ones; herds that do not fit are an error
+  index casts     a constant cast to index becomes an index constant; a cast
+                  from index keeps its type
+  herd depth      whether code is a herd's is kept per thread of compilation
 
 Needs no NPU.
 
@@ -20,7 +22,7 @@ import sys
 import threading
 
 try:
-    from air.ir import Context, Location, Module
+    from air.ir import Context, IntegerAttr, Location, Module
     from triton.backends.amd_triton_npu import superkernel as S
     from triton.language.extra.air import superkernel as L
 except ImportError as e:
@@ -63,38 +65,53 @@ def alloc(module, n):
     return S._ops_named(herd_of(module), "memref.alloc")[n].results[0]
 
 
-def in_place():
-    whole = """
-      %tmp = memref.alloc() : memref<32xbf16, 2>
-      air.channel.get @c[] (%tmp[] [] []) : (memref<32xbf16, 2>)
-      %home = memref.alloc() : memref<32xbf16, 2>
-      %v = vector.transfer_read %tmp[%c0], %pad {in_bounds = [true]} : memref<32xbf16, 2>, vector<32xbf16>
-      vector.transfer_write %v, %home[%c0] {in_bounds = [true]} : vector<32xbf16>, memref<32xbf16, 2>
+def forward_copies():
+    # A block loaded from a channel's address and stored into the kernel's own
+    # buffer unchanged, as triton-shared lowers it.
+    text = """
+func.func @k(%chan: memref<*xbf16>, %own: memref<*xbf16>) {
+  %c0 = arith.constant 0 : index
+  %src = memref.reinterpret_cast %chan to offset: [%c0], sizes: [256], strides: [1] : memref<*xbf16> to memref<256xbf16, strided<[1], offset: ?>>
+  %dst = memref.reinterpret_cast %own to offset: [0], sizes: [256], strides: [1] : memref<*xbf16> to memref<256xbf16, strided<[1]>>
+  %buf = memref.alloc() : memref<256xbf16>
+  memref.copy %src, %buf : memref<256xbf16, strided<[1], offset: ?>> to memref<256xbf16>
+  %t = bufferization.to_tensor %buf restrict writable : memref<256xbf16> to tensor<256xbf16>
+  bufferization.materialize_in_destination %t in writable %dst : (tensor<256xbf16>, memref<256xbf16, strided<[1]>>) -> ()
+  return
+}
 """
-    part = """
-      %tmp = memref.alloc() : memref<256xbf16, 2>
-      air.channel.get @c[] (%tmp[] [] []) : (memref<256xbf16, 2>)
-      %home = memref.alloc() : memref<32xbf16, 2>
-      %v = vector.transfer_read %tmp[%c32], %pad {in_bounds = [true]} : memref<256xbf16, 2>, vector<32xbf16>
-      vector.transfer_write %v, %home[%c0] {in_bounds = [true]} : vector<32xbf16>, memref<32xbf16, 2>
-"""
-    for body, want, what in (
-        (whole, 1, "a whole copy is removed"),
-        (part, 0, "a copy of 32 elements at 32 of 256 is kept"),
-    ):
-        m = Module.parse(herd_module(body))
-        got = S._l1_copies(herd_of(m), [alloc(m, 1)])
-        check(len(got) == want, f"in place: {what}")
+    own = S._Local(256, "bf16", "air.local.0")
+    got = S._forward_copies(text, ["chan", own])
+    check(
+        got.count("memref.copy") == 1
+        and "materialize_in_destination" not in got
+        and "memref.alloc" not in got,
+        "forward copies: a channel load stored into the kernel's buffer is one copy",
+    )
+    check(
+        S._forward_copies(text, ["chan", "ddr"]) == text,
+        "forward copies: a kernel without buffers of its own is left as it is",
+    )
 
 
 def forwarding():
-    body = """
+    from air.compiler.util import run_transform
+
+    def herds(body):
+        m = Module.parse(herd_module("      %f0 = arith.constant 0.0 : f32\n" + body))
+        run_transform(Module.parse(S._HERDS), m)
+        return m
+
+    write = """
       %buf = memref.alloc() : memref<8x8xf32, 2>
       %cst = arith.constant dense<1.0> : vector<8x8xf32>
       vector.transfer_write %cst, %buf[%c0, %c0] {{in_bounds = [true, true]}} : vector<8x8xf32>, memref<8x8xf32, 2>
+"""
+    read = """
       %r = vector.transfer_read %buf[%c0, %c0], %f0 {{in_bounds = [true, true]{map}}} : memref<8x8xf32, 2>, vector<8x8xf32>
       %out = memref.alloc() : memref<8x8xf32, 2>
       vector.transfer_write %r, %out[%c0, %c0] {{in_bounds = [true, true]}} : vector<8x8xf32>, memref<8x8xf32, 2>
+      air.channel.put @c[%c0] (%out[] [] []) : (memref<8x8xf32, 2>)
 """
     for perm, want, what in (
         ("", True, "a read of the whole buffer takes the written vector"),
@@ -104,13 +121,77 @@ def forwarding():
             "a transposed read keeps reading the buffer",
         ),
     ):
-        text = herd_module(
-            "      %f0 = arith.constant 0.0 : f32\n" + body.format(map=perm)
-        )
-        m = Module.parse(text)
-        S._forward_private_vectors(m.operation)
-        reads = S._ops_named(herd_of(m), "vector.transfer_read")
+        m = herds((write + read).format(map=perm))
+        h = herd_of(m)
+        reads = S._ops_named(h, "vector.transfer_read")
         check((not reads) == want, f"forwarding: {what}")
+        check(
+            len(S._ops_named(h, "air.channel.put")) == 1,
+            f"forwarding: the sent buffer stays ({what})",
+        )
+    send = "      air.channel.put @c[%c0] (%buf[] [] []) : (memref<8x8xf32, 2>)\n"
+    m = herds(write.format() + send)
+    h = herd_of(m)
+    check(
+        len(S._ops_named(h, "vector.transfer_write")) == 1
+        and len(S._ops_named(h, "air.channel.put")) == 1,
+        "forwarding: a buffer the core fills and sends stays, with its write",
+    )
+
+
+def placement():
+    def seg_module(herds):
+        body = "".join(f"""
+        air.herd @{name} tile (%tx, %ty) in (%sx=%c{w}, %sy=%c1){attrs} {{
+        }}""" for name, w, attrs in herds)
+        return f"""
+module {{
+  func.func @f() {{
+    air.launch () in () {{
+      air.segment @seg attributes {{x_loc = 0 : i64, y_loc = 2 : i64}} {{
+        %c1 = arith.constant 1 : index
+        %c2 = arith.constant 2 : index
+        %c8 = arith.constant 8 : index{body}
+      }}
+    }}
+    return
+  }}
+}}
+"""
+
+    def places(m):
+        return {
+            str(h.attributes["sym_name"]).strip('"'): (
+                IntegerAttr(h.attributes["x_loc"]).value,
+                IntegerAttr(h.attributes["y_loc"]).value,
+            )
+            for h in S._ops_named(m.operation, "air.herd")
+        }
+
+    pinned = " attributes {x_loc = 0 : i64, y_loc = 2 : i64}"
+    m = Module.parse(seg_module([("p", 2, pinned), ("q", 2, "")]))
+    seg = S._ops_named(m.operation, "air.segment")[0]
+    S._place_herds(m, seg, "npu2")
+    got = places(m)
+    check(
+        got["p"] == (0, 2)
+        and got["q"][1] in range(2, 6)
+        and got["q"][0] + 2 <= 8
+        and got["q"] not in ((0, 2), (1, 2)),
+        f"placement: a herd without `at` goes beside the pinned one ({got})",
+    )
+    m = Module.parse(seg_module([("p", 2, pinned)]))
+    seg = S._ops_named(m.operation, "air.segment")[0]
+    S._place_herds(m, seg, "npu1")
+    check(places(m) == {"p": (0, 2)}, "placement: pinned herds need no array")
+    m = Module.parse(seg_module([(f"h{i}", 8, "") for i in range(5)]))
+    seg = S._ops_named(m.operation, "air.segment")[0]
+    try:
+        S._place_herds(m, seg, "npu2")
+        failed = False
+    except Exception:
+        failed = True
+    check(failed, "placement: herds that do not fit are an error")
 
 
 def index_casts():
@@ -161,8 +242,9 @@ def herd_depth():
 def main():
     with Context() as ctx, Location.unknown():
         ctx.allow_unregistered_dialects = True
-        in_place()
+        forward_copies()
         forwarding()
+        placement()
         index_casts()
     herd_depth()
     if failures:

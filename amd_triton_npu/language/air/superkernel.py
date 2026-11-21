@@ -28,12 +28,14 @@ through channels (`Channel`, `ChannelPut`, `ChannelGet`, as AIR's). DDR
 buffers, the pointer arguments, are updated in place.
 
 A herd's `size` is its core count, an int or (columns, rows). A kernel that
-reads `tl.program_id` runs one program a core, its program ids the core's
-index in the herd. Any other kernel is split over its cores by its
+reads `herd_id` runs one program a core, `herd_id(0)` and `herd_id(1)` the
+core's column and row in the herd, as AIR's `air.herd tile (%x, %y)`.
+`tl.program_id` stays the superkernel's, of its launch grid, so a herd's
+kernel may not read it. Any other kernel is split over its cores by its
 `schedule`: the path of a transform script whose `@__transform_main` takes,
 after the payload, one `!transform.param<i64>` per core dimension, for use
-as `num_threads`. Herds are placed on the array in order unless `at` gives
-the (column, row) of a herd's corner.
+as `num_threads`. `at` gives the (column, row) of a herd's corner; AIR's
+placer places the herds without it.
 
 The loop over the waves must have a constexpr trip count. Ints computed from
 the wave index, such as `wave * 2 + 1` or `air.table(values, wave)`, are
@@ -154,6 +156,27 @@ def herd(fn, args, size, schedule, name=None, at=None, _semantic=None, _generato
         )
     finally:
         _HERD.reset(token)
+
+
+@core.builtin
+def herd_id(axis, _semantic=None, _generator=None):
+    """The index of the core running this code in its herd, along `axis`: 0
+    for the column, 1 for the row. Only in a herd's kernel."""
+    axis = core._unwrap_if_constexpr(axis)
+    if axis not in (0, 1):
+        raise ValueError(f"herd_id: a herd's axes are 0 and 1, not {axis}")
+    if not _in_herd():
+        raise ValueError("herd_id: only in a herd's kernel")
+    b = _semantic.builder
+    module = _generator.module
+    name = f"air.herd_id.{axis}"
+    if not module.has_function(name):
+        decl = ir.builder(_generator.context).get_or_insert_function(
+            module, name, b.get_function_ty([], [b.get_int32_ty()]), "private", None
+        )
+        module.push_back(decl)
+    call = b.call(module.get_function(name), [])
+    return core.tensor(call.get_result(0), core.int32)
 
 
 @core.builtin
