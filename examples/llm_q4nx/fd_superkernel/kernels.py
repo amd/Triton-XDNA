@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""The models' own core functions: SiLU's GLU, the per-head qk-norm and
-half-split RoPE, q padded to the attention kernels' 4 heads a kv head. The
+"""The models' own core functions: SiLU's GLU, the q/k/v bias or per-head
+qk-norm and half-split RoPE, q padded with zero heads. The
 rest (Q4 products, norms, attention, GELU's GLU) are the Gemma4
 superkernel's.
 """
@@ -9,7 +9,7 @@ superkernel's.
 import triton
 import triton.language as tl
 
-from gemma4_superkernel.kernels import bf_parts, copy_n, exp2_f32, rms_norm
+from gemma4_superkernel.kernels import add_bf, bf_parts, copy_n, exp2_f32, rms_norm
 
 
 @triton.jit
@@ -73,29 +73,39 @@ def rope(
     NKV: tl.constexpr,
     DH: tl.constexpr,
     EPS: tl.constexpr,
+    QPAD: tl.constexpr,
+    BIAS: tl.constexpr,
 ):
-    """q/k/v from the QKV projection's [q | k | v] at qkv: each q head
-    q-normed and rotated, each k head k-normed and rotated, v as it is
-    (air-FLM's rope.cc). q comes out 4 heads a kv head: its own, then zero
-    heads (Gemma3's 2 a kv head, as air-FLM pads them). w: [cos DH/2 | sin
-    DH/2 | q_norm DH | k_norm DH]. The heads are normed in place."""
+    """q/k/v from the QKV projection's [q | k | v] at qkv (air-FLM's
+    rope.cc): with BIAS, the q/k/v biases added first; each q head q-normed
+    (without BIAS) and rotated, each k head k-normed (likewise) and rotated,
+    v as it is. q comes out QPAD heads a kv head: its own, then zero heads,
+    as air-FLM pads them. w: [cos DH/2 | sin DH/2] then [q_norm DH | k_norm
+    DH] or the biases [q | k | v]. The heads are normed in place."""
     G: tl.constexpr = NQ // NKV  # q heads a kv head
-    if G == 4:
+    if BIAS:
+        add_bf(qkv, w + DH, (NQ + 2 * NKV) * DH)
+    if G == QPAD:
         for h in range(NQ):
-            rms_norm(qkv + h * DH, qkv + h * DH, w + DH, sq, DH, EPS)
+            if not BIAS:
+                rms_norm(qkv + h * DH, qkv + h * DH, w + DH, sq, DH, EPS)
             apply_rope(q + h * DH, qkv + h * DH, w, DH // 2)
     else:
         k = tl.arange(0, 32)
         for h in range(NKV):
             for j in range(G):
                 o = (h * G + j) * DH
-                rms_norm(qkv + o, qkv + o, w + DH, sq, DH, EPS)
-                apply_rope(q + (h * 4 + j) * DH, qkv + o, w, DH // 2)
-            for c in range((4 - G) * DH // 32):
-                tl.store(q + (h * 4 + G) * DH + c * 32 + k, tl.zeros([32], tl.bfloat16))
+                if not BIAS:
+                    rms_norm(qkv + o, qkv + o, w + DH, sq, DH, EPS)
+                apply_rope(q + (h * QPAD + j) * DH, qkv + o, w, DH // 2)
+            for c in range((QPAD - G) * DH // 32):
+                tl.store(
+                    q + (h * QPAD + G) * DH + c * 32 + k, tl.zeros([32], tl.bfloat16)
+                )
     for h in range(NKV):
         o = NQ * DH + h * DH
-        rms_norm(qkv + o, qkv + o, w + 2 * DH, sq, DH, EPS)
+        if not BIAS:
+            rms_norm(qkv + o, qkv + o, w + 2 * DH, sq, DH, EPS)
         apply_rope(kk + h * DH, qkv + o, w, DH // 2)
     copy_n(v, qkv + (NQ + NKV) * DH, NKV * DH)
 
@@ -103,6 +113,27 @@ def rope(
 @triton.jit
 def real_heads(o2, o, NCH: tl.constexpr, NH: tl.constexpr):
     """o2 [NCH][NH][8] = the first NH heads of o [NCH][4][8]."""
-    k = tl.arange(0, NH * 8)
+    if NH % 2 == 0:
+        k = tl.arange(0, NH * 8)
+        for c in range(NCH):
+            tl.store(o2 + c * NH * 8 + k, tl.load(o + c * 32 + k))
+    else:
+        k = tl.arange(0, 8)
+        for c in range(NCH):
+            for h in range(NH):
+                tl.store(o2 + (c * NH + h) * 8 + k, tl.load(o + c * 32 + h * 8 + k))
+
+
+@triton.jit
+def real_heads2(o2, o, NCH: tl.constexpr, NH: tl.constexpr):
+    """o2 [NCH][NH][8] = the first NH of the 8 heads of o [2][NCH][4][8]:
+    the first group's 4, then the second's first NH - 4. A head's 8 at a
+    time: o2's rows of NH 8s leave wider stores unaligned."""
+    k = tl.arange(0, 8)
     for c in range(NCH):
-        tl.store(o2 + c * NH * 8 + k, tl.load(o + c * 32 + k))
+        for h in range(NH):
+            g = h // 4
+            tl.store(
+                o2 + (c * NH + h) * 8 + k,
+                tl.load(o + (g * NCH + c) * 32 + (h % 4) * 8 + k),
+            )

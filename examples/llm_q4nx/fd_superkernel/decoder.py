@@ -35,11 +35,6 @@ class SuperkernelDecoder:
     """
 
     def __init__(self, model=None, max_L=None, verbose=True):
-        import airsrc
-
-        from .spec import MODELS, NAME
-
-        airsrc.add_air_paths(*MODELS[NAME]["packages"])
         from . import geom as G
         from . import pack as K
         from .wave import slab_offsets
@@ -49,7 +44,11 @@ class SuperkernelDecoder:
         self.maxL = self.ATTN_MAXL = max(128, 1 << ((max_L or 1) - 1).bit_length())
         D = qw.D
         t0 = time.time()
-        m = qw.Q4nxModel(model)
+        S = G.S
+        if S.get("source") == "requant":
+            m = qw.open_weight_source(model or S["default_source"])
+        else:
+            m = qw.Q4nxModel(model)
         nl = qw.NUM_LAYERS
         # arm 1 a layer, 2 a sliding one, 0 an LM wave
         self.arms = tuple(
@@ -66,18 +65,32 @@ class SuperkernelDecoder:
         final = [np.zeros(D * (G.NORMS // 2 - 1), np.float32)]
         final += [m.bf16("model.norm.weight")]
         self.embed = np.asarray(m.bf16("model.embed_tokens.weight"), bfloat16)
-        self.qk = [m.layer_qk_norm(L) for L in range(nl)]
+        # what a layer's rope weights take besides the position
+        rw = m.layer_qkv_bias if G.ROPE == "bias" else m.layer_qk_norm
+        self.rw = [rw(L) for L in range(nl)]
         self.RS = self.maxL * G.GW  # a group's KV region
+        # the weight buffers: one, or LPW layers' a buffer and the LM head's
+        # in W4 (`wave`)
+        if G.LPW:
+            wbo = tuple(L // G.LPW for L in range(nl)) + (4,) * G.NL
+            assert wbo[nl - 1] < 4
+        else:
+            wbo = (0,) * (nl + G.NL)
+        ws = {}
+        for b, w in zip(wbo, W):
+            ws.setdefault(b, []).append(w)
+        ws = {b: torch.from_numpy(np.concatenate(v)) for b, v in ws.items()}
         self.args = [
             bf_tensor(np.zeros(D + G.NL * G.LM_ROWS)),  # XL
             bf_tensor(np.concatenate(rms + final)),  # RMS
-            torch.from_numpy(np.concatenate(W)),  # W
+            ws.pop(0),  # W
             bf_tensor(np.zeros(nl * G.ROPE_W)),  # ROPE
             bf_tensor(np.zeros((nl + 1) * 4 * self.RS)),  # KV
         ]
+        self.wx = {f"W{b}": t for b, t in sorted(ws.items())}
         self.kw = dict(
             ARMS=self.arms,
-            SLABS=slab_offsets(self.arms),
+            SLABS=slab_offsets(self.arms, wbo),
             KVAPP=tuple(range(nl)) + (nl,) * G.NL,
             NDEC=nl,
             NW=nl + G.NL,
@@ -85,6 +98,8 @@ class SuperkernelDecoder:
             SM=os.path.join(SCRIPTS, "attn_aie2p.mlir"),
             MAXL=self.maxL,
         )
+        if self.wx:
+            self.kw.update(NWB=1 + len(self.wx), WBO=wbo)
         self.res = None
         if verbose:
             print(
@@ -129,8 +144,7 @@ class SuperkernelDecoder:
         xl[: qw.D] = self.embed[tok]
         rope = _bf16_view(self._buf(self.ROPE))
         for L in range(qw.NUM_LAYERS):
-            qn, kn = self.qk[L]
-            rope[L * G.ROPE_W : (L + 1) * G.ROPE_W] = qw.rope_w_layer(p, L, qn, kn)
+            rope[L * G.ROPE_W : (L + 1) * G.ROPE_W] = qw.rope_w_layer(p, L, *self.rw[L])
         if self.res is None:
             self._first(p)
         else:
@@ -147,10 +161,10 @@ class SuperkernelDecoder:
         from .wave import wave
 
         with driver_scope("npu"), config_context(bf16_emulation=False):
-            ck = wave[(1,)](*self.args, p, **self.kw)
-            self.res = ck.run.launch.resident(*self.args, p)
+            ck = wave[(1,)](*self.args, p, **self.kw, **self.wx)
+            self.res = ck.run.launch.resident(*self.args, p, *self.wx.values())
         # the device's copies are the ones read from here on
-        self.args = None
+        self.args = self.wx = None
 
     def close(self):
         if self.res is not None:

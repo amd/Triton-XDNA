@@ -585,6 +585,7 @@ QWEN2_5_7B = ModelSpec(
     # against; mlir-air's own weights module inserts it at import.
     extra_packages=("qwen25_3b",),
     supports_hsa=False,
+    superkernel_decoder="fd_superkernel.qwen25_7b:SuperkernelDecoder",
 )
 
 

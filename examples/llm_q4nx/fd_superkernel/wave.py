@@ -49,6 +49,7 @@ from .geom import (
     KVPC,
     LM_ROWS,
     LMR,
+    NBC,
     NBMAX,
     NCH,
     NFA,
@@ -56,15 +57,17 @@ from .geom import (
     NKV,
     NORMS,
     NQ,
+    NQG,
     NR,
     NX,
     QPAD,
     QPC,
+    ROPE,
     ROPE_W,
     SCALE,
     SWA,
 )
-from .kernels import glu_silu, real_heads, rope
+from .kernels import glu_silu, real_heads, real_heads2, rope
 from .spec import S as SPEC
 
 # as constexprs, for the jitted code
@@ -76,7 +79,9 @@ KB_ = tl.constexpr(KB)
 LMR_ = tl.constexpr(LMR)
 I2P_ = tl.constexpr(I2P)
 J2P_ = tl.constexpr(J2P)
+NBC_ = tl.constexpr(NBC)
 NBMAX_ = tl.constexpr(NBMAX)
+XQ_ = tl.constexpr(NBC if NBC == NBMAX else NBC + 2)  # q4_prep's slots
 NCH_ = tl.constexpr(NCH)
 NQ_ = tl.constexpr(NQ)
 NKV_ = tl.constexpr(NKV)
@@ -87,6 +92,8 @@ NORMS_ = tl.constexpr(NORMS)
 RL_ = tl.constexpr(NORMS * D)  # a layer's norm weights
 WH_ = tl.constexpr(NORMS // 2 * D)  # rmsW's and rmsW2's: half of them
 SILU_ = tl.constexpr(SPEC["act"] == "silu")
+BIAS_ = tl.constexpr(ROPE == "bias")
+NQG_ = tl.constexpr(NQG)
 SWA_ = tl.constexpr(SWA)
 GW_ = tl.constexpr(GW)
 INTER_ = tl.constexpr(INTER)
@@ -104,10 +111,13 @@ QB = tl.constexpr(KVPC * QPAD * DH)  # a CU's q, padded
 NF0, NF1, NF2, NF3 = NFA
 
 
-def slab_offsets(arms):
-    """The first fill of each wave's weight slab, waves of `arms`."""
+def slab_offsets(arms, wbo=None):
+    """The first fill of each wave's weight slab in its buffer, waves of
+    `arms` in buffers `wbo` (all in one if None)."""
     out, at = [], 0
-    for a in arms:
+    for i, a in enumerate(arms):
+        if wbo is not None and i and wbo[i] != wbo[i - 1]:
+            at = 0
         out.append(at)
         at += 8 * sum(NFA[p].value[a] for p in range(4))
     return tuple(out)
@@ -128,8 +138,8 @@ def proj_core(arm, CX0: tl.constexpr):
     acc = air.alloc([32], tl.float32, memory_space=air.L1)
     # x prepared for the products (q4_prep), a column block's per slot: the
     # same in every round of a phase, so prepared in its first
-    xqc = air.alloc([NBMAX_ * 256], tl.bfloat16, memory_space=air.L1)
-    sxc = air.alloc([NBMAX_ * 8], tl.float32, memory_space=air.L1)
+    xqc = air.alloc([XQ_ * 256], tl.bfloat16, memory_space=air.L1)
+    sxc = air.alloc([XQ_ * 8], tl.float32, memory_space=air.L1)
     t = air.alloc([32], tl.float32, memory_space=air.L1)
     y = air.alloc([64], tl.bfloat16, memory_space=air.L1)
     tab = air.alloc([256], tl.int16, memory_space=air.L1)
@@ -146,6 +156,10 @@ def proj_core(arm, CX0: tl.constexpr):
             first = (i == 0).to(tl.int32)
             for jp in range(j2):
                 j = 2 * jp
+                if NBC_ < NBMAX_:
+                    kept = (j < NBC_).to(tl.int32)
+                    j = j * kept + NBC_ * (1 - kept)
+                    first = tl.maximum((i == 0).to(tl.int32), 1 - kept)
                 air.ChannelGet("inX", x0, indices=[cx, cy], sizes=[256])
                 air.ChannelGet("inX", x1, indices=[cx, cy], sizes=[256])
                 air.ChannelGet("wL2ToL1", w0, indices=[cx, cy], sizes=[2560])
@@ -195,8 +209,12 @@ def rms_core(arm):
         else:
             residual(h, x, o, D_)
         rms_norm(xn, h, w2, sq, D_, EPS_)
-        for n in range(I2P_[2]):
-            air.ChannelPut("xnorm", xn, offsets=[0], sizes=[D_])
+        # a lock counts the sends of a fill to 63: more in groups, as
+        # air-FLM's refeed
+        NG: tl.constexpr = (I2P_[2] + 62) // 63
+        for g in tl.static_range(NG):
+            for n in range(I2P_[2] // NG + (g < I2P_[2] % NG)):
+                air.ChannelPut("xnorm", xn, offsets=[0], sizes=[D_])
         air.ChannelGet("outY", o, indices=[0, 1], sizes=[D_])
         if NORMS_ == 4:
             rms_norm(t, o, w2 + D_, sq, D_, EPS_)
@@ -235,7 +253,7 @@ def rope_core(arm):
         for n in range(I2P_[0]):
             air.ChannelGet("outY", qkv, indices=[0, 0], offsets=[n * 512], sizes=[512])
         air.ChannelGet("ropeLUT", w, sizes=[ROPE_W_])
-        rope(q, kk, v, qkv, w, sq, NQ_, NKV_, DH_, EPS_)
+        rope(q, kk, v, qkv, w, sq, NQ_, NKV_, DH_, EPS_, QPAD_, BIAS_)
         air.ChannelPut("ropeQ", q, offsets=[0], sizes=[NKV_ * QPAD_ * DH_])
     # in every wave, as the host's gets: an LM wave's are not read
     air.ChannelPut("appendK", kk, offsets=[0], sizes=[DK_])
@@ -332,7 +350,7 @@ def kv_core1(arm, pos, CU: tl.constexpr):
 def qk_scores(q, kb, mst, pc, acc, tmp, sb, mb, blk, pos, G: tl.constexpr):
     """Group G's (a kv head's 4 q heads') scores of block blk."""
     attn_qk_block_mm(
-        q + G * (QB // KVPC_),
+        q + G * (QB // NQG_),
         kb,
         mst + G * 32,
         pc + G * 96,
@@ -350,80 +368,108 @@ def qk_scores(q, kb, mst, pc, acc, tmp, sb, mb, blk, pos, G: tl.constexpr):
 
 @triton.jit
 def qk_core2(arm, pos, CU: tl.constexpr):
-    """Attention scores of a CU's 8 heads (two groups of 4, one a kv head)
-    over the 16-key blocks up to the token's position pos (set each token),
-    the keys after it masked, scaled by 1/sqrt(DH): a pair of blocks a trip,
-    each kv head's keys of a block into a buffer of their own (the DMA fills
-    one while the core reads another), p and c to the kv core."""
+    """Attention scores of a CU's 8 heads, two groups of 4 on its kv heads
+    (one each, or both on its one), over the 16-key blocks up to the token's
+    position pos (set each token), the keys after it masked, scaled: a pair
+    of blocks a trip, each kv head's keys of a block into a buffer of their
+    own (the DMA fills one while the core reads another), p and c to the kv
+    core."""
     q = air.alloc([QB], tl.bfloat16, memory_space=air.L1)
     ka = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
-    kb = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
+    if KVPC_ == 2:
+        kb = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
     ka1 = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
-    kb1 = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
-    mst = air.alloc([32 * KVPC_], tl.float32, memory_space=air.L1)
-    pc = air.alloc([96 * KVPC_], tl.bfloat16, memory_space=air.L1)
-    pc1 = air.alloc([96 * KVPC_], tl.bfloat16, memory_space=air.L1)
+    if KVPC_ == 2:
+        kb1 = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
+    mst = air.alloc([64], tl.float32, memory_space=air.L1)
+    pc = air.alloc([192], tl.bfloat16, memory_space=air.L1)
+    pc1 = air.alloc([192], tl.bfloat16, memory_space=air.L1)
     acc = air.alloc([32], tl.float32, memory_space=air.L1)
     tmp = air.alloc([64], tl.float32, memory_space=air.L1)
     sb = air.alloc([64], tl.float32, memory_space=air.L1)
     mb = air.alloc([64], tl.float32, memory_space=air.L1)
     for _ in range((arm != 0).to(tl.int32)):
-        tl.store(
-            mst + tl.arange(0, 32 * KVPC_), tl.full([32 * KVPC_], -1.0e4, tl.float32)
-        )
+        tl.store(mst + tl.arange(0, 64), tl.full([64], -1.0e4, tl.float32))
         air.ChannelGet("toAttnQ", q, indices=[CU], sizes=[QB])
         n2 = ((pos + 16) // 16 + 1) // 2
         for i in range(n2):
             b = 2 * i
             air.ChannelGet("toK", ka, indices=[CU], sizes=[HB])
-            air.ChannelGet("toK", kb, indices=[CU], sizes=[HB])
-            qk_scores(q, ka, mst, pc, acc, tmp, sb, mb, b, pos, 0)
-            qk_scores(q, kb, mst, pc, acc, tmp, sb, mb, b, pos, 1)
-            air.ChannelPut("sPC", pc, indices=[CU], offsets=[0], sizes=[96 * KVPC_])
+            if KVPC_ == 2:
+                air.ChannelGet("toK", kb, indices=[CU], sizes=[HB])
+                qk_scores(q, ka, mst, pc, acc, tmp, sb, mb, b, pos, 0)
+                qk_scores(q, kb, mst, pc, acc, tmp, sb, mb, b, pos, 1)
+            else:
+                qk_scores(q, ka, mst, pc, acc, tmp, sb, mb, b, pos, 0)
+                qk_scores(q, ka, mst, pc, acc, tmp, sb, mb, b, pos, 1)
+            air.ChannelPut("sPC", pc, indices=[CU], offsets=[0], sizes=[192])
             air.ChannelGet("toK", ka1, indices=[CU], sizes=[HB])
-            air.ChannelGet("toK", kb1, indices=[CU], sizes=[HB])
-            qk_scores(q, ka1, mst, pc1, acc, tmp, sb, mb, b + 1, pos, 0)
-            qk_scores(q, kb1, mst, pc1, acc, tmp, sb, mb, b + 1, pos, 1)
-            air.ChannelPut("sPC", pc1, indices=[CU], offsets=[0], sizes=[96 * KVPC_])
+            if KVPC_ == 2:
+                air.ChannelGet("toK", kb1, indices=[CU], sizes=[HB])
+                qk_scores(q, ka1, mst, pc1, acc, tmp, sb, mb, b + 1, pos, 0)
+                qk_scores(q, kb1, mst, pc1, acc, tmp, sb, mb, b + 1, pos, 1)
+            else:
+                qk_scores(q, ka1, mst, pc1, acc, tmp, sb, mb, b + 1, pos, 0)
+                qk_scores(q, ka1, mst, pc1, acc, tmp, sb, mb, b + 1, pos, 1)
+            air.ChannelPut("sPC", pc1, indices=[CU], offsets=[0], sizes=[192])
 
 
 @triton.jit
 def kv_core2(arm, pos, CU: tl.constexpr):
-    """A CU's attention sums from its qk core's p and c and the values, a kv
-    head's values of a block in a buffer of their own; then its output y / l,
-    blocked [kv head][NCH][4][8]."""
+    """A CU's attention sums of its two groups from its qk core's p and c and
+    the values, a kv head's values of a block in a buffer of their own; then
+    its output y / l, blocked [group][NCH][4][8], its real heads only (a
+    group's zero heads dropped) as air-FLM sends them."""
     YB: tl.constexpr = NCH_ * 32  # a group's sums
     va = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
-    vb = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
+    if KVPC_ == 2:
+        vb = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
     va1 = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
-    vb1 = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
-    pc = air.alloc([96 * KVPC_], tl.bfloat16, memory_space=air.L1)
-    pc1 = air.alloc([96 * KVPC_], tl.bfloat16, memory_space=air.L1)
-    y = air.alloc([YB * KVPC_], tl.float32, memory_space=air.L1)
-    lst = air.alloc([32 * KVPC_], tl.float32, memory_space=air.L1)
+    if KVPC_ == 2:
+        vb1 = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
+    pc = air.alloc([192], tl.bfloat16, memory_space=air.L1)
+    pc1 = air.alloc([192], tl.bfloat16, memory_space=air.L1)
+    y = air.alloc([YB * 2], tl.float32, memory_space=air.L1)
+    lst = air.alloc([64], tl.float32, memory_space=air.L1)
     ct = air.alloc([32], tl.float32, memory_space=air.L1)
     o = air.alloc([QB], tl.bfloat16, memory_space=air.L1)
+    if QPC_ < 8:
+        o2 = air.alloc([NCH_ * QPC_ * 8], tl.bfloat16, memory_space=air.L1)
     for _ in range((arm != 0).to(tl.int32)):
         k = tl.arange(0, 32)
-        for c in range(YB * KVPC_ // 32):
+        for c in range(YB * 2 // 32):
             tl.store(y + c * 32 + k, tl.zeros([32], tl.float32))
-        for g in tl.static_range(KVPC_):
+        for g in tl.static_range(2):
             tl.store(lst + g * 32 + k, tl.zeros([32], tl.float32))
         n2 = ((pos + 16) // 16 + 1) // 2
         for i in range(n2):
             air.ChannelGet("toV", va, indices=[CU], sizes=[HB])
-            air.ChannelGet("toV", vb, indices=[CU], sizes=[HB])
-            air.ChannelGet("sPC", pc, indices=[CU], sizes=[96 * KVPC_])
+            if KVPC_ == 2:
+                air.ChannelGet("toV", vb, indices=[CU], sizes=[HB])
+            air.ChannelGet("sPC", pc, indices=[CU], sizes=[192])
             attn_kv_block_mm(va, pc, y, lst, ct, NCH_)
-            attn_kv_block_mm(vb, pc + 96, y + YB, lst + 32, ct, NCH_)
+            if KVPC_ == 2:
+                attn_kv_block_mm(vb, pc + 96, y + YB, lst + 32, ct, NCH_)
+            else:
+                attn_kv_block_mm(va, pc + 96, y + YB, lst + 32, ct, NCH_)
             air.ChannelGet("toV", va1, indices=[CU], sizes=[HB])
-            air.ChannelGet("toV", vb1, indices=[CU], sizes=[HB])
-            air.ChannelGet("sPC", pc1, indices=[CU], sizes=[96 * KVPC_])
+            if KVPC_ == 2:
+                air.ChannelGet("toV", vb1, indices=[CU], sizes=[HB])
+            air.ChannelGet("sPC", pc1, indices=[CU], sizes=[192])
             attn_kv_block_mm(va1, pc1, y, lst, ct, NCH_)
-            attn_kv_block_mm(vb1, pc1 + 96, y + YB, lst + 32, ct, NCH_)
-        for g in tl.static_range(KVPC_):
-            attn_kv_fin_mm(o + g * (QB // KVPC_), y + g * YB, lst + g * 32, ct, NCH_)
-        air.ChannelPut("attnO", o, indices=[CU], offsets=[0], sizes=[QB])
+            if KVPC_ == 2:
+                attn_kv_block_mm(vb1, pc1 + 96, y + YB, lst + 32, ct, NCH_)
+            else:
+                attn_kv_block_mm(va1, pc1 + 96, y + YB, lst + 32, ct, NCH_)
+        for g in tl.static_range(2):
+            attn_kv_fin_mm(o + g * YB, y + g * YB, lst + g * 32, ct, NCH_)
+        if QPC_ == 8:
+            air.ChannelPut("attnO", o, indices=[CU], offsets=[0], sizes=[QB])
+        else:
+            real_heads2(o2, o, NCH_, QPC_)
+            air.ChannelPut(
+                "attnO", o2, indices=[CU], offsets=[0], sizes=[NCH_ * QPC_ * 8]
+            )
 
 
 @triton.jit
@@ -515,6 +561,12 @@ def wave(
     SLABS: tl.constexpr,
     KVAPP: tl.constexpr,
     NDEC: tl.constexpr,
+    W1=None,
+    W2=None,
+    W3=None,
+    W4=None,
+    NWB: tl.constexpr = 1,
+    WBO: tl.constexpr = None,
 ):
     """One token: NW waves, the NDEC decoder layers then the LM head's vocab
     chunks, all in one dispatch. A wave's arm (ARMS) is 1 for a layer, 2 for
@@ -524,7 +576,9 @@ def wave(
           layer the next x; an LM wave a chunk of logits
     RMS   each layer's NORMS norm weights, then the final norm's (behind D
           zeros with 4 norms, as rmsW's last D)
-    W     the Q4 weights, a slab a wave (SLABS: its first fill)
+    W     the Q4 weights, a slab a wave (SLABS: its first fill); with NWB
+          buffers, the layers' in W, W1, W2, W3 and the LM head's in W4
+          (WBO: a wave's buffer), each under the 4 GiB a shim BD addresses
     ROPE  each layer's [cos | sin | q_norm | k_norm] at this position
     KV    a layer's [K group 0 | K group 1 | V group 0 | V group 1], each
           MAXL rows of GW (KVAPP: the slab a wave appends to), then a
@@ -590,13 +644,30 @@ def wave(
         # air-FLM's index_switch. Before the KV append: the host waits for
         # the append before it reads the KV back, and the append needs them.
         at = air.table(SLABS, wave)
-        if arm == 1:
-            feed_arm(W, at, 1)
-        if SWA_ > 0:
-            if arm == 2:
-                feed_arm(W, at, 2)
-        if arm == 0:
-            feed_arm(W, at, 0)
+        if NWB == 1:
+            if arm == 1:
+                feed_arm(W, at, 1)
+            if SWA_ > 0:
+                if arm == 2:
+                    feed_arm(W, at, 2)
+            if arm == 0:
+                feed_arm(W, at, 0)
+        else:
+            # a branch a buffer, as air-FLM's DECODE_WGROUP
+            wb = air.table(WBO, wave)
+            if wb == 0:
+                feed_arm(W, at, 1)
+            if NWB > 2:
+                if wb == 1:
+                    feed_arm(W1, at, 1)
+            if NWB > 3:
+                if wb == 2:
+                    feed_arm(W2, at, 1)
+            if NWB > 4:
+                if wb == 3:
+                    feed_arm(W3, at, 1)
+            if wb == 4:
+                feed_arm(W4, at, 0)
         RS: tl.constexpr = MAXL * GW_  # a group's region
         # this token's k and v at row pos of the wave's slab: each group's
         # part of the row in its region
@@ -662,9 +733,9 @@ def wave(
                 "toAttnQ",
                 rq,
                 indices=[cu],
-                offsets=[cu * KVPC_, 0, 0, 0],
-                sizes=[KVPC_, NCH_, QPAD_, 8],
-                strides=[QPAD_ * DH_, 8, DH_, 1],
+                offsets=[cu * NQG_, 0, 0, 0],
+                sizes=[NQG_, NCH_, 4, 8],
+                strides=[4 * DH_, 8, DH_, 1],
             )
         # each group's blocks of 16 rows in its column's memtile (3 or 4), to
         # its 2 CUs, a kv head's keys at a time, blocked [2][NCH][8][8] (8 keys
@@ -703,7 +774,16 @@ def wave(
         # the attention output, heads in order, as o-proj's x a round each
         og = air.alloc([DQ_], tl.bfloat16, memory_space=air.L2, memtile_col=5)
         for cu in tl.static_range(4):
-            if KVPC_ == 1:
+            if QPC_ == 8:
+                air.ChannelGet(
+                    "attnO",
+                    og,
+                    indices=[cu],
+                    offsets=[cu * 2, 0, 0, 0],
+                    sizes=[2, NCH_, 4, 8],
+                    strides=[4 * DH_, 8, DH_, 1],
+                )
+            else:
                 air.ChannelGet(
                     "attnO",
                     og,
@@ -711,15 +791,6 @@ def wave(
                     offsets=[0, cu * QPC_, 0],
                     sizes=[NCH_, QPC_, 8],
                     strides=[8, DH_, 1],
-                )
-            else:
-                air.ChannelGet(
-                    "attnO",
-                    og,
-                    indices=[cu],
-                    offsets=[cu * KVPC_, 0, 0, 0],
-                    sizes=[KVPC_, NCH_, 4, 8],
-                    strides=[4 * DH_, 8, DH_, 1],
                 )
         for n in range(I2P_[1]):
             air.ChannelPut("xnorm", og, offsets=[0], sizes=[DQ_])
@@ -735,7 +806,7 @@ def wave(
         air.herd(rope_core, (arm,), 1, S, name="rope", at=(2, 3))
         # attention: a qk and a kv core per CU, CUs 0 and 1 in column 3, 2
         # and 3 in column 4
-        if KVPC_ == 1:
+        if NQG_ == 1:
             air.herd(qk_core1, (arm, pos, 0), 1, SM, name="qk0", at=(3, 2))
             air.herd(kv_core1, (arm, pos, 0), 1, SM, name="kv0", at=(3, 3))
             air.herd(qk_core1, (arm, pos, 1), 1, SM, name="qk1", at=(3, 4))
