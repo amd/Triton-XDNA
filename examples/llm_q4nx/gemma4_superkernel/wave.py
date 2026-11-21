@@ -296,13 +296,15 @@ def qk_core(arm, pos, CU: tl.constexpr, PART: tl.constexpr, SWA: tl.constexpr):
                 air.ChannelGet("toK", kb, indices=[0, CU], sizes=[8192])
             else:
                 air.ChannelGet("toK1", kb, indices=[0, CU], sizes=[8192])
-            attn_qk_block_mm(q, kb, mst, pc, acc, tmp, sb, mb, b, pos + 1, lo)
+            attn_qk_block_mm(q, kb, mst, pc, acc, tmp, sb, mb, b, pos + 1, lo, 64, 1.0)
             air.ChannelPut("sPC", pc, indices=[CU, PART], offsets=[0], sizes=[96])
             if PART == 0:
                 air.ChannelGet("toK", kb1, indices=[0, CU], sizes=[8192])
             else:
                 air.ChannelGet("toK1", kb1, indices=[0, CU], sizes=[8192])
-            attn_qk_block_mm(q, kb1, mst, pc1, acc, tmp, sb, mb, b + 1, pos + 1, lo)
+            attn_qk_block_mm(
+                q, kb1, mst, pc1, acc, tmp, sb, mb, b + 1, pos + 1, lo, 64, 1.0
+            )
             air.ChannelPut("sPC", pc1, indices=[CU, PART], offsets=[0], sizes=[96])
         if PARTS_ == 2:
             # the maxima, for the merge, in two messages (the buffers
@@ -336,13 +338,13 @@ def kv_core(arm, pos, CU: tl.constexpr, PART: tl.constexpr, SWA: tl.constexpr):
             else:
                 air.ChannelGet("toV1", vb, indices=[0, CU], sizes=[8192])
             air.ChannelGet("sPC", pc, indices=[CU, PART], sizes=[96])
-            attn_kv_block_mm(vb, pc, y, lst, ct)
+            attn_kv_block_mm(vb, pc, y, lst, ct, 64)
             if PART == 0:
                 air.ChannelGet("toV", vb1, indices=[0, CU], sizes=[8192])
             else:
                 air.ChannelGet("toV1", vb1, indices=[0, CU], sizes=[8192])
             air.ChannelGet("sPC", pc1, indices=[CU, PART], sizes=[96])
-            attn_kv_block_mm(vb1, pc1, y, lst, ct)
+            attn_kv_block_mm(vb1, pc1, y, lst, ct, 64)
         if PARTS_ == 2:
             air.ChannelGet("sPC", pc, indices=[CU, PART], sizes=[96])
             air.ChannelGet("sPC", pc1, indices=[CU, PART], sizes=[96])
@@ -350,7 +352,7 @@ def kv_core(arm, pos, CU: tl.constexpr, PART: tl.constexpr, SWA: tl.constexpr):
             air.ChannelPut("part", y, indices=[CU, PART], offsets=[0], sizes=[2112])
         else:
             o = air.alloc([2048], tl.bfloat16, memory_space=air.L1)
-            attn_kv_fin_mm(o, y, lst, ct)
+            attn_kv_fin_mm(o, y, lst, ct, 64)
             air.ChannelPut("attnO", o, indices=[CU], offsets=[0], sizes=[2048])
 
 

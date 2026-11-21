@@ -364,6 +364,7 @@ QWEN3_4B = ModelSpec(
     extra_packages=("qwen3_8b_q4nx", "qwen3_4b"),
     supports_hsa=True,
     supports_xrt_zero_copy=True,
+    superkernel_decoder="qwen3_superkernel:SuperkernelDecoder",
 )
 
 

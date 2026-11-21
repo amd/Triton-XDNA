@@ -224,10 +224,26 @@ def exp2_f32(t, N: tl.constexpr):
 
 
 @triton.jit
-def attn_qk_block_mm(qb, kb, mst, pc, acc, tmp, sb, mb, blk, L, LO):
+def attn_qk_block_mm(
+    qb,
+    kb,
+    mst,
+    pc,
+    acc,
+    tmp,
+    sb,
+    mb,
+    blk,
+    L,
+    LO,
+    NCH: tl.constexpr,
+    SCALE: tl.constexpr,
+):
     """One 16-key block of 4 heads' attention scores, as 4x8x8 matrix
-    products: q blocked [64][4][8] (8 columns of the 4 heads), the keys
-    [2][64][8][8] (8 keys by 8 columns). Keys outside [LO, L) are masked.
+    products: q blocked [NCH][4][8] (8 columns of the 4 heads, NCH = head
+    dim / 8), the keys [2][NCH][8][8] (8 keys by 8 columns). The scores are
+    scaled by SCALE in bf16, as air-FLM's are. Keys outside [LO, L) are
+    masked.
     Updates the running max mst [4] (f32) and writes to pc: p = exp(s - m)
     as bf16 [half][head][8], then c [4] = exp(m_old - m_new), the factor that
     rescales the sums so far."""
@@ -240,17 +256,21 @@ def attn_qk_block_mm(qb, kb, mst, pc, acc, tmp, sb, mb, blk, L, LO):
     tl.store(a1, tl.zeros([4, 8], tl.float32))
     # the sums in tmp across the chunks (a loop, not unrolled: a product's
     # code is large)
-    for c in range(64):
+    for c in range(NCH):
         # K read [key][column]: the transpose folds into the contraction
         qc = tl.load(qb + c * 32 + r4[:, None] * 8 + r8[None, :])
         k0 = tl.load(kb + c * 64 + r8[:, None] * 8 + r8[None, :])
-        k1 = tl.load(kb + 4096 + c * 64 + r8[:, None] * 8 + r8[None, :])
+        k1 = tl.load(kb + NCH * 64 + c * 64 + r8[:, None] * 8 + r8[None, :])
         tl.store(a0, tl.dot(qc, tl.trans(k0), tl.load(a0)))
         tl.store(a1, tl.dot(qc, tl.trans(k1), tl.load(a1)))
     # the scores as the products leave them, [half][head][8]
     r32 = tl.arange(0, 32)
     tl.store(sb + r32, tl.load(acc + r32))
     tl.store(sb + 32 + r32, tl.load(tmp + r32))
+    if SCALE != 1.0:
+        for hp in tl.static_range(2):
+            s = tl.load(sb + hp * 32 + r32).to(tl.bfloat16).to(tl.float32) * SCALE
+            tl.store(sb + hp * 32 + r32, s.to(tl.bfloat16).to(tl.float32))
     # a block the window's ends cut: its keys outside [LO, L) masked, a
     # scalar at a time (a lane mask would be kept in memory)
     for _ in range(tl.where((blk * 16 < LO) | (blk * 16 + 16 > L), 1, 0)):
@@ -315,12 +335,12 @@ def qk_softmax_mm(mst, pc, tmp, sb, mb):
 
 
 @triton.jit
-def attn_kv_block_mm(vb, pc, yb, lst, ct):
+def attn_kv_block_mm(vb, pc, yb, lst, ct, NCH: tl.constexpr):
     """One 16-key block of 4 heads' attention sums, p V as 4x8x8 matrix
-    products: the sums yb [64][4][8] (f32) and l lst [4] (f32) rescaled by c,
-    then yb += p V and l += sum(p); the values blocked [2][64][8][8] (8 keys
-    by 8 columns), p and c at pc as attn_qk_block_mm writes them; ct a buffer
-    of 32 f32."""
+    products: the sums yb [NCH][4][8] (f32) and l lst [4] (f32) rescaled by
+    c, then yb += p V and l += sum(p); the values blocked [2][NCH][8][8] (8
+    keys by 8 columns), p and c at pc as attn_qk_block_mm writes them; ct a
+    buffer of 32 f32."""
     r4 = tl.arange(0, 4)
     r8 = tl.arange(0, 8)
     for h in range(4):
@@ -346,31 +366,31 @@ def attn_kv_block_mm(vb, pc, yb, lst, ct):
     p0 = tl.load(pc + r4[:, None] * 8 + r8[None, :])
     p1 = tl.load(pc + 32 + r4[:, None] * 8 + r8[None, :])
     for _ in range(tl.where(moved > 0, 1, 0)):
-        for ch in range(64):
+        for ch in range(NCH):
             # (flat: AIE2P computes 1-D vectors)
             yh, ym = bf_parts(tl.load(yb + ch * 32 + r32))
             a = tl.reshape(yh * cv + ym * cv, [4, 8])
-            kv_chunk_mm(vb, yb, a, p0, p1, ch)
+            kv_chunk_mm(vb, yb, a, p0, p1, ch, NCH)
     for _ in range(tl.where(moved > 0, 0, 1)):
-        for ch in range(64):
+        for ch in range(NCH):
             a = tl.reshape(tl.load(yb + ch * 32 + r32), [4, 8])
-            kv_chunk_mm(vb, yb, a, p0, p1, ch)
+            kv_chunk_mm(vb, yb, a, p0, p1, ch, NCH)
 
 
 @triton.jit
-def kv_chunk_mm(vb, yb, a, p0, p1, ch):
+def kv_chunk_mm(vb, yb, a, p0, p1, ch, NCH: tl.constexpr):
     """The block's keys added to chunk ch's sums a ([4][8]) into yb."""
     r8 = tl.arange(0, 8)
     v0 = tl.load(vb + ch * 64 + r8[:, None] * 8 + r8[None, :])
-    v1 = tl.load(vb + 4096 + ch * 64 + r8[:, None] * 8 + r8[None, :])
+    v1 = tl.load(vb + NCH * 64 + ch * 64 + r8[:, None] * 8 + r8[None, :])
     a = tl.dot(p0, v0, a)
     a = tl.dot(p1, v1, a)
     tl.store(yb + ch * 32 + tl.arange(0, 32), tl.reshape(a, [32]))
 
 
 @triton.jit
-def attn_kv_fin_mm(o, yb, lst, ct):
-    """o [64][4][8] (bf16) = y / l of the blocked sums yb, in
+def attn_kv_fin_mm(o, yb, lst, ct, NCH: tl.constexpr):
+    """o [NCH][4][8] (bf16) = y / l of the blocked sums yb, in
     32-lane steps (AIE2P computes f32 vectors 16 lanes or more); ct a
     buffer of 32 f32."""
     r8 = tl.arange(0, 8)
@@ -378,7 +398,7 @@ def attn_kv_fin_mm(o, yb, lst, ct):
     for h in tl.static_range(4):
         tl.store(ct + h * 8 + r8, tl.full([8], 1.0 / tl.load(lst + h), tl.float32))
     rh, rl = bf_parts(tl.load(ct + r32))
-    for ch in range(64):
+    for ch in range(NCH):
         yh, ym = bf_parts(tl.load(yb + ch * 32 + r32))
         v = ym * rh + yh * rl + yh * rh
         tl.store(o + ch * 32 + r32, v.to(tl.bfloat16))
@@ -444,7 +464,7 @@ def attn_merge(o, ba, bb, lst, ct, cs):
         yah, yam = bf_parts(tl.load(ba + ch * 32 + k))
         ybh, ybm = bf_parts(tl.load(bb + ch * 32 + k))
         tl.store(ba + ch * 32 + k, yah * fa + yam * fa + ybh * fb + ybm * fb)
-    attn_kv_fin_mm(o, ba, lst, ct)
+    attn_kv_fin_mm(o, ba, lst, ct, 64)
 
 
 @triton.jit

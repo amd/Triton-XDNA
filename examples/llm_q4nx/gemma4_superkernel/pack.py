@@ -7,23 +7,12 @@ projections as bf16 blocks; the per-position RoPE and norm vector.
 """
 
 import numpy as np
-import torch
 
 import gemma4_e2b_q4nx_weights as gw
 
+from q4_blocks import _blocks, _cat, _rows, bf, pack_blocks
+
 from .geom import DH, I2A, I2P, INTER, J2P, KV_REPL, LM_ROWS, LMR, MASKA, NBA, NQ
-
-
-def bf(a):
-    """float32 values rounded to bfloat16 (to nearest even), as float32."""
-    u = np.asarray(a, np.float32).view(np.uint32)
-    u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
-    return u.view(np.float32)
-
-
-def bf_tensor(a):
-    """`a` as a bfloat16 tensor."""
-    return torch.from_numpy(bf(a)).to(torch.bfloat16)
 
 
 def arm_of(L):
@@ -39,18 +28,6 @@ def arm_of(L):
 def has_w(arm, p, i, j):
     k = p * 8 + arm
     return i < I2A.value[k] and j < NBA.value[k] and (j & MASKA.value[k]) == 0
-
-
-def _rows(t, n):
-    """(q, scale, min) padded with zero rows to n."""
-    return tuple(
-        np.concatenate([a, np.zeros((n - a.shape[0],) + a.shape[1:], a.dtype)])
-        for a in t
-    )
-
-
-def _cat(*mats):
-    return tuple(np.concatenate(p, 0) for p in zip(*mats))
 
 
 def _ocols(dh):
@@ -123,29 +100,6 @@ def phase_mats(m, L):
         for i, a in enumerate(dn)
     )
     return [ph0, ph1, ph2, ph3]
-
-
-def _blocks(t, rb, cb):
-    """(q [rb*32, cb*256], sc, mn) -> q [rb, cb, 32, 256], sc/mn [rb, cb, 8, 32]."""
-    q, sc, mn = t
-    q = q.reshape(rb, 32, cb, 256).transpose(0, 2, 1, 3)
-    f = lambda a: a.reshape(rb, 32, cb, 8).transpose(0, 2, 3, 1)  # noqa: E731
-    return q, f(sc), f(mn)
-
-
-def pack_blocks(q, sc, mn):
-    """q [n, 32, 256] of 0..15, sc/mn [n, 8, 32] -> [n, 2560] int16."""
-    n = q.shape[0]
-    s16 = lambda a: (bf(a).view(np.uint32) >> 16).astype(np.uint16)
-    out = np.zeros((n, 2560), np.uint16)
-    out[:, :256] = s16(sc).reshape(n, -1)
-    out[:, 256:512] = s16(mn).reshape(n, -1)
-    qq = q.reshape(n, 32, 8, 8, 4).astype(np.uint16)  # [n, row, g, j, s]
-    words = (
-        qq[..., 0] | qq[..., 1] << 4 | qq[..., 2] << 8 | qq[..., 3] << 12
-    )  # [n, row, g, j]
-    out[:, 512:] = words.transpose(0, 2, 3, 1).reshape(n, -1)
-    return out.view(np.int16)
 
 
 def pack_wave(mats, arm, phases):
