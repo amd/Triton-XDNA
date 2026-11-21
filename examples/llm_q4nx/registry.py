@@ -457,7 +457,7 @@ GEMMA4_E2B = ModelSpec(
     # per-token patching hsaco dispatch has no counterpart for; the HSA decode
     # runs only the shared engine's scratchpad ELF (see hsa_decode.py).
     supports_hsa=False,
-    superkernel_decoder="superkernel_decode:SuperkernelDecoder",
+    superkernel_decoder="gemma4_superkernel:SuperkernelDecoder",
 )
 
 
@@ -718,6 +718,7 @@ GEMMA4_E4B = ModelSpec(
     decoder_class="FusedDecoder",
     decode_dir_env="Q4NX_GEMMA4_DECODE_DIR",
     extra_packages=("gemma4_e2b_q4nx",),
+    superkernel_decoder="gemma4_superkernel:SuperkernelDecoder",
     # The iGPU prefill and decode read the bundle's packed weights; their KV
     # kernels take E4B's two heads.
     supports_igpu=True,
