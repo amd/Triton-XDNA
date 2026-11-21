@@ -361,6 +361,8 @@ class Superkernel:
             Location,
             Module,
         )
+        from air.compiler.util import run_transform
+        from air.passmanager import PassManager
 
         bufs = self.buffers
         onchip = [t for t in self.tensors if t.onchip]
@@ -442,11 +444,8 @@ class Superkernel:
             shared = [value[id(t)] for t in onchip if t.space == 2]
             _in_place(seg, homes, shared)
             _forward_private_vectors(seg)
-            _scalar_transfers(seg)
+            run_transform(Module.parse(_HERDS), top)
             _hoist_ddr_reads(sblock, sargs[: len(bufs)], end)
-            # A herd whose kernel took a DDR buffer directly now takes the
-            # on-chip tensor's L2 buffer instead.
-            _retype_herd_args(seg)
             # A one-column herd's own L2 buffers go in its column's memtile.
             # On-chip tensors keep their placement, since herds in several
             # columns may read them.
@@ -462,8 +461,9 @@ class Superkernel:
                     per = [value[id(x)] for x in per]
                     by_buffer[_edge_key(value[id(t)], edge_buffers)] = (loop, kind, per)
             _lower_edges(top, seg, edge_buffers, by_buffer)
-            for n, d in enumerate(_ops_named(seg, "air.dma_memcpy_nd")):
-                d.attributes["id"] = IntegerAttr.get(i32, n + 1)
+            PassManager.parse(
+                "builtin.module(func.func(air-renumber-dma{mode=segment}))"
+            ).run(top.operation)
             _fold_constant_casts(top.operation, seg)
             return str(top)
 
@@ -684,6 +684,27 @@ module {{
         return out["bin_path"], header
 
 
+# In the herds, after merging: block arguments and views take their buffers'
+# types (an on-chip tensor's L2 buffer where a kernel took a DDR buffer, a
+# core's own L1 buffer where it took a placeholder), and size-1 vectors, such
+# as a 0-d buffer's (a reduction's scalar result), become scalars. Each step
+# rewrites the herds only: folding constants elsewhere would change how aircc
+# reads the segment's loops.
+_HERDS = """
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%m: !transform.any_op {transform.readonly}) {
+    %h = transform.structured.match ops{["air.herd"]} in %m
+        : (!transform.any_op) -> !transform.any_op
+    %typed = transform.air.override_memref_memory_space %h <{memory_space = 2 : i32}>
+        : (!transform.any_op) -> !transform.any_op
+    %r = transform.air.convert_size1_vector_to_scalar %typed
+        : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+"""
+
+
 def _emit_segment(top, sg, end, value, wave, made, channels):
     """Put segment code `sg` before `end`, its arguments bound."""
     from air.dialects import arith
@@ -747,18 +768,6 @@ def _bind_constants(m, args):
                 continue
             c = arith.ConstantOp(a.type, attr, ip=ip)
             a.replace_all_uses_with(c.result)
-
-
-def _retype_herd_args(seg):
-    """Give each herd block argument its operand's type. They differ where an
-    on-chip tensor's L2 buffer replaced a DDR buffer."""
-    for h in _ops_named(seg, "air.herd"):
-        body = h.regions[0].blocks[0]
-        n = len(body.arguments) - len(h.operands)
-        for i, v in enumerate(h.operands):
-            a = body.arguments[n + i]
-            if a.type != v.type:
-                a.set_type(v.type)
 
 
 def _func_args_of(seg):
@@ -1136,7 +1145,6 @@ def _lower_locals(seg, owns):
                 with InsertionPoint.at_block_begin(body):
                     mine = memref.AllocOp(t, [], [])
                 body.arguments[first + i].replace_all_uses_with(mine.result)
-                _respace_views(mine.result)
                 homes.append((b.symbol, mine.result))
             _drop_herd_operands(h, drop)
         for u in list(holder.uses):
@@ -1204,27 +1212,6 @@ def _allocate_locals(ttshared, args):
                 op.erase()
             arg.replace_all_uses_with(a.result)
         return str(m)
-
-
-def _respace_views(v):
-    """Give the views of buffer `v` (`memref.reinterpret_cast` and the
-    like, which triton-shared makes of a kernel's arguments) `v`'s memory
-    space."""
-    from air.ir import MemRefType
-
-    space = MemRefType(v.type).memory_space
-    for u in list(v.uses):
-        op = u.owner
-        if op.name not in _VIEWS:
-            continue
-        r = op.results[0]
-        t = MemRefType(r.type)
-        r.set_type(
-            MemRefType.get(
-                list(t.shape), t.element_type, layout=t.layout, memory_space=space
-            )
-        )
-        _respace_views(r)
 
 
 def _in_place(seg, homes, shared):
@@ -1439,32 +1426,6 @@ def _fold_constant_casts(op, seg):
             k = arith.ConstantOp(idx, IntegerAttr.get(idx, v)).result
         c.results[0].replace_all_uses_with(k)
         c.erase()
-
-
-def _scalar_transfers(seg):
-    """In the herds, vector reads and writes of a 0-d buffer (a reduction's
-    scalar result) as a scalar load and store."""
-    from air.dialects import memref, vector
-    from air.ir import InsertionPoint, MemRefType, VectorType
-
-    for h in _ops_named(seg, "air.herd"):
-        for r in _ops_named(h, "vector.transfer_read"):
-            src = r.operands[0]
-            if MemRefType(src.type).rank != 0:
-                continue
-            with InsertionPoint(r):
-                v = memref.LoadOp(src, []).result
-                b = vector.BroadcastOp(VectorType(r.results[0].type), v).result
-            r.results[0].replace_all_uses_with(b)
-            r.erase()
-        for w in _ops_named(h, "vector.transfer_write"):
-            dst = w.operands[1]
-            if MemRefType(dst.type).rank != 0:
-                continue
-            with InsertionPoint(w):
-                v = vector.ExtractOp(w.operands[0], [], []).result
-                memref.StoreOp(v, dst, [])
-            w.erase()
 
 
 def _forward_private_vectors(seg):
