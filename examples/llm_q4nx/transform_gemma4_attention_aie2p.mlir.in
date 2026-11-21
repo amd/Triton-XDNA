@@ -700,7 +700,7 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %fv2 { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %fv2 : !transform.any_op
     %hv = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %hvv = transform.air.herd_vectorize %hv : (!transform.any_op) -> !transform.any_op
+    %hvv = transform.structured.vectorize_children_and_apply_patterns %hv : (!transform.any_op) -> !transform.any_op
     %fu = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %fu {
       transform.apply_patterns.vector.cast_away_vector_leading_one_dim

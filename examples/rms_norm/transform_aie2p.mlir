@@ -109,7 +109,7 @@ module attributes {transform.with_named_sequence} {
 
     %fou1 = transform.air.convert_divf_sqrt_to_rsqrt %func_op_updated : (!transform.any_op) -> !transform.any_op
 
-    // PHASE 10: par_to_herd, copy_to_dma, herd_vectorize, casts
+    // PHASE 10: par_to_herd, copy_to_dma, vectorize, casts
     %fa = transform.structured.match ops{["scf.forall"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %parallel = transform.loop.forall_to_parallel %fa : (!transform.any_op) -> !transform.any_op
     %herd = transform.air.par_to_herd %parallel : (!transform.any_op) -> !transform.any_op
@@ -117,7 +117,7 @@ module attributes {transform.with_named_sequence} {
     %copies_in_herd = transform.structured.match ops{["memref.copy", "linalg.copy"]} in %herd : (!transform.any_op) -> !transform.any_op
     %dmas = transform.air.copy_to_dma %copies_in_herd : (!transform.any_op) -> !transform.any_op
 
-    %vh = transform.air.herd_vectorize %herd : (!transform.any_op) -> !transform.any_op
+    %vh = transform.structured.vectorize_children_and_apply_patterns %herd : (!transform.any_op) -> !transform.any_op
 
     %func4 = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %func4 {

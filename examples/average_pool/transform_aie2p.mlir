@@ -89,7 +89,7 @@ module attributes {transform.with_named_sequence} {
     %inner_r, %inner_rl:1 = transform.structured.tile_using_for %reds_h tile_sizes [0, 16] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %fills_h = transform.structured.match ops{["linalg.fill"]} in %h2 : (!transform.any_op) -> !transform.any_op
     %fill_scl = transform.structured.convert_to_loops %fills_h : (!transform.any_op) -> !transform.any_op
-    %vh = transform.air.herd_vectorize %h2 : (!transform.any_op) -> !transform.any_op
+    %vh = transform.structured.vectorize_children_and_apply_patterns %h2 : (!transform.any_op) -> !transform.any_op
 
     // Lower vector reductions
     %func_final = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op

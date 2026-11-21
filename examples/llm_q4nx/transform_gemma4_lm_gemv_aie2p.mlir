@@ -375,7 +375,7 @@ module attributes {transform.with_named_sequence} {
       transform.annotate %hh "sym_name" = %hname : !transform.any_op, !transform.any_param
     }
     %hs = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %hv = transform.air.herd_vectorize %hs : (!transform.any_op) -> !transform.any_op
+    %hv = transform.structured.vectorize_children_and_apply_patterns %hs : (!transform.any_op) -> !transform.any_op
     %hc = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %hc {
       transform.apply_patterns.memref.fold_memref_alias_ops

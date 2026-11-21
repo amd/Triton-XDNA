@@ -19,7 +19,7 @@ transform.named_sequence @air_herd_mapping_and_vectorize(
       : (!transform.any_op) -> !transform.any_op
   %dmas_from_copies = transform.air.copy_to_dma %copies_in_herd
       : (!transform.any_op) -> !transform.any_op
-  %vectorized_herd = transform.air.herd_vectorize %herd
+  %vectorized_herd = transform.structured.vectorize_children_and_apply_patterns %herd
       : (!transform.any_op) -> !transform.any_op
   transform.yield %vectorized_herd : !transform.any_op
 }
@@ -43,7 +43,7 @@ transform.named_sequence @air_herd_mapping_with_extern_and_vectorize(
       : (!transform.any_op) -> !transform.any_op
   %dmas_from_copies = transform.air.copy_to_dma %copies_in_herd
       : (!transform.any_op) -> !transform.any_op
-  %vectorized_herd = transform.air.herd_vectorize %herd
+  %vectorized_herd = transform.structured.vectorize_children_and_apply_patterns %herd
       : (!transform.any_op) -> !transform.any_op
   transform.yield %vectorized_herd : !transform.any_op
 }

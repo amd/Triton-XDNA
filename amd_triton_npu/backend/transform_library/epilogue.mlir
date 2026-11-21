@@ -10,7 +10,7 @@
 //   @epilogue_unpack_after_tail after C is packed
 //   @epilogue_unpack_to_l2     before the unpack is tiled for the herd
 //   ... tile the unpack, fuse the `epilogue_op` generic into its loops ...
-//   @epilogue_vectorize        after herd_vectorize
+//   @epilogue_vectorize        after vectorize_children_and_apply_patterns
 
 // Fuse the tail into one generic tagged `epilogue_op`. Scalar operands then
 // sit in its body rather than in broadcast fills, so the accumulator init is
