@@ -1,18 +1,19 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Qwen3-4B's decode as one superkernel: the 36 layers and the LM head of a
-token in one dispatch, a wave a layer (or a vocab chunk of the LM head), on
-the dataflow of air-FLM's fused decode (`fused_decode`, its `qwen3-4b`
-entry).
+"""The selected model's decode (`spec`) as one superkernel: its layers and the
+LM head of a token in one dispatch, a wave a layer (or a vocab chunk of the
+LM head), on the dataflow of air-FLM's fused decode (`fused_decode`).
 
 Each wave streams its Q4 weights from DDR through memtiles to 16 projection
 cores (2 blocks of 2x4), which compute its four phases -- QKV, o-proj,
 up/gate, down -- a round of 512 rows at a time, each round gathered in a
 memtile and sent on to the core that takes it: rope for QKV, the rms core for
 o-proj and down, glu for up/gate. Attention runs a qk and a kv core for each
-of 4 CUs, a CU 8 q heads on 2 kv heads; the KV cache comes in two groups, a
-CU column's each, through that column's memtile. The rms core writes the
-layer's output back over x.
+of 4 CUs, a CU's kv heads with 4 q heads each (padded with zero heads where
+the model has fewer, as air-FLM pads them), a sliding layer's over the
+window's keys; the KV cache comes in two groups, a CU column's each,
+through that column's memtile. The rms core writes the layer's output back
+over x.
 """
 
 import triton
@@ -24,6 +25,7 @@ from gemma4_superkernel.kernels import (
     attn_kv_fin_mm,
     attn_qk_block_mm,
     copy_n,
+    glu,
     q4_groups,
     q4_prep,
     q4_shift_table,
@@ -49,17 +51,21 @@ from .geom import (
     LMR,
     NBMAX,
     NCH,
-    NCU,
     NFA,
     NFILL,
     NKV,
+    NORMS,
     NQ,
     NR,
     NX,
+    QPAD,
+    QPC,
     ROPE_W,
     SCALE,
+    SWA,
 )
-from .kernels import glu_silu, rope
+from .kernels import glu_silu, real_heads, rope
+from .spec import S as SPEC
 
 # as constexprs, for the jitted code
 D_ = tl.constexpr(D)
@@ -74,7 +80,14 @@ NBMAX_ = tl.constexpr(NBMAX)
 NCH_ = tl.constexpr(NCH)
 NQ_ = tl.constexpr(NQ)
 NKV_ = tl.constexpr(NKV)
+QPC_ = tl.constexpr(QPC)
+QPAD_ = tl.constexpr(QPAD)
 KVPC_ = tl.constexpr(KVPC)
+NORMS_ = tl.constexpr(NORMS)
+RL_ = tl.constexpr(NORMS * D)  # a layer's norm weights
+WH_ = tl.constexpr(NORMS // 2 * D)  # rmsW's and rmsW2's: half of them
+SILU_ = tl.constexpr(SPEC["act"] == "silu")
+SWA_ = tl.constexpr(SWA)
 GW_ = tl.constexpr(GW)
 INTER_ = tl.constexpr(INTER)
 GLU_HALF_ = tl.constexpr(GLU_HALF)
@@ -86,7 +99,8 @@ LM_ROWS_ = tl.constexpr(LM_ROWS)
 ROPE_W_ = tl.constexpr(ROPE_W)
 EPS_ = tl.constexpr(EPS)
 SCALE_ = tl.constexpr(SCALE)
-QPC = tl.constexpr(DQ // NCU)  # q of a CU
+HB = tl.constexpr(16 * DH)  # a kv head's block of 16 keys
+QB = tl.constexpr(KVPC * QPAD * DH)  # a CU's q, padded
 NF0, NF1, NF2, NF3 = NFA
 
 
@@ -151,20 +165,23 @@ def proj_core(arm, CX0: tl.constexpr):
 @triton.jit
 def rms_core(arm):
     """The layer's norms and residuals: x normed for the QKV projection;
-    o-proj's output added to x, that normed for the MLP; the MLP's output
+    o-proj's output (normed too, in Gemma's sandwich of four norms) added to
+    x; that normed for the MLP; the MLP's output (normed in the sandwich)
     added, back to the host as the next layer's x. In an LM wave, the final
-    norm and the logits' rounds on to the host."""
+    norm (the last D of w) and the logits on to the host."""
     x = air.alloc([D_], tl.bfloat16, memory_space=air.L1)
-    w = air.alloc([D_], tl.bfloat16, memory_space=air.L1)
-    w2 = air.alloc([D_], tl.bfloat16, memory_space=air.L1)
+    w = air.alloc([WH_], tl.bfloat16, memory_space=air.L1)
+    w2 = air.alloc([WH_], tl.bfloat16, memory_space=air.L1)
     xn = air.alloc([D_], tl.bfloat16, memory_space=air.L1)
     o = air.alloc([D_], tl.bfloat16, memory_space=air.L1)
+    if NORMS_ == 4:
+        t = air.alloc([D_], tl.bfloat16, memory_space=air.L1)
     h = air.alloc([D_], tl.bfloat16, memory_space=air.L1)
     sq = air.alloc([64], tl.float32, memory_space=air.L1)
     lo = air.alloc([D_], tl.bfloat16, memory_space=air.L1)
     air.ChannelGet("rmsX", x, sizes=[D_])
-    air.ChannelGet("rmsW", w, sizes=[D_])
-    air.ChannelGet("rmsW2", w2, sizes=[D_])
+    air.ChannelGet("rmsW", w, sizes=[WH_])
+    air.ChannelGet("rmsW2", w2, sizes=[WH_])
     dec = (arm != 0).to(tl.int32)
     # loops of 0 or 1 trips, not ifs: pointers keep their structure
     for _ in range(dec):
@@ -172,18 +189,26 @@ def rms_core(arm):
         for n in range(I2P_[0]):
             air.ChannelPut("xnorm", xn, offsets=[0], sizes=[D_])
         air.ChannelGet("outY", o, indices=[0, 1], sizes=[D_])
-        residual(h, x, o, D_)
+        if NORMS_ == 4:
+            rms_norm(t, o, w + D_, sq, D_, EPS_)
+            residual(h, x, t, D_)
+        else:
+            residual(h, x, o, D_)
         rms_norm(xn, h, w2, sq, D_, EPS_)
         for n in range(I2P_[2]):
             air.ChannelPut("xnorm", xn, offsets=[0], sizes=[D_])
         air.ChannelGet("outY", o, indices=[0, 1], sizes=[D_])
-        residual(lo, h, o, D_)
+        if NORMS_ == 4:
+            rms_norm(t, o, w2 + D_, sq, D_, EPS_)
+            residual(lo, h, t, D_)
+        else:
+            residual(lo, h, o, D_)
         air.ChannelPut("layerOut", lo, offsets=[0], sizes=[D_])
-    # an LM wave: the final norm (w), x for its rounds, and the rounds'
-    # logits on to the host, D at a time (KB rounds) as air-FLM
+    # an LM wave: the final norm, x for its rounds, and the rounds' logits on
+    # to the host, D at a time (KB rounds) as air-FLM
     LB: tl.constexpr = LMR_ // KB_
     for _ in range(1 - dec):
-        rms_norm(xn, x, w, sq, D_, EPS_)
+        rms_norm(xn, x, w + (WH_ - D_), sq, D_, EPS_)
         for n in range(KB_):
             air.ChannelPut("xnorm", xn, offsets=[0], sizes=[D_])
         for i in range(LB):
@@ -202,7 +227,7 @@ def rope_core(arm):
     v also to the host, which appends them to the KV cache."""
     qkv = air.alloc([DQ_ + 2 * DK_], tl.bfloat16, memory_space=air.L1)
     w = air.alloc([ROPE_W_], tl.bfloat16, memory_space=air.L1)
-    q = air.alloc([DQ_], tl.bfloat16, memory_space=air.L1)
+    q = air.alloc([NKV_ * QPAD_ * DH_], tl.bfloat16, memory_space=air.L1)
     kk = air.alloc([DK_], tl.bfloat16, memory_space=air.L1)
     v = air.alloc([DK_], tl.bfloat16, memory_space=air.L1)
     sq = air.alloc([64], tl.float32, memory_space=air.L1)
@@ -211,17 +236,103 @@ def rope_core(arm):
             air.ChannelGet("outY", qkv, indices=[0, 0], offsets=[n * 512], sizes=[512])
         air.ChannelGet("ropeLUT", w, sizes=[ROPE_W_])
         rope(q, kk, v, qkv, w, sq, NQ_, NKV_, DH_, EPS_)
-        air.ChannelPut("ropeQ", q, offsets=[0], sizes=[DQ_])
+        air.ChannelPut("ropeQ", q, offsets=[0], sizes=[NKV_ * QPAD_ * DH_])
     # in every wave, as the host's gets: an LM wave's are not read
     air.ChannelPut("appendK", kk, offsets=[0], sizes=[DK_])
     air.ChannelPut("appendV", v, offsets=[0], sizes=[DK_])
 
 
 @triton.jit
+def window_start(arm, pos):
+    """The first key a sliding layer (arm 2) sees: pos - SWA + 1."""
+    if SWA_ > 0:
+        return tl.where(pos >= SWA_, pos - SWA_ + 1, 0) * (arm == 2).to(tl.int32)
+    else:
+        return 0
+
+
+@triton.jit
+def block_pairs(arm, pos):
+    """The first KV block attention reads and the pairs it reads (its cores'
+    K and V buffers ping-pong): the window's blocks, the count rounded up
+    with blocks whose keys are after pos (masked)."""
+    b0 = window_start(arm, pos) // 16
+    return b0, ((pos + 16) // 16 - b0 + 1) // 2
+
+
+@triton.jit
+def qk_core1(arm, pos, CU: tl.constexpr):
+    """Attention scores of a CU's 4 heads on its one kv head (Gemma3's: 2 of
+    them zero) over the 16-key blocks of the window up to the token's
+    position pos (set each token), the keys outside it masked, scaled: a
+    pair of blocks a trip, one into each buffer (the DMA fills one while the
+    core reads the other), p and c to the kv core."""
+    q = air.alloc([QPAD_ * DH_], tl.bfloat16, memory_space=air.L1)
+    kb = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
+    kb1 = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
+    mst = air.alloc([32], tl.float32, memory_space=air.L1)
+    pc = air.alloc([96], tl.bfloat16, memory_space=air.L1)
+    pc1 = air.alloc([96], tl.bfloat16, memory_space=air.L1)
+    acc = air.alloc([32], tl.float32, memory_space=air.L1)
+    tmp = air.alloc([64], tl.float32, memory_space=air.L1)
+    sb = air.alloc([64], tl.float32, memory_space=air.L1)
+    mb = air.alloc([64], tl.float32, memory_space=air.L1)
+    for _ in range((arm != 0).to(tl.int32)):
+        tl.store(mst + tl.arange(0, 32), tl.full([32], -1.0e4, tl.float32))
+        air.ChannelGet("toAttnQ", q, indices=[CU], sizes=[QPAD_ * DH_])
+        lo = window_start(arm, pos)
+        b0, n2 = block_pairs(arm, pos)
+        for i in range(n2):
+            b = b0 + 2 * i
+            air.ChannelGet("toK", kb, indices=[CU], sizes=[HB])
+            attn_qk_block_mm(
+                q, kb, mst, pc, acc, tmp, sb, mb, b, pos + 1, lo, NCH_, SCALE_
+            )
+            air.ChannelPut("sPC", pc, indices=[CU], offsets=[0], sizes=[96])
+            air.ChannelGet("toK", kb1, indices=[CU], sizes=[HB])
+            attn_qk_block_mm(
+                q, kb1, mst, pc1, acc, tmp, sb, mb, b + 1, pos + 1, lo, NCH_, SCALE_
+            )
+            air.ChannelPut("sPC", pc1, indices=[CU], offsets=[0], sizes=[96])
+
+
+@triton.jit
+def kv_core1(arm, pos, CU: tl.constexpr):
+    """A CU's attention sums from its qk core's p and c and the values,
+    then its output y / l, its real heads' blocked [NCH][QPC][8]."""
+    vb = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
+    vb1 = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
+    pc = air.alloc([96], tl.bfloat16, memory_space=air.L1)
+    pc1 = air.alloc([96], tl.bfloat16, memory_space=air.L1)
+    y = air.alloc([NCH_ * 32], tl.float32, memory_space=air.L1)
+    lst = air.alloc([32], tl.float32, memory_space=air.L1)
+    ct = air.alloc([32], tl.float32, memory_space=air.L1)
+    o = air.alloc([NCH_ * 32], tl.bfloat16, memory_space=air.L1)
+    o2 = air.alloc([NCH_ * QPC_ * 8], tl.bfloat16, memory_space=air.L1)
+    for _ in range((arm != 0).to(tl.int32)):
+        k = tl.arange(0, 32)
+        for c in range(NCH_):
+            tl.store(y + c * 32 + k, tl.zeros([32], tl.float32))
+        tl.store(lst + k, tl.zeros([32], tl.float32))
+        _, n2 = block_pairs(arm, pos)
+        for i in range(n2):
+            air.ChannelGet("toV", vb, indices=[CU], sizes=[HB])
+            air.ChannelGet("sPC", pc, indices=[CU], sizes=[96])
+            attn_kv_block_mm(vb, pc, y, lst, ct, NCH_)
+            air.ChannelGet("toV", vb1, indices=[CU], sizes=[HB])
+            air.ChannelGet("sPC", pc1, indices=[CU], sizes=[96])
+            attn_kv_block_mm(vb1, pc1, y, lst, ct, NCH_)
+        attn_kv_fin_mm(o, y, lst, ct, NCH_)
+        # only the real heads, as air-FLM sends them
+        real_heads(o2, o, NCH_, QPC_)
+        air.ChannelPut("attnO", o2, indices=[CU], offsets=[0], sizes=[NCH_ * QPC_ * 8])
+
+
+@triton.jit
 def qk_scores(q, kb, mst, pc, acc, tmp, sb, mb, blk, pos, G: tl.constexpr):
     """Group G's (a kv head's 4 q heads') scores of block blk."""
     attn_qk_block_mm(
-        q + G * (QPC // KVPC_),
+        q + G * (QB // KVPC_),
         kb,
         mst + G * 32,
         pc + G * 96,
@@ -238,14 +349,13 @@ def qk_scores(q, kb, mst, pc, acc, tmp, sb, mb, blk, pos, G: tl.constexpr):
 
 
 @triton.jit
-def qk_core(arm, pos, CU: tl.constexpr):
+def qk_core2(arm, pos, CU: tl.constexpr):
     """Attention scores of a CU's 8 heads (two groups of 4, one a kv head)
     over the 16-key blocks up to the token's position pos (set each token),
     the keys after it masked, scaled by 1/sqrt(DH): a pair of blocks a trip,
     each kv head's keys of a block into a buffer of their own (the DMA fills
     one while the core reads another), p and c to the kv core."""
-    HB: tl.constexpr = 16 * DH_  # a kv head's block
-    q = air.alloc([QPC], tl.bfloat16, memory_space=air.L1)
+    q = air.alloc([QB], tl.bfloat16, memory_space=air.L1)
     ka = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
     kb = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
     ka1 = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
@@ -261,7 +371,7 @@ def qk_core(arm, pos, CU: tl.constexpr):
         tl.store(
             mst + tl.arange(0, 32 * KVPC_), tl.full([32 * KVPC_], -1.0e4, tl.float32)
         )
-        air.ChannelGet("toAttnQ", q, indices=[CU], sizes=[QPC])
+        air.ChannelGet("toAttnQ", q, indices=[CU], sizes=[QB])
         n2 = ((pos + 16) // 16 + 1) // 2
         for i in range(n2):
             b = 2 * i
@@ -278,11 +388,10 @@ def qk_core(arm, pos, CU: tl.constexpr):
 
 
 @triton.jit
-def kv_core(arm, pos, CU: tl.constexpr):
+def kv_core2(arm, pos, CU: tl.constexpr):
     """A CU's attention sums from its qk core's p and c and the values, a kv
     head's values of a block in a buffer of their own; then its output y / l,
     blocked [kv head][NCH][4][8]."""
-    HB: tl.constexpr = 16 * DH_
     YB: tl.constexpr = NCH_ * 32  # a group's sums
     va = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
     vb = air.alloc([HB], tl.bfloat16, memory_space=air.L1)
@@ -293,7 +402,7 @@ def kv_core(arm, pos, CU: tl.constexpr):
     y = air.alloc([YB * KVPC_], tl.float32, memory_space=air.L1)
     lst = air.alloc([32 * KVPC_], tl.float32, memory_space=air.L1)
     ct = air.alloc([32], tl.float32, memory_space=air.L1)
-    o = air.alloc([QPC], tl.bfloat16, memory_space=air.L1)
+    o = air.alloc([QB], tl.bfloat16, memory_space=air.L1)
     for _ in range((arm != 0).to(tl.int32)):
         k = tl.arange(0, 32)
         for c in range(YB * KVPC_ // 32):
@@ -313,19 +422,23 @@ def kv_core(arm, pos, CU: tl.constexpr):
             attn_kv_block_mm(va1, pc1, y, lst, ct, NCH_)
             attn_kv_block_mm(vb1, pc1 + 96, y + YB, lst + 32, ct, NCH_)
         for g in tl.static_range(KVPC_):
-            attn_kv_fin_mm(o + g * (QPC // KVPC_), y + g * YB, lst + g * 32, ct, NCH_)
-        air.ChannelPut("attnO", o, indices=[CU], offsets=[0], sizes=[QPC])
+            attn_kv_fin_mm(o + g * (QB // KVPC_), y + g * YB, lst + g * 32, ct, NCH_)
+        air.ChannelPut("attnO", o, indices=[CU], offsets=[0], sizes=[QB])
 
 
 @triton.jit
 def glu_core(arm):
-    """silu(gate) up of the up/gate projection's rows, GLU_HALF at a time."""
+    """act(gate) up of the up/gate projection's rows, GLU_HALF at a time:
+    SiLU's or gelu_tanh's, as the model's."""
     gu = air.alloc([2 * GLU_HALF_], tl.bfloat16, memory_space=air.L1)
     y = air.alloc([GLU_HALF_], tl.bfloat16, memory_space=air.L1)
     for _ in range((arm != 0).to(tl.int32)):
         for s in range(GLU_SLICES_):
             air.ChannelGet("outY", gu, indices=[0, 2], sizes=[2 * GLU_HALF_])
-            glu_silu(y, gu, GLU_HALF_)
+            if SILU_:
+                glu_silu(y, gu, GLU_HALF_)
+            else:
+                glu(y, gu, GLU_HALF_)
             air.ChannelPut("gluOut", y, offsets=[0], sizes=[GLU_HALF_])
 
 
@@ -403,13 +516,14 @@ def wave(
     KVAPP: tl.constexpr,
     NDEC: tl.constexpr,
 ):
-    """One token of Qwen3-4B: NW waves, the NDEC decoder layers then the LM
-    head's vocab chunks, all in one dispatch. A wave's arm (ARMS) is 1 for a
-    layer, 0 for an LM wave. Buffers (bf16 unless said):
+    """One token: NW waves, the NDEC decoder layers then the LM head's vocab
+    chunks, all in one dispatch. A wave's arm (ARMS) is 1 for a layer, 2 for
+    a sliding one, 0 for an LM wave. Buffers (bf16 unless said):
 
     XL    [x | logits]: the host writes the token's embedding into x, each
           layer the next x; an LM wave a chunk of logits
-    RMS   each layer's 2 norm weights, then the final norm's
+    RMS   each layer's NORMS norm weights, then the final norm's (behind D
+          zeros with 4 norms, as rmsW's last D)
     W     the Q4 weights, a slab a wave (SLABS: its first fill)
     ROPE  each layer's [cos | sin | q_norm | k_norm] at this position
     KV    a layer's [K group 0 | K group 1 | V group 0 | V group 1], each
@@ -463,12 +577,12 @@ def wave(
         # on them, so every get is in all waves.
         lm = arm == 0
         air.ChannelPut("rmsX", XL, offsets=[0], sizes=[D_])
-        # an LM wave's rmsW: the final norm; its rmsW2 unused
+        # an LM wave's rmsW: the final norm as its last D; its rmsW2 unused
         air.ChannelPut(
-            "rmsW", RMS, offsets=[tl.where(lm, NDEC, wave) * 2 * D_], sizes=[D_]
+            "rmsW", RMS, offsets=[tl.where(lm, NDEC, wave) * RL_], sizes=[WH_]
         )
         air.ChannelPut(
-            "rmsW2", RMS, offsets=[tl.where(lm, 0, wave * 2 * D_ + D_)], sizes=[D_]
+            "rmsW2", RMS, offsets=[tl.where(lm, 0, wave * RL_ + WH_)], sizes=[WH_]
         )
         if arm != 0:
             air.ChannelPut("ropeLUT", ROPE, offsets=[wave * ROPE_W_], sizes=[ROPE_W_])
@@ -478,6 +592,9 @@ def wave(
         at = air.table(SLABS, wave)
         if arm == 1:
             feed_arm(W, at, 1)
+        if SWA_ > 0:
+            if arm == 2:
+                feed_arm(W, at, 2)
         if arm == 0:
             feed_arm(W, at, 0)
         RS: tl.constexpr = MAXL * GW_  # a group's region
@@ -488,11 +605,14 @@ def wave(
         air.ChannelGet(
             "appendV", KV, offsets=[0, ks + 2 * RS], sizes=[2, GW_], strides=[RS, 1]
         )
-        # then the blocks attention reads, of whole pairs, up to pos
+        # then the blocks attention reads, of whole pairs, up to pos: a
+        # sliding layer's from the window's first key's (as `block_pairs`)
         NB: tl.constexpr = MAXL // 16
-        nh = ((pos + 16) // 16 + 1) // 2 * 2
+        nb = (pos + 16) // 16
+        lb = window_start(arm, pos) // 16
+        nh = (nb - lb + 1) // 2 * 2
         if arm != 0:
-            k0 = wave * 4 * RS
+            k0 = wave * 4 * RS + lb * 16 * GW_
             for g in tl.static_range(2):
                 air.ChannelPut(
                     "inKV_K",
@@ -531,21 +651,24 @@ def wave(
                             offsets=[c * 2560],
                             sizes=[2560],
                         )
-        # q: a CU's 8 heads, as its two groups of 4 blocked [NCH][4][8]
-        rq = air.alloc([DQ_], tl.bfloat16, memory_space=air.L2, memtile_col=5)
-        air.ChannelGet("ropeQ", rq, offsets=[0], sizes=[DQ_])
+        # q: a CU's kv heads' 4 heads each (the padding heads zero), a kv
+        # head's blocked [NCH][4][8]
+        rq = air.alloc(
+            [NKV_ * QPAD_ * DH_], tl.bfloat16, memory_space=air.L2, memtile_col=5
+        )
+        air.ChannelGet("ropeQ", rq, offsets=[0], sizes=[NKV_ * QPAD_ * DH_])
         for cu in tl.static_range(4):
             air.ChannelPut(
                 "toAttnQ",
                 rq,
                 indices=[cu],
                 offsets=[cu * KVPC_, 0, 0, 0],
-                sizes=[KVPC_, NCH_, 4, 8],
-                strides=[4 * DH_, 8, DH_, 1],
+                sizes=[KVPC_, NCH_, QPAD_, 8],
+                strides=[QPAD_ * DH_, 8, DH_, 1],
             )
         # each group's blocks of 16 rows in its column's memtile (3 or 4), to
-        # its 2 CUs: a kv head's keys at a time, blocked [2][NCH][8][8] (8
-        # keys by 8 columns)
+        # its 2 CUs, a kv head's keys at a time, blocked [2][NCH][8][8] (8 keys
+        # by 8 columns)
         for g in tl.static_range(2):
             for b in range(NB):
                 t = air.alloc(
@@ -553,12 +676,12 @@ def wave(
                 )
                 air.ChannelGet("inKV_K", t, indices=[g], offsets=[0], sizes=[16 * GW_])
                 for lc in tl.static_range(2):
-                    for h in tl.static_range(KVPC_):
+                    for hh in tl.static_range(KVPC_):
                         air.ChannelPut(
                             "toK",
                             t,
                             indices=[2 * g + lc],
-                            offsets=[0, 0, 0, (lc * KVPC_ + h) * DH_],
+                            offsets=[0, 0, 0, (lc * KVPC_ + hh) * DH_],
                             sizes=[2, NCH_, 8, 8],
                             strides=[8 * GW_, 8, GW_, 1],
                         )
@@ -568,26 +691,36 @@ def wave(
                 )
                 air.ChannelGet("inKV_V", t, indices=[g], offsets=[0], sizes=[16 * GW_])
                 for lc in tl.static_range(2):
-                    for h in tl.static_range(KVPC_):
+                    for hh in tl.static_range(KVPC_):
                         air.ChannelPut(
                             "toV",
                             t,
                             indices=[2 * g + lc],
-                            offsets=[0, 0, 0, (lc * KVPC_ + h) * DH_],
+                            offsets=[0, 0, 0, (lc * KVPC_ + hh) * DH_],
                             sizes=[2, NCH_, 8, 8],
                             strides=[8 * GW_, 8, GW_, 1],
                         )
         # the attention output, heads in order, as o-proj's x a round each
         og = air.alloc([DQ_], tl.bfloat16, memory_space=air.L2, memtile_col=5)
         for cu in tl.static_range(4):
-            air.ChannelGet(
-                "attnO",
-                og,
-                indices=[cu],
-                offsets=[cu * KVPC_, 0, 0, 0],
-                sizes=[KVPC_, NCH_, 4, 8],
-                strides=[4 * DH_, 8, DH_, 1],
-            )
+            if KVPC_ == 1:
+                air.ChannelGet(
+                    "attnO",
+                    og,
+                    indices=[cu],
+                    offsets=[0, cu * QPC_, 0],
+                    sizes=[NCH_, QPC_, 8],
+                    strides=[8, DH_, 1],
+                )
+            else:
+                air.ChannelGet(
+                    "attnO",
+                    og,
+                    indices=[cu],
+                    offsets=[cu * KVPC_, 0, 0, 0],
+                    sizes=[KVPC_, NCH_, 4, 8],
+                    strides=[4 * DH_, 8, DH_, 1],
+                )
         for n in range(I2P_[1]):
             air.ChannelPut("xnorm", og, offsets=[0], sizes=[DQ_])
         # glu's output, as down's x a round each
@@ -602,14 +735,24 @@ def wave(
         air.herd(rope_core, (arm,), 1, S, name="rope", at=(2, 3))
         # attention: a qk and a kv core per CU, CUs 0 and 1 in column 3, 2
         # and 3 in column 4
-        air.herd(qk_core, (arm, pos, 0), 1, SM, name="qk0", at=(3, 2))
-        air.herd(kv_core, (arm, pos, 0), 1, SM, name="kv0", at=(3, 3))
-        air.herd(qk_core, (arm, pos, 1), 1, SM, name="qk1", at=(3, 4))
-        air.herd(kv_core, (arm, pos, 1), 1, SM, name="kv1", at=(3, 5))
-        air.herd(qk_core, (arm, pos, 2), 1, SM, name="qk2", at=(4, 2))
-        air.herd(kv_core, (arm, pos, 2), 1, SM, name="kv2", at=(4, 3))
-        air.herd(qk_core, (arm, pos, 3), 1, SM, name="qk3", at=(4, 4))
-        air.herd(kv_core, (arm, pos, 3), 1, SM, name="kv3", at=(4, 5))
+        if KVPC_ == 1:
+            air.herd(qk_core1, (arm, pos, 0), 1, SM, name="qk0", at=(3, 2))
+            air.herd(kv_core1, (arm, pos, 0), 1, SM, name="kv0", at=(3, 3))
+            air.herd(qk_core1, (arm, pos, 1), 1, SM, name="qk1", at=(3, 4))
+            air.herd(kv_core1, (arm, pos, 1), 1, SM, name="kv1", at=(3, 5))
+            air.herd(qk_core1, (arm, pos, 2), 1, SM, name="qk2", at=(4, 2))
+            air.herd(kv_core1, (arm, pos, 2), 1, SM, name="kv2", at=(4, 3))
+            air.herd(qk_core1, (arm, pos, 3), 1, SM, name="qk3", at=(4, 4))
+            air.herd(kv_core1, (arm, pos, 3), 1, SM, name="kv3", at=(4, 5))
+        else:
+            air.herd(qk_core2, (arm, pos, 0), 1, SM, name="qk0", at=(3, 2))
+            air.herd(kv_core2, (arm, pos, 0), 1, SM, name="kv0", at=(3, 3))
+            air.herd(qk_core2, (arm, pos, 1), 1, SM, name="qk1", at=(3, 4))
+            air.herd(kv_core2, (arm, pos, 1), 1, SM, name="kv1", at=(3, 5))
+            air.herd(qk_core2, (arm, pos, 2), 1, SM, name="qk2", at=(4, 2))
+            air.herd(kv_core2, (arm, pos, 2), 1, SM, name="kv2", at=(4, 3))
+            air.herd(qk_core2, (arm, pos, 3), 1, SM, name="qk3", at=(4, 4))
+            air.herd(kv_core2, (arm, pos, 3), 1, SM, name="kv3", at=(4, 5))
         air.herd(rms_core, (arm,), 1, S, name="rms", at=(2, 2))
         air.herd(glu_core, (arm,), 1, S, name="glu", at=(5, 3))
         # the layer's output over x; an LM wave's logits after it

@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""`SuperkernelDecoder`: Gemma3-4B's decode as one Triton superkernel dispatch
-a token (`wave.py`), behind the interface of mlir-air's `FusedDecoder`, so
+"""`SuperkernelDecoder`: the selected model's (`spec`) decode as one Triton
+superkernel dispatch a token (`wave.py`), behind the interface of mlir-air's `FusedDecoder`, so
 that mlir-air's `generate()` drives it unchanged.
 
 The first dispatch compiles the superkernel (cached by Triton afterwards) and
@@ -37,33 +37,37 @@ class SuperkernelDecoder:
     def __init__(self, model=None, max_L=None, verbose=True):
         import airsrc
 
-        airsrc.add_air_paths("gemma3_4b_q4nx")
-        import gemma3_4b_q4nx_weights as gw
+        from .spec import MODELS, NAME
 
+        airsrc.add_air_paths(*MODELS[NAME]["packages"])
         from . import geom as G
         from . import pack as K
         from .wave import slab_offsets
 
-        self.gw, self.G = gw, G
+        qw = G.W
+        self.qw, self.G = qw, G
         self.maxL = self.ATTN_MAXL = max(128, 1 << ((max_L or 1) - 1).bit_length())
+        D = qw.D
         t0 = time.time()
-        m = gw.Q4nxModel(model)
-        nl = gw.NUM_LAYERS
-        # arm 1 a full layer, 2 a sliding one, 0 an LM wave
-        self.arms = tuple(1 if gw.is_global_layer(L) else 2 for L in range(nl))
+        m = qw.Q4nxModel(model)
+        nl = qw.NUM_LAYERS
+        # arm 1 a layer, 2 a sliding one, 0 an LM wave
+        self.arms = tuple(
+            2 if G.SWA and not qw.is_global_layer(L) else 1 for L in range(nl)
+        )
         self.arms += (0,) * G.NL
         W = [K.pack_wave(K.phase_mats(m, L), 1) for L in range(nl)]
-        lm = K.lm_q4(m, gw.VOCAB)
+        lm = K.lm_q4(m, qw.VOCAB)
         W += [K.pack_wave([K.lm_mats(lm, c)], 0) for c in range(G.NL)]
         rms = []
         for L in range(nl):
             rms += list(m.layer_rms(L))
-        # the final norm as an LM wave's rmsW's hi half
-        final = [np.zeros(gw.D, np.float32), m.bf16("model.norm.weight")]
+        # the final norm as an LM wave's rmsW's last D
+        final = [np.zeros(D * (G.NORMS // 2 - 1), np.float32)]
+        final += [m.bf16("model.norm.weight")]
         self.embed = np.asarray(m.bf16("model.embed_tokens.weight"), bfloat16)
         self.qk = [m.layer_qk_norm(L) for L in range(nl)]
         self.RS = self.maxL * G.GW  # a group's KV region
-        D = gw.D
         self.args = [
             bf_tensor(np.zeros(D + G.NL * G.LM_ROWS)),  # XL
             bf_tensor(np.concatenate(rms + final)),  # RMS
@@ -103,7 +107,7 @@ class SuperkernelDecoder:
             raise ValueError(f"P={P} does not fit a KV cache of {self.maxL}")
         a = _bf16_view(self._buf(self.KV))
         a[:] = 0
-        for L in range(self.gw.NUM_LAYERS):
+        for L in range(self.qw.NUM_LAYERS):
             for g in range(2):
                 cols = slice(g * G.GW, (g + 1) * G.GW)
                 for r, src in ((g, fk), (2 + g, fv)):
@@ -118,21 +122,21 @@ class SuperkernelDecoder:
     def dispatch(self, tok, p):
         """Token `tok` at position `p`: appends its K/V at row p and returns
         the logits [VOCAB]."""
-        gw, G = self.gw, self.G
+        qw, G = self.qw, self.G
         if not 0 <= p < self.maxL:
             raise ValueError(f"position {p} is outside [0, {self.maxL - 1}]")
         xl = _bf16_view(self._buf(self.XL))
-        xl[: gw.D] = self.embed[tok]
+        xl[: qw.D] = self.embed[tok]
         rope = _bf16_view(self._buf(self.ROPE))
-        for L in range(gw.NUM_LAYERS):
+        for L in range(qw.NUM_LAYERS):
             qn, kn = self.qk[L]
-            rope[L * G.ROPE_W : (L + 1) * G.ROPE_W] = gw.rope_w_layer(p, L, qn, kn)
+            rope[L * G.ROPE_W : (L + 1) * G.ROPE_W] = qw.rope_w_layer(p, L, qn, kn)
         if self.res is None:
             self._first(p)
         else:
             self.res.run(p, to=(self.XL, self.ROPE), back=(self.XL,))
         x = self._buf(self.XL)
-        return x[gw.D : gw.D + gw.VOCAB].to(torch.float32).numpy()
+        return x[qw.D : qw.D + qw.VOCAB].to(torch.float32).numpy()
 
     def _first(self, p):
         """Builds the dispatch (or takes Triton's cached build), runs the

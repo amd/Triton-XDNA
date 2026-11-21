@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT
 """The model's weights in the layouts the decode superkernel streams them in:
 Q4 blocks of 32 rows by 256 columns ([scale | min | nibbles], 5120 bytes),
-in each phase's round order. The LM head is the embedding, tied: requantized
-to Q4 as air-FLM's packer does.
+in each phase's round order. The LM head is the bundle's own Q4 head, or a
+tied one (the embedding) requantized to Q4, as air-FLM's packer takes them.
 """
 
 import numpy as np
@@ -11,6 +11,7 @@ import numpy as np
 from q4_blocks import _blocks, _cat, _rows, bf, pack_blocks
 
 from .geom import D, DK, DQ, GLU_HALF, I2P, INTER, J2P, LM_ROWS, LMR
+from .spec import S
 
 GROUP = 32  # the Q4 groups' columns
 
@@ -64,15 +65,18 @@ def pack_wave(mats, arm):
     return np.concatenate(chunks).reshape(-1)
 
 
-def lm_mats(lm_q4, c):
-    """LM-head wave c's rows of the requantized head (q, scale, min)."""
+def lm_mats(lm, c):
+    """LM-head wave c's rows of the head (q, scale, min), zero rows past the
+    vocabulary."""
     r0 = c * LM_ROWS
-    return _rows(tuple(a[r0 : r0 + LM_ROWS] for a in lm_q4), LM_ROWS)
+    return _rows(tuple(a[r0 : r0 + LM_ROWS] for a in lm), LM_ROWS)
 
 
 def lm_q4(m, vocab):
-    """The tied head, the embedding, requantized to Q4 by groups of 32 columns
-    as air-FLM's requant does."""
+    """The LM head in Q4: the bundle's, or the embedding requantized by groups
+    of 32 columns as air-FLM's requant does."""
+    if S["lm_head"] == "q4":
+        return m.q4nx("lm_head.weight", vocab, D)
     from air_examples.llms.shared.infra import host_weights
 
     lm = m.bf16("model.embed_tokens.weight")[:vocab]

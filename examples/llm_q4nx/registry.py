@@ -364,7 +364,7 @@ QWEN3_4B = ModelSpec(
     extra_packages=("qwen3_8b_q4nx", "qwen3_4b"),
     supports_hsa=True,
     supports_xrt_zero_copy=True,
-    superkernel_decoder="qwen3_superkernel:SuperkernelDecoder",
+    superkernel_decoder="fd_superkernel.qwen3_4b:SuperkernelDecoder",
 )
 
 
@@ -410,7 +410,7 @@ GEMMA3_4B = ModelSpec(
     min_host_gib=17.0,
     supports_hsa=True,
     supports_xrt_zero_copy=True,
-    superkernel_decoder="gemma3_superkernel:SuperkernelDecoder",
+    superkernel_decoder="fd_superkernel.gemma3_4b:SuperkernelDecoder",
 )
 
 #: `DECODE_ENV` in `fused_decode_ple/Makefile` -- the ENGINE's, not the model's:
