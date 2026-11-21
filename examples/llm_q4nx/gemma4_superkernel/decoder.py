@@ -36,8 +36,9 @@ class SuperkernelDecoder:
     def __init__(self, model=None, max_L=None, verbose=True):
         import airsrc
 
+        # the variant's package, whose modules are E2B's at its dims
         variant = os.environ.get("GEMMA4_VARIANT", "e2b")
-        airsrc.add_air_paths(f"gemma4_{variant}_q4nx")
+        airsrc.add_air_paths(f"gemma4_{variant}_q4nx", "gemma4_e2b_q4nx")
         import gemma4_e2b_q4nx_weights as gw
 
         from . import geom as G

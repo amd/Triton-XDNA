@@ -782,28 +782,29 @@ def wave(
                     sizes=[2, 64, 8, 8],
                     strides=[8 * KVW_, 8, KVW_, 1],
                 )
-        for b in range(NB // 2 * (PARTS_ - 1)):
-            t = air.alloc([8192], tl.bfloat16, memory_space=air.L2, memtile_col=2)
-            air.ChannelGet("inKV_K1", t, offsets=[0], sizes=[8192])
-            air.ChannelPut(
-                "toK1",
-                t,
-                indices=[0, 0],
-                offsets=[0, 0, 0, 0],
-                sizes=[2, 64, 8, 8],
-                strides=[4096, 8, 512, 1],
-            )
-        for b in range(NB // 2 * (PARTS_ - 1)):
-            t = air.alloc([8192], tl.bfloat16, memory_space=air.L2, memtile_col=5)
-            air.ChannelGet("inKV_V1", t, offsets=[0], sizes=[8192])
-            air.ChannelPut(
-                "toV1",
-                t,
-                indices=[0, 0],
-                offsets=[0, 0, 0, 0],
-                sizes=[2, 64, 8, 8],
-                strides=[4096, 8, 512, 1],
-            )
+        if PARTS_ == 2:
+            for b in range(NB // 2):
+                t = air.alloc([8192], tl.bfloat16, memory_space=air.L2, memtile_col=2)
+                air.ChannelGet("inKV_K1", t, offsets=[0], sizes=[8192])
+                air.ChannelPut(
+                    "toK1",
+                    t,
+                    indices=[0, 0],
+                    offsets=[0, 0, 0, 0],
+                    sizes=[2, 64, 8, 8],
+                    strides=[4096, 8, 512, 1],
+                )
+            for b in range(NB // 2):
+                t = air.alloc([8192], tl.bfloat16, memory_space=air.L2, memtile_col=5)
+                air.ChannelGet("inKV_V1", t, offsets=[0], sizes=[8192])
+                air.ChannelPut(
+                    "toV1",
+                    t,
+                    indices=[0, 0],
+                    offsets=[0, 0, 0, 0],
+                    sizes=[2, 64, 8, 8],
+                    strides=[4096, 8, 512, 1],
+                )
         # the attention output, as o-proj's x a round each
         og = air.alloc([DQ_], tl.bfloat16, memory_space=air.L2, memtile_col=5)
         for cu in tl.static_range(2):
