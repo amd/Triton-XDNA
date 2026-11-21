@@ -410,6 +410,7 @@ GEMMA3_4B = ModelSpec(
     min_host_gib=17.0,
     supports_hsa=True,
     supports_xrt_zero_copy=True,
+    superkernel_decoder="gemma3_superkernel:SuperkernelDecoder",
 )
 
 #: `DECODE_ENV` in `fused_decode_ple/Makefile` -- the ENGINE's, not the model's:

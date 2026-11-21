@@ -1264,11 +1264,16 @@ def _decode_gate(air, spec, cfg, args, ids, out):
     mlir-air's fused prefill computes in lower precision than the Triton one,
     which moves a later greedy token on some models. Those record
     `EXPECT_IDS_AIR_FUSED`, what mlir-air's own driver generates from the same
-    build; the rest gate on `EXPECT_IDS`.
+    build; the rest gate on `EXPECT_IDS`. `EXPECT_IDS_SUPERKERNEL`, where a
+    model has it, is the superkernel decode's.
     """
     golden = getattr(cfg, "EXPECT_IDS", None)
     if getattr(args, "prefill_engine", None) in ("air-fused", "triton-fused"):
         golden = getattr(cfg, "EXPECT_IDS_AIR_FUSED", golden)
+    # The superkernel decode follows the prefill where mlir-air's decode
+    # departs from it on some models; those record what it generates.
+    if getattr(args, "decode", None) == "superkernel":
+        golden = getattr(cfg, "EXPECT_IDS_SUPERKERNEL", golden)
     # The iGPU's numerics are its own, so what follows an iGPU prefill or comes
     # out of the iGPU decode is recorded separately.
     record = None
