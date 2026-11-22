@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: MIT
 """Qwen3-8B's superkernel decode: the registry's entry for it."""
 
-import os
+from . import select
 
-os.environ["FD_SUPERKERNEL_MODEL"] = "qwen3-8b"
+select("qwen3-8b")
 
 from .decoder import SuperkernelDecoder  # noqa: E402
 

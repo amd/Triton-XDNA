@@ -1,11 +1,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 """What tells the models apart, as air-FLM's `fused_decode` entries and its
-models' packages do. The selected model is FD_SUPERKERNEL_MODEL's, which a
-model's decoder sets before it imports `geom` or `wave`."""
+models' packages do. The model is the one a model's entry module selected
+(`select`) before anything imports this."""
 
 import importlib
-import os
 import types
 
 import airsrc
@@ -131,6 +130,7 @@ MODELS = {
         layers_per_w=8,
     ),
     "qwen3-4b": dict(
+        default_source="FastFlowLM/Qwen3-4B-NPU2",
         weights="qwen3_4b_q4nx_weights",
         packages=("qwen3_4b_q4nx", "qwen3_8b_q4nx", "qwen3_4b"),
         lm_rounds=30,  # VOCAB_CHUNK_I2
@@ -174,6 +174,7 @@ MODELS = {
         default_source="FastFlowLM/Qwen2.5-3B-Instruct-NPU2",
     ),
     "gemma3-4b": dict(
+        default_source="FastFlowLM/Gemma3-4B-NPU2",
         weights="gemma3_4b_q4nx_weights",
         packages=("gemma3_4b_q4nx",),
         lm_rounds=5,
@@ -186,7 +187,13 @@ MODELS = {
     ),
 }
 
-NAME = os.environ.get("FD_SUPERKERNEL_MODEL", "qwen3-4b")
+from . import _model as NAME  # noqa: E402
+
+if NAME is None:
+    raise RuntimeError(
+        "no model selected: import a model's module (fd_superkernel.qwen3_4b, "
+        "...) or call fd_superkernel.select first"
+    )
 S = MODELS[NAME]
 airsrc.add_air_paths(*S["packages"])
 W = importlib.import_module(S["weights"])  # the model's weights module

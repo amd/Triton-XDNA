@@ -3,9 +3,9 @@
 """Llama-3.2-1B's superkernel decode: the registry's entry for it. Its
 mlir-air driver constructs the decoder with the sequence length alone."""
 
-import os
+from . import select
 
-os.environ["FD_SUPERKERNEL_MODEL"] = "llama-3.2-1b"
+select("llama-3.2-1b")
 
 from .decoder import SuperkernelDecoder as _Decoder  # noqa: E402
 

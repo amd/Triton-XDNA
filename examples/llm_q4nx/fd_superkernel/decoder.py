@@ -45,10 +45,12 @@ class SuperkernelDecoder:
         D = qw.D
         t0 = time.time()
         S = G.S
+        # the bundle the examples' configs default to, the prefill's too
+        model = model or os.environ.get("Q4NX_MODEL_SOURCE") or S["default_source"]
         if S.get("source") in ("requant", "q4_0"):
-            m = qw.open_weight_source(model or S["default_source"])
+            m = qw.open_weight_source(model)
         else:
-            m = qw.Q4nxModel(model or S.get("default_source"))
+            m = qw.Q4nxModel(model)
         nl = G.NDEC
         # arm 1 a layer, 2 a sliding one, 0 an LM wave
         self.arms = tuple(

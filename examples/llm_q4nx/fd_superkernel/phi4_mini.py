@@ -4,9 +4,9 @@
 interface of mlir-air's prefiller drivers (FusedDecodePhi4's): constructed
 from the model and the decode's directory, its KV seeded a layer at a time."""
 
-import os
+from . import select
 
-os.environ["FD_SUPERKERNEL_MODEL"] = "phi4-mini"
+select("phi4-mini")
 
 from .decoder import PrefillerDecoder as SuperkernelDecoder  # noqa: E402
 
