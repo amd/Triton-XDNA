@@ -38,7 +38,8 @@ records it.
 an argument.
 
 It also has a second decode, this repo's own: `--decode superkernel` runs
-`superkernel_decode/`, the same 35 layers and LM head in one dispatch a token,
+`../llm_q4nx/gemma4_superkernel/`, the same 35 layers and LM head in one
+dispatch a token,
 written in Triton as a superkernel (`tl.extra.air`) on air-FLM's dataflow. It
 stands in for mlir-air's `FusedDecoder` under mlir-air's `generate()`, and
 needs no `make compile-decode`: Triton compiles it on its first token.

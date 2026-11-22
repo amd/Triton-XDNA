@@ -11,12 +11,7 @@ import torch
 
 import gemma4_e2b_q4nx_weights as gw
 
-from .wave import I2A, I2P, J2P, MASKA, NBA
-
-DH = 512  # every head in a 512 slot: the full layers' head dim
-NQ = gw.N_Q_HEADS
-LM_ROWS = 13824  # vocab rows an LM-head wave computes
-NL = (gw.VOCAB + LM_ROWS - 1) // LM_ROWS  # LM-head waves
+from .geom import DH, I2A, I2P, INTER, J2P, KV_REPL, LM_ROWS, LMR, MASKA, NBA, NQ
 
 
 def bf(a):
@@ -97,9 +92,11 @@ def phase_mats(m, L):
     columns and build-max rows: (q uint8 [M, K], scale, min [M, K / 32])."""
     w = m.layer_q4nx(L)
     dh = gw.head_dim(L)
-    if gw.owns_kv(L):
+    if gw.owns_kv(L) and KV_REPL:
         rep = lambda t: tuple(np.concatenate([a, a]) for a in t)  # the 2 CUs' copies
         qkv = _cat(w["q"], rep(w["k"]), rep(w["v"]))
+    elif gw.owns_kv(L):
+        qkv = _cat(w["q"], w["k"], w["v"])
     else:
         qkv = w["q"]
     ph0 = _rows(qkv, I2P[0] * 512)
@@ -118,7 +115,7 @@ def phase_mats(m, L):
     )
     ph2 = _rows(il, I2P[2] * 512)
     dn = w["down"]
-    pad = 12288 - inter
+    pad = INTER - inter
     ph3 = tuple(
         np.concatenate(
             [a, np.zeros((a.shape[0], pad // (1 if i == 0 else 32)), a.dtype)], 1
@@ -153,8 +150,8 @@ def pack_blocks(q, sc, mn):
 
 def pack_wave(mats, arm, phases):
     """A wave's weight slab: [stream][phase][fill], the arm's blocks only."""
-    # rounds of 512 rows: an LM wave's 27, a layer's phases' build max
-    rounds = [27] if arm == 0 else list(I2P)
+    # rounds of 512 rows: an LM wave's, a layer's phases' build max
+    rounds = [LMR] if arm == 0 else list(I2P)
     blocks = [_blocks(mats[p], rounds[p] * 16, J2P[p] * 2) for p in range(phases)]
     chunks = []
     for x in range(4):
