@@ -1261,6 +1261,12 @@ module attributes {transform.with_named_sequence} {
         %mod = transform.structured.match ops{["builtin.module"]} in %arg1 : (!transform.any_op) -> !transform.any_op
         %m_sccp = transform.apply_registered_pass "sccp" to %mod : (!transform.any_op) -> !transform.any_op
         %m_rdv = transform.apply_registered_pass "remove-dead-values" to %m_sccp : (!transform.any_op) -> !transform.any_op
+        // The dequant writes only its own tile, which none of the weights it
+        // reads overlaps: llvm.noalias on its arguments, as __restrict on a C
+        // kernel's.
+        %dq_fns = transform.structured.match ops{["func.func"]} attributes{no_inline} in %m_rdv : (!transform.any_op) -> !transform.any_op
+        %noalias = transform.param.constant [{llvm.noalias}, {llvm.noalias}, {llvm.noalias}, {llvm.noalias}] -> !transform.any_param
+        transform.annotate %dq_fns "arg_attrs" = %noalias : !transform.any_op, !transform.any_param
     transform.yield
   }
 }
