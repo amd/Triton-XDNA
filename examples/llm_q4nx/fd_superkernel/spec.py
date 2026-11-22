@@ -37,6 +37,22 @@ MODELS = {
         default_source="Qwen/Qwen2.5-7B-Instruct",
         layers_per_w=7,  # DECODE_WGROUP: a W buffer stays under 4 GiB
     ),
+    "qwen2.5-3b": dict(
+        weights="qwen25_3b_q4_weights",
+        packages=("qwen25_3b_q4", "qwen25_3b"),
+        lm_rounds=12,
+        kv_per_cu=1,
+        cus=2,  # 2 kv heads: the CUs of one column
+        q_seg=8,
+        norms=2,
+        act="silu",
+        glu_half=512,
+        window=False,
+        rope="bias",
+        lm_head="q4_0",
+        source="q4_0",  # FastFlowLM's bundle, Q4_0
+        default_source="FastFlowLM/Qwen2.5-3B-Instruct-NPU2",
+    ),
     "gemma3-4b": dict(
         weights="gemma3_4b_q4nx_weights",
         packages=("gemma3_4b_q4nx",),

@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: MIT
 """The model's weights in the layouts the decode superkernel streams them in:
 Q4 blocks of 32 rows by 256 columns ([scale | min | nibbles], 5120 bytes),
-in each phase's round order. Weights come from the bundle, or are quantized
-on load from a checkpoint, as air-FLM's requant cache quantizes them; so is
-the LM head, or a tied one (the embedding) is requantized to Q4.
+in each phase's round order. Weights come from the bundle (Q4_0 ones with
+their nibbles offset by 8), or are quantized on load from a checkpoint, as
+air-FLM's requant cache quantizes them; so is the LM head, or a tied one
+(the embedding) is requantized to Q4.
 """
 
 import numpy as np
@@ -28,6 +29,8 @@ def phase_mats(m, L):
         if S.get("source") == "requant":
             # quantized on load, as air-FLM's requant cache is
             return _requant(m.proj_fp(L, nm))
+        if S.get("source") == "q4_0":
+            return _from_q4_0(*m.proj_raw(L, nm))
         return m.q4nx(f"model.layers.{L}.{t}.weight", rows, cols)
 
     qkv = _cat(q4("q"), q4("k"), q4("v"))
@@ -83,7 +86,16 @@ def lm_q4(m, vocab):
         return m.q4nx("lm_head.weight", vocab, D)
     if S["lm_head"] == "requant":
         return _requant(m.lm_head_fp()[:vocab])
+    if S["lm_head"] == "q4_0":
+        return _from_q4_0(*(a[:vocab] for a in m.lm_head_raw()))
     return _requant(m.bf16("model.embed_tokens.weight")[:vocab])
+
+
+def _from_q4_0(q, sc):
+    """Q4_0 (signed nibbles q, w = q sc) in the blocks: q + 8 as the nibbles,
+    which `q40_group_b` takes 8 off, and no min."""
+    u = (q.view(np.int8).astype(np.int16) + 8).astype(np.uint8)
+    return u, sc, np.zeros_like(sc)
 
 
 def _requant(w):

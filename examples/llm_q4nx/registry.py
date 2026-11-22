@@ -693,6 +693,7 @@ QWEN2_5_3B = ModelSpec(
     min_host_gib=12.0,
     extra_packages=("qwen25_3b",),
     supports_hsa=True,
+    superkernel_decoder="fd_superkernel.qwen25_3b:SuperkernelDecoder",
 )
 
 

@@ -41,6 +41,7 @@ from .geom import (
     EPS,
     GLU_HALF,
     GLU_SLICES,
+    GCOL,
     GW,
     I2P,
     INTER,
@@ -53,7 +54,9 @@ from .geom import (
     NBMAX,
     NCH,
     NFA,
+    NCU,
     NFILL,
+    NGRP,
     NKV,
     NORMS,
     NQ,
@@ -67,7 +70,7 @@ from .geom import (
     SCALE,
     SWA,
 )
-from .kernels import glu_silu, real_heads, real_heads2, rope
+from .kernels import glu_silu, q40_groups, real_heads, real_heads2, rope
 from .spec import S as SPEC
 
 # as constexprs, for the jitted code
@@ -93,9 +96,13 @@ RL_ = tl.constexpr(NORMS * D)  # a layer's norm weights
 WH_ = tl.constexpr(NORMS // 2 * D)  # rmsW's and rmsW2's: half of them
 SILU_ = tl.constexpr(SPEC["act"] == "silu")
 BIAS_ = tl.constexpr(ROPE == "bias")
+Q40_ = tl.constexpr(SPEC.get("source") == "q4_0")  # Q4_0 weights
 NQG_ = tl.constexpr(NQG)
 SWA_ = tl.constexpr(SWA)
 GW_ = tl.constexpr(GW)
+NCU_ = tl.constexpr(NCU)
+NGRP_ = tl.constexpr(NGRP)
+GCOL_ = tl.constexpr(GCOL)
 INTER_ = tl.constexpr(INTER)
 GLU_HALF_ = tl.constexpr(GLU_HALF)
 GLU_SLICES_ = tl.constexpr(GLU_SLICES)
@@ -165,11 +172,17 @@ def proj_core(arm, CX0: tl.constexpr):
                 air.ChannelGet("wL2ToL1", w0, indices=[cx, cy], sizes=[2560])
                 for _ in range(first):
                     q4_prep(x0, xqc + j * 256, sxc + j * 8, tab)
-                q4_groups(xqc + j * 256, w0, acc, t, sxc + j * 8)
+                if Q40_:
+                    q40_groups(xqc + j * 256, w0, acc, t)
+                else:
+                    q4_groups(xqc + j * 256, w0, acc, t, sxc + j * 8)
                 air.ChannelGet("wL2ToL1", w1, indices=[cx, cy], sizes=[2560])
                 for _ in range(first):
                     q4_prep(x1, xqc + j * 256 + 256, sxc + j * 8 + 8, tab)
-                q4_groups(xqc + j * 256 + 256, w1, acc, t, sxc + j * 8 + 8)
+                if Q40_:
+                    q40_groups(xqc + j * 256 + 256, w1, acc, t)
+                else:
+                    q4_groups(xqc + j * 256 + 256, w1, acc, t, sxc + j * 8 + 8)
             tl.store(y + 32 + r, tl.load(acc + r).to(tl.bfloat16))
             air.ChannelPut(
                 "outA", y, indices=[cx, cy], offsets=[30], sizes=[34], dest=dest
@@ -610,17 +623,17 @@ def wave(
         channel_type="npu_dma_packet",
         tile_dma_channel=1,
     )
-    air.Channel("attnO", size=[4])
+    air.Channel("attnO", size=[NCU_])
     air.Channel("ropeLUT")
     air.Channel("ropeQ")
-    air.Channel("toAttnQ", size=[4])
+    air.Channel("toAttnQ", size=[NCU_])
     air.Channel("appendK")
     air.Channel("appendV")
-    air.Channel("inKV_K", size=[2])
-    air.Channel("inKV_V", size=[2])
-    air.Channel("toK", size=[4])
-    air.Channel("toV", size=[4])
-    air.Channel("sPC", size=[4])
+    air.Channel("inKV_K", size=[NGRP_])
+    air.Channel("inKV_V", size=[NGRP_])
+    air.Channel("toK", size=[NCU_])
+    air.Channel("toV", size=[NCU_])
+    air.Channel("sPC", size=[NCU_])
     air.Channel("gluOut")
     air.Channel("layerOut")
     # host
@@ -671,10 +684,16 @@ def wave(
         RS: tl.constexpr = MAXL * GW_  # a group's region
         # this token's k and v at row pos of the wave's slab: each group's
         # part of the row in its region
-        ks = air.table(KVAPP, wave) * 4 * RS + pos * GW_
-        air.ChannelGet("appendK", KV, offsets=[0, ks], sizes=[2, GW_], strides=[RS, 1])
+        ks = air.table(KVAPP, wave) * 2 * NGRP_ * RS + pos * GW_
         air.ChannelGet(
-            "appendV", KV, offsets=[0, ks + 2 * RS], sizes=[2, GW_], strides=[RS, 1]
+            "appendK", KV, offsets=[0, ks], sizes=[NGRP_, GW_], strides=[RS, 1]
+        )
+        air.ChannelGet(
+            "appendV",
+            KV,
+            offsets=[0, ks + NGRP_ * RS],
+            sizes=[NGRP_, GW_],
+            strides=[RS, 1],
         )
         # then the blocks attention reads, of whole pairs, up to pos: a
         # sliding layer's from the window's first key's (as `block_pairs`)
@@ -683,8 +702,8 @@ def wave(
         lb = window_start(arm, pos) // 16
         nh = (nb - lb + 1) // 2 * 2
         if arm != 0:
-            k0 = wave * 4 * RS + lb * 16 * GW_
-            for g in tl.static_range(2):
+            k0 = wave * 2 * NGRP_ * RS + lb * 16 * GW_
+            for g in tl.static_range(NGRP_):
                 air.ChannelPut(
                     "inKV_K",
                     KV,
@@ -696,7 +715,7 @@ def wave(
                     "inKV_V",
                     KV,
                     indices=[g],
-                    offsets=[k0 + (2 + g) * RS],
+                    offsets=[k0 + (NGRP_ + g) * RS],
                     sizes=[nh * 16 * GW_],
                 )
         # x of every round: 512 at a time into memtile 3, broadcast as 2 x 256.
@@ -728,7 +747,7 @@ def wave(
             [NKV_ * QPAD_ * DH_], tl.bfloat16, memory_space=air.L2, memtile_col=5
         )
         air.ChannelGet("ropeQ", rq, offsets=[0], sizes=[NKV_ * QPAD_ * DH_])
-        for cu in tl.static_range(4):
+        for cu in tl.static_range(NCU_):
             air.ChannelPut(
                 "toAttnQ",
                 rq,
@@ -737,13 +756,13 @@ def wave(
                 sizes=[NQG_, NCH_, 4, 8],
                 strides=[4 * DH_, 8, DH_, 1],
             )
-        # each group's blocks of 16 rows in its column's memtile (3 or 4), to
-        # its 2 CUs, a kv head's keys at a time, blocked [2][NCH][8][8] (8 keys
-        # by 8 columns)
-        for g in tl.static_range(2):
+        # each group's blocks of 16 rows in its column's memtile, to its 2
+        # CUs, a kv head's keys at a time, blocked [2][NCH][8][8] (8 keys by 8
+        # columns)
+        for g in tl.static_range(NGRP_):
             for b in range(NB):
                 t = air.alloc(
-                    [16 * GW_], tl.bfloat16, memory_space=air.L2, memtile_col=3 + g
+                    [16 * GW_], tl.bfloat16, memory_space=air.L2, memtile_col=GCOL_ + g
                 )
                 air.ChannelGet("inKV_K", t, indices=[g], offsets=[0], sizes=[16 * GW_])
                 for lc in tl.static_range(2):
@@ -758,7 +777,7 @@ def wave(
                         )
             for b in range(NB):
                 t = air.alloc(
-                    [16 * GW_], tl.bfloat16, memory_space=air.L2, memtile_col=3 + g
+                    [16 * GW_], tl.bfloat16, memory_space=air.L2, memtile_col=GCOL_ + g
                 )
                 air.ChannelGet("inKV_V", t, indices=[g], offsets=[0], sizes=[16 * GW_])
                 for lc in tl.static_range(2):
@@ -773,7 +792,7 @@ def wave(
                         )
         # the attention output, heads in order, as o-proj's x a round each
         og = air.alloc([DQ_], tl.bfloat16, memory_space=air.L2, memtile_col=5)
-        for cu in tl.static_range(4):
+        for cu in tl.static_range(NCU_):
             if QPC_ == 8:
                 air.ChannelGet(
                     "attnO",
@@ -804,9 +823,14 @@ def wave(
         air.herd(proj_core, (arm, 2), (2, 4), S, name="proj_blk1", at=(6, 2))
         gather_rounds(NR_)
         air.herd(rope_core, (arm,), 1, S, name="rope", at=(2, 3))
-        # attention: a qk and a kv core per CU, CUs 0 and 1 in column 3, 2
-        # and 3 in column 4
-        if NQG_ == 1:
+        # attention: a qk and a kv core per CU; of 4 CUs, 0 and 1 in column
+        # 3, 2 and 3 in column 4; 2 CUs in column 4
+        if NCU_ == 2:
+            air.herd(qk_core2, (arm, pos, 0), 1, SM, name="qk0", at=(4, 2))
+            air.herd(kv_core2, (arm, pos, 0), 1, SM, name="kv0", at=(4, 3))
+            air.herd(qk_core2, (arm, pos, 1), 1, SM, name="qk1", at=(4, 4))
+            air.herd(kv_core2, (arm, pos, 1), 1, SM, name="kv1", at=(4, 5))
+        elif NQG_ == 1:
             air.herd(qk_core1, (arm, pos, 0), 1, SM, name="qk0", at=(3, 2))
             air.herd(kv_core1, (arm, pos, 0), 1, SM, name="kv0", at=(3, 3))
             air.herd(qk_core1, (arm, pos, 1), 1, SM, name="qk1", at=(3, 4))

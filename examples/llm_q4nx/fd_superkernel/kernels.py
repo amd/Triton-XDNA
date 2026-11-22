@@ -9,7 +9,14 @@ superkernel's.
 import triton
 import triton.language as tl
 
-from gemma4_superkernel.kernels import add_bf, bf_parts, copy_n, exp2_f32, rms_norm
+from gemma4_superkernel.kernels import (
+    add_bf,
+    bf_parts,
+    copy_n,
+    exp2_f32,
+    rms_norm,
+    splat,
+)
 
 
 @triton.jit
@@ -137,3 +144,36 @@ def real_heads2(o2, o, NCH: tl.constexpr, NH: tl.constexpr):
                 o2 + (c * NH + h) * 8 + k,
                 tl.load(o + (g * NCH + c) * 32 + (h % 4) * 8 + k),
             )
+
+
+@triton.jit
+def q40_group_b(xq, w, acc, t, g):
+    """q4_group_b for Q4_0 weights, w = q scale with q signed: the nibbles
+    hold q + 8, which the products take off, and no min (air-FLM's Q4_0
+    _qmm_q4k_bf16). x as q4_prep leaves it at xq."""
+    r = tl.arange(0, 32)
+    tl.store(t + r, tl.zeros([32], tl.float32))
+    for j in range(8):
+        v = tl.load(w + 512 + g * 256 + j * 32 + r)
+        tj = tl.load(t + r)
+        c = xq + g * 32 + j * 4
+        for s in tl.static_range(4):
+            # column 4 j + s, q 2^(4 s): the nibble's word less 8 2^(4 s),
+            # in integers (the top nibble's by flipping its sign bit), then
+            # exactly as bf16
+            if s == 3:
+                q = ((v & -4096) ^ -32768).to(tl.bfloat16)
+            else:
+                q = ((v & (15 << (4 * s))) - (8 << (4 * s))).to(tl.bfloat16)
+            tj += q.to(tl.float32) * splat(tl.load(c + s), 32)
+        tl.store(t + r, tj)
+    part = tl.load(t + r).to(tl.bfloat16).to(tl.float32)
+    scale = tl.load(w + g * 32 + r).to(tl.bfloat16, bitcast=True).to(tl.float32)
+    tl.store(acc + r, tl.load(acc + r) + part * scale)
+
+
+@triton.jit
+def q40_groups(xq, w, acc, t):
+    """A Q4_0 block at w times the x q4_prep left at xq, added to acc."""
+    for g in range(8):
+        q40_group_b(xq, w, acc, t, g)

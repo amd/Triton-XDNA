@@ -16,7 +16,7 @@ DH = W.DH
 NQ, NKV = W.N_Q_HEADS, W.N_KV_HEADS
 DQ, DK = W.DQ, W.DK
 M = DQ + 2 * DK  # the QKV projection's rows
-INTER = W.INTER
+INTER = getattr(W, "INTER_PAD", W.INTER)  # padded to 512s where it is not
 EPS = W.RMS_EPS
 SWA = W.SLIDING_WINDOW if S["window"] else 0
 # the scores' scale, as the bf16 the kernels multiply by: Gemma3's
@@ -28,7 +28,7 @@ J2P = (KB, DQ // 512, KB, INTER // 512)  # pairs of 256-column blocks a phase
 LMR = S["lm_rounds"]  # rounds of an LM-head wave (VOCAB_CHUNK_I2)
 LM_ROWS = LMR * 512  # vocab rows an LM-head wave computes
 NL = (W.VOCAB + LM_ROWS - 1) // LM_ROWS  # LM-head waves
-NCU = 4  # attention CUs, a qk and a kv core each
+NCU = S.get("cus", 4)  # attention CUs, a qk and a kv core each
 KVPC = S["kv_per_cu"]  # kv heads a CU
 QG = NQ // NKV  # q heads a kv head
 QSEG = S.get("q_seg", 4)
@@ -36,7 +36,10 @@ QPAD = -(-QG // QSEG) * QSEG  # those padded with zero heads to QSEG's
 NQG = KVPC * QPAD // 4  # a CU's groups of 4 q heads, the attention kernels'
 QPC = KVPC * QG  # a CU's (real) q heads
 NCH = DH // 8  # 8-column chunks of a head
-NGRP = 2  # KV groups: the CUs of a column share one, and its memtile
+# KV groups: the CUs of a column share one, and its memtile; 4 CUs take
+# columns 3 and 4, 2 column 4 (air-FLM's ATTN_PCOL)
+NGRP = NCU // 2
+GCOL = 3 if NGRP == 2 else 4  # the first group's column
 GW = NCU // NGRP * KVPC * DH  # a group's KV row
 ROPE = S.get("rope", "qk_norm")
 # a layer's rope weights at a position: [cos | sin] then [q_norm | k_norm], or

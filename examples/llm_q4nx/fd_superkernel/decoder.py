@@ -45,7 +45,7 @@ class SuperkernelDecoder:
         D = qw.D
         t0 = time.time()
         S = G.S
-        if S.get("source") == "requant":
+        if S.get("source") in ("requant", "q4_0"):
             m = qw.open_weight_source(model or S["default_source"])
         else:
             m = qw.Q4nxModel(model)
@@ -85,7 +85,7 @@ class SuperkernelDecoder:
             bf_tensor(np.concatenate(rms + final)),  # RMS
             ws.pop(0),  # W
             bf_tensor(np.zeros(nl * G.ROPE_W)),  # ROPE
-            bf_tensor(np.zeros((nl + 1) * 4 * self.RS)),  # KV
+            bf_tensor(np.zeros((nl + 1) * 2 * G.NGRP * self.RS)),  # KV
         ]
         self.wx = {f"W{b}": t for b, t in sorted(ws.items())}
         self.kw = dict(
@@ -122,11 +122,12 @@ class SuperkernelDecoder:
             raise ValueError(f"P={P} does not fit a KV cache of {self.maxL}")
         a = _bf16_view(self._buf(self.KV))
         a[:] = 0
+        NG = G.NGRP
         for L in range(self.qw.NUM_LAYERS):
-            for g in range(2):
+            for g in range(NG):
                 cols = slice(g * G.GW, (g + 1) * G.GW)
-                for r, src in ((g, fk), (2 + g, fv)):
-                    o = (L * 4 + r) * RS
+                for r, src in ((g, fk), (NG + g, fv)):
+                    o = (L * 2 * NG + r) * RS
                     rows = np.asarray(src[L, :P, cols], np.float32)
                     a[o : o + P * G.GW] = bf(rows).reshape(-1).astype(bfloat16)
         if self.res is not None:

@@ -102,6 +102,13 @@ BOS = 151643
 #: harness stops propagating it (see `harness.air_inference_module`).
 EXPECT_IDS = [12095, 13, 576, 6722, 315, 15344, 374, 21718, 13, 576]
 
+#: The superkernel decode's (`--decode superkernel`) after the Triton prefill.
+#: Its sixth token, the country, departs from EXPECT_IDS: there the decodes
+#: and the prefill each pick a different one (a Triton prefill over that
+#: prefix picks a third). A Triton prefill over each other prefix predicts
+#: each of these tokens.
+EXPECT_IDS_SUPERKERNEL = [12095, 13, 576, 6722, 315, 17689, 374, 24081, 13, 576]
+
 MODEL_DEFAULT = os.environ.get(
     "Q4NX_MODEL_SOURCE", "FastFlowLM/Qwen2.5-3B-Instruct-NPU2"
 )
