@@ -46,7 +46,9 @@ GW = NCU // NGRP * KVPC * DH  # a group's KV row
 ROPE = S.get("rope", "qk_norm")
 # a layer's rope weights at a position: [cos | sin], then [q_norm | k_norm] or
 # the q/k/v biases where the model has them
-ROPE_W = DH + {"bias": M, "qk_norm": 2 * DH, "lut": 0}[ROPE]
+RD = S.get("rope_dim", DH)  # the dims a head rotates on
+ROPE_W = RD + {"bias": M, "qk_norm": 2 * DH, "lut": 0}[ROPE]
+assert RD == DH or ROPE == "lut"
 LPW = S.get("layers_per_w", 0)  # layers a W buffer, 0 for all in one
 NORMS = S["norms"]  # a layer's norms: 2, or Gemma's sandwich of 4
 GLU_HALF = S["glu_half"]  # up/gate rows a glu slice takes of each

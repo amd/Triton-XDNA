@@ -179,3 +179,38 @@ class SuperkernelDecoder:
         if self.res is not None:
             self.res.device.close()
             self.res = None
+
+
+def _host(t):
+    """A K or V array as float32 numpy, from numpy or a torch tensor."""
+    if hasattr(t, "detach"):
+        return t.detach().float().cpu().numpy()
+    return np.asarray(t, np.float32)
+
+
+class PrefillerDecoder(SuperkernelDecoder):
+    """`SuperkernelDecoder` behind the interface of mlir-air's prefiller
+    drivers (`generate_stream`): constructed from the model and the decode's
+    directory, which it does not need, for air-FLM's default 2048 positions;
+    its KV seeded from per-layer [ctx, kv heads x head dim] arrays, and
+    cleared for a new sequence."""
+
+    def __init__(
+        self, model=None, fused_dir=None, model_type=None, max_L=2048, verbose=True
+    ):
+        super().__init__(model=model, max_L=max_L, verbose=verbose)
+        self.N_LAYERS = self.G.NDEC
+
+    def seed_kv(self, k_layers, v_layers):
+        P = _host(k_layers[0]).shape[0]
+        fk = np.stack([_host(k).reshape(P, -1) for k in k_layers])
+        fv = np.stack([_host(v).reshape(P, -1) for v in v_layers])
+        super().seed_kv(fk, fv, P)
+        return P
+
+    def reset_kv(self):
+        _bf16_view(self._buf(self.KV))[:] = 0
+        if self.res is not None:
+            from triton.backends.amd_triton_npu.npu_runner import sync_to
+
+            sync_to(self.res.bos[self.KV])

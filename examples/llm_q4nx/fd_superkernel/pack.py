@@ -18,6 +18,18 @@ from .spec import S
 GROUP = 32  # the Q4 groups' columns
 
 
+# each projection's (rows, columns)
+DIMS = dict(
+    q=(DQ, D),
+    k=(DK, D),
+    v=(DK, D),
+    o=(D, DQ),
+    up=(INTER, D),
+    gate=(INTER, D),
+    down=(D, INTER),
+)
+
+
 def phase_mats(m, L):
     """The layer's 4 phase matrices as the cores take them: (q uint8 [M, K],
     scale, min [M, K / 32]); up and gate interleaved GLU_HALF rows at a time,
@@ -25,10 +37,11 @@ def phase_mats(m, L):
     P = m._PROJ
 
     def q4(nm):
-        # (name, rows, cols), or the name and the rows and columns apart
-        t, rows, cols = (
-            P[nm] if isinstance(P[nm], tuple) else (P[nm],) + m._PROJ_DIMS[nm]
-        )
+        # (name, rows, cols), or the name alone
+        if isinstance(P[nm], tuple):
+            t, rows, cols = P[nm]
+        else:
+            t, (rows, cols) = P[nm], DIMS[nm]
         if S.get("source") == "requant":
             # quantized on load, as air-FLM's requant cache is
             return _requant(m.proj_fp(L, nm))

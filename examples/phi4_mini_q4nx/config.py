@@ -95,6 +95,11 @@ EXPECT_IDS = [12650, 11, 1118, 382, 5542, 395, 1617, 37118, 88691, 1299]
 #: move a later greedy token on this model.
 EXPECT_IDS_AIR_FUSED = [12650, 11, 1118, 382, 261, 5030, 5542, 395, 1617, 10358]
 
+#: The superkernel decode's (`--decode superkernel`) after the Triton prefill:
+#: what mlir-air's own decode gives after the Triton prefill too, run against
+#: the same build, and EXPECT_IDS_AIR_FUSED.
+EXPECT_IDS_SUPERKERNEL = EXPECT_IDS_AIR_FUSED
+
 MODEL_DEFAULT = os.environ.get(
     "Q4NX_MODEL_SOURCE", "FastFlowLM/Phi4-mini-Instruct-NPU2"
 )

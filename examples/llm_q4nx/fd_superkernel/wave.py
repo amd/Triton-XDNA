@@ -63,8 +63,10 @@ from .geom import (
     NQG,
     NR,
     NX,
+    QG,
     QPAD,
     QPC,
+    RD,
     ROPE,
     ROPE_W,
     SCALE,
@@ -90,6 +92,7 @@ NQ_ = tl.constexpr(NQ)
 NKV_ = tl.constexpr(NKV)
 QPC_ = tl.constexpr(QPC)
 QPAD_ = tl.constexpr(QPAD)
+QG_ = tl.constexpr(QG)
 KVPC_ = tl.constexpr(KVPC)
 NORMS_ = tl.constexpr(NORMS)
 RL_ = tl.constexpr(NORMS * D)  # a layer's norm weights
@@ -97,6 +100,7 @@ WH_ = tl.constexpr(NORMS // 2 * D)  # rmsW's and rmsW2's: half of them
 SILU_ = tl.constexpr(SPEC["act"] == "silu")
 BIAS_ = tl.constexpr(ROPE == "bias")
 QKNORM_ = tl.constexpr(ROPE == "qk_norm")
+RD_ = tl.constexpr(RD)
 Q40_ = tl.constexpr(SPEC.get("source") == "q4_0")  # Q4_0 weights
 NQG_ = tl.constexpr(NQG)
 SWA_ = tl.constexpr(SWA)
@@ -267,7 +271,7 @@ def rope_core(arm):
         for n in range(I2P_[0]):
             air.ChannelGet("outY", qkv, indices=[0, 0], offsets=[n * 512], sizes=[512])
         air.ChannelGet("ropeLUT", w, sizes=[ROPE_W_])
-        rope(q, kk, v, qkv, w, sq, NQ_, NKV_, DH_, EPS_, QPAD_, BIAS_, QKNORM_)
+        rope(q, kk, v, qkv, w, sq, NQ_, NKV_, DH_, EPS_, QPAD_, BIAS_, QKNORM_, RD_)
         air.ChannelPut("ropeQ", q, offsets=[0], sizes=[NKV_ * QPAD_ * DH_])
     # in every wave, as the host's gets: an LM wave's are not read
     air.ChannelPut("appendK", kk, offsets=[0], sizes=[DK_])
@@ -480,7 +484,7 @@ def kv_core2(arm, pos, CU: tl.constexpr):
         if QPC_ == 8:
             air.ChannelPut("attnO", o, indices=[CU], offsets=[0], sizes=[QB])
         else:
-            real_heads2(o2, o, NCH_, QPC_)
+            real_heads2(o2, o, NCH_, QPC_, QG_, QPAD_)
             air.ChannelPut(
                 "attnO", o2, indices=[CU], offsets=[0], sizes=[NCH_ * QPC_ * 8]
             )

@@ -56,16 +56,27 @@ def glu_silu(y, x, N: tl.constexpr):
 def apply_rope(y, x, cs, H: tl.constexpr):
     """y = x rotated, half-split: y[i] = x[i] cos[i] - x[i + H] sin[i],
     y[i + H] = x[i] sin[i] + x[i + H] cos[i], i < H; cos at cs, sin at
-    cs + H."""
-    k = tl.arange(0, 32)
-    for c in range(H // 32):
-        o = c * 32 + k
+    cs + H. 32 lanes at a time, or 16 where H is not 32s (partial
+    rotary's 48)."""
+    L: tl.constexpr = 32 if H % 32 == 0 else 16
+    k = tl.arange(0, L)
+    for c in range(H // L):
+        o = c * L + k
         x1 = tl.load(x + o).to(tl.float32)
         x2 = tl.load(x + H + o).to(tl.float32)
         co = tl.load(cs + o).to(tl.float32)
         si = tl.load(cs + H + o).to(tl.float32)
         tl.store(y + o, (x1 * co - x2 * si).to(tl.bfloat16))
         tl.store(y + H + o, (x1 * si + x2 * co).to(tl.bfloat16))
+
+
+@triton.jit
+def rotate(y, x, cs, DH: tl.constexpr, RD: tl.constexpr):
+    """A head rotated on its first RD dims (all of them, or partial
+    rotary's), the rest as they are."""
+    apply_rope(y, x, cs, RD // 2)
+    if RD < DH:
+        copy_n(y + RD, x + RD, DH - RD)
 
 
 @triton.jit
@@ -83,13 +94,15 @@ def rope(
     QPAD: tl.constexpr,
     BIAS: tl.constexpr,
     QKNORM: tl.constexpr,
+    RD: tl.constexpr,
 ):
     """q/k/v from the QKV projection's [q | k | v] at qkv (air-FLM's
     rope.cc): with BIAS, the q/k/v biases added first; each q head q-normed
     (with QKNORM) and rotated, each k head k-normed (likewise) and rotated,
     v as it is. q comes out QPAD heads a kv head: its own, then zero heads,
-    as air-FLM pads them. w: [cos DH/2 | sin DH/2] then [q_norm DH | k_norm
-    DH] or the biases [q | k | v]. The heads are normed in place."""
+    as air-FLM pads them; a head rotated on its first RD dims. w: [cos RD/2
+    | sin RD/2] then [q_norm DH | k_norm DH] or the biases [q | k | v]. The
+    heads are normed in place."""
     G: tl.constexpr = NQ // NKV  # q heads a kv head
     if BIAS:
         add_bf(qkv, w + DH, (NQ + 2 * NKV) * DH)
@@ -97,7 +110,7 @@ def rope(
         for h in range(NQ):
             if QKNORM:
                 rms_norm(qkv + h * DH, qkv + h * DH, w + DH, sq, DH, EPS)
-            apply_rope(q + h * DH, qkv + h * DH, w, DH // 2)
+            rotate(q + h * DH, qkv + h * DH, w, DH, RD)
     else:
         k = tl.arange(0, 32)
         for h in range(NKV):
@@ -105,7 +118,7 @@ def rope(
                 o = (h * G + j) * DH
                 if QKNORM:
                     rms_norm(qkv + o, qkv + o, w + DH, sq, DH, EPS)
-                apply_rope(q + (h * QPAD + j) * DH, qkv + o, w, DH // 2)
+                rotate(q + (h * QPAD + j) * DH, qkv + o, w, DH, RD)
             for c in range((QPAD - G) * DH // 32):
                 tl.store(
                     q + (h * QPAD + G) * DH + c * 32 + k, tl.zeros([32], tl.bfloat16)
@@ -114,7 +127,7 @@ def rope(
         o = NQ * DH + h * DH
         if QKNORM:
             rms_norm(qkv + o, qkv + o, w + 2 * DH, sq, DH, EPS)
-        apply_rope(kk + h * DH, qkv + o, w, DH // 2)
+        rotate(kk + h * DH, qkv + o, w, DH, RD)
     copy_n(v, qkv + (NQ + NKV) * DH, NKV * DH)
 
 
@@ -133,17 +146,19 @@ def real_heads(o2, o, NCH: tl.constexpr, NH: tl.constexpr):
 
 
 @triton.jit
-def real_heads2(o2, o, NCH: tl.constexpr, NH: tl.constexpr):
-    """o2 [NCH][NH][8] = the first NH of the 8 heads of o [2][NCH][4][8]:
-    the first group's 4, then the second's first NH - 4. A head's 8 at a
-    time: o2's rows of NH 8s leave wider stores unaligned."""
+def real_heads2(
+    o2, o, NCH: tl.constexpr, NH: tl.constexpr, QG: tl.constexpr, QPAD: tl.constexpr
+):
+    """o2 [NCH][NH][8] = the NH real heads of o [2][NCH][4][8], whose heads
+    are QPAD a kv head, the first QG of them real. A head's 8 at a time:
+    o2's rows of NH 8s leave wider stores unaligned."""
     k = tl.arange(0, 8)
     for c in range(NCH):
-        for h in range(NH):
-            g = h // 4
+        for r in tl.static_range(NH):
+            p = (r // QG) * QPAD + r % QG  # the padded head
             tl.store(
-                o2 + (c * NH + h) * 8 + k,
-                tl.load(o + (g * NCH + c) * 32 + (h % 4) * 8 + k),
+                o2 + (c * NH + r) * 8 + k,
+                tl.load(o + ((p // 4) * NCH + c) * 32 + (p % 4) * 8 + k),
             )
 
 

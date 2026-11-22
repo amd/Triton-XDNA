@@ -270,6 +270,7 @@ LLAMA_3_2_3B = ModelSpec(
     decoder_class="FusedDecode3B",
     supports_hsa=True,
     supports_xrt_zero_copy=True,
+    superkernel_decoder="fd_superkernel.llama32_3b:SuperkernelDecoder",
 )
 
 
@@ -314,6 +315,7 @@ LLAMA_3_1_8B = ModelSpec(
     decoder_class="FusedDecode8B",
     supports_hsa=True,
     supports_xrt_zero_copy=True,
+    superkernel_decoder="fd_superkernel.llama31_8b:SuperkernelDecoder",
 )
 
 
@@ -522,6 +524,7 @@ QWEN3_8B = ModelSpec(
     # same whichever module gets imported first.
     extra_packages=("qwen3_4b",),
     supports_hsa=True,
+    superkernel_decoder="fd_superkernel.qwen3_8b:SuperkernelDecoder",
 )
 
 
@@ -644,6 +647,7 @@ PHI4_MINI = ModelSpec(
     extra_packages=("llama32_1b_q4nx", "llama32_3b"),
     supports_hsa=True,
     supports_xrt_zero_copy=True,
+    superkernel_decoder="fd_superkernel.phi4_mini:SuperkernelDecoder",
 )
 
 

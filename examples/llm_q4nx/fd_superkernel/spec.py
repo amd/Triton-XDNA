@@ -6,16 +6,39 @@ model's decoder sets before it imports `geom` or `wave`."""
 
 import importlib
 import os
+import types
 
 import airsrc
 
 
-def _llama_lut(n):
-    """Llama-3.2's RoPE LUT for n positions, [cos | sin] a position, with
-    the llama3 frequency scaling (mlir-air's generate_rope_lut)."""
-    from llama32_1b_weights import LlamaConfig, generate_rope_lut
+def _lut(package, config="LlamaConfig"):
+    """The model's RoPE LUT for n positions, [cos | sin] a position, from
+    mlir-air's generate_rope_lut in `package` on its `config`: Llama-3.2's
+    with the llama3 frequency scaling, Phi-4-mini's LongRoPE."""
 
-    return generate_rope_lut(LlamaConfig(), n)
+    def lut(n):
+        m = importlib.import_module(package)
+        return m.generate_rope_lut(getattr(m, config)(), n)
+
+    return lut
+
+
+def _dims(package, config="LlamaConfig"):
+    """The dims a weights module without them leaves to `package`'s config."""
+
+    def dims():
+        c = getattr(importlib.import_module(package), config)()
+        return dict(
+            D=c.emb_dim,
+            DH=c.head_dim,
+            N_Q_HEADS=c.n_heads,
+            N_KV_HEADS=c.n_kv_heads,
+            DQ=c.n_heads * c.head_dim,
+            DK=c.n_kv_heads * c.head_dim,
+            INTER=c.hidden_dim,
+        )
+
+    return dims
 
 
 MODELS = {
@@ -35,8 +58,77 @@ MODELS = {
         glu_half=512,
         window=False,
         rope="lut",  # one LUT every layer shares
-        rope_lut=_llama_lut,
+        rope_lut=_lut("llama32_1b_weights"),
         lm_head="tied",
+    ),
+    "llama-3.2-3b": dict(
+        weights="llama32_3b_q4nx_weights",
+        packages=("llama32_3b_q4nx", "llama32_3b", "llama32_1b_q4nx"),
+        dims=_dims("llama32_3b_weights"),
+        default_source="FastFlowLM/Llama-3.2-3B-NPU2",
+        layers=28,
+        vocab=128256,
+        eps=1e-6,
+        lm_rounds=18,  # VOCAB_CHUNK_I2 9, paired
+        kv_per_cu=2,
+        norms=2,
+        act="silu",
+        glu_half=512,
+        window=False,
+        rope="lut",
+        rope_lut=_lut("llama32_3b_weights"),
+        lm_head="tied",
+    ),
+    "phi4-mini": dict(
+        weights="phi4_mini_q4nx_weights",
+        packages=("phi4_mini_q4nx", "llama32_1b_q4nx", "llama32_3b"),
+        dims=_dims("phi4_mini_q4nx_weights", "phi4_mini_config"),
+        default_source="FastFlowLM/Phi4-mini-Instruct-NPU2",
+        layers=32,
+        vocab=200064,
+        eps=1e-6,
+        lm_rounds=36,  # VOCAB_CHUNK_I2 18, paired
+        kv_per_cu=2,
+        norms=2,
+        act="silu",
+        glu_half=512,
+        window=False,
+        rope="lut",
+        rope_dim=96,  # partial rotary: the first 96 of a head's 128
+        rope_lut=_lut("phi4_mini_q4nx_weights", "phi4_mini_config"),
+        lm_head="tied",
+    ),
+    "qwen3-8b": dict(
+        weights="qwen3_8b_q4nx_weights",
+        packages=("qwen3_8b_q4nx", "qwen3_4b"),
+        default_source="FastFlowLM/Qwen3-8B-NPU2",
+        lm_rounds=16,  # VOCAB_CHUNK_I2 8, paired
+        kv_per_cu=2,
+        norms=2,
+        act="silu",
+        glu_half=512,
+        window=False,
+        lm_head="q4",
+        layers_per_w=9,
+    ),
+    "llama-3.1-8b": dict(
+        weights="llama31_8b_q4nx_weights",
+        packages=("llama31_8b_q4nx", "llama32_3b", "llama32_1b_q4nx"),
+        dims=_dims("llama31_8b_q4nx_weights", "llama31_8b_config"),
+        default_source="FastFlowLM/Llama-3.1-8B-NPU2",
+        layers=32,
+        vocab=128256,
+        eps=1e-6,
+        lm_rounds=32,  # VOCAB_CHUNK_I2 16, paired
+        kv_per_cu=2,
+        norms=2,
+        act="silu",
+        glu_half=512,
+        window=False,
+        rope="lut",
+        rope_lut=_lut("llama31_8b_q4nx_weights", "llama31_8b_config"),
+        lm_head="q4",
+        layers_per_w=8,
     ),
     "qwen3-4b": dict(
         weights="qwen3_4b_q4nx_weights",
@@ -98,3 +190,5 @@ NAME = os.environ.get("FD_SUPERKERNEL_MODEL", "qwen3-4b")
 S = MODELS[NAME]
 airsrc.add_air_paths(*S["packages"])
 W = importlib.import_module(S["weights"])  # the model's weights module
+if "dims" in S:
+    W = types.SimpleNamespace(**{**vars(W), **S["dims"]()})
