@@ -14,6 +14,9 @@ from gemma4_superkernel.kernels import (
     bf_parts,
     copy_n,
     exp2_f32,
+    f32_key,
+    key_f32,
+    kv_chunk_mm,
     rms_norm,
     splat,
 )
@@ -193,3 +196,166 @@ def q40_groups(xq, w, acc, t):
     """A Q4_0 block at w times the x q4_prep left at xq, added to acc."""
     for g in range(8):
         q40_group_b(xq, w, acc, t, g)
+
+
+@triton.jit
+def kv_block(vb, pc, yb, l, ct, NCH: tl.constexpr):
+    """attn_kv_block_mm with l kept as [4][8], a head's partial sums across
+    its row of 8 (its keys k and k + 8 a lane), added as vectors, not key by
+    key; `kv_fin` sums the row."""
+    r4 = tl.arange(0, 4)
+    r8 = tl.arange(0, 8)
+    r32 = tl.arange(0, 32)
+    # each head's c across its row of 8 (through ct: a broadcast read does
+    # not lower)
+    for h in tl.static_range(4):
+        tl.store(ct + h * 8 + r8, splat(tl.load(pc + 64 + h), 8))
+    # (c is bf16: so the multiplies below are bf16's)
+    cv = tl.load(ct + r32).to(tl.bfloat16).to(tl.float32)
+    moved = 0
+    for h in tl.static_range(4):
+        cb = tl.load(pc + 64 + h).to(tl.int16, bitcast=True)
+        moved += tl.where(cb != 16256, 1, 0)
+    # p as attn_qk_block_mm leaves it, [half][head][8]
+    p0 = tl.load(pc + r4[:, None] * 8 + r8[None, :])
+    p1 = tl.load(pc + 32 + r4[:, None] * 8 + r8[None, :])
+    # l rescaled only if a head's max moved: in three bf16 parts, whose
+    # products with c are exact, so l keeps f32's precision as a scalar
+    # multiply keeps it (the cores multiply f32 vectors only by bf16 ones)
+    for _ in range(tl.where(moved > 0, 1, 0)):
+        lv = tl.load(l + r32)
+        lh, lm = bf_parts(lv)
+        lr = ((lv - lh) - lm).to(tl.bfloat16).to(tl.float32)
+        tl.store(l + r32, lh * cv + lm * cv + lr * cv)
+    # each lane's sum of its two halves' p: a head's l the sum of its row
+    pa = tl.load(pc + r32).to(tl.float32)
+    pb = tl.load(pc + 32 + r32).to(tl.float32)
+    tl.store(l + r32, tl.load(l + r32) + (pa + pb))
+    for _ in range(tl.where(moved > 0, 1, 0)):
+        for ch in range(NCH):
+            yh, ym = bf_parts(tl.load(yb + ch * 32 + r32))
+            a = tl.reshape(yh * cv + ym * cv, [4, 8])
+            kv_chunk_mm(vb, yb, a, p0, p1, ch, NCH)
+    for _ in range(tl.where(moved > 0, 0, 1)):
+        for ch in range(NCH):
+            a = tl.reshape(tl.load(yb + ch * 32 + r32), [4, 8])
+            kv_chunk_mm(vb, yb, a, p0, p1, ch, NCH)
+
+
+@triton.jit
+def kv_fin(o, yb, l, ct, NCH: tl.constexpr):
+    """attn_kv_fin_mm on kv_block's l, a head's the sum of its row."""
+    r8 = tl.arange(0, 8)
+    r32 = tl.arange(0, 32)
+    for h in tl.static_range(4):
+        lh = tl.load(l + h * 8)
+        for j in tl.static_range(1, 8):
+            lh += tl.load(l + h * 8 + j)
+        tl.store(ct + h * 8 + r8, tl.full([8], 1.0 / lh, tl.float32))
+    rh, rl = bf_parts(tl.load(ct + r32))
+    for ch in range(NCH):
+        yh, ym = bf_parts(tl.load(yb + ch * 32 + r32))
+        v = ym * rh + yh * rl + yh * rh
+        tl.store(o + ch * 32 + r32, v.to(tl.bfloat16))
+
+
+@triton.jit
+def qk_block(
+    qb,
+    kb,
+    mst,
+    pc,
+    acc,
+    tmp,
+    sb,
+    mb,
+    blk,
+    L,
+    LO,
+    NCH: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    """attn_qk_block_mm, its running max taken as `qk_softmax` takes it.
+    One 16-key block of 4 heads' attention scores, as 4x8x8 matrix
+    products: q blocked [NCH][4][8] (8 columns of the 4 heads, NCH = head
+    dim / 8), the keys [2][NCH][8][8] (8 keys by 8 columns). The scores are
+    scaled by SCALE in bf16, as air-FLM's are. Keys outside [LO, L) are
+    masked.
+    Updates the running max mst [4] (f32) and writes to pc: p = exp(s - m)
+    as bf16 [half][head][8], then c [4] = exp(m_old - m_new), the factor that
+    rescales the sums so far."""
+    r4 = tl.arange(0, 4)
+    r8 = tl.arange(0, 8)
+    # the two halves' sums in buffers of their own (acc, tmp)
+    a0 = acc + r4[:, None] * 8 + r8[None, :]
+    a1 = tmp + r4[:, None] * 8 + r8[None, :]
+    tl.store(a0, tl.zeros([4, 8], tl.float32))
+    tl.store(a1, tl.zeros([4, 8], tl.float32))
+    # the sums in tmp across the chunks (a loop, not unrolled: a product's
+    # code is large)
+    for c in range(NCH):
+        # K read [key][column]: the transpose folds into the contraction
+        qc = tl.load(qb + c * 32 + r4[:, None] * 8 + r8[None, :])
+        k0 = tl.load(kb + c * 64 + r8[:, None] * 8 + r8[None, :])
+        k1 = tl.load(kb + NCH * 64 + c * 64 + r8[:, None] * 8 + r8[None, :])
+        tl.store(a0, tl.dot(qc, tl.trans(k0), tl.load(a0)))
+        tl.store(a1, tl.dot(qc, tl.trans(k1), tl.load(a1)))
+    # the scores as the products leave them, [half][head][8]
+    r32 = tl.arange(0, 32)
+    tl.store(sb + r32, tl.load(acc + r32))
+    tl.store(sb + 32 + r32, tl.load(tmp + r32))
+    if SCALE != 1.0:
+        for hp in tl.static_range(2):
+            s = tl.load(sb + hp * 32 + r32).to(tl.bfloat16).to(tl.float32) * SCALE
+            tl.store(sb + hp * 32 + r32, s.to(tl.bfloat16).to(tl.float32))
+    # a block the window's ends cut: its keys outside [LO, L) masked, a
+    # scalar at a time (a lane mask would be kept in memory)
+    for _ in range(tl.where((blk * 16 < LO) | (blk * 16 + 16 > L), 1, 0)):
+        for hh in range(4):
+            for key in range(16):
+                pos = blk * 16 + key
+                at = sb + (key // 8) * 32 + hh * 8 + key % 8
+                tl.store(at, tl.where((pos < L) & (pos >= LO), tl.load(at), -1.0e4))
+    qk_softmax(mst, pc, tmp, sb, mb)
+
+
+@triton.jit
+def qk_softmax(mst, pc, tmp, sb, mb):
+    """qk_softmax_mm with the two halves' keys maxed as vectors of integer
+    keys first (in mb, before mb takes the maxima), so that a head's
+    max is over 8 lanes, not 16."""
+    k = tl.arange(0, 32)
+    r8 = tl.arange(0, 8)
+    tl.store(tmp + k, tl.full([32], -1.0e4, tl.float32))
+    tl.store(tmp + 32 + k, tl.zeros([32], tl.float32))
+    # 16 lanes at a time: 32 lanes of i32 do not compare
+    k16 = tl.arange(0, 16)
+    for c in tl.static_range(2):
+        o = c * 16 + k16
+        km = tl.maximum(f32_key(tl.load(sb + o)), f32_key(tl.load(sb + 32 + o)))
+        tl.store(mb + o, km.to(tl.float32, bitcast=True))
+    # each head's max over its 8, then its row of mb the new max (its 8 read
+    # before they are written)
+    for h in range(4):
+        m = tl.load(mb + h * 8).to(tl.int32, bitcast=True)
+        for key in range(1, 8):
+            m = tl.maximum(m, tl.load(mb + h * 8 + key).to(tl.int32, bitcast=True))
+        mo = tl.load(mst + h)
+        mn = key_f32(tl.maximum(m, f32_key(mo)))
+        tl.store(mst + h, mn)
+        tl.store(tmp + h, mo)
+        tl.store(tmp + 32 + h, mn)
+        row = tl.full([8], mn, tl.float32)
+        tl.store(mb + h * 8 + r8, row)
+        tl.store(mb + 32 + h * 8 + r8, row)
+    L2EH: tl.constexpr = 1.4453125
+    L2EM: tl.constexpr = -0.00262451171875
+    for hp in range(2):
+        d = tl.load(sb + hp * 32 + k) - tl.load(mb + hp * 32 + k)
+        dh, dm = bf_parts(d)
+        t = (dm * L2EH + dh * L2EM) + dh * L2EH
+        tl.store(pc + hp * 32 + k, exp2_f32(t, 32))
+    d = tl.load(tmp + k) - tl.load(tmp + 32 + k)
+    dh, dm = bf_parts(d)
+    t = (dm * L2EH + dh * L2EM) + dh * L2EH
+    tl.store(pc + 64 + k, exp2_f32(t, 32))

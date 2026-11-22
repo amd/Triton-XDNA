@@ -72,7 +72,16 @@ from .geom import (
     SCALE,
     SWA,
 )
-from .kernels import glu_silu, q40_groups, real_heads, real_heads2, rope
+from .kernels import (
+    glu_silu,
+    kv_block,
+    kv_fin,
+    q40_groups,
+    qk_block,
+    real_heads,
+    real_heads2,
+    rope,
+)
 from .spec import S as SPEC
 
 # as constexprs, for the jitted code
@@ -367,7 +376,7 @@ def kv_core1(arm, pos, CU: tl.constexpr):
 @triton.jit
 def qk_scores(q, kb, mst, pc, acc, tmp, sb, mb, blk, pos, G: tl.constexpr):
     """Group G's (a kv head's 4 q heads') scores of block blk."""
-    attn_qk_block_mm(
+    qk_block(
         q + G * (QB // NQG_),
         kb,
         mst + G * 32,
@@ -465,22 +474,22 @@ def kv_core2(arm, pos, CU: tl.constexpr):
             if KVPC_ == 2:
                 air.ChannelGet("toV", vb, indices=[CU], sizes=[HB])
             air.ChannelGet("sPC", pc, indices=[CU], sizes=[192])
-            attn_kv_block_mm(va, pc, y, lst, ct, NCH_)
+            kv_block(va, pc, y, lst, ct, NCH_)
             if KVPC_ == 2:
-                attn_kv_block_mm(vb, pc + 96, y + YB, lst + 32, ct, NCH_)
+                kv_block(vb, pc + 96, y + YB, lst + 32, ct, NCH_)
             else:
-                attn_kv_block_mm(va, pc + 96, y + YB, lst + 32, ct, NCH_)
+                kv_block(va, pc + 96, y + YB, lst + 32, ct, NCH_)
             air.ChannelGet("toV", va1, indices=[CU], sizes=[HB])
             if KVPC_ == 2:
                 air.ChannelGet("toV", vb1, indices=[CU], sizes=[HB])
             air.ChannelGet("sPC", pc1, indices=[CU], sizes=[192])
-            attn_kv_block_mm(va1, pc1, y, lst, ct, NCH_)
+            kv_block(va1, pc1, y, lst, ct, NCH_)
             if KVPC_ == 2:
-                attn_kv_block_mm(vb1, pc1 + 96, y + YB, lst + 32, ct, NCH_)
+                kv_block(vb1, pc1 + 96, y + YB, lst + 32, ct, NCH_)
             else:
-                attn_kv_block_mm(va1, pc1 + 96, y + YB, lst + 32, ct, NCH_)
+                kv_block(va1, pc1 + 96, y + YB, lst + 32, ct, NCH_)
         for g in tl.static_range(2):
-            attn_kv_fin_mm(o + g * YB, y + g * YB, lst + g * 32, ct, NCH_)
+            kv_fin(o + g * YB, y + g * YB, lst + g * 32, ct, NCH_)
         if QPC_ == 8:
             air.ChannelPut("attnO", o, indices=[CU], offsets=[0], sizes=[QB])
         else:
