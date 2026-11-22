@@ -82,10 +82,11 @@ def rope(
     EPS: tl.constexpr,
     QPAD: tl.constexpr,
     BIAS: tl.constexpr,
+    QKNORM: tl.constexpr,
 ):
     """q/k/v from the QKV projection's [q | k | v] at qkv (air-FLM's
     rope.cc): with BIAS, the q/k/v biases added first; each q head q-normed
-    (without BIAS) and rotated, each k head k-normed (likewise) and rotated,
+    (with QKNORM) and rotated, each k head k-normed (likewise) and rotated,
     v as it is. q comes out QPAD heads a kv head: its own, then zero heads,
     as air-FLM pads them. w: [cos DH/2 | sin DH/2] then [q_norm DH | k_norm
     DH] or the biases [q | k | v]. The heads are normed in place."""
@@ -94,7 +95,7 @@ def rope(
         add_bf(qkv, w + DH, (NQ + 2 * NKV) * DH)
     if G == QPAD:
         for h in range(NQ):
-            if not BIAS:
+            if QKNORM:
                 rms_norm(qkv + h * DH, qkv + h * DH, w + DH, sq, DH, EPS)
             apply_rope(q + h * DH, qkv + h * DH, w, DH // 2)
     else:
@@ -102,7 +103,7 @@ def rope(
         for h in range(NKV):
             for j in range(G):
                 o = (h * G + j) * DH
-                if not BIAS:
+                if QKNORM:
                     rms_norm(qkv + o, qkv + o, w + DH, sq, DH, EPS)
                 apply_rope(q + (h * QPAD + j) * DH, qkv + o, w, DH // 2)
             for c in range((QPAD - G) * DH // 32):
@@ -111,7 +112,7 @@ def rope(
                 )
     for h in range(NKV):
         o = NQ * DH + h * DH
-        if not BIAS:
+        if QKNORM:
             rms_norm(qkv + o, qkv + o, w + 2 * DH, sq, DH, EPS)
         apply_rope(kk + h * DH, qkv + o, w, DH // 2)
     copy_n(v, qkv + (NQ + NKV) * DH, NKV * DH)

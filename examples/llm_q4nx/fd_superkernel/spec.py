@@ -9,7 +9,35 @@ import os
 
 import airsrc
 
+
+def _llama_lut(n):
+    """Llama-3.2's RoPE LUT for n positions, [cos | sin] a position, with
+    the llama3 frequency scaling (mlir-air's generate_rope_lut)."""
+    from llama32_1b_weights import LlamaConfig, generate_rope_lut
+
+    return generate_rope_lut(LlamaConfig(), n)
+
+
 MODELS = {
+    "llama-3.2-1b": dict(
+        weights="llama32_1b_q4nx_weights",
+        packages=("llama32_1b_q4nx", "llama32_1b"),
+        default_source="FastFlowLM/Llama-3.2-1B-NPU2",
+        layers=16,
+        vocab=128256,
+        eps=1e-6,
+        # air-FLM pairs its proj rows (PAIR_ROWS=2); its non-paired build
+        # (DECODE_PAIR_ROWS=1), which this one follows, runs as fast
+        lm_rounds=36,
+        kv_per_cu=2,
+        norms=2,
+        act="silu",
+        glu_half=512,
+        window=False,
+        rope="lut",  # one LUT every layer shares
+        rope_lut=_llama_lut,
+        lm_head="tied",
+    ),
     "qwen3-4b": dict(
         weights="qwen3_4b_q4nx_weights",
         packages=("qwen3_4b_q4nx", "qwen3_8b_q4nx", "qwen3_4b"),

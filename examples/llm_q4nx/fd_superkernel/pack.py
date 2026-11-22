@@ -25,7 +25,10 @@ def phase_mats(m, L):
     P = m._PROJ
 
     def q4(nm):
-        t, rows, cols = P[nm]
+        # (name, rows, cols), or the name and the rows and columns apart
+        t, rows, cols = (
+            P[nm] if isinstance(P[nm], tuple) else (P[nm],) + m._PROJ_DIMS[nm]
+        )
         if S.get("source") == "requant":
             # quantized on load, as air-FLM's requant cache is
             return _requant(m.proj_fp(L, nm))

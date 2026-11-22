@@ -96,6 +96,7 @@ RL_ = tl.constexpr(NORMS * D)  # a layer's norm weights
 WH_ = tl.constexpr(NORMS // 2 * D)  # rmsW's and rmsW2's: half of them
 SILU_ = tl.constexpr(SPEC["act"] == "silu")
 BIAS_ = tl.constexpr(ROPE == "bias")
+QKNORM_ = tl.constexpr(ROPE == "qk_norm")
 Q40_ = tl.constexpr(SPEC.get("source") == "q4_0")  # Q4_0 weights
 NQG_ = tl.constexpr(NQG)
 SWA_ = tl.constexpr(SWA)
@@ -266,7 +267,7 @@ def rope_core(arm):
         for n in range(I2P_[0]):
             air.ChannelGet("outY", qkv, indices=[0, 0], offsets=[n * 512], sizes=[512])
         air.ChannelGet("ropeLUT", w, sizes=[ROPE_W_])
-        rope(q, kk, v, qkv, w, sq, NQ_, NKV_, DH_, EPS_, QPAD_, BIAS_)
+        rope(q, kk, v, qkv, w, sq, NQ_, NKV_, DH_, EPS_, QPAD_, BIAS_, QKNORM_)
         air.ChannelPut("ropeQ", q, offsets=[0], sizes=[NKV_ * QPAD_ * DH_])
     # in every wave, as the host's gets: an LM wave's are not read
     air.ChannelPut("appendK", kk, offsets=[0], sizes=[DK_])

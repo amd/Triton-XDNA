@@ -48,15 +48,15 @@ class SuperkernelDecoder:
         if S.get("source") in ("requant", "q4_0"):
             m = qw.open_weight_source(model or S["default_source"])
         else:
-            m = qw.Q4nxModel(model)
-        nl = qw.NUM_LAYERS
+            m = qw.Q4nxModel(model or S.get("default_source"))
+        nl = G.NDEC
         # arm 1 a layer, 2 a sliding one, 0 an LM wave
         self.arms = tuple(
             2 if G.SWA and not qw.is_global_layer(L) else 1 for L in range(nl)
         )
         self.arms += (0,) * G.NL
         W = [K.pack_wave(K.phase_mats(m, L), 1) for L in range(nl)]
-        lm = K.lm_q4(m, qw.VOCAB)
+        lm = K.lm_q4(m, G.VOCAB)
         W += [K.pack_wave([K.lm_mats(lm, c)], 0) for c in range(G.NL)]
         rms = []
         for L in range(nl):
@@ -65,9 +65,13 @@ class SuperkernelDecoder:
         final = [np.zeros(D * (G.NORMS // 2 - 1), np.float32)]
         final += [m.bf16("model.norm.weight")]
         self.embed = np.asarray(m.bf16("model.embed_tokens.weight"), bfloat16)
-        # what a layer's rope weights take besides the position
-        rw = m.layer_qkv_bias if G.ROPE == "bias" else m.layer_qk_norm
-        self.rw = [rw(L) for L in range(nl)]
+        # what a layer's rope weights take besides the position, or (a LUT
+        # every layer shares) the LUT of every position
+        if G.ROPE == "lut":
+            self.lut = np.asarray(S["rope_lut"](self.maxL), bfloat16)
+        else:
+            rw = m.layer_qkv_bias if G.ROPE == "bias" else m.layer_qk_norm
+            self.rw = [rw(L) for L in range(nl)]
         self.RS = self.maxL * G.GW  # a group's KV region
         # the weight buffers: one, or LPW layers' a buffer and the LM head's
         # in W4 (`wave`)
@@ -123,7 +127,7 @@ class SuperkernelDecoder:
         a = _bf16_view(self._buf(self.KV))
         a[:] = 0
         NG = G.NGRP
-        for L in range(self.qw.NUM_LAYERS):
+        for L in range(self.G.NDEC):
             for g in range(NG):
                 cols = slice(g * G.GW, (g + 1) * G.GW)
                 for r, src in ((g, fk), (NG + g, fv)):
@@ -144,14 +148,18 @@ class SuperkernelDecoder:
         xl = _bf16_view(self._buf(self.XL))
         xl[: qw.D] = self.embed[tok]
         rope = _bf16_view(self._buf(self.ROPE))
-        for L in range(qw.NUM_LAYERS):
-            rope[L * G.ROPE_W : (L + 1) * G.ROPE_W] = qw.rope_w_layer(p, L, *self.rw[L])
+        if G.ROPE == "lut":
+            rope[: G.NDEC * G.ROPE_W] = np.tile(self.lut[p], G.NDEC)
+        else:
+            for L in range(G.NDEC):
+                w = qw.rope_w_layer(p, L, *self.rw[L])
+                rope[L * G.ROPE_W : (L + 1) * G.ROPE_W] = w
         if self.res is None:
             self._first(p)
         else:
             self.res.run(p, to=(self.XL, self.ROPE), back=(self.XL,))
         x = self._buf(self.XL)
-        return x[qw.D : qw.D + qw.VOCAB].to(torch.float32).numpy()
+        return x[qw.D : qw.D + G.VOCAB].to(torch.float32).numpy()
 
     def _first(self, p):
         """Builds the dispatch (or takes Triton's cached build), runs the

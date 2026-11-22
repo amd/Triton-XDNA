@@ -226,6 +226,7 @@ LLAMA_3_2_1B = ModelSpec(
     extra_packages=("llama32_1b",),
     supports_hsa=True,
     supports_xrt_zero_copy=True,
+    superkernel_decoder="fd_superkernel.llama32_1b:SuperkernelDecoder",
 )
 
 
