@@ -56,6 +56,11 @@ PROMPT = [128000, 791, 6864, 3363, 315, 9822, 374, 2663]
 EXPECT_FIRST = 12366  # " Paris"
 BOS = 128000  # <|begin_of_text|>, for the session warmup
 
+#: The superkernel decode's (`--decode superkernel`) after the Triton prefill,
+#: which mlir-air's decode gives too. The model records no continuation of
+#: its own for mlir-air's decode.
+EXPECT_IDS_SUPERKERNEL = [12366, 13, 1102, 374, 7559, 304, 279, 18671, 961, 315]
+
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Llama-3.1-8B-NPU2")
 
 

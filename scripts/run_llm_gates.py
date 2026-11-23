@@ -70,6 +70,7 @@ PR_CASES = {
         "zero-copy",
         "dense-decode-vs-prefill",
         "elf",
+        "superkernel",
     },
     "gemma4_e2b_q4nx": {
         "default",

@@ -16,6 +16,7 @@ import time
 import numpy as np
 import torch
 from ml_dtypes import bfloat16
+from q4_blocks import bf, bf_tensor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -60,7 +61,7 @@ class SuperkernelDecoder:
         g = m.globals()
         norms = [m.layer_norms(L) for L in range(nl)]
         rms = [
-            K.bf(
+            bf(
                 np.concatenate(
                     [n["input"], n["post_attn"], n["pre_ffn"], n["post_ffn"]]
                 )
@@ -70,7 +71,7 @@ class SuperkernelDecoder:
         ple = [m.layer_ple(L) for L in range(nl)]
         wa, wb = [], []
         for p in ple:
-            g_, u_ = K.bf(p["inp_gate"]), K.bf(p["per_layer_projection"])
+            g_, u_ = bf(p["inp_gate"]), bf(p["per_layer_projection"])
             n = gw.D // 64  # each stream's half of the up projection's rows
             wa += K.ple_blocks(g_[:128]) + [
                 u_[i * 32 : (i + 1) * 32, :].T.reshape(-1) for i in range(n)
@@ -85,30 +86,30 @@ class SuperkernelDecoder:
         kvapp = tuple(L if gw.owns_kv(L) else len(own) for L in range(nl))
         kvapp += (len(own),) * G.NL
         self.SL = self.maxL * G.KVW
-        PX = K.bf_tensor(np.zeros(nl * G.PXW))
+        PX = bf_tensor(np.zeros(nl * G.PXW))
         px = _bf16_view(PX)
         for L, n in enumerate(norms):
-            px[L * G.PXW + gw.PLI_D : (L + 1) * G.PXW] = K.bf(
+            px[L * G.PXW + gw.PLI_D : (L + 1) * G.PXW] = bf(
                 np.concatenate(
                     [g["ple_proj_norm"], n["post_ple"], np.full(32, n["out_scale"])]
                 )
             ).astype(bfloat16)
         D = gw.D
         self.args = [
-            K.bf_tensor(np.zeros(2 * D)),  # X
-            K.bf_tensor(np.concatenate(rms + [np.zeros(D), K.bf(g["final_norm"])])),
+            bf_tensor(np.zeros(2 * D)),  # X
+            bf_tensor(np.concatenate(rms + [np.zeros(D), bf(g["final_norm"])])),
             torch.from_numpy(np.concatenate(W)),  # W
-            K.bf_tensor(np.zeros(nl * 1536)),  # ROPE
-            K.bf_tensor(np.zeros((len(own) + 1) * 2 * self.SL)),  # KV
-            K.bf_tensor(np.zeros(D)),  # E
+            bf_tensor(np.zeros(nl * 1536)),  # ROPE
+            bf_tensor(np.zeros((len(own) + 1) * 2 * self.SL)),  # KV
+            bf_tensor(np.zeros(D)),  # E
             PX,
-            K.bf_tensor(
+            bf_tensor(
                 np.concatenate(
-                    [b for p in ple for b in K.ple_blocks(K.bf(p["model_proj"]))]
+                    [b for p in ple for b in K.ple_blocks(bf(p["model_proj"]))]
                 )
             ),  # WP
-            K.bf_tensor(np.concatenate(wa)),  # WA
-            K.bf_tensor(np.concatenate(wb)),  # WB
+            bf_tensor(np.concatenate(wa)),  # WA
+            bf_tensor(np.concatenate(wb)),  # WB
             torch.zeros((G.NL + 1) * G.LM_ROWS, dtype=torch.bfloat16),  # LOG
         ]
         self.kw = dict(
@@ -159,8 +160,8 @@ class SuperkernelDecoder:
             vr = np.zeros((P, NKV, DH), np.float32)
             vr[..., :dh] = v
             o, n = L * 2 * SL, P * NKV * DH
-            a[o : o + n] = self.K.bf(kr).reshape(-1).astype(bfloat16)
-            a[o + SL : o + SL + n] = self.K.bf(vr).reshape(-1).astype(bfloat16)
+            a[o : o + n] = bf(kr).reshape(-1).astype(bfloat16)
+            a[o + SL : o + SL + n] = bf(vr).reshape(-1).astype(bfloat16)
         if self.res is not None:
             from triton.backends.amd_triton_npu.npu_runner import sync_to
 
@@ -172,7 +173,7 @@ class SuperkernelDecoder:
         gw, K, m = self.gw, self.K, self.m
         if not 0 <= p < self.maxL:
             raise ValueError(f"position {p} is outside [0, {self.maxL - 1}]")
-        x0 = K.bf(
+        x0 = bf(
             m.embed_rows("model.embed_tokens.weight", [tok]).reshape(-1)
             * gw.EMBED_SCALE
         )
@@ -180,15 +181,15 @@ class SuperkernelDecoder:
             gw.NUM_LAYERS, gw.PLI_D
         )
         _bf16_view(self._buf(self.X))[: gw.D] = x0.astype(bfloat16)
-        self._buf(self.E)[:] = K.bf_tensor(x0)
+        self._buf(self.E)[:] = bf_tensor(x0)
         rope = _bf16_view(self._buf(self.ROPE))
         px = _bf16_view(self._buf(self.PX))
         PXW = self.G.PXW
         for L in range(gw.NUM_LAYERS):
             rope[L * 1536 : (L + 1) * 1536] = K.rope_w(m, L, p).astype(bfloat16)
-            px[L * PXW : L * PXW + gw.PLI_D] = K.bf(
-                embs[L] * gw.PLE_EMBED_SCALE
-            ).astype(bfloat16)
+            px[L * PXW : L * PXW + gw.PLI_D] = bf(embs[L] * gw.PLE_EMBED_SCALE).astype(
+                bfloat16
+            )
         if self.res is None:
             self._first(p)
         else:

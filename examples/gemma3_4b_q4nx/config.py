@@ -87,6 +87,12 @@ EXPECT_IDS = [9079, 236761, 108, 50429, 563, 496, 4185, 3988, 573, 1610]
 #: move a later greedy token on this model.
 EXPECT_IDS_AIR_FUSED = [9079, 236761, 108, 50429, 563, 3224, 618, 506, 623, 17698]
 
+#: The superkernel decode's (`--decode superkernel`) after the Triton prefill.
+#: From the sixth token it departs from EXPECT_IDS, mlir-air's decode, and
+#: follows the prefill: a Triton prefill over each prefix predicts each of
+#: these tokens, and an air-fused one the sixth too.
+EXPECT_IDS_SUPERKERNEL = [9079, 236761, 108, 50429, 563, 5628, 528, 506, 8339, 236772]
+
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Gemma3-4B-NPU2")
 
 
