@@ -6,7 +6,7 @@
 #
 # Each stage of an image turn is placed on its own:
 #   VISION=auto|air|triton|igpu|host  ENGINE=air-fused|triton-fused|triton|igpu
-#   DECODE=npu|gpu
+#   DECODE=auto|superkernel|npu|gpu
 #   TAIL=npu|igpu  (ENGINE=triton-fused: the layers that write no KV cache, and
 #                   the head, for the prompt's last row)
 # Whatever the placement, the prefill writes K/V into the slab the decode
@@ -26,7 +26,7 @@ MAX_SEQ  ?= $(DECODE_L)
 
 VISION   ?= auto
 ENGINE   ?= air-fused
-DECODE   ?= npu
+DECODE   ?= auto
 TAIL     ?= npu
 ## The image resolution budget (70, 140, 280, 560, 1120); empty = 280.
 SOFT     ?=
@@ -58,12 +58,12 @@ help:
 	@echo "  make verify           run, gated on the shapes image's description"
 	@echo "  make prefill          Vision + prefill only (no decode build)"
 	@echo "  make vision           Gate a vision TOWER against transformers"
-	@echo "  make compile-decode   Build the decode at DECODE_L=$(DECODE_L) (once)"
+	@echo "  make compile-decode   Build mlir-air's decode at DECODE_L=$(DECODE_L) (DECODE=npu)"
 	@echo "  make test-image       Write the two-shape test image to $(IMAGE)"
 	@echo ""
 	@echo "  VISION=auto|air|triton|igpu|host     (default: $(VISION))"
 	@echo "  ENGINE=air-fused|triton-fused|triton|igpu  prefill (default: $(ENGINE))"
-	@echo "  DECODE=npu|gpu                       (default: $(DECODE))"
+	@echo "  DECODE=auto|superkernel|npu|gpu      (default: $(DECODE), the superkernel)"
 	@echo "  TAIL=npu|igpu                        triton-fused prefill tail (default: $(TAIL))"
 	@echo "  SOFT=70|140|280|560|1120             image budget (default: 280)"
 	@echo "  REPEAT=n                             median TTFT over n turns"
@@ -93,10 +93,11 @@ vision: preflight $(IMAGE)
 prefill: preflight $(IMAGE)
 	@cd $(srcdir) && $(PYTHON) $(DRIVER) --prefill-only $(RUN_ARGS)
 
-run: preflight $(IMAGE)
+# air-src: both NPU decodes run under mlir-air's driver.
+run: preflight air-src $(IMAGE)
 	@cd $(srcdir) && $(PYTHON) $(DRIVER) $(RUN_ARGS) --max-tokens $(N_TOKENS)
 
-verify: preflight $(IMAGE)
+verify: preflight air-src $(IMAGE)
 	@cd $(srcdir) && $(PYTHON) $(DRIVER) $(RUN_ARGS) --max-tokens $(N_TOKENS) --gate
 
 compile-decode recompile-decode air-src:

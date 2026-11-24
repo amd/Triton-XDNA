@@ -244,7 +244,11 @@ class Gemma4Prefill(LlamaPrefill):
     #: Prefix reuse needs it off (see `prefill`).
     npu_attention = True
 
-    def __init__(self, *a, **kw):
+    #: `make_prefiller` says whether mlir-air's decode reads the slab
+    #: (`npu_decode`), which decides its row count (`_resolve_attn_maxl`).
+    SIZES_KV_TO_NPU_DECODE = True
+
+    def __init__(self, *a, npu_decode=True, **kw):
         """Llama's, with ONE KV cache in mlir-air's device layout.
 
         The base class allocates one `[max_seq, DK]` pair per layer at a fixed
@@ -269,6 +273,7 @@ class Gemma4Prefill(LlamaPrefill):
           owning layers write.
         """
         super().__init__(*a, **kw)
+        self._npu_decode = npu_decode
         self.kv_attn_maxl = self._resolve_attn_maxl()
         kv_src = [kv_source_layer(L) for L in range(self.n_layers)]
         self._kv_slabs, _, self._kv_slot = kv_layout.kv_slots(kv_src)
@@ -297,6 +302,11 @@ class Gemma4Prefill(LlamaPrefill):
     def _resolve_attn_maxl(self):
         """The slab's row count: the decode template's ATTN_MAXL, or `max_seq`.
 
+        `max_seq` when mlir-air's decode does not read the slab (`npu_decode`
+        False: the superkernel decode, which seeds its own cache, or the
+        iGPU's, which reads the slab at whatever size it has): a template on
+        disk then has nothing to agree with.
+
         See `airsrc.decode_attn_maxl` for why both ends agree on a window from
         `max_seq` rather than each deriving one from the generation length.
         With no decode build present -- `--prefill-only`, `--decode gpu` --
@@ -310,6 +320,8 @@ class Gemma4Prefill(LlamaPrefill):
         prompt that needs more rows is a prompt this build cannot run --
         `prefill` says so rather than writing past the slab.
         """
+        if not self._npu_decode:
+            return self.max_seq
         import airsrc
 
         got = airsrc.decode_attn_maxl("ple", want=self.max_seq)
