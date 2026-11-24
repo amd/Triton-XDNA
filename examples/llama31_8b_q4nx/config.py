@@ -61,6 +61,22 @@ BOS = 128000  # <|begin_of_text|>, for the session warmup
 #: its own for mlir-air's decode.
 EXPECT_IDS_SUPERKERNEL = [12366, 13, 1102, 374, 7559, 304, 279, 18671, 961, 315]
 
+#: The same after mlir-air's fused prefill, the default engine: the fused
+#: prefill over each prefix predicts each of these tokens but the fifth, the
+#: near-tie EXPECT_IDS_SUPERKERNEL's fifth is too.
+EXPECT_IDS_SUPERKERNEL_AIR_FUSED = [
+    12366,
+    13,
+    1102,
+    374,
+    264,
+    3363,
+    315,
+    2294,
+    13444,
+    323,
+]
+
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Llama-3.1-8B-NPU2")
 
 

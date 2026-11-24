@@ -27,9 +27,12 @@ Its driver's `generate()` takes no handoff parameter, as the Qwen3 ones do not,
 so the harness substitutes the one prefill function it calls;
 `ModelSpec.driver_api` names which of the three each model uses.
 
-Prerequisite for generation (not for --prefill-only):
+Prerequisites for generation (not for --prefill-only): mlir-air's sources,
+whose driver runs either decode (`make run` fetches them), and for mlir-air's
+decode (--decode npu) its build; the default superkernel decode needs no build:
 
-    make compile-decode
+    make air-src
+    make compile-decode     # --decode npu only
 """
 
 import os

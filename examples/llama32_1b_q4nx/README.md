@@ -1,8 +1,11 @@
-# Llama-3.2-1B Q4NX: a Triton prefill feeding mlir-air's fused decode
+# Llama-3.2-1B Q4NX: a Triton prefill and a Triton superkernel decode
 
 End-to-end Llama-3.2-1B on the AMD XDNA NPU. The prefill is Triton — this
 repo's kernels, compiled through the `amd_triton_npu` backend. The decode is
-mlir-air's Q4NX fused decode, run unmodified.
+this repo's superkernel (`../llm_q4nx/fd_superkernel/`): every layer and the
+LM head in one dispatch a token, on the dataflow of mlir-air's fused decode.
+`--decode npu` runs mlir-air's Q4NX fused decode itself, unmodified, and
+`make chat` always does.
 
 ```
 $ make chat
@@ -138,7 +141,8 @@ pip install transformers ml_dtypes           # transformers only for --text
 
 `make preflight` checks all of the above and says which piece is missing.
 
-One-time, and only needed for `chat`/`run` (not `prefill`):
+One-time, and only needed for `chat` and `make run DECODE=npu`: `make run`
+uses the superkernel decode, which Triton builds on its first token:
 
 ```bash
 make compile-decode      # ~22 s; the decode's AIE kernels, then its xclbins
@@ -165,7 +169,7 @@ make chat                       # interactive REPL  <-- start here
 make run PROMPT="..." N_TOKENS=50
 make prefill                    # prefill only + the Paris gate
 make profile                    # per-operator prefill timing
-make compile-decode             # one-time, only needed for chat/run
+make compile-decode             # one-time, for chat and DECODE=npu
 ```
 
 `make chat` loads the weights once and keeps both the Triton prefill and the

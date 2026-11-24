@@ -23,9 +23,12 @@ token-by-token through the decode and the prefill this example exists to test is
 never touched. The harness passes it; `ModelSpec.driver_api` names which of the
 three shapes each model uses.
 
-Prerequisite for generation (not for --prefill-only):
+Prerequisites for generation (not for --prefill-only): mlir-air's sources,
+whose driver runs either decode (`make run` fetches them), and for mlir-air's
+decode (--decode npu) its build; the default superkernel decode needs no build:
 
-    make compile-decode
+    make air-src
+    make compile-decode     # --decode npu only
 """
 
 import os

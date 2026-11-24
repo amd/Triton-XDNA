@@ -844,13 +844,16 @@ def build_parser(doc, backends=("cpu", "npu", "hetero")):
     ap = argparse.ArgumentParser(description=doc)
     ap.add_argument(
         "--decode",
-        choices=("npu", "gpu", "superkernel"),
-        default="npu",
+        choices=("auto", "npu", "gpu", "superkernel"),
+        default="auto",
         help="npu: mlir-air's fused decode, all layers in one dispatch. gpu: "
         "Triton on the iGPU, token by token, reading the KV cache in place "
         "whichever engine prefilled it. superkernel: this repo's decode in "
         "Triton, all layers in one superkernel dispatch, where the model has "
-        "one (registry.ModelSpec.superkernel_decoder).",
+        "one (registry.ModelSpec.superkernel_decoder). auto (default): "
+        "superkernel where the model has it, except with --interactive or "
+        "AMD_TRITON_NPU_RUNTIME=hsa, which only drive mlir-air's decode; npu "
+        "otherwise.",
     )
     ap.add_argument(
         "--prefill-engine",
@@ -947,6 +950,16 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         raise SystemExit(
             "--prefill-engine igpu cannot be combined with --interactive: the "
             "interactive session is mlir-air's and hosts the Triton prefill only."
+        )
+    if args.decode == "auto":
+        # Depends only on the model, the runtime and --interactive, as the
+        # prefill engine's auto does.
+        args.decode = (
+            "superkernel"
+            if spec.superkernel_decoder
+            and not getattr(args, "interactive", False)
+            and os.environ.get("AMD_TRITON_NPU_RUNTIME") != "hsa"
+            else "npu"
         )
     if args.decode == "superkernel":
         if not spec.superkernel_decoder:
@@ -1111,8 +1124,9 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         )
 
     # The superkernel decode stands in for the driver's decoder class the
-    # same way, so that the driver's own generate() runs it.
-    if args.decode == "superkernel":
+    # same way, so that the driver's own generate() runs it. A prefill-only
+    # run loads no driver and decodes nothing.
+    if args.decode == "superkernel" and air is not None:
         mod, cls = spec.superkernel_decoder.split(":")
         setattr(
             air,
@@ -1268,12 +1282,20 @@ def _decode_gate(air, spec, cfg, args, ids, out):
     model has it, is the superkernel decode's.
     """
     golden = getattr(cfg, "EXPECT_IDS", None)
-    if getattr(args, "prefill_engine", None) in ("air-fused", "triton-fused"):
-        golden = getattr(cfg, "EXPECT_IDS_AIR_FUSED", golden)
+    fused = getattr(args, "prefill_engine", None) in ("air-fused", "triton-fused")
     # The superkernel decode follows the prefill where mlir-air's decode
-    # departs from it on some models; those record what it generates.
+    # departs from it on some models; those record what it generates, after
+    # the Triton prefill and (`_AIR_FUSED`) after a fused one.
     if getattr(args, "decode", None) == "superkernel":
         golden = getattr(cfg, "EXPECT_IDS_SUPERKERNEL", golden)
+        if fused:
+            golden = getattr(
+                cfg,
+                "EXPECT_IDS_SUPERKERNEL_AIR_FUSED",
+                getattr(cfg, "EXPECT_IDS_AIR_FUSED", golden),
+            )
+    elif fused:
+        golden = getattr(cfg, "EXPECT_IDS_AIR_FUSED", golden)
     # The iGPU's numerics are its own, so what follows an iGPU prefill or comes
     # out of the iGPU decode is recorded separately.
     record = None

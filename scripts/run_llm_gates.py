@@ -63,6 +63,7 @@ MODELS = {
 PR_CASES = {
     "llama32_1b_q4nx": {
         "default",
+        "npu",
         "triton",
         "triton-gpu",
         "igpu-gpu",
@@ -74,6 +75,7 @@ PR_CASES = {
     },
     "gemma4_e2b_q4nx": {
         "default",
+        "npu",
         "triton",
         "triton-fused",
         "triton-fused-gemm",
@@ -129,16 +131,26 @@ def plan(ex, spec, fused):
     d = EXAMPLES / ex
     entry = [sys.executable, f"{ex}_inference.py"]
     gen = ["--max-tokens", MAX_TOKENS, "--greedy"]
+    npu = ["--decode", "npu"]
+    # The decode the harness picks by default: the superkernel where the model
+    # has one, except under the HSA runtime, which drives mlir-air's.
+    sk_default = (
+        bool(spec.superkernel_decoder)
+        and os.environ.get("AMD_TRITON_NPU_RUNTIME") != "hsa"
+    )
     cases = [
-        # The default prefill engine (mlir-air's fused one where the model has
-        # it) and mlir-air's NPU decode, gated on the recorded continuation.
-        Case("default", entry + gen, d, HIDE_IGPU, npu_decode=True),
+        # The defaults: mlir-air's fused prefill where the model has it, and
+        # the default decode, gated on the recorded continuation.
+        Case("default", entry + gen, d, HIDE_IGPU, npu_decode=not sk_default),
     ]
+    if spec.superkernel_decoder:
+        # The default prefill again, and mlir-air's NPU decode.
+        cases.append(Case("npu", entry + npu + gen, d, HIDE_IGPU, npu_decode=True))
     if fused:
         cases.append(
             Case(
                 "triton",
-                entry + ["--prefill-engine", "triton"] + gen,
+                entry + ["--prefill-engine", "triton"] + npu + gen,
                 d,
                 HIDE_IGPU,
                 npu_decode=True,
@@ -149,7 +161,10 @@ def plan(ex, spec, fused):
             # RoPE and attention of the Triton prefill on the iGPU.
             Case(
                 "hetero",
-                entry + ["--prefill-engine", "triton", "--backend", "hetero"] + gen,
+                entry
+                + ["--prefill-engine", "triton", "--backend", "hetero"]
+                + npu
+                + gen,
                 d,
                 SHOW_IGPU,
                 npu_decode=True,
@@ -168,7 +183,7 @@ def plan(ex, spec, fused):
             ),
             Case(
                 "igpu-npu",
-                entry + ["--prefill-engine", "igpu"] + gen,
+                entry + ["--prefill-engine", "igpu"] + npu + gen,
                 d,
                 SHOW_IGPU,
                 npu_decode=True,
@@ -180,7 +195,12 @@ def plan(ex, spec, fused):
         # the decode's KV cache into pages XRT and HIP share.
         cases.append(
             Case(
-                "zero-copy", entry + gen, d, SHOW_IGPU, npu_decode=True, zero_copy=True
+                "zero-copy",
+                entry + npu + gen,
+                d,
+                SHOW_IGPU,
+                npu_decode=True,
+                zero_copy=True,
             )
         )
     if ex == "llama32_1b_q4nx":
@@ -201,7 +221,7 @@ def plan(ex, spec, fused):
         cases.append(
             Case(
                 "triton-fused",
-                entry + ["--prefill-engine", "triton-fused"] + gen,
+                entry + ["--prefill-engine", "triton-fused"] + npu + gen,
                 d,
                 HIDE_IGPU,
                 npu_decode=True,
@@ -250,7 +270,7 @@ def plan(ex, spec, fused):
         cases.append(
             Case(
                 "elf",
-                entry + gen,
+                entry + npu + gen,
                 d,
                 {**HIDE_IGPU, "DECODE_ELF": "1"},
                 npu_decode=True,

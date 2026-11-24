@@ -93,6 +93,22 @@ EXPECT_IDS_AIR_FUSED = [9079, 236761, 108, 50429, 563, 3224, 618, 506, 623, 1769
 #: these tokens, and an air-fused one the sixth too.
 EXPECT_IDS_SUPERKERNEL = [9079, 236761, 108, 50429, 563, 5628, 528, 506, 8339, 236772]
 
+#: The same after mlir-air's fused prefill: the fused prefill over each prefix
+#: predicts each of these tokens, where mlir-air's decode
+#: (EXPECT_IDS_AIR_FUSED) departs from the fourth.
+EXPECT_IDS_SUPERKERNEL_AIR_FUSED = [
+    9079,
+    236761,
+    108,
+    818,
+    94648,
+    25822,
+    563,
+    496,
+    9639,
+    43123,
+]
+
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Gemma3-4B-NPU2")
 
 
