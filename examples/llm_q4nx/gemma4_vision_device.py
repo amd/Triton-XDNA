@@ -131,13 +131,29 @@ class TritonOps:
             raise ValueError(f"the device holds projections to {OUT_DIMS}")
         self._attn.build(shape, m_soft, out_dim)
 
-    def release(self):
-        """Close the device's and the attention's hardware contexts."""
-        import gemma4_vision_air
+    def contexts(self):
+        """The devices holding hardware contexts: the GEMMs', and the Triton
+        attention's (mlir-air's ELFs reopen theirs on their own)."""
+        attn = getattr(self._attn, "attn", None)
+        return [self.prog.device] + ([attn.prog.device] if attn else [])
 
-        self.prog.device.close()
-        gemma4_vision_air._release(self._attn)
-        return True
+    def release(self):
+        """Close the devices' hardware contexts, keeping their buffers. True
+        if any were open."""
+        open_ = any(d.ctx is not None for d in self.contexts())
+        for d in self.contexts():
+            d.close()
+        if not hasattr(self._attn, "attn"):
+            import gemma4_vision_air
+
+            open_ |= bool(gemma4_vision_air._release(self._attn))
+        return open_
+
+    def resume(self):
+        """Reopen what `release` closed."""
+        for d in self.contexts():
+            if d.ctx is None:
+                d.open()
 
     # ---- buffers
 
@@ -342,13 +358,14 @@ class VisionTower:
 
     def release(self):
         """Close the tower's hardware contexts, keeping its buffers; the next
-        encode reopens them. True if any were open."""
+        encode reopens them (`TritonOps.resume`). True if any were open."""
         return self.ops.release()
 
     def timings(self):
         return self.ops.timings()
 
     def encode(self, pixels, pos_ids):
+        self.ops.resume()
         pos = np.asarray(pos_ids, np.int64)
         pad = (pos == -1).all(axis=-1)
         L, valid = len(pad), int((~pad).sum())
