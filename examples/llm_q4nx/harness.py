@@ -1214,6 +1214,8 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             args.model,
             None,
             profile=args.profile,
+            # no decode reads the cache: it takes --max-seq's rows
+            npu_decode=False,
         )
         if ids != list(cfg.PROMPT):
             return 0
