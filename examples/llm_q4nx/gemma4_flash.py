@@ -10,8 +10,9 @@ the NPU or the iGPU.
 The three stages and where each can run:
 
     --vision          air      mlir-air's NPU tower (gemma4_vision_air)
-                      triton   the same tower pipeline, its GEMMs and attention
-                               Triton kernels on the NPU (gemma4_vision_device)
+                      triton   the same tower, its GEMMs and attention Triton
+                               kernels on the NPU and the work between them
+                               Triton kernels on the CPU (gemma4_vision_device)
                       igpu     the tower as Triton kernels on the iGPU
                       host     the tower on the host, its GEMMs placed by
                                --backend/--ops like the Triton prefill's

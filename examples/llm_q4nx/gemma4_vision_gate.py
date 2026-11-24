@@ -12,8 +12,9 @@
   `--backend`/`--ops` as for the text prefill. Scored stage by stage, so a
   failure names the stage that broke.
 * `air`: mlir-air's NPU tower (`gemma4_vision_air`). Scored on its soft tokens.
-* `triton`: mlir-air's tower pipeline with its GEMMs on this repository's
-  Triton device (`gemma4_vision_device`). Scored on its soft tokens.
+* `triton`: this repository's NPU tower (`gemma4_vision_device`): its GEMMs
+  and attention Triton kernels on the NPU, the work between them Triton
+  kernels on the CPU. Scored on its soft tokens.
 * `igpu`: `gemma4_vision.Gemma4GpuVisionTower`, every stage a Triton kernel
   on the iGPU. Scored on its soft tokens.
 

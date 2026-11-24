@@ -263,6 +263,9 @@ runs:
         # against numpy at Gemma4-E2B's shapes. No NPU, no weights.
         ( cd examples/llm_q4nx && python3 test_host_kernels.py )
 
+        # The same for Gemma4's vision tower, against mlir-air's hostops.c.
+        ( cd examples/llm_q4nx && python3 test_vision_host_kernels.py )
+
         # fd_superkernel serves one model a process, and refuses a second
         # rather than mixing two models' sizes. No NPU, no weights.
         ( cd examples/llm_q4nx && python3 test_fd_superkernel_select.py )
