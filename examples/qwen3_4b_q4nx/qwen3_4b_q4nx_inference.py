@@ -19,7 +19,8 @@ Its driver's `generate()` takes no handoff parameter, unlike the 1B's npz and
 the 3B's prefiller object, so the harness substitutes the one prefill function
 it calls; `ModelSpec.driver_api` names which of the three each model uses.
 
-Prerequisite for generation (not for --prefill-only):
+Prerequisite for mlir-air's decode (--decode npu); the default, the
+superkernel decode, needs none:
 
     make compile-decode
 """

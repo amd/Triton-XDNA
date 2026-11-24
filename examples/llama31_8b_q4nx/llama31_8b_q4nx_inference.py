@@ -16,7 +16,8 @@ qk-norm -- so it shares the 1B's forward as well as the harness. Everything
 weight bundle, and -- unlike both siblings -- an untied LM head and its own
 gate prompt.
 
-Prerequisite for generation (not for --prefill-only):
+Prerequisite for mlir-air's decode (--decode npu); the default, the
+superkernel decode, needs none:
 
     make compile-decode
 """

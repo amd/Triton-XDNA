@@ -35,9 +35,10 @@ BACKEND  ?= npu
 # Empty uses the model's DEFAULT_OPS.
 OPS      ?=
 N_TOKENS ?= 200
-# Decode: npu (mlir-air's fused decode), gpu (Triton on the iGPU), or
-# superkernel (Triton, one NPU dispatch a token) where the model has one.
-DECODE   ?= npu
+# Decode: superkernel (Triton, one NPU dispatch a token), npu (mlir-air's
+# fused decode) or gpu (Triton on the iGPU); auto is superkernel where the
+# model has one.
+DECODE   ?= auto
 MODEL    ?=
 SYSTEM   ?=
 
@@ -73,22 +74,22 @@ preflight:
 	  echo "ERROR: MLIR_AIE_INSTALL_DIR is unset.  Run: source $(root)/utils/env_setup.sh"; exit 1; }
 
 help:
-	@echo "$(TITLE) Q4NX -- Triton prefill + mlir-air fused decode"
+	@echo "$(TITLE) Q4NX -- prefill and decode on the NPU"
 	@echo ""
 	$(if $(CHAT),@echo "  make chat             Interactive REPL (/clear resets, /exit quits)")
 	@echo "  make run              One prompt, N_TOKENS=$(N_TOKENS)$(if $(PROMPT_IDS), (empty PROMPT: the gated ids))"
 	@echo "  make prefill          Prefill only + Paris gate (no decode build)"
 	@echo "  make profile          Per-operator prefill timing"
-	@echo "  make compile-decode   Build the decode from nothing (run once)"
-	@echo "  make recompile-decode Relower just the decode templates"
-	@echo "  make decode-kernels   Rebuild just the decode's AIE kernels"
+	@echo "  make compile-decode   Build mlir-air's decode from nothing (DECODE=npu)"
+	@echo "  make recompile-decode Relower just its templates"
+	@echo "  make decode-kernels   Rebuild just its AIE kernels"
 	@echo "  make air-src          Fetch mlir-air sources at the pinned commit"
 	@echo "  make preflight        Check the environment is set up"
 	@echo ""
 	@echo "  RUNTIME=xrt|hsa       Dispatch runtime (default: xrt)"
 	@echo "  DECODE_ELF=1          (xrt) mlir-air's full-ELF decode instead of the xclbin"
 	@echo "  ENGINE=triton|auto    Prefill engine (default: triton; auto = fused where available)"
-	@echo "  DECODE=npu|gpu|superkernel Decode (default: npu, mlir-air's)"
+	@echo "  DECODE=auto|superkernel|npu|gpu Decode (default: auto, the superkernel)"
 	@echo "  BACKEND=npu|hetero|cpu Where the Triton prefill's operators run (default: npu)"
 	@echo "  OPS=all|matmul,...    Which operators go to the NPU (default: the model's)"
 	$(if $(CHAT),@echo "  SYSTEM=\"...\"          System prompt for chat")

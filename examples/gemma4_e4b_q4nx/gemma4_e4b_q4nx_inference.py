@@ -16,7 +16,8 @@ The default prefill is mlir-air's fused NPU prefill (`--prefill-engine
 air-fused`); the decode is its `fused_decode_ple`, 42 layers plus the LM head
 in one dispatch.
 
-Prerequisite for generation (not for --prefill-only):
+Prerequisite for mlir-air's decode (--decode npu); the default, the
+superkernel decode, needs none:
 
     make compile-decode
 """

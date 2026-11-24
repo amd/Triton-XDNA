@@ -203,7 +203,9 @@ EXAMPLES = [
         "datatypes": "bf16 prefill, q4nx decode",
         "description": (
             "End-to-end Llama-3.2-1B on the NPU: a Triton prefill built from "
-            "this repo's kernels, feeding mlir-air's fused Q4NX decode."
+            "this repo's kernels, and a decode that runs every layer and the "
+            "LM head in one Triton superkernel dispatch a token (mlir-air's "
+            "fused Q4NX decode with --decode npu)."
         ),
     },
     {
@@ -212,8 +214,8 @@ EXAMPLES = [
         "path": "llama32_3b_q4nx",
         "datatypes": "bf16 prefill, q4nx decode",
         "description": (
-            "The Llama-3.2-3B configuration of the same Triton-prefill / "
-            "AIR-decode split, sharing the llm_q4nx harness."
+            "The Llama-3.2-3B configuration of the same Triton prefill and "
+            "superkernel decode, sharing the llm_q4nx harness."
         ),
     },
     {
@@ -233,7 +235,7 @@ EXAMPLES = [
         "path": "qwen3_4b_q4nx",
         "datatypes": "bf16 prefill, q4nx decode",
         "description": (
-            "Qwen3-4B on the same Triton-prefill / AIR-decode split, and the "
+            "Qwen3-4B on the same Triton prefill and superkernel decode, and the "
             "first Q4NX model here that is not Llama-shaped: each head is "
             "RMS-normalized between the QKV projection and RoPE."
         ),
@@ -267,8 +269,8 @@ EXAMPLES = [
         "datatypes": "bf16 prefill, q4nx decode",
         "description": (
             "Qwen2.5-7B's block at 2048, on the same biased-QKV forward. The "
-            "only model here whose decode runs with the dual-channel weight "
-            "feed off."
+            "only model here whose mlir-air decode (--decode npu) runs with "
+            "the dual-channel weight feed off."
         ),
     },
     {
@@ -288,7 +290,7 @@ EXAMPLES = [
         "path": "gemma3_4b_q4nx",
         "datatypes": "bf16 prefill, q4nx decode",
         "description": (
-            "Gemma3-4B on the same split, and the furthest from the Llama "
+            "Gemma3-4B on the same prefill and decode, and the furthest from the Llama "
             "block: a four-norm sandwich, two RoPE thetas chosen per layer, a "
             "1024-token sliding window, and a GELU-tanh GLU."
         ),
@@ -301,9 +303,9 @@ EXAMPLES = [
         "description": (
             "Gemma3's block plus per-layer embeddings, layers that differ in "
             "shape from each other, and twenty that carry no KV cache of "
-            "their own. Its decode runs on mlir-air's per-layer-embedding "
-            "engine rather than the shared one, or with --decode superkernel "
-            "as one Triton superkernel dispatch a token."
+            "their own. Its decode is one Triton superkernel dispatch a token, "
+            "or with --decode npu mlir-air's per-layer-embedding engine rather "
+            "than the shared one."
         ),
     },
     {
@@ -313,8 +315,8 @@ EXAMPLES = [
         "datatypes": "bf16 prefill, q4nx decode",
         "description": (
             "Gemma4-E2B's architecture at D 2560 and 42 layers, with two KV "
-            "heads. mlir-air's fused NPU prefill and per-layer-embedding "
-            "decode."
+            "heads. mlir-air's fused NPU prefill, and the superkernel decode "
+            "or mlir-air's per-layer-embedding one."
         ),
     },
     {

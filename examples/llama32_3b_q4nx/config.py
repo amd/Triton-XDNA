@@ -60,6 +60,21 @@ BOS = 128000  # <|begin_of_text|>, for the session warmup
 #: prefill over the prefix takes " the", as here.
 EXPECT_IDS_SUPERKERNEL = [12366, 13, 1102, 374, 279, 7928, 3363, 304, 9822, 323]
 
+#: The same after mlir-air's fused prefill, the default engine: the fused
+#: prefill over each prefix predicts each of these tokens.
+EXPECT_IDS_SUPERKERNEL_AIR_FUSED = [
+    12366,
+    13,
+    578,
+    6864,
+    315,
+    9822,
+    374,
+    7559,
+    304,
+    279,
+]
+
 MODEL_DEFAULT = os.environ.get("Q4NX_MODEL_SOURCE", "FastFlowLM/Llama-3.2-3B-NPU2")
 
 

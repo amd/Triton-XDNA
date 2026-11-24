@@ -32,24 +32,24 @@ bundle ships raw HF weights and the device multiplies by `w` with no add.
 Copying the sibling here is the obvious mistake; `config.RMS_NORM_ADDS_ONE`
 records it.
 
-**Its decode is the only one here built by a different engine**: mlir-air's
-`fused_decode_ple`, a fork carrying the per-layer-embedding branch.
-`registry.ModelSpec.engine` says so and `tl.extra.npu.fused_decode` takes it as
-an argument.
+Its decode, by default, is this repo's own: `../llm_q4nx/gemma4_superkernel/`
+runs the 35 layers and the LM head in one dispatch a token, written in Triton
+as a superkernel (`tl.extra.air`) on air-FLM's dataflow. It stands in for
+mlir-air's `FusedDecoder` under mlir-air's `generate()`, and needs no `make
+compile-decode`: Triton compiles it on its first token.
 
-It also has a second decode, this repo's own: `--decode superkernel` runs
-`../llm_q4nx/gemma4_superkernel/`, the same 35 layers and LM head in one
-dispatch a token,
-written in Triton as a superkernel (`tl.extra.air`) on air-FLM's dataflow. It
-stands in for mlir-air's `FusedDecoder` under mlir-air's `generate()`, and
-needs no `make compile-decode`: Triton compiles it on its first token.
+**mlir-air's decode of it (`--decode npu`) is the only one here built by a
+different engine**: `fused_decode_ple`, a fork carrying the
+per-layer-embedding branch. `registry.ModelSpec.engine` says so and
+`tl.extra.npu.fused_decode` takes it as an argument.
 
 Its driver takes the same `kv_arrays` handoff Qwen3's and Gemma3's do: no
 handoff parameter, so the harness substitutes the one prefill function it
 calls. On this model that handoff is a pair of LISTS rather than stacked
 arrays, because the per-layer caches are not the same width.
 
-Prerequisite for generation (not for --prefill-only):
+Prerequisite for mlir-air's decode (--decode npu); the default, the
+superkernel decode, needs none:
 
     make compile-decode
 """

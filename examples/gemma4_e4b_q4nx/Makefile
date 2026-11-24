@@ -1,8 +1,8 @@
-# Gemma4-E4B Q4NX on the NPU: mlir-air's fused prefill feeding its fused decode.
+# Gemma4-E4B Q4NX on the NPU: mlir-air's fused prefill and a Triton superkernel decode.
 #
 #   make run             One prompt, N_TOKENS of output  <-- start here
 #   make prefill         Prefill only + the Paris gate (no decode build needed)
-#   make compile-decode  One-time: build the fused decode templates
+#   make compile-decode  For DECODE=npu: build mlir-air's decode templates
 #
 # Run these two lines FIRST, from the repo root. A virtualenv is required --
 # `utils/env_setup.sh` pip-installs into whatever Python is active, and the

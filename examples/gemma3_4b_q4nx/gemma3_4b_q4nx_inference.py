@@ -24,7 +24,8 @@ fluent wrong text rather than an error.
 Its driver takes the same `kv_arrays` handoff Qwen3's does: no handoff
 parameter, so the harness substitutes the one prefill function it calls.
 
-Prerequisite for generation (not for --prefill-only):
+Prerequisite for mlir-air's decode (--decode npu); the default, the
+superkernel decode, needs none:
 
     make compile-decode
 """
