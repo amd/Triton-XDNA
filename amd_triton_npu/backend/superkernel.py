@@ -432,7 +432,9 @@ class Superkernel:
             _bind_tile_ids(seg, tiles, spmd)
             _lower_channels(top, seg, [(c, value[id(c)]) for c in self.channels])
             _lower_locals(seg, [(b, value[id(b)]) for b in owns])
+            _hide_call_buffers(top.operation)
             run_transform(Module.parse(_HERDS), top)
+            _unhide_call_buffers(top.operation)
             _hoist_ddr_reads(sblock, sargs[: len(bufs)], end)
             _place_herds(top, seg)
             # A one-column herd's own L2 buffers go in its column's memtile.
@@ -696,6 +698,44 @@ module attributes {transform.with_named_sequence} {
   }
 }
 """
+
+
+# MLIR's transform.memref.erase_dead_alloc_and_stores reads an op that
+# declares no memory effects as one that does not read its operands, so it
+# erases a buffer only result-less calls read, with the calls (twice, for a
+# call that takes it twice). So while _HERDS runs, each buffer a herd's
+# result-less call takes reaches the call through a marked cast: a use with a
+# result, which keeps the buffer.
+_CALL_BUFFER = "npu.call_buffer"
+
+
+def _hide_call_buffers(top):
+    """Pass each buffer operand of the result-less calls in `top`'s herds
+    through an `unrealized_conversion_cast` marked `_CALL_BUFFER`."""
+    from air.dialects import builtin
+    from air.ir import InsertionPoint, MemRefType, UnitAttr, UnrankedMemRefType
+
+    for h in _ops_named(top, "air.herd"):
+        for c in _ops_named(h, "func.call"):
+            if len(c.results):
+                continue
+            for i, v in enumerate(c.operands):
+                if not isinstance(v.type, (MemRefType, UnrankedMemRefType)):
+                    continue
+                with InsertionPoint(c):
+                    cast = builtin.UnrealizedConversionCastOp([v.type], [v])
+                cast.operation.attributes[_CALL_BUFFER] = UnitAttr.get()
+                c.operands[i] = cast.result
+
+
+def _unhide_call_buffers(top):
+    """Undo `_hide_call_buffers`: each marked cast still in a herd is
+    replaced by its operand (a rewrite may have folded some away)."""
+    for h in _ops_named(top, "air.herd"):
+        for c in _ops_named(h, "builtin.unrealized_conversion_cast"):
+            if _CALL_BUFFER in c.attributes:
+                c.results[0].replace_all_uses_with(c.operands[0])
+                c.erase()
 
 
 #: the core array AIR places herds on, per NPU: columns, first core row,
