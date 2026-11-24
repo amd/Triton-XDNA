@@ -14,10 +14,12 @@ Everything here is Llama-3.2-1B-specific and nothing else is: the driver,
 the decode build and the HSA dispatch all live in ../llm_q4nx/ and are shared
 with the other model families.
 
-Prerequisite for mlir-air's decode (--decode npu); the default, the
-superkernel decode, needs none:
+Prerequisites for generation (not for --prefill-only): mlir-air's sources,
+whose driver runs either decode (`make run` fetches them), and for mlir-air's
+decode (--decode npu) its build; the default superkernel decode needs no build:
 
-    make compile-decode
+    make air-src
+    make compile-decode     # --decode npu only
 """
 
 import os

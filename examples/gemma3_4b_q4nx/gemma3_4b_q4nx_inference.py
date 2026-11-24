@@ -24,10 +24,12 @@ fluent wrong text rather than an error.
 Its driver takes the same `kv_arrays` handoff Qwen3's does: no handoff
 parameter, so the harness substitutes the one prefill function it calls.
 
-Prerequisite for mlir-air's decode (--decode npu); the default, the
-superkernel decode, needs none:
+Prerequisites for generation (not for --prefill-only): mlir-air's sources,
+whose driver runs either decode (`make run` fetches them), and for mlir-air's
+decode (--decode npu) its build; the default superkernel decode needs no build:
 
-    make compile-decode
+    make air-src
+    make compile-decode     # --decode npu only
 """
 
 import os

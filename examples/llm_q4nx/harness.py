@@ -1124,8 +1124,9 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         )
 
     # The superkernel decode stands in for the driver's decoder class the
-    # same way, so that the driver's own generate() runs it.
-    if args.decode == "superkernel":
+    # same way, so that the driver's own generate() runs it. A prefill-only
+    # run loads no driver and decodes nothing.
+    if args.decode == "superkernel" and air is not None:
         mod, cls = spec.superkernel_decoder.split(":")
         setattr(
             air,

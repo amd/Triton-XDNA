@@ -17,10 +17,12 @@ qk-norm -- so it shares the 1B's forward as well as the harness. Everything
 3B-specific is in `config.py`: 28 layers of 3072, 128-wide heads, and its own
 weight bundle.
 
-Prerequisite for mlir-air's decode (--decode npu); the default, the
-superkernel decode, needs none:
+Prerequisites for generation (not for --prefill-only): mlir-air's sources,
+whose driver runs either decode (`make run` fetches them), and for mlir-air's
+decode (--decode npu) its build; the default superkernel decode needs no build:
 
-    make compile-decode
+    make air-src
+    make compile-decode     # --decode npu only
 """
 
 import os

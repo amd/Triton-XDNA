@@ -132,17 +132,16 @@ def plan(ex, spec, fused):
     entry = [sys.executable, f"{ex}_inference.py"]
     gen = ["--max-tokens", MAX_TOKENS, "--greedy"]
     npu = ["--decode", "npu"]
+    # The decode the harness picks by default: the superkernel where the model
+    # has one, except under the HSA runtime, which drives mlir-air's.
+    sk_default = (
+        bool(spec.superkernel_decoder)
+        and os.environ.get("AMD_TRITON_NPU_RUNTIME") != "hsa"
+    )
     cases = [
         # The defaults: mlir-air's fused prefill where the model has it, and
-        # the superkernel decode where it has one, gated on the recorded
-        # continuation.
-        Case(
-            "default",
-            entry + gen,
-            d,
-            HIDE_IGPU,
-            npu_decode=not spec.superkernel_decoder,
-        ),
+        # the default decode, gated on the recorded continuation.
+        Case("default", entry + gen, d, HIDE_IGPU, npu_decode=not sk_default),
     ]
     if spec.superkernel_decoder:
         # The default prefill again, and mlir-air's NPU decode.

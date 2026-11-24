@@ -101,7 +101,10 @@ chat: preflight
 endif
 
 ## One prompt, greedy, N_TOKENS of output.
-run: preflight
+# air-src: every decode runs under mlir-air's driver, which comes from its
+# sources; compile-decode fetches them for mlir-air's decode, but the default
+# superkernel decode needs no compile-decode.
+run: preflight air-src
 	@cd $(srcdir) && $(PYTHON) $(DRIVER) $(COMMON) $(RUN_PROMPT) \
 		--max-tokens $(N_TOKENS) --greedy
 

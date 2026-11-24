@@ -48,10 +48,12 @@ handoff parameter, so the harness substitutes the one prefill function it
 calls. On this model that handoff is a pair of LISTS rather than stacked
 arrays, because the per-layer caches are not the same width.
 
-Prerequisite for mlir-air's decode (--decode npu); the default, the
-superkernel decode, needs none:
+Prerequisites for generation (not for --prefill-only): mlir-air's sources,
+whose driver runs either decode (`make run` fetches them), and for mlir-air's
+decode (--decode npu) its build; the default superkernel decode needs no build:
 
-    make compile-decode
+    make air-src
+    make compile-decode     # --decode npu only
 """
 
 import os
