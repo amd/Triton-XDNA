@@ -20,14 +20,18 @@ The three stages and where each can run:
                       triton-fused  the same device, its ops from Triton
                       triton        this repository's prefill, per --backend
                       igpu          the prefill as Triton kernels on the iGPU
-    --decode          npu      mlir-air's fused PLE decode
+    --decode          superkernel  this repo's decode, one Triton superkernel
+                                   dispatch a token
+                      npu      mlir-air's fused PLE decode
                       gpu      the decode as Triton kernels on the iGPU
+                      auto     superkernel
 
 The soft tokens the tower produces replace the image placeholders' embeddings
 in the prompt. Every prefill writes K/V into a single slab in the layout both
 decoders read (`kv_layout`), in pages the NPU (an XRT BO) and the iGPU (a HIP
-mapping of the same pages) both address, so the decode reads the cache in
-place without a copy.
+mapping of the same pages) both address, so mlir-air's decode and the
+iGPU's read the cache in place without a copy; the superkernel decode seeds
+its own copy.
 
 A model is this module plus its `config` (`examples/gemma4_*_flash/`).
 """
@@ -64,7 +68,9 @@ def build_parser(doc):
     ap.add_argument("--system", default=None, help="a system turn before the image")
     ap.add_argument("--vision", choices=VISION, default="auto")
     ap.add_argument("--prefill-engine", choices=ENGINES, default="air-fused")
-    ap.add_argument("--decode", choices=("npu", "gpu"), default="npu")
+    ap.add_argument(
+        "--decode", choices=("auto", "superkernel", "npu", "gpu"), default="auto"
+    )
     ap.add_argument(
         "--prefill-tail",
         choices=("npu", "igpu"),
@@ -202,10 +208,16 @@ def main(cfg, doc=None, argv=None):
     spec = registry.spec(cfg.MODEL_NAME)
     model = args.model or cfg.MODEL_DEFAULT
 
+    if args.decode == "auto":
+        args.decode = "superkernel" if spec.superkernel_decoder else "npu"
     air = None
-    if not args.prefill_only and args.decode == "npu":
+    if not args.prefill_only and args.decode in ("npu", "superkernel"):
+        # mlir-air's driver runs either decode; only its own needs its build.
         air = harness.air_inference_module(spec)
-        harness.decode_build.check_stamp(spec)
+        if args.decode == "npu":
+            harness.decode_build.check_stamp(spec)
+        else:
+            harness.install_superkernel_decoder(air, spec)
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -243,6 +255,7 @@ def main(cfg, doc=None, argv=None):
         args.max_seq,
         args.model,
         npu_resident=args.decode != "gpu",
+        npu_decode=args.decode == "npu",
     )
     if args.prefill_tail == "igpu":
         from gemma4_prefill import Gemma4GpuDecode
@@ -286,9 +299,9 @@ def main(cfg, doc=None, argv=None):
     if hasattr(tower, "release"):
         tower.release()
 
-    # `--max-tokens` counts the prefill's first token. Both decodes return it
-    # first; the iGPU's returns `max_tokens` in total, mlir-air's returns
-    # `max_tokens` more, so mlir-air's is asked for one fewer.
+    # `--max-tokens` counts the prefill's first token. Every decode returns it
+    # first; the iGPU's returns `max_tokens` in total, those under mlir-air's
+    # driver `max_tokens` more, so they are asked for one fewer.
     want = args.max_tokens
     t0 = time.perf_counter()
     if args.decode == "gpu":
@@ -305,8 +318,9 @@ def main(cfg, doc=None, argv=None):
         n = max(len(out) - 1, 1)
         rate = f"{n / t_dec:.2f} tok/s"
     else:
-        # mlir-air builds its decoder inside `generate`, weights and all, and
-        # prints the decode's own rate above; this wall time includes that.
+        # mlir-air's driver builds the decoder inside `generate`, weights and
+        # all, and prints the decode's own rate above; this wall time
+        # includes that.
         rate = "including the decoder's setup"
     print(
         f"[flash] decode({args.decode}): {len(out)} tokens in {t_dec:.2f}s, {rate}",

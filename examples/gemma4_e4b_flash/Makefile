@@ -5,7 +5,7 @@
 #   make verify          The same, gated on the description
 #   make prefill         Vision + prefill only (no decode build needed)
 #   make vision          Gate a vision tower against transformers
-#   make compile-decode  One-time: build the decode (../gemma4_e4b_q4nx's)
+#   make compile-decode  For DECODE=npu: build mlir-air's decode (../gemma4_e4b_q4nx's)
 #
 # Run these first, from the repo root. A virtualenv is required, and the iGPU
 # stages need a ROCm build of torch in it:

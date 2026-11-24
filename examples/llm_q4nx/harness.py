@@ -225,12 +225,29 @@ def load_prefill_weights(m, backend, npu_resident=True):
         m.make_npu_resident()
 
 
-def make_prefiller(prefill_cls, cfg, backend, ops, max_seq, model, npu_resident=True):
-    """Construct `prefill_cls` for `cfg` and load its weights.
+def make_prefiller(
+    prefill_cls,
+    cfg,
+    backend,
+    ops,
+    max_seq,
+    model,
+    npu_resident=True,
+    npu_decode=True,
+):
+    """Construct `prefill_cls` for `cfg` and load its weights. `npu_decode`:
+    whether mlir-air's decode reads the KV cache the prefill writes, which a
+    prefill that writes its layout sizes the cache to
+    (`SIZES_KV_TO_NPU_DECODE`).
 
     A failure to obtain the weights (no network, no bundle) is raised as
     `ExampleUnavailable`, which the example reports as a skip (exit 77).
     """
+    kw = (
+        dict(npu_decode=npu_decode)
+        if getattr(prefill_cls, "SIZES_KV_TO_NPU_DECODE", False)
+        else {}
+    )
     m = prefill_cls(
         backend=backend,
         ops=ops,
@@ -238,6 +255,7 @@ def make_prefiller(prefill_cls, cfg, backend, ops, max_seq, model, npu_resident=
         max_seq=max_seq,
         model=model,
         expect_model=cfg.MODEL_NAME,
+        **kw,
     )
     try:
         load_prefill_weights(m, backend, npu_resident=npu_resident)
@@ -277,6 +295,7 @@ def run_prefill(
     profile=False,
     npu_resident=True,
     gpu_decode=False,
+    npu_decode=True,
 ):
     """Our prefill -> the handoff npz.
 
@@ -292,7 +311,14 @@ def run_prefill(
 
     t0 = time.time()
     m = make_prefiller(
-        prefill_cls, cfg, backend, ops, max_seq, model, npu_resident=npu_resident
+        prefill_cls,
+        cfg,
+        backend,
+        ops,
+        max_seq,
+        model,
+        npu_resident=npu_resident,
+        npu_decode=npu_decode,
     )
     if gpu_decode:
         attach_gpu_decoder(cfg, m)
@@ -368,6 +394,17 @@ def make_session_class(air, prefill_cls, cfg, backend, ops, model):
             )
 
     return TritonSession
+
+
+def install_superkernel_decoder(air, spec):
+    """Put the model's superkernel decoder where mlir-air's driver `air`
+    looks for its decoder class, so that the driver's generate() runs it."""
+    mod, cls = spec.superkernel_decoder.split(":")
+    setattr(
+        air,
+        spec.decoder_class or "FusedDecoder",
+        getattr(importlib.import_module(mod), cls),
+    )
 
 
 def make_decoder(air, spec, cfg, args, max_L=None):
@@ -787,6 +824,8 @@ def fused_prefill_cls(cfg, prefill_cls, config, triton=False):
     def make(backend=None, **kw):
         return cls(built["build_dir"], backend="cpu", **kw)
 
+    # what `make_prefiller` reads off a prefill class
+    make.SIZES_KV_TO_NPU_DECODE = getattr(cls, "SIZES_KV_TO_NPU_DECODE", False)
     return make
 
 
@@ -1127,12 +1166,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
     # same way, so that the driver's own generate() runs it. A prefill-only
     # run loads no driver and decodes nothing.
     if args.decode == "superkernel" and air is not None:
-        mod, cls = spec.superkernel_decoder.split(":")
-        setattr(
-            air,
-            spec.decoder_class or "FusedDecoder",
-            getattr(importlib.import_module(mod), cls),
-        )
+        install_superkernel_decoder(air, spec)
 
     if args.interactive:
         # Swap our prefill into mlir-air's Session, then hand off to its REPL.
@@ -1180,6 +1214,8 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             args.model,
             None,
             profile=args.profile,
+            # no decode reads the cache: it takes --max-seq's rows
+            npu_decode=False,
         )
         if ids != list(cfg.PROMPT):
             return 0
@@ -1227,6 +1263,7 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
             # A GPU decode reads the torch weights this would have released.
             npu_resident=args.decode != "gpu",
             gpu_decode=args.decode == "gpu",
+            npu_decode=args.decode == "npu",
         )
         ttft = time.time() - t_pf
         # Stop rather than decode from a prefill already known to be wrong.
