@@ -131,6 +131,12 @@ def main(argv=None):
     )
     _sync(args.tower)
     print(f"[vision] first encode {time.perf_counter() - t0:.2f}s (incl. builds)")
+    if ours is None and hasattr(tower, "release") and tower.release():
+        # An image turn releases the tower's hardware contexts for the decode
+        # and the next turn reopens them; the soft tokens scored come from
+        # a reopened tower.
+        got = tower.encode(pixels, pos_ids)
+        _sync(args.tower)
     times = []
     for _ in range(args.repeat - 1 if args.repeat > 1 else 0):
         t0 = time.perf_counter()
