@@ -25,6 +25,7 @@ buffer arguments, read and written in place every wave.
 import os
 import re
 
+from . import aie_ops
 from .arg_access import read_args, written_args
 from .compiler import (
     _allow_fp_contraction,
@@ -264,6 +265,7 @@ class Superkernel:
         if self.fp_fusion:
             ttshared = _allow_fp_contraction(ttshared)
         ttshared = _optimize_ttsharedir(ttshared, {})
+        ttshared = aie_ops.lower(ttshared)
         ttshared = _allocate_locals(ttshared, args)
         ttshared = _forward_copies(ttshared, args)
         with config_context(transform_tiling_script=schedule):

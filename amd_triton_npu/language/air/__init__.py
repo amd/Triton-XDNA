@@ -5,7 +5,10 @@
 
 Installed like ``tl.extra.npu``, from this backend's ``language/`` directory.
 These ops lower to AIR (herds, channels, L2 buffers), which is not specific
-to one device; see ``superkernel.py``.
+to one device; see ``superkernel.py``. A core's code may call aie_api's
+operations one by one: ``from triton.language.extra.air import aie``.
+That module is not imported with this one: its functions are compiled by
+``triton.jit`` when it is imported, which needs ``triton.language`` loaded.
 """
 
 from .superkernel import (
