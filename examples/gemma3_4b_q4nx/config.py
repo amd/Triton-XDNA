@@ -79,13 +79,10 @@ EXPECT_FIRST = 9079  # " Paris"
 BOS = 2
 
 #: What `--greedy` must generate from PROMPT, first token included --
-#: mlir-air's own PARIS_GREEDY for this model. The only assertion that covers
-#: the decode at all; the first-token gate above is pure prefill.
+#: mlir-air's own PARIS_GREEDY for this model, after the Triton prefill and
+#: mlir-air's fused one alike. The only assertion that covers the decode at
+#: all; the first-token gate above is pure prefill.
 EXPECT_IDS = [9079, 236761, 108, 50429, 563, 496, 4185, 3988, 573, 1610]
-
-#: The same after mlir-air's fused prefill, the default engine. Its numerics
-#: move a later greedy token on this model.
-EXPECT_IDS_AIR_FUSED = [9079, 236761, 108, 50429, 563, 3224, 618, 506, 623, 17698]
 
 #: The superkernel decode's (`--decode superkernel`) after the Triton prefill.
 #: From the sixth token it departs from EXPECT_IDS, mlir-air's decode, and
@@ -94,8 +91,8 @@ EXPECT_IDS_AIR_FUSED = [9079, 236761, 108, 50429, 563, 3224, 618, 506, 623, 1769
 EXPECT_IDS_SUPERKERNEL = [9079, 236761, 108, 50429, 563, 5628, 528, 506, 8339, 236772]
 
 #: The same after mlir-air's fused prefill: the fused prefill over each prefix
-#: predicts each of these tokens, where mlir-air's decode
-#: (EXPECT_IDS_AIR_FUSED) departs from the fourth.
+#: predicts each of these tokens, where mlir-air's decode (EXPECT_IDS) departs
+#: from the fourth.
 EXPECT_IDS_SUPERKERNEL_AIR_FUSED = [
     9079,
     236761,
