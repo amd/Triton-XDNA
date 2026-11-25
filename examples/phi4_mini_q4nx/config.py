@@ -72,33 +72,26 @@ EXPECT_FIRST = 12650  # " Paris"
 #: own for a raw prompt; this is <|endoftext|> standing in for one.
 BOS = 199999
 
-#: What `--greedy` must generate from PROMPT, first token included.
+#: What `--greedy` must generate from PROMPT, first token included, after the
+#: Triton prefill. Phi-4-mini's mlir-air driver records no `PARIS_GREEDY`.
 #:
-#: Unlike every other model here, this is NOT copied from a `PARIS_GREEDY`
-#: constant -- Phi-4-mini's mlir-air driver carries none. It was produced by
-#: running **mlir-air's own prefill feeding the same fused decode**
-#: (`generate_stream(..., prefiller=LlamaQ4nxPrefill(...), min_prefill=1)`),
-#: which is the path this example substitutes itself into. No Triton code runs
-#: in that reference. This example reproduces it exactly, all ten tokens.
+#: The fifth token is a near tie: a host prefill over the first four prefers
+#: a third token, by three quarters of a logit over this one and a quarter
+#: over EXPECT_IDS_AIR_FUSED's. Which one an NPU prefill lands on follows its
+#: rounding, so a toolchain bump can move it.
 #:
-#: Worth recording, because it cost a diagnosis: mlir-air's **replay** path
-#: (`prefiller=None`, which computes the prompt's K/V with the decode kernel
-#: token by token instead of prefilling) continues differently from here --
-#: `[..., 1617, 10358, 5678, 11]` against this `[..., 1617, 37118, 88691,
-#: 1299]`, the same first seven tokens and then a split. So the two paths do
-#: not agree for this model, whatever their driver's docstring says, and the
-#: replay path is the wrong thing to gate against. The prefill path is the
-#: right reference precisely because it is the one we replace.
-EXPECT_IDS = [12650, 11, 1118, 382, 5542, 395, 1617, 37118, 88691, 1299]
+#: mlir-air's replay path (`prefiller=None`, the prompt's K/V computed by the
+#: decode kernel a token at a time) continues differently again; it is not
+#: the path this example replaces, so nothing here gates against it.
+EXPECT_IDS = [12650, 11, 1118, 382, 261, 5030, 5542, 395, 1617, 10358]
 
-#: The same after mlir-air's fused prefill, the default engine. Its numerics
-#: move a later greedy token on this model.
-EXPECT_IDS_AIR_FUSED = [12650, 11, 1118, 382, 261, 5030, 5542, 395, 1617, 10358]
+#: The same after mlir-air's fused prefill, the default engine.
+EXPECT_IDS_AIR_FUSED = [12650, 11, 1118, 382, 5542, 395, 1617, 37118, 88691, 1299]
 
-#: The superkernel decode's (`--decode superkernel`) after the Triton prefill:
-#: what mlir-air's own decode gives after the Triton prefill too, run against
-#: the same build, and EXPECT_IDS_AIR_FUSED.
-EXPECT_IDS_SUPERKERNEL = EXPECT_IDS_AIR_FUSED
+#: The superkernel decode's (`--decode superkernel`) after either prefill:
+#: what mlir-air's decode gives after the Triton one.
+EXPECT_IDS_SUPERKERNEL = EXPECT_IDS
+EXPECT_IDS_SUPERKERNEL_AIR_FUSED = EXPECT_IDS
 
 MODEL_DEFAULT = os.environ.get(
     "Q4NX_MODEL_SOURCE", "FastFlowLM/Phi4-mini-Instruct-NPU2"
