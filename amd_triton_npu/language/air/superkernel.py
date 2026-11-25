@@ -224,6 +224,19 @@ def alloc(
     return core.tensor(call.get_result(0), ptr)
 
 
+def _backend_text(key, value):
+    """`air.backend`'s option `key` as its attribute's text: a list joined
+    by commas, but a tool's arguments, which may hold commas as pass
+    pipelines do, one a line. None for an option not given."""
+    value = core._unwrap_if_constexpr(value)
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, core.tuple)):
+        sep = "\n" if key in ("opt_args", "llc_args") else ","
+        value = sep.join(str(core._unwrap_if_constexpr(x)) for x in value)
+    return str(value)
+
+
 @core.builtin
 def backend(
     omit_pingpong=None,
@@ -236,6 +249,8 @@ def backend(
     allow_deadlock_prone_routing=None,
     trace_size=None,
     trace_offset=None,
+    opt_args=None,
+    llc_args=None,
     _semantic=None,
     _generator=None,
 ):
@@ -246,7 +261,9 @@ def backend(
     prove drain, where the order of the transfers rules the cycle out); and
     whether the host's feed loops are unrolled and contiguous feeds merged; and
     `trace_size` bytes of the cores' and memtiles' event traces, which AIR
-    writes into the third pointer argument from byte `trace_offset`. Called
+    writes into the third pointer argument from byte `trace_offset`; and
+    `opt_args` and `llc_args`, arguments for the Peano opt and llc that compile
+    the cores (aircc's -Xopt and -Xllc, one each). Called
     once, in the superkernel; without it, the defaults suit superkernels
     whose herds only exchange L2 buffers."""
     b = _semantic.builder
@@ -268,14 +285,13 @@ def backend(
         stack_size=stack_size,
         trace_size=trace_size,
         trace_offset=trace_offset,
+        opt_args=opt_args,
+        llc_args=llc_args,
     )
     for k, v in opts.items():
-        v = core._unwrap_if_constexpr(v)
-        if v is None:
-            continue
-        if isinstance(v, (list, tuple, core.tuple)):
-            v = ",".join(str(core._unwrap_if_constexpr(x)) for x in v)
-        decl.set_attr(f"air.backend.{k}", b.get_string_attr(str(v)))
+        v = _backend_text(k, v)
+        if v is not None:
+            decl.set_attr(f"air.backend.{k}", b.get_string_attr(v))
     b.call(module.get_function("air.backend"), [])
 
 

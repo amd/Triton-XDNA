@@ -12,6 +12,8 @@
   index casts     a constant cast to index becomes an index constant; a cast
                   from index keeps its type
   herd depth      whether code is a herd's is kept per thread of compilation
+  tool args       air.backend's opt_args and llc_args reach aircc as one -Xopt
+                  or -Xllc each, commas kept
 
 Needs no NPU.
 
@@ -24,6 +26,7 @@ import threading
 try:
     from air.ir import Context, IntegerAttr, Location, Module
     from triton.backends.amd_triton_npu import superkernel as S
+    from triton.backends.amd_triton_npu import superkernel_jit as SJ
     from triton.language.extra.air import superkernel as L
 except ImportError as e:
     print(f"SKIP: {e}")
@@ -239,6 +242,35 @@ def herd_depth():
     check(seen == [False], "herd depth: another thread is not in the herd")
 
 
+def tool_args():
+    gep = (
+        "--passes-ep-optimizer-last=function(separate-const-offset-from-gep,early-cse)"
+    )
+    opts = {
+        k: L._backend_text(k, v)
+        for k, v in dict(
+            opt_args=[gep, "-b"],
+            llc_args="--c",
+            stack_size=4096,
+            channel_multiplexing=["L1", "L2"],
+        ).items()
+    }
+    check(
+        opts["channel_multiplexing"] == "L1,L2",
+        "tool args: other lists still joined by commas",
+    )
+    check(
+        L._backend_text("opt_args", None) is None,
+        "tool args: an option not given has no text",
+    )
+    args = SJ._aircc_options(opts)["extra_args"]
+    check(
+        [a for a in args if a.startswith("-X")]
+        == [f"-Xopt={gep}", "-Xopt=-b", "-Xllc=--c"],
+        "tool args: one -Xopt/-Xllc each, in order, commas kept",
+    )
+
+
 def main():
     with Context() as ctx, Location.unknown():
         ctx.allow_unregistered_dialects = True
@@ -247,6 +279,7 @@ def main():
         placement()
         index_casts()
     herd_depth()
+    tool_args()
     if failures:
         print(f"{failures} check(s) failed")
         sys.exit(1)
