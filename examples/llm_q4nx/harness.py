@@ -1134,6 +1134,9 @@ def main(spec, cfg, prefill_cls, doc=None, argv=None):
         if args.prefill_only or args.decode == "gpu"
         else air_inference_module(spec)
     )
+    if igpu and air is not None:
+        # The iGPU prefill starts ROCm before the NPU decode opens the NPU.
+        hold_npu()
 
     if air is not None and args.decode != "superkernel":
         # One model's artifacts under another's name decode to fluent nonsense
