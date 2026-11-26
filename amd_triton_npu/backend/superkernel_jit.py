@@ -974,7 +974,14 @@ class Launcher:
         )
         # The code that lowers it, so that a change to it rebuilds.
         here = os.path.dirname(__file__)
-        for f in ("superkernel.py", "superkernel_jit.py", "transform_inject.py"):
+        for f in (
+            "superkernel.py",
+            "superkernel_jit.py",
+            "transform_inject.py",
+            "aie_ops.py",
+            "aie_post.py",
+            os.path.join("aie_templates", "ops.mlir"),
+        ):
             with open(os.path.join(here, f), "rb") as src:
                 key.update(src.read())
         proj = os.path.join(knobs.cache.dir, "npu_superkernel", key.hexdigest()[:32])

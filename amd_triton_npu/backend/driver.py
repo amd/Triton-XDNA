@@ -30,6 +30,7 @@ from air.compiler.util import run_transform
 from air.ir import *
 import air.passmanager
 
+from . import aie_post
 from .config import npu_config, _VALID_RUNTIMES
 from .codegen import (
     written_pointer_args,
@@ -1714,6 +1715,8 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ, actual_sizes=None, matmul_info=No
         transform_ir_string = _get_transform_ir_string(matmul_info=matmul_info)
         transform_ir = Module.parse(transform_ir_string, context=air_context)
         run_transform(transform_ir, air_module)
+        # the functions of core code written with tl.extra.air.aie
+        aie_post.finish(air_module)
         # MLIR-AIR compilation step 3: converting to AIR
         wrap_params = f"loop-bounds={gridX},{gridY},{gridZ}"
         if actual_sizes:

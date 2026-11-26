@@ -255,6 +255,11 @@ runs:
         # weights.
         python3 scripts/test_fused_device.py
 
+        # The lowering of tl.extra.air.aie's core ops, and the steps after a
+        # kernel's schedule that make their functions. No NPU.
+        python3 scripts/test_aie_ops.py
+        python3 scripts/test_aie_post.py
+
         # Which pointer arguments a kernel writes, read from its TTIR: what a
         # fused device's calls sync back. No NPU.
         python3 scripts/test_arg_access.py
