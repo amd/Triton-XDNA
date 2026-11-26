@@ -14,6 +14,8 @@
   herd depth      whether code is a herd's is kept per thread of compilation
   tool args       air.backend's opt_args and llc_args reach aircc as one -Xopt
                   or -Xllc each, commas kept
+  call buffers    a buffer only a call reads stays, with the call, through the
+                  herds' rewrites; one nothing reads goes
 
 Needs no NPU.
 
@@ -271,6 +273,99 @@ def tool_args():
     )
 
 
+def call_buffers():
+    from air.compiler.util import run_transform
+
+    def module(body):
+        return Module.parse(
+            """
+module {
+  func.func private @use(memref<8xf32, 2>)
+  func.func private @use2(memref<8xf32, 2>, memref<4xf32, strided<[1], offset: 2>, 2>)
+  func.func private @get(memref<8xf32, 2>) -> f32
+  func.func @f() {
+    %c1 = arith.constant 1 : index
+    air.herd tile (%tx, %ty) in (%sx=%c1, %sy=%c1) {
+      %c0 = arith.constant 0 : index
+      %x = arith.constant 1.0 : f32
+      %buf = memref.alloc() : memref<8xf32, 2>
+      memref.store %x, %buf[%c0] : memref<8xf32, 2>
+"""
+            + body
+            + """
+    }
+    return
+  }
+}
+"""
+        )
+
+    def herds(m):
+        S._hide_call_buffers(m.operation)
+        run_transform(Module.parse(S._HERDS), m)
+        S._unhide_call_buffers(m.operation)
+        h = herd_of(m)
+        casts = S._ops_named(h, "builtin.unrealized_conversion_cast")
+        return h, not casts and m.operation.verify()
+
+    def owners(op):
+        return [v.owner.name for v in op.operands]
+
+    m = module("""
+      func.call @use(%buf) : (memref<8xf32, 2>) -> ()
+      %dead = memref.alloc() : memref<8xf32, 2>
+      memref.store %x, %dead[%c0] : memref<8xf32, 2>
+""")
+    h, clean = herds(m)
+    calls = S._ops_named(h, "func.call")
+    check(
+        len(calls) == 1
+        and owners(calls[0]) == ["memref.alloc"]
+        and len(S._ops_named(h, "memref.alloc")) == 1,
+        "call buffers: a buffer only a call reads stays, and the call takes it;"
+        " one nothing reads goes",
+    )
+    check(clean, "call buffers: no cast is left, and the module verifies")
+
+    # The buffer twice in one call, once through a view.
+    m = module("""
+      %v = memref.subview %buf[2] [4] [1] : memref<8xf32, 2> to memref<4xf32, strided<[1], offset: 2>, 2>
+      func.call @use2(%buf, %v) : (memref<8xf32, 2>, memref<4xf32, strided<[1], offset: 2>, 2>) -> ()
+""")
+    h, clean = herds(m)
+    calls = S._ops_named(h, "func.call")
+    check(
+        len(calls) == 1 and owners(calls[0]) == ["memref.alloc", "memref.subview"],
+        "call buffers: a buffer a call takes twice, once through a view, stays",
+    )
+    check(clean, "call buffers: no cast is left after a call taking two")
+
+    # A call with a result is one the erasure keeps already: left as it is.
+    m = module("""
+      %r = func.call @get(%buf) : (memref<8xf32, 2>) -> f32
+      memref.store %r, %buf[%c0] : memref<8xf32, 2>
+""")
+    S._hide_call_buffers(m.operation)
+    call = S._ops_named(herd_of(m), "func.call")[0]
+    check(
+        owners(call) == ["memref.alloc"],
+        "call buffers: a call with a result is not given casts",
+    )
+
+    # Casts not made here are not undone.
+    m = module("""
+      %c = builtin.unrealized_conversion_cast %buf : memref<8xf32, 2> to memref<8xf32, 2>
+      func.call @use(%c) : (memref<8xf32, 2>) -> ()
+""")
+    S._hide_call_buffers(m.operation)
+    S._unhide_call_buffers(m.operation)
+    call = S._ops_named(herd_of(m), "func.call")[0]
+    check(
+        owners(call) == ["builtin.unrealized_conversion_cast"],
+        "call buffers: a herd's own cast stays",
+    )
+
+
 def main():
     with Context() as ctx, Location.unknown():
         ctx.allow_unregistered_dialects = True
@@ -278,6 +373,7 @@ def main():
         forwarding()
         placement()
         index_casts()
+        call_buffers()
     herd_depth()
     tool_args()
     if failures:
